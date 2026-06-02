@@ -5,6 +5,9 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: write
+
 jobs:
   build-windows:
     runs-on: windows-latest
@@ -79,6 +82,7 @@ jobs:
         run: bun run tauri android build -t aarch64 --apk
         env:
           NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
+          PATH: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin:${{ env.PATH }}
           CC_aarch64_linux_android: aarch64-linux-android21-clang
           CXX_aarch64_linux_android: aarch64-linux-android21-clang++
           AR_aarch64_linux_android: llvm-ar
