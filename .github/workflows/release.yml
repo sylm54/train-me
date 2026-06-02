@@ -91,10 +91,12 @@ jobs:
 
       - name: Sign APK
         run: |
-          BUILD_TOOLS=$(echo "$ANDROID_HOME/build-tools"/*/ | sort -V | tail -1)
+          BUILD_TOOLS=$(ls -d1 "$ANDROID_HOME/build-tools"/*/ | sort -V | tail -1)
           UNSIGNED_APK=$(find src-tauri/gen/android/app/build/outputs/apk -name '*-unsigned.apk' | head -1)
-          "$BUILD_TOOLS/zipalign" -f 4 "$UNSIGNED_APK" aligned.apk
-          "$BUILD_TOOLS/apksigner" sign \
+          echo "Build tools: $BUILD_TOOLS"
+          echo "Unsigned APK: $UNSIGNED_APK"
+          "${BUILD_TOOLS}zipalign" -f 4 "$UNSIGNED_APK" aligned.apk
+          "${BUILD_TOOLS}apksigner" sign \
             --ks <(echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d) \
             --ks-key-alias "${{ secrets.ANDROID_KEY_ALIAS }}" \
             --ks-pass "pass:${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" \
