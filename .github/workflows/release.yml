@@ -91,8 +91,8 @@ jobs:
 
       - name: Rename APK
         run: |
-          mv src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk \
-             train-me-${{ github.ref_name }}-arm64-v8a.apk
+          APK=$(find src-tauri/gen/android/app/build/outputs/apk -name '*.apk' | head -1)
+          mv "$APK" train-me-${{ github.ref_name }}-arm64-v8a.apk
 
       - name: Upload APK to release
         uses: softprops/action-gh-release@v2
