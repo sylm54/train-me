@@ -89,10 +89,18 @@ jobs:
           CXX_aarch64_linux_android: aarch64-linux-android21-clang++
           AR_aarch64_linux_android: llvm-ar
 
-      - name: Rename APK
+      - name: Sign APK
         run: |
-          APK=$(find src-tauri/gen/android/app/build/outputs/apk -name '*.apk' | head -1)
-          mv "$APK" train-me-${{ github.ref_name }}-arm64-v8a.apk
+          BUILD_TOOLS=$(echo "$ANDROID_HOME/build-tools"/*/ | sort -V | tail -1)
+          UNSIGNED_APK=$(find src-tauri/gen/android/app/build/outputs/apk -name '*-unsigned.apk' | head -1)
+          "$BUILD_TOOLS/zipalign" -f 4 "$UNSIGNED_APK" aligned.apk
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks <(echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d) \
+            --ks-key-alias "${{ secrets.ANDROID_KEY_ALIAS }}" \
+            --ks-pass "pass:${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" \
+            --key-pass "pass:${{ secrets.ANDROID_KEY_PASSWORD }}" \
+            --out train-me-${{ github.ref_name }}-arm64-v8a.apk \
+            aligned.apk
 
       - name: Upload APK to release
         uses: softprops/action-gh-release@v2
