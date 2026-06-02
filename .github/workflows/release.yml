@@ -78,11 +78,13 @@ jobs:
         env:
           NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
 
+      - name: Add NDK toolchain to PATH
+        run: echo "${ANDROID_HOME}/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+
       - name: Build Android APK
         run: bun run tauri android build -t aarch64 --apk
         env:
           NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
-          PATH: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin:${{ env.PATH }}
           CC_aarch64_linux_android: aarch64-linux-android21-clang
           CXX_aarch64_linux_android: aarch64-linux-android21-clang++
           AR_aarch64_linux_android: llvm-ar
