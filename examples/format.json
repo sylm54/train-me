@@ -1,0 +1,15 @@
+[
+  {
+    "type": "freeform",
+    "prompt": "How was your day?"
+  },
+  {
+    "type": "scale",
+    "prompt": "On a scale of 1-5 how content are you?"
+  },
+  {
+    "type": "choice",
+    "prompt": "What do you like most?",
+    "options": ["Birds", "Deers"]
+  }
+]

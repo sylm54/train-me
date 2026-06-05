@@ -1,0 +1,1 @@
+Here you describe your rule you can link to other files like so: [go here](conditioning/some_file.md) or [SomeItem](inventory/items.csv#some_item) the user gets a clickable link that leads to the referenced conditioning/item/rule etc. The rule name gets converted from e.g. 'rules/rule_name.md' to 'Rule Name'
