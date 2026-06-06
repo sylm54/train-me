@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{Manager, State};
 
 mod audio_renderer;
+mod bash;
 mod expression;
 mod helper;
 mod model_downloader;
@@ -20,12 +21,19 @@ mod tag_parser;
 
 /// Managed state shared across all Tauri commands.
 ///
-/// `model_dir` = `<app_data>/model`
+/// `data_dir`   = the app's full data directory
+/// `agent_dir`  = `<app_data>/agent_data` — the agent's writable scratch
+///                 space, also the bash sandbox root
+/// `model_dir`  = `<app_data>/model`
 /// `tracks_dir` = `<app_data>/tracks`
+/// `bash`       = bashkit sandbox mounted over `agent_dir`
 pub struct AppState {
+    pub data_dir: PathBuf,
+    pub agent_dir: PathBuf,
     pub model_dir: PathBuf,
     pub tracks_dir: PathBuf,
     pub renderer: Arc<Mutex<Option<audio_renderer::AudioRenderer>>>,
+    pub bash: Arc<bash::BashSandbox>,
 }
 
 // ============================================================================
@@ -54,6 +62,14 @@ pub struct ModelStatus {
     pub loaded: bool,
     pub missing_files: Vec<String>,
     pub speakers: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct FileEntry {
+    pub path: String,
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
 }
 
 // ============================================================================
@@ -252,6 +268,18 @@ fn get_sound_names() -> Vec<String> {
         .collect()
 }
 
+/// Return the absolute path of the app data directory (for debugging UI).
+#[tauri::command]
+fn get_data_dir(state: State<'_, AppState>) -> String {
+    state.data_dir.to_string_lossy().to_string()
+}
+
+/// Return the absolute path of the agent's writable data directory.
+#[tauri::command]
+fn get_agent_dir(state: State<'_, AppState>) -> String {
+    state.agent_dir.to_string_lossy().to_string()
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -287,25 +315,44 @@ pub fn run() {
                 .app_data_dir()
                 .expect("Failed to resolve app data directory");
 
+            let agent_dir = data_dir.join("agent_data");
             let model_dir = data_dir.join("model");
             let tracks_dir = data_dir.join("tracks");
 
             // Ensure they exist
+            std::fs::create_dir_all(&data_dir).ok();
+            std::fs::create_dir_all(&agent_dir).ok();
             std::fs::create_dir_all(&model_dir).ok();
             std::fs::create_dir_all(&tracks_dir).ok();
 
+            // Ensure prompts/ exists with a placeholder main_agent.md if missing.
+            bash::ensure_prompts_dir(&data_dir).ok();
+            // Ensure agent_data/ exists with conventional subdirs.
+            bash::ensure_agent_dir(&data_dir).ok();
+            seed_default_prompts(&data_dir).ok();
+
+            log::info!("Data dir: {:?}", data_dir);
+            log::info!("Agent dir: {:?}", agent_dir);
             log::info!("Model dir: {:?}", model_dir);
-            log::info!("Tracks dir: {:?}", model_dir);
+            log::info!("Tracks dir: {:?}", tracks_dir);
+
+            // Build the bash sandbox scoped to the agent's writable area.
+            let bash_sandbox = bash::create_bash_sandbox(&agent_dir)
+                .expect("Failed to initialize bashkit sandbox");
 
             app.manage(AppState {
+                data_dir,
+                agent_dir,
                 model_dir,
                 tracks_dir,
                 renderer: Arc::new(Mutex::new(None)),
+                bash: Arc::new(bash_sandbox),
             });
 
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            // Existing TTS commands
             get_model_status,
             download_model,
             load_model,
@@ -314,7 +361,27 @@ pub fn run() {
             get_track_audio,
             delete_track,
             get_sound_names,
+            // Agent / bash / file commands
+            bash::exec_bash,
+            bash::read_data_file,
+            bash::write_data_file,
+            bash::list_data_files,
+            bash::read_prompt,
+            bash::list_prompt_files,
+            get_data_dir,
+            get_agent_dir,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+/// Write a starter `prompts/main_agent.md` if none exists yet.
+fn seed_default_prompts(data_dir: &std::path::Path) -> std::io::Result<()> {
+    let main = data_dir.join("prompts").join("main_agent.md");
+    if !main.exists() {
+        fs::write(&main, DEFAULT_MAIN_AGENT_PROMPT)?;
+    }
+    Ok(())
+}
+
+const DEFAULT_MAIN_AGENT_PROMPT: &str = include_str!("default_main_agent_prompt.md");
