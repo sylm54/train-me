@@ -5,13 +5,14 @@
 //! Expression-based volume envelopes are evaluated per-sample and baked into the waveform.
 
 use anyhow::{bail, Context, Result};
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use crate::expression::{self, Expr};
 use crate::helper::{load_text_to_speech, load_voice_style, write_wav_file, TextToSpeech};
 use crate::model_downloader;
 use crate::sounds::SoundType;
-use crate::tag_parser::{Node, OverlayPart};
+use crate::tag_parser::{self, Node, OverlayPart};
 
 /// Default sample rate for generated audio (overridden by TTS model).
 const DEFAULT_SAMPLE_RATE: u32 = 24000;
@@ -387,6 +388,11 @@ impl AudioRenderer {
                         _total_duration += *pp;
                     }
                 }
+
+                Node::Include { .. } => {
+                    // Includes should have been resolved by `resolve_includes`
+                    // before reaching the renderer. Silently ignore if not.
+                }
             }
         }
 
@@ -557,6 +563,205 @@ impl AudioRenderer {
         let duration = mixed.len() as f32 / self.sample_rate as f32;
         Ok((mixed, duration))
     }
+}
+
+// ============================================================================
+// Include resolution (pre-rendering pass)
+// ============================================================================
+
+/// Resolve all `<include>` nodes by inlining the contents of referenced files.
+///
+/// `base_dir` is the directory that relative `src` paths are resolved against
+/// (typically `state.agent_dir`).
+///
+/// Behavior:
+/// - Circular includes are silently skipped (tracked via the active recursion
+///   path; siblings may re-include the same file).
+/// - Missing files are silently skipped.
+/// - Parse errors are silently skipped (a `log::warn!` is emitted).
+pub fn resolve_includes(nodes: Vec<Node>, base_dir: &Path) -> Vec<Node> {
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    resolve_includes_inner(nodes, base_dir, &mut visited)
+}
+
+fn resolve_includes_inner(
+    nodes: Vec<Node>,
+    base_dir: &Path,
+    visited: &mut HashSet<PathBuf>,
+) -> Vec<Node> {
+    let mut result = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let resolved = resolve_includes_in_node(node, base_dir, visited);
+        result.extend(resolved);
+    }
+    result
+}
+
+/// Resolve includes within a single node. Returns a `Vec<Node>` because an
+/// `Include` expands to the (potentially many) top-level nodes of the included
+/// file. Non-`Include` nodes always return a single-element vec with their
+/// children recursively resolved.
+fn resolve_includes_in_node(
+    node: Node,
+    base_dir: &Path,
+    visited: &mut HashSet<PathBuf>,
+) -> Vec<Node> {
+    match node {
+        Node::Include { src } => resolve_one_include(&src, base_dir, visited),
+
+        Node::Voice {
+            speaker,
+            pitch,
+            volume,
+            speed,
+            children,
+        } => {
+            let children = resolve_includes_inner(children, base_dir, visited);
+            vec![Node::Voice {
+                speaker,
+                pitch,
+                volume,
+                speed,
+                children,
+            }]
+        }
+
+        Node::Speed { value, children } => {
+            let children = resolve_includes_inner(children, base_dir, visited);
+            vec![Node::Speed { value, children }]
+        }
+
+        Node::Volume { value, children } => {
+            let children = resolve_includes_inner(children, base_dir, visited);
+            vec![Node::Volume { value, children }]
+        }
+
+        Node::Effect {
+            effect_type,
+            preset,
+            cutoff,
+            children,
+        } => {
+            let children = resolve_includes_inner(children, base_dir, visited);
+            vec![Node::Effect {
+                effect_type,
+                preset,
+                cutoff,
+                children,
+            }]
+        }
+
+        Node::Loop { loops, children } => {
+            let children = resolve_includes_inner(children, base_dir, visited);
+            vec![Node::Loop { loops, children }]
+        }
+
+        Node::Background {
+            volume,
+            speed,
+            children,
+        } => {
+            let children = resolve_includes_inner(children, base_dir, visited);
+            vec![Node::Background {
+                volume,
+                speed,
+                children,
+            }]
+        }
+
+        Node::Until {
+            button,
+            waiting_sound,
+            waiting_sound_volume,
+            pre_pause,
+            post_pause,
+            children,
+        } => {
+            let children = resolve_includes_inner(children, base_dir, visited);
+            vec![Node::Until {
+                button,
+                waiting_sound,
+                waiting_sound_volume,
+                pre_pause,
+                post_pause,
+                children,
+            }]
+        }
+
+        Node::Overlay { duration, parts } => {
+            let parts = parts
+                .into_iter()
+                .map(|part| OverlayPart {
+                    looped: part.looped,
+                    volume: part.volume,
+                    speed: part.speed,
+                    children: resolve_includes_inner(part.children, base_dir, visited),
+                })
+                .collect();
+            vec![Node::Overlay { duration, parts }]
+        }
+
+        // Leaves with no nested children — pass through unchanged.
+        Node::Text(_) | Node::Pause { .. } | Node::Sound { .. } | Node::Tone { .. } => vec![node],
+    }
+}
+
+/// Resolve a single `<include src="...">` reference.
+fn resolve_one_include(src: &str, base_dir: &Path, visited: &mut HashSet<PathBuf>) -> Vec<Node> {
+    let joined = base_dir.join(src);
+    let normalized = normalize_path(&joined);
+
+    if visited.contains(&normalized) {
+        log::warn!("Skipping circular include: {}", normalized.display());
+        return Vec::new();
+    }
+
+    if !normalized.exists() {
+        log::warn!("Skipping missing include: {}", normalized.display());
+        return Vec::new();
+    }
+
+    let content = match std::fs::read_to_string(&normalized) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("Failed to read include '{}': {}", normalized.display(), e);
+            return Vec::new();
+        }
+    };
+
+    let inner_nodes = match tag_parser::parse(&content) {
+        Ok(n) => n,
+        Err(e) => {
+            log::warn!("Failed to parse include '{}': {}", normalized.display(), e);
+            return Vec::new();
+        }
+    };
+
+    // Track this file on the recursion stack so descendants can detect cycles.
+    visited.insert(normalized.clone());
+    let resolved = resolve_includes_inner(inner_nodes, base_dir, visited);
+    visited.remove(&normalized);
+
+    resolved
+}
+
+/// Normalize a path without requiring it to exist on disk.
+///
+/// Mirrors the logic in `bash::resolve_under`: collapses `.` and `..`
+/// components manually. Unlike `Path::canonicalize`, this works for paths
+/// that point to missing files.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 // ============================================================================
@@ -1644,5 +1849,206 @@ mod tests {
         // During "B" after swoosh (1.5 s – 2.0 s): only 0.3
         let after_idx = sr as usize + 3 * sr as usize / 4;
         assert!((mixed[after_idx] - 0.3).abs() < 0.001, "During B only");
+    }
+
+    // ========================================================================
+    // resolve_includes tests
+    // ========================================================================
+
+    use crate::tag_parser;
+    use std::fs;
+    use tempfile::tempdir;
+
+    /// Helper: collect all text nodes from a node vec, ignoring nested structure.
+    fn collect_text(nodes: &[Node]) -> Vec<String> {
+        let mut texts = Vec::new();
+        for node in nodes {
+            collect_text_recursive(node, &mut texts);
+        }
+        texts
+    }
+
+    fn collect_text_recursive(node: &Node, texts: &mut Vec<String>) {
+        match node {
+            Node::Text(t) => {
+                if !t.is_empty() {
+                    texts.push(t.clone());
+                }
+            }
+            Node::Voice { children, .. }
+            | Node::Speed { children, .. }
+            | Node::Volume { children, .. }
+            | Node::Effect { children, .. }
+            | Node::Loop { children, .. }
+            | Node::Background { children, .. }
+            | Node::Until { children, .. } => {
+                for child in children {
+                    collect_text_recursive(child, texts);
+                }
+            }
+            Node::Overlay { parts, .. } => {
+                for part in parts {
+                    for child in &part.children {
+                        collect_text_recursive(child, texts);
+                    }
+                }
+            }
+            Node::Pause { .. } | Node::Sound { .. } | Node::Tone { .. } | Node::Include { .. } => {}
+        }
+    }
+
+    /// True if any node in the tree is an unresolved `Include`.
+    fn contains_include(nodes: &[Node]) -> bool {
+        for node in nodes {
+            if contains_include_recursive(node) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn contains_include_recursive(node: &Node) -> bool {
+        match node {
+            Node::Include { .. } => true,
+            Node::Voice { children, .. }
+            | Node::Speed { children, .. }
+            | Node::Volume { children, .. }
+            | Node::Effect { children, .. }
+            | Node::Loop { children, .. }
+            | Node::Background { children, .. }
+            | Node::Until { children, .. } => children.iter().any(contains_include_recursive),
+            Node::Overlay { parts, .. } => parts
+                .iter()
+                .any(|p| p.children.iter().any(contains_include_recursive)),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn test_resolve_includes_basic() {
+        let dir = tempdir().expect("create tempdir");
+        fs::write(dir.path().join("sub.xml"), "hello").expect("write sub.xml");
+
+        let nodes = tag_parser::parse(r#"<include src="sub.xml"/>"#).expect("parse main");
+        let resolved = resolve_includes(nodes, dir.path());
+
+        assert!(
+            !contains_include(&resolved),
+            "Include should have been resolved away"
+        );
+        let texts = collect_text(&resolved);
+        assert!(
+            texts.iter().any(|t| t == "hello"),
+            "Expected inlined text 'hello', got {:?}",
+            texts,
+        );
+    }
+
+    #[test]
+    fn test_resolve_includes_circular() {
+        let dir = tempdir().expect("create tempdir");
+        fs::write(
+            dir.path().join("a.xml"),
+            r#"A-start <include src="b.xml"/> A-end"#,
+        )
+        .expect("write a.xml");
+        fs::write(
+            dir.path().join("b.xml"),
+            r#"B-start <include src="a.xml"/> B-end"#,
+        )
+        .expect("write b.xml");
+
+        let nodes = tag_parser::parse(r#"<include src="a.xml"/>"#).expect("parse main");
+        // The resolver must terminate rather than recurse forever.
+        let resolved = resolve_includes(nodes, dir.path());
+
+        let texts = collect_text(&resolved);
+        // We expect at least one occurrence of each side, plus the second-occurrence
+        // circular skip meaning the second 'a.xml' reference is dropped.
+        assert!(
+            texts.iter().any(|t| t.contains("A-start")),
+            "A-start should appear: {:?}",
+            texts,
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("B-start")),
+            "B-start should appear: {:?}",
+            texts,
+        );
+        // Should not contain a duplicate A-start (would indicate infinite recursion
+        // — actually with the current per-path visited tracking it would, but the
+        // circular detection prevents it).
+        let a_count = texts.iter().filter(|t| t.contains("A-start")).count();
+        assert_eq!(
+            a_count, 1,
+            "A-start should appear exactly once (circular skipped), got {}: {:?}",
+            a_count, texts,
+        );
+    }
+
+    #[test]
+    fn test_resolve_includes_missing_file() {
+        let dir = tempdir().expect("create tempdir");
+        let nodes = tag_parser::parse(r#"before <include src="does_not_exist.xml"/> after"#)
+            .expect("parse main");
+        let resolved = resolve_includes(nodes, dir.path());
+
+        let texts = collect_text(&resolved);
+        assert!(
+            texts.iter().any(|t| t == "before"),
+            "'before' should survive: {:?}",
+            texts,
+        );
+        assert!(
+            texts.iter().any(|t| t == "after"),
+            "'after' should survive: {:?}",
+            texts,
+        );
+        assert!(
+            !contains_include(&resolved),
+            "Missing include should have been silently dropped (no Include node left)",
+        );
+    }
+
+    #[test]
+    fn test_resolve_includes_nested() {
+        let dir = tempdir().expect("create tempdir");
+        fs::write(dir.path().join("a.xml"), r#"A <include src="b.xml"/>"#).expect("write a.xml");
+        fs::write(dir.path().join("b.xml"), "B").expect("write b.xml");
+
+        let nodes = tag_parser::parse(r#"<include src="a.xml"/>"#).expect("parse main");
+        let resolved = resolve_includes(nodes, dir.path());
+
+        let texts = collect_text(&resolved);
+        assert!(
+            texts.iter().any(|t| t.contains("A")),
+            "Expected content from a.xml: {:?}",
+            texts,
+        );
+        assert!(
+            texts.iter().any(|t| t == "B"),
+            "Expected inlined 'B' from b.xml: {:?}",
+            texts,
+        );
+    }
+
+    #[test]
+    fn test_resolve_includes_recursive_in_sibling_branches() {
+        let dir = tempdir().expect("create tempdir");
+        fs::write(dir.path().join("a.xml"), r#"<include src="c.xml"/>"#).expect("write a.xml");
+        fs::write(dir.path().join("b.xml"), r#"<include src="c.xml"/>"#).expect("write b.xml");
+        fs::write(dir.path().join("c.xml"), "shared").expect("write c.xml");
+
+        let nodes = tag_parser::parse(r#"<include src="a.xml"/> <include src="b.xml"/>"#)
+            .expect("parse main");
+        let resolved = resolve_includes(nodes, dir.path());
+
+        let texts = collect_text(&resolved);
+        let shared_count = texts.iter().filter(|t| t.as_str() == "shared").count();
+        assert_eq!(
+            shared_count, 2,
+            "'shared' should appear in BOTH sibling branches, got {}: {:?}",
+            shared_count, texts,
+        );
     }
 }

@@ -7,6 +7,9 @@ import { AppShell } from "@/components/AppShell";
 import { ChatView } from "@/views/ChatView";
 import { SettingsView } from "@/views/SettingsView";
 import { TtsView } from "@/views/TtsView";
+import { ConditioningView } from "@/views/ConditioningView";
+import { RulesView } from "@/views/RulesView";
+import { RoutinesView } from "@/views/RoutinesView";
 import { PlaceholderView } from "@/views/PlaceholderView";
 import type { View } from "@/lib/views";
 
@@ -27,8 +30,14 @@ export default function App() {
       body = <TtsView />;
       break;
     case "conditioning":
+      body = <ConditioningView />;
+      break;
     case "rules":
+      body = <RulesView />;
+      break;
     case "routines":
+      body = <RoutinesView />;
+      break;
     case "inventory":
     case "chastity":
     case "journal":

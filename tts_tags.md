@@ -192,6 +192,18 @@ Since the inside content is looped, any dynamic expressions (fades, beats) will 
 
 ---
 
+<include src="filename.xml"/>
+
+Includes the content of another XML file at this point in the document. The included file can contain any valid tags and expressions; its content is inlined at parse time before rendering.
+
+Path is relative to the filesystem root (the app's data directory).
+
+Included files may themselves contain `<include>` tags (recursive includes). Circular includes are silently skipped. Missing files are silently skipped.
+
+The include is resolved before rendering, so all tags inside the included file behave exactly as if they were written inline.
+
+---
+
 3. Dynamic expressions
 
 Expressions can be used anywhere "<expression>" is expected, and may be combined with +, -, *, /.

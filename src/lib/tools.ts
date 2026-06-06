@@ -20,12 +20,9 @@ import type { BashResult, FileEntry } from "./types";
 /** Execute a bash script in the bashkit sandbox backed by agent_data/. */
 export const bashTool = tool({
   description:
-    "Execute a bash script in the sandboxed virtual bash interpreter. " +
-    "The working directory is the agent's writable area " +
-    "(<app_data>/agent_data), mounted as `/`. Files created or modified " +
-    "are persisted to disk. Output is captured (stdout, stderr, exit code). " +
-    "The sandbox CANNOT see anything outside agent_data/ (no access to " +
-    "prompts/, tracks/, model/). Use read_prompt for prompt files.",
+    "Execute a bash command. " +
+    "Files created or modified " +
+    "are persisted to disk. Output is captured (stdout, stderr, exit code). ",
   inputSchema: z.object({
     command: z
       .string()
@@ -42,13 +39,11 @@ export const bashTool = tool({
 /** Read a file from the agent's writable area (<app_data>/agent_data). */
 export const readFileTool = tool({
   description:
-    "Read a UTF-8 text file from the agent's writable area " +
-    "(<app_data>/agent_data). Path is relative to that directory " +
+    "Read a file" +
+    "Path is relative to that directory " +
     "(POSIX-style, no leading slash).",
   inputSchema: z.object({
-    path: z
-      .string()
-      .describe("Relative file path inside the app data directory."),
+    path: z.string().describe("File path."),
   }),
   execute: async ({ path }) => {
     return await invoke<string>("read_data_file", { path });
@@ -58,10 +53,9 @@ export const readFileTool = tool({
 /** Write a file to the agent's writable area (<app_data>/agent_data). */
 export const writeFileTool = tool({
   description:
-    "Write a UTF-8 text file to the agent's writable area " +
-    "(<app_data>/agent_data). Parent directories are created automatically.",
+    "Write a text file Parent directories are created automatically.",
   inputSchema: z.object({
-    path: z.string().describe("Relative file path inside the app data dir."),
+    path: z.string().describe("File path."),
     content: z.string().describe("The text content to write."),
   }),
   execute: async ({ path, content }) => {
@@ -72,54 +66,19 @@ export const writeFileTool = tool({
 
 /** List files in a directory under the agent's writable area. */
 export const listFilesTool = tool({
-  description:
-    "List entries in a directory under the agent's writable area " +
-    "(<app_data>/agent_data). Returns name, path, isDir, and size.",
+  description: "List entries in a directory",
   inputSchema: z.object({
     path: z
       .string()
       .default(".")
-      .describe(
-        "Relative directory path. Use '.' for the agent's writable root.",
-      ),
+      .describe("Relative directory path. Use '.' for the root."),
   }),
   execute: async ({ path }) => {
-    return await invoke<FileEntry[]>("list_data_files", { path });
-  },
-});
-
-/** Read a UTF-8 file from the app's prompts/ directory. */
-export const readPromptTool = tool({
-  description:
-    "Read a UTF-8 text file from the app's prompts/ directory (outside " +
-    "the agent's writable area). Use this to inspect prompt files like " +
-    "main_agent.md or skill docs in special/. Path is relative to the " +
-    "prompts directory (POSIX-style, no leading slash).",
-  inputSchema: z.object({
-    path: z
-      .string()
-      .describe("Relative file path inside the prompts directory."),
-  }),
-  execute: async ({ path }) => {
-    return await invoke<string>("read_prompt", { path });
-  },
-});
-
-/** List entries in a directory under the app's prompts/ directory. */
-export const listPromptsTool = tool({
-  description:
-    "List entries in a directory under the app's prompts/ directory " +
-    "(outside the agent's writable area). Returns name, path, isDir, and size.",
-  inputSchema: z.object({
-    path: z
-      .string()
-      .default(".")
-      .describe(
-        "Relative directory path inside prompts/. Use '.' for the root.",
-      ),
-  }),
-  execute: async ({ path }) => {
-    return await invoke<FileEntry[]>("list_prompt_files", { path });
+    const entries = await invoke<FileEntry[]>("list_data_files", { path });
+    if (entries.length === 0) {
+      return `No files in directory "${path}".`;
+    }
+    return `Directory "${path}" contains:\n${entries.map((e) => `  - ${e.isDir ? "[DIR]" : "[FILE]" + e.path}`).join("\n")}`;
   },
 });
 
@@ -129,6 +88,4 @@ export const MAIN_AGENT_TOOLS = {
   read_file: readFileTool,
   write_file: writeFileTool,
   list_files: listFilesTool,
-  read_prompt: readPromptTool,
-  list_prompts: listPromptsTool,
 } as const;

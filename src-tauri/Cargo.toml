@@ -76,3 +76,6 @@ bashkit = { version = "0.9", features = ["realfs"] }
 
 # Async runtime required by bashkit
 tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+tempfile = "3"

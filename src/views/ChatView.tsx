@@ -26,6 +26,8 @@ import { useChat } from "@ai-sdk/react";
 import type { UIMessage } from "ai";
 import {
   AlertCircle,
+  Brain,
+  ChevronDown,
   Loader2,
   RefreshCcw,
   Settings as SettingsIcon,
@@ -48,6 +50,11 @@ import {
   MessageContent,
   MessageResponse,
 } from "@/components/ai-elements/message";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
 import {
   Tool,
   ToolHeader,
@@ -144,17 +151,30 @@ function ChatViewInner({
   // The outer component mounts us only after `transport` is ready, so the
   // first call to useChat here is guaranteed to see a real transport (or
   // for the API-key-missing case, an outer guard prevents sending).
-  const { messages, sendMessage, status, error, regenerate, setMessages } =
-    useChat({
-      transport: transport ?? undefined,
-      onError: (e) => console.error("[chat] error:", e),
-    });
+  const {
+    messages,
+    sendMessage,
+    status,
+    error,
+    regenerate,
+    setMessages,
+    stop,
+  } = useChat({
+    transport: transport ?? undefined,
+    onError: (e) => console.error("[chat] error:", e),
+  });
 
   const [input, setInput] = useState("");
+  const isGenerating = status === "submitted" || status === "streaming";
+
   const onSubmit = ({ text }: { text: string }) => {
     const trimmed = text.trim();
-    if (!trimmed || !transport) return;
+    if (!trimmed || !transport || isGenerating) return;
     sendMessage({ text: trimmed });
+    // Clear the controlled input state; PromptInput only resets the underlying
+    // form via form.reset() in its local (non-provider) path, which doesn't
+    // affect React-controlled values.
+    setInput("");
   };
 
   const clearChat = () => setMessages([]);
@@ -294,6 +314,37 @@ function ChatViewInner({
               <MessageContent>
                 {message.parts.map((part, i) => {
                   const key = `${message.id}-${i}`;
+                  if (part.type === "reasoning") {
+                    // Native model thinking (e.g. Claude extended thinking,
+                    // o1/o3 reasoning). Hidden by default — expand to inspect.
+                    // Skipped entirely if the model didn't emit any text.
+                    if (!part.text) return null;
+                    return (
+                      <Collapsible key={key} className="group/collapsible">
+                        <CollapsibleTrigger
+                          className="flex items-center gap-2 text-xs text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)] transition-colors"
+                          title="Show / hide model reasoning"
+                        >
+                          <Brain size={12} />
+                          <span>
+                            Thinking
+                            {part.state === "streaming" && (
+                              <span className="ml-1 text-[10px] opacity-70">
+                                …
+                              </span>
+                            )}
+                          </span>
+                          <ChevronDown
+                            size={12}
+                            className="transition-transform group-data-[state=open]/collapsible:rotate-180"
+                          />
+                        </CollapsibleTrigger>
+                        <CollapsibleContent className="mt-2 border-l-2 border-[var(--color-border)] pl-3 text-xs text-[var(--color-muted-foreground)] leading-relaxed whitespace-pre-wrap">
+                          {part.text}
+                        </CollapsibleContent>
+                      </Collapsible>
+                    );
+                  }
                   if (part.type === "text") {
                     return (
                       <MessageResponse key={key}>{part.text}</MessageResponse>
@@ -367,7 +418,8 @@ function ChatViewInner({
           </span>
           <PromptInputSubmit
             status={status}
-            disabled={!transport || !input.trim()}
+            onStop={stop}
+            disabled={!transport || (!isGenerating && !input.trim())}
           />
         </PromptInputFooter>
       </PromptInput>

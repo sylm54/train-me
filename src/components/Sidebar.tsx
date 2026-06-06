@@ -29,9 +29,9 @@ interface NavItem {
 const NAV_ITEMS: NavItem[] = [
   { view: "chat", label: "Agent", icon: MessageSquare },
   { view: "settings", label: "Settings", icon: SettingsIcon },
-  { view: "conditioning", label: "Conditioning", icon: Sparkles, disabled: true },
-  { view: "rules", label: "Rules", icon: BookOpen, disabled: true },
-  { view: "routines", label: "Routines", icon: ListChecks, disabled: true },
+  { view: "conditioning", label: "Conditioning", icon: Sparkles },
+  { view: "rules", label: "Rules", icon: BookOpen },
+  { view: "routines", label: "Routines", icon: ListChecks },
   { view: "inventory", label: "Inventory", icon: PackageOpen, disabled: true },
   { view: "chastity", label: "Chastity", icon: Lock, disabled: true },
   { view: "journal", label: "Journal", icon: PenLine, disabled: true },
