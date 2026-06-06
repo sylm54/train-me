@@ -70,3 +70,9 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Singleton state management
 parking_lot = "0.12"
+
+# Bash sandbox for the agent
+bashkit = { version = "0.9", features = ["realfs"] }
+
+# Async runtime required by bashkit
+tokio = { version = "1", features = ["full"] }

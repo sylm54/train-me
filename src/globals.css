@@ -1,0 +1,111 @@
+@import "tailwindcss";
+@import "katex/dist/katex.min.css";
+
+/* Source scanning for streaming markdown (Streamdown) and katex styles */
+@source "../node_modules/streamdown/dist/*.js";
+
+/* ──────────────────────────────────────────────────────────────────────── */
+/*  Pastel-pink theme (Tailwind 4 `@theme` directive)                       */
+/* ──────────────────────────────────────────────────────────────────────── */
+
+@theme {
+    /* Pastel pink palette */
+    --color-pink-50: #fff5f8;
+    --color-pink-100: #ffe4ee;
+    --color-pink-200: #ffc8dd;
+    --color-pink-300: #f8c6d6;
+    --color-pink-400: #f4a6c0;
+    --color-pink-500: #ff9fba;
+    --color-pink-600: #ec7ea1;
+    --color-pink-700: #c95a85;
+    --color-pink-800: #9c4367;
+    --color-pink-900: #6e2f49;
+
+    /* Surface tokens */
+    --color-background: #ffffff;
+    --color-foreground: #1f1426;
+    --color-surface: #ffffff;
+    --color-surface-muted: #faf7f9;
+    --color-border: #f0dde5;
+    --color-muted: #6b5a6f;
+    --color-muted-foreground: #8a7a8f;
+
+    /* Accent */
+    --color-accent: #f4a6c0;
+    --color-accent-foreground: #1f1426;
+
+    /* Primary (uses pink-400) */
+    --color-primary: #f4a6c0;
+    --color-primary-foreground: #1f1426;
+
+    /* Secondary — used by user-message bubbles in AI Elements. */
+    --color-secondary: #ffe4ee; /* pink-100 */
+    --color-secondary-foreground: #1f1426;
+
+    /* Card — used by shadcn surfaces. Maps to our surface token. */
+    --color-card: #ffffff;
+    --color-card-foreground: #1f1426;
+
+    /* Popover — used by ToolContent and shadcn overlays. */
+    --color-popover: #ffffff;
+    --color-popover-foreground: #1f1426;
+
+    /* Destructive — used for errors (matches our danger token). */
+    --color-destructive: #ef8aa0;
+    --color-destructive-foreground: #ffffff;
+
+    /* Input border + focus ring for shadcn form controls. */
+    --color-input: #f0dde5;
+    --color-ring: #f8c6d6; /* pink-300 */
+
+    /* Status */
+    --color-success: #8ed1b6;
+    --color-warning: #ffd29a;
+    --color-danger: #ef8aa0;
+
+    /* Fonts */
+    --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+    --font-mono:
+        "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+        monospace;
+}
+
+/* ──────────────────────────────────────────────────────────────────────── */
+/*  Global base styles                                                       */
+/* ──────────────────────────────────────────────────────────────────────── */
+
+html,
+body,
+#root {
+    height: 100%;
+}
+
+body {
+    background: var(--color-background);
+    color: var(--color-foreground);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+/* Custom scrollbar (subtle pink) */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+::-webkit-scrollbar-thumb {
+    background: var(--color-border);
+    border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+    background: var(--color-pink-300);
+}
+
+/* Selection */
+::selection {
+    background: var(--color-pink-200);
+    color: var(--color-foreground);
+}
