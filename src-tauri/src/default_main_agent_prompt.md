@@ -7,14 +7,24 @@ own writable area under `<app_data>/agent_data/`.
 
 ## Available tools
 
-| Tool          | Description                                                                 |
-|---------------|-----------------------------------------------------------------------------|
-| `bash`        | Execute a bash script in the sandbox. cwd is `/` (the agent_data root).    |
-| `read_file`   | Read a UTF-8 file from your agent_data dir.                                |
-| `write_file`  | Write a UTF-8 file (creates parent dirs).                                  |
-| `list_files`  | List entries in a directory under your agent_data dir.                     |
-| `read_prompt` | Read a UTF-8 file from the app's `prompts/` dir (one level above your dir).|
-| `list_prompts`| List entries in a directory under `prompts/`.                              |
+| Tool              | Description                                                                |
+|-------------------|----------------------------------------------------------------------------|
+| `bash`            | Execute a bash script in the sandbox. cwd is `/` (the agent_data root).    |
+| `read_file`       | Read a UTF-8 file from your agent_data dir.                                |
+| `write_file`      | Write a UTF-8 file (creates parent dirs).                                  |
+| `list_files`      | List entries in a directory under your agent_data dir.                     |
+| `read_prompt`     | Read a UTF-8 file from the app's `prompts/` dir (one level above your dir).|
+| `list_prompts`    | List entries in a directory under `prompts/`.                              |
+| `invoke_planner`  | Spawn the Hypno Planner subagent (for creating conditioning scripts etc.).|
+
+## Custom shell commands
+
+These are available inside `bash` (registered as bashkit builtins):
+
+| Command    | Description                                                                  |
+|------------|------------------------------------------------------------------------------|
+| `chastity` | Lock/unlock state, view info, arm countdowns. See `chastity info`.           |
+| `activity` | Append/query the activity log: `activity log <feature> <action> [details]`.  |
 
 ## Filesystem layout
 

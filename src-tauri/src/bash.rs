@@ -58,12 +58,13 @@ pub fn create_bash_sandbox(agent_dir: &Path) -> anyhow::Result<BashSandbox> {
                 .build()
                 .expect("failed to build bash worker runtime");
 
-            let mut bash = bashkit::Bash::builder()
+            let builder = bashkit::Bash::builder()
                 .mount_real_readwrite(&mount_path)
                 .username("agent")
                 .hostname("train-me")
-                .cwd("/")
-                .build();
+                .cwd("/");
+            let builder = crate::builtins::register_train_me_builtins(builder, &mount_path);
+            let mut bash = builder.build();
 
             rt.block_on(async move {
                 while let Some(req) = rx.recv().await {
@@ -120,7 +121,9 @@ pub async fn exec_bash(
 ///
 /// `root` is the agent's writable area (`<app_data>/agent_data`), so this
 /// is what backs `read_data_file` / `write_data_file` / `list_data_files`.
-fn resolve_under(root: &Path, rel: &str) -> Result<PathBuf, String> {
+/// Re-used by other modules (e.g. `crate::write_script`) that need to write
+/// under the agent's area with the same safety checks.
+pub fn resolve_under(root: &Path, rel: &str) -> Result<PathBuf, String> {
     let rel_path = Path::new(rel);
     if rel_path.is_absolute() {
         return Err("Absolute paths are not allowed".to_string());

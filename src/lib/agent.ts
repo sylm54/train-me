@@ -13,11 +13,13 @@ import {
   stepCountIs,
   type UIMessage,
   type ChatTransport,
+  type ToolSet,
 } from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
 
 import type { AgentSettings, AgentName, ProviderName } from "./types";
 import { MAIN_AGENT_TOOLS } from "./tools";
+import { buildInvokePlannerTool } from "./subagents";
 
 /** Endpoint URLs per provider. */
 const PROVIDER_BASE_URL: Record<ProviderName, string> = {
@@ -42,6 +44,19 @@ export function getProvider(
 }
 
 /**
+ * Build the main agent's toolset. Includes the base tools (bash, files,
+ * prompts) plus the `invoke_planner` subagent tool. The planner tool is
+ * rebuilt whenever `settings` change because it captures the settings to
+ * spawn the planner/writer LLM calls.
+ */
+export function buildMainAgentTools(settings: AgentSettings): ToolSet {
+  return {
+    ...MAIN_AGENT_TOOLS,
+    invoke_planner: buildInvokePlannerTool(settings),
+  };
+}
+
+/**
  * Create a custom `ChatTransport` that streams from the main agent.
  *
  * Reads the main agent prompt from disk on every submission (so users can
@@ -54,6 +69,10 @@ export function createMainAgentTransport(
   settings: AgentSettings,
   systemPrompt: string,
 ): ChatTransport<UIMessage> {
+  // Build the toolset once per (settings, systemPrompt) pair. The planner
+  // tool captures `settings`, so we need to rebuild when settings change.
+  const tools = buildMainAgentTools(settings);
+
   return {
     async sendMessages({ messages, body, abortSignal }) {
       const bodyObj = (body ?? {}) as Record<string, unknown>;
@@ -68,11 +87,18 @@ export function createMainAgentTransport(
 
       const modelMessages = await convertToModelMessages(messages);
 
+      // Use `.chat()` to force the Chat Completions API (/chat/completions).
+      // The default `provider(modelId)` call uses OpenAI's Responses API
+      // (/responses), which uses `item_reference` / `function_call_output`
+      // item types that OpenRouter and most other OpenAI-compatible
+      // providers do not understand. Without `.chat()`, prior assistant
+      // text, tool calls, and tool results are silently dropped, causing
+      // the agent to appear to "forget" everything after a tool call.
       const result = streamText({
-        model: cfg.provider(cfg.model),
+        model: cfg.provider.chat(cfg.model),
         system: systemPrompt,
         messages: modelMessages,
-        tools: MAIN_AGENT_TOOLS,
+        tools,
         stopWhen: stepCountIs(12),
         abortSignal,
       });

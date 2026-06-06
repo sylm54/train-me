@@ -99,6 +99,10 @@ pub enum Node {
         post_pause: Option<f32>,
         children: Vec<Node>,
     },
+
+    /// Include another XML file at this point. Resolved by the audio renderer
+    /// before rendering (see `audio_renderer::resolve_includes`).
+    Include { src: String },
 }
 
 /// A part within an overlay.
@@ -191,6 +195,7 @@ impl TagParser {
             "sound" => self.parse_sound_tag(),
             "tone" => self.parse_tone_tag(),
             "effect" => self.parse_effect_tag(),
+            "include" => self.parse_include_tag(),
             "overlay" => self.parse_overlay_tag(),
             "loop" => self.parse_loop_tag(),
             "background" => self.parse_background_tag(),
@@ -278,6 +283,17 @@ impl TagParser {
             .unwrap_or(0.5);
         self.expect_str("/>")?;
         Ok(Node::Pause { duration })
+    }
+
+    fn parse_include_tag(&mut self) -> Result<Node> {
+        let attrs = self.read_attributes();
+        self.skip_ws();
+        let src = attrs
+            .get("src")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("<include> tag requires a 'src' attribute"))?;
+        self.expect_str("/>")?;
+        Ok(Node::Include { src })
     }
 
     fn parse_sound_tag(&mut self) -> Result<Node> {
@@ -676,7 +692,7 @@ fn extract_text_recursive(node: &Node, texts: &mut Vec<String>) {
                 }
             }
         }
-        Node::Pause { .. } | Node::Sound { .. } | Node::Tone { .. } => {}
+        Node::Pause { .. } | Node::Sound { .. } | Node::Tone { .. } | Node::Include { .. } => {}
     }
 }
 
@@ -972,5 +988,37 @@ mod tests {
 </voice>"#;
         let result = parse(input);
         assert!(result.is_ok(), "Failed to parse: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_parse_include_tag() {
+        let nodes = parse(r#"<include src="foo.xml"/>"#).unwrap();
+        assert_eq!(nodes.len(), 1);
+        match &nodes[0] {
+            Node::Include { src } => assert_eq!(src, "foo.xml"),
+            _ => panic!("Expected Include node"),
+        }
+    }
+
+    #[test]
+    fn test_parse_include_missing_src() {
+        let result = parse(r#"<include/>"#);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("src"),
+            "Error should mention missing src attribute: {}",
+            err,
+        );
+    }
+
+    #[test]
+    fn test_parse_include_not_self_closing() {
+        let result = parse(r#"<include src="foo.xml"></include>"#);
+        assert!(
+            result.is_err(),
+            "Non-self-closing <include> should error; got {:?}",
+            result,
+        );
     }
 }

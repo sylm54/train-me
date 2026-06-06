@@ -9,6 +9,7 @@ use tauri::{Manager, State};
 
 mod audio_renderer;
 mod bash;
+mod builtins;
 mod expression;
 mod helper;
 mod model_downloader;
@@ -134,6 +135,7 @@ async fn synthesize(
     state: State<'_, AppState>,
 ) -> Result<TrackInfo, String> {
     let tracks_dir = state.tracks_dir.clone();
+    let agent_dir = state.agent_dir.clone();
     let renderer_arc = state.renderer.clone();
     tauri::async_runtime::spawn_blocking(move || {
         // Ensure output directory exists
@@ -144,6 +146,10 @@ async fn synthesize(
         if nodes.is_empty() {
             return Err("No content to synthesize".to_string());
         }
+
+        // Resolve <include> tags against the agent's writable data directory.
+        // Missing/circular/invalid includes are silently skipped here.
+        let nodes = audio_renderer::resolve_includes(nodes, &agent_dir);
 
         // Lock renderer
         let mut guard = renderer_arc.lock();
@@ -281,6 +287,70 @@ fn get_agent_dir(state: State<'_, AppState>) -> String {
 }
 
 // ============================================================================
+// writeScript command (writer subagent)
+// ============================================================================
+
+/// Result returned by the `write_script` Tauri command.
+/// `valid=false` means the XML failed validation; the writer subagent
+/// should look at `error` and try again.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct WriteScriptResult {
+    pub valid: bool,
+    /// Absolute path the file was written to (only present on success).
+    pub path: Option<String>,
+    /// Validation error message (only present on failure).
+    pub error: Option<String>,
+    /// Number of top-level AST nodes parsed (debug info).
+    pub node_count: usize,
+}
+
+/// Tauri command invoked by the writer subagent's `writeScript` tool.
+///
+/// Validates the XML body via `tag_parser::parse()` and writes it to
+/// `<agent_data>/<path>` on success. On validation failure, returns
+/// `valid=false` with the parser error — the writer can read the error
+/// from the tool result and try again.
+#[tauri::command]
+fn write_script(
+    path: String,
+    content: String,
+    state: State<'_, AppState>,
+) -> Result<WriteScriptResult, String> {
+    // Validate XML by parsing the TTS tag AST.
+    let nodes = match tag_parser::parse(&content) {
+        Ok(nodes) => nodes,
+        Err(e) => {
+            return Ok(WriteScriptResult {
+                valid: false,
+                path: None,
+                error: Some(format!("Invalid TTS markup: {}", e)),
+                node_count: 0,
+            });
+        }
+    };
+
+    // Resolve the destination under the agent's writable area.
+    // We reuse the same traversal-safe resolver used for read_data_file /etc.
+    let resolved = match bash::resolve_under(&state.agent_dir, &path) {
+        Ok(p) => p,
+        Err(e) => return Err(e),
+    };
+
+    if let Some(parent) = resolved.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
+    }
+
+    fs::write(&resolved, &content).map_err(|e| format!("write {}: {}", resolved.display(), e))?;
+
+    Ok(WriteScriptResult {
+        valid: true,
+        path: Some(resolved.to_string_lossy().to_string()),
+        error: None,
+        node_count: nodes.len(),
+    })
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
@@ -368,6 +438,8 @@ pub fn run() {
             bash::list_data_files,
             bash::read_prompt,
             bash::list_prompt_files,
+            // Subagent commands
+            write_script,
             get_data_dir,
             get_agent_dir,
         ])
@@ -375,13 +447,27 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
-/// Write a starter `prompts/main_agent.md` if none exists yet.
+/// Write starter prompts if they're missing.
+///
+/// - `prompts/main_agent.md` is required for the chat view.
+/// - `prompts/hypno_planner.md` and `prompts/hypno_writer.md` are required
+///   for the subagent orchestration (Phase 2).
 fn seed_default_prompts(data_dir: &std::path::Path) -> std::io::Result<()> {
     let main = data_dir.join("prompts").join("main_agent.md");
     if !main.exists() {
         fs::write(&main, DEFAULT_MAIN_AGENT_PROMPT)?;
     }
+    let planner = data_dir.join("prompts").join("hypno_planner.md");
+    if !planner.exists() {
+        fs::write(&planner, DEFAULT_PLANNER_PROMPT)?;
+    }
+    let writer = data_dir.join("prompts").join("hypno_writer.md");
+    if !writer.exists() {
+        fs::write(&writer, DEFAULT_WRITER_PROMPT)?;
+    }
     Ok(())
 }
 
 const DEFAULT_MAIN_AGENT_PROMPT: &str = include_str!("default_main_agent_prompt.md");
+const DEFAULT_PLANNER_PROMPT: &str = include_str!("default_hypno_planner_prompt.md");
+const DEFAULT_WRITER_PROMPT: &str = include_str!("default_hypno_writer_prompt.md");
