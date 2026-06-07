@@ -46,6 +46,7 @@ import { loadPrompt } from "./prompts";
 import { getProvider } from "./agent";
 import { bashTool, readFileTool, writeFileTool, listFilesTool } from "./tools";
 import type { AgentSettings } from "./types";
+import { emitAgentEvent, type AgentRole } from "./agent-events";
 
 /** Result of the backend `write_script` Tauri command. */
 interface WriteScriptResult {
@@ -101,6 +102,76 @@ function log(agent: SubagentName, message: string, ...args: unknown[]) {
   console.log(`%c[${agent}]`, LOG_STYLES[agent], message, ...args);
 }
 
+// ── UI progress events ────────────────────────────────────────────────
+//
+// High-level labels surfaced to the UI via the agent event bus. These
+// intentionally hide *what* a tool is doing — the user just sees a
+// friendly verb like "Reading file". Exact arguments/results stay in the
+// console (via `log` above).
+
+const START_LABEL: Record<SubagentName, string> = {
+  planner: "Planning",
+  writer: "Writing script",
+};
+
+const STEP_LABEL: Record<string, string> = {
+  bash: "Running command",
+  read_file: "Reading file",
+  write_file: "Writing file",
+  edit_file: "Editing file",
+  list_files: "Listing files",
+  writeScript: "Writing script",
+  invoke_writer: "Writing script",
+  invoke_planner: "Planning",
+};
+
+/** Push a subagent-start event so the UI can show "Planning…" etc. */
+function emitStart(agent: SubagentName) {
+  emitAgentEvent({
+    type: "subagent-start",
+    agent,
+    label: START_LABEL[agent],
+    ts: Date.now(),
+  });
+}
+
+/** Update the current step label for a running subagent. */
+function emitStep(agent: SubagentName, toolName: string, detail?: string) {
+  emitAgentEvent({
+    type: "subagent-step",
+    agent,
+    label: STEP_LABEL[toolName] ?? toolName,
+    detail,
+    ts: Date.now(),
+  });
+}
+
+/** Pop a subagent activity when its run completes. */
+function emitEnd(agent: SubagentName) {
+  emitAgentEvent({ type: "subagent-end", agent, ts: Date.now() });
+}
+
+/** Report normalized token usage for a subagent run to the UI bus. */
+function reportUsage(agent: SubagentName, usage: unknown) {
+  try {
+    const u = (usage ?? {}) as Record<string, number | undefined>;
+    const promptTokens = u.promptTokens ?? u.inputTokens ?? 0;
+    const completionTokens = u.completionTokens ?? u.outputTokens ?? 0;
+    emitAgentEvent({
+      type: "usage",
+      role: agent as AgentRole,
+      ts: Date.now(),
+      usage: {
+        promptTokens,
+        completionTokens,
+        totalTokens: u.totalTokens ?? promptTokens + completionTokens,
+      },
+    });
+  } catch {
+    // Usage is informational; never let it break a run.
+  }
+}
+
 /**
  * Slot for the destination path of the currently-running writer call.
  * Written by `invoke_writer.execute`, read by the `writeScript` tool's
@@ -148,128 +219,151 @@ async function runSubagent(opts: {
     opts.agent,
     `▶ starting (${opts.settings.agents[opts.agent].provider}/${cfg.model})`,
   );
+  emitStart(opts.agent);
 
-  // Use `.chat()` to force the Chat Completions API — see agent.ts for
-  // the full rationale (OpenRouter doesn't support the Responses API).
-  const result = streamText({
-    model: cfg.provider.chat(cfg.model),
-    system: opts.systemPrompt,
-    messages: await convertToModelMessages(opts.messages),
-    tools: opts.tools,
-    stopWhen: stepCountIs(8),
-  });
+  // Declared outside the try so the `finally` block can read its usage.
+  // `streamText` runs synchronously, but the awaited message conversion
+  // happens before assignment — so it may stay undefined if that throws.
+  let result: ReturnType<typeof streamText> | undefined;
+  try {
+    const modelMessages = await convertToModelMessages(opts.messages);
+    // Use `.chat()` to force the Chat Completions API — see agent.ts for
+    // the full rationale (OpenRouter doesn't support the Responses API).
+    result = streamText({
+      model: cfg.provider.chat(cfg.model),
+      system: opts.systemPrompt,
+      messages: modelMessages,
+      tools: opts.tools,
+      // stopWhen: stepCountIs(8),
+    });
 
-  // Track per-step text so we can flush it when a tool call or finish
-  // arrives. The SDK emits text-delta chunks per turn; accumulating and
-  // flushing on tool/start-of-next-activity keeps the console readable.
-  let finalText = "";
-  let pendingText = "";
+    // Track per-step text so we can flush it when a tool call or finish
+    // arrives. The SDK emits text-delta chunks per turn; accumulating and
+    // flushing on tool/start-of-next-activity keeps the console readable.
+    let finalText = "";
+    let pendingText = "";
 
-  for await (const part of result.fullStream) {
-    switch (part.type) {
-      case "text-delta":
-        pendingText += part.text;
-        finalText += part.text;
-        break;
+    for await (const part of result.fullStream) {
+      switch (part.type) {
+        case "text-delta":
+          pendingText += part.text;
+          finalText += part.text;
+          break;
 
-      case "text-end":
-        if (pendingText.trim()) {
-          log(opts.agent, "💬 text", preview(pendingText.trim()));
-        }
-        pendingText = "";
-        break;
-
-      case "reasoning-start":
-        // Reasoning is intentionally NOT accumulated into finalText —
-        // subagent thinking must not leak into tool results returned to
-        // the parent agent. We just open a console group for it so it
-        // can be inspected during debugging.
-        if (pendingText.trim()) {
-          log(opts.agent, "💬 text", preview(pendingText.trim()));
+        case "text-end":
+          if (pendingText.trim()) {
+            log(opts.agent, "💬 text", preview(pendingText.trim()));
+          }
           pendingText = "";
+          break;
+
+        case "reasoning-start":
+          // Reasoning is intentionally NOT accumulated into finalText —
+          // subagent thinking must not leak into tool results returned to
+          // the parent agent. We just open a console group for it so it
+          // can be inspected during debugging.
+          if (pendingText.trim()) {
+            log(opts.agent, "💬 text", preview(pendingText.trim()));
+            pendingText = "";
+          }
+          console.groupCollapsed(
+            `%c[${opts.agent}]`,
+            LOG_STYLES[opts.agent],
+            "💭 reasoning",
+          );
+          break;
+
+        case "reasoning-delta":
+          // See reasoning-start: intentionally not added to finalText.
+          break;
+
+        case "reasoning-end":
+          console.groupEnd();
+          break;
+
+        case "tool-input-start": {
+          // Flush any text that preceded this tool call.
+          if (pendingText.trim()) {
+            log(opts.agent, "💬 text", preview(pendingText.trim()));
+            pendingText = "";
+          }
+          // Discard any text accumulated so far — it was inter-step
+          // "thinking" emitted before this tool call, not the final
+          // answer. The caller only wants the text from the LAST
+          // assistant message (after the final tool call returns).
+          finalText = "";
+          const dynamic = "dynamic" in part && part.dynamic ? " (dynamic)" : "";
+          log(opts.agent, `🔧 tool call: ${part.toolName}${dynamic}`);
+          // Surface a friendly step label (no args) to the UI progress feed.
+          emitStep(opts.agent, part.toolName);
+          break;
         }
-        console.groupCollapsed(
-          `%c[${opts.agent}]`,
-          LOG_STYLES[opts.agent],
-          "💭 reasoning",
-        );
-        break;
 
-      case "reasoning-delta":
-        // See reasoning-start: intentionally not added to finalText.
-        break;
+        case "tool-input-end":
+          // Tool input parsing complete; we don't log the args here because
+          // the SDK emits them as separate deltas and we'd just see JSON.
+          break;
 
-      case "reasoning-end":
-        console.groupEnd();
-        break;
-
-      case "tool-input-start": {
-        // Flush any text that preceded this tool call.
-        if (pendingText.trim()) {
-          log(opts.agent, "💬 text", preview(pendingText.trim()));
-          pendingText = "";
+        case "tool-result": {
+          // The `output` field is the JSON the tool's execute() returned.
+          const outputPreview = preview("output" in part ? part.output : part);
+          log(opts.agent, `↳ ${part.toolName} result`, outputPreview);
+          break;
         }
-        // Discard any text accumulated so far — it was inter-step
-        // "thinking" emitted before this tool call, not the final
-        // answer. The caller only wants the text from the LAST
-        // assistant message (after the final tool call returns).
-        finalText = "";
-        const dynamic = "dynamic" in part && part.dynamic ? " (dynamic)" : "";
-        log(opts.agent, `🔧 tool call: ${part.toolName}${dynamic}`);
-        break;
-      }
 
-      case "tool-input-end":
-        // Tool input parsing complete; we don't log the args here because
-        // the SDK emits them as separate deltas and we'd just see JSON.
-        break;
-
-      case "tool-result": {
-        // The `output` field is the JSON the tool's execute() returned.
-        const outputPreview = preview("output" in part ? part.output : part);
-        log(opts.agent, `↳ ${part.toolName} result`, outputPreview);
-        break;
-      }
-
-      case "tool-error": {
-        const msg =
-          "errorText" in part && typeof part.errorText === "string"
-            ? part.errorText
-            : "unknown tool error";
-        log(opts.agent, `✗ ${part.toolName} error`, msg);
-        break;
-      }
-
-      case "error": {
-        const msg =
-          "error" in part && part.error instanceof Error
-            ? part.error.message
-            : String(part);
-        log(opts.agent, "✗ stream error", msg);
-        break;
-      }
-
-      case "finish": {
-        if (pendingText.trim()) {
-          log(opts.agent, "💬 text", preview(pendingText.trim()));
-          pendingText = "";
+        case "tool-error": {
+          const msg =
+            "errorText" in part && typeof part.errorText === "string"
+              ? part.errorText
+              : "unknown tool error";
+          log(opts.agent, `✗ ${part.toolName} error`, msg);
+          break;
         }
-        log(
-          opts.agent,
-          `■ finish`,
-          `reason=${("finishReason" in part ? part.finishReason : "?") as string}`,
-        );
-        break;
-      }
 
-      default:
-        // text-start, tool-input-delta, raw, etc. — too noisy
-        // to log by default.
-        break;
+        case "error": {
+          const msg =
+            "error" in part && part.error instanceof Error
+              ? part.error.message
+              : String(part);
+          log(opts.agent, "✗ stream error", msg);
+          break;
+        }
+
+        case "finish": {
+          if (pendingText.trim()) {
+            log(opts.agent, "💬 text", preview(pendingText.trim()));
+            pendingText = "";
+          }
+          log(
+            opts.agent,
+            `■ finish`,
+            `reason=${("finishReason" in part ? part.finishReason : "?") as string}`,
+          );
+          break;
+        }
+
+        default:
+          // text-start, tool-input-delta, raw, etc. — too noisy
+          // to log by default.
+          break;
+      }
     }
-  }
 
-  return finalText;
+    return finalText;
+  } finally {
+    // Report cumulative token usage for this run, then pop the activity
+    // from the UI progress feed. Done in `finally` so an error still
+    // clears the spinner.
+    if (result) {
+      try {
+        const usage = await Promise.resolve(result.totalUsage);
+        reportUsage(opts.agent, usage);
+      } catch {
+        // ignore — usage is best-effort
+      }
+    }
+    emitEnd(opts.agent);
+  }
 }
 
 // ============================================================================

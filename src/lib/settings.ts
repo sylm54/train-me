@@ -24,6 +24,7 @@ const DEFAULT_SETTINGS: AgentSettings = {
     planner: { provider: "openrouter", model: DEFAULT_MODELS.openrouter },
     writer: { provider: "openrouter", model: DEFAULT_MODELS.openrouter },
   },
+  onboarded: false,
 };
 
 function load(): AgentSettings {
@@ -37,6 +38,7 @@ function load(): AgentSettings {
         ...DEFAULT_SETTINGS.agents,
         ...(parsed.agents ?? {}),
       } as AgentSettings["agents"],
+      onboarded: parsed.onboarded ?? false,
     };
   } catch {
     return { ...DEFAULT_SETTINGS };
@@ -73,19 +75,16 @@ export function useSettings() {
     return () => window.removeEventListener("storage", onStorage);
   }, []);
 
-  const setApiKey = useCallback(
-    (provider: ProviderName, value: string) => {
-      setSettings((prev) => {
-        const next: AgentSettings = {
-          ...prev,
-          apiKeys: { ...prev.apiKeys, [provider]: value || undefined },
-        };
-        save(next);
-        return next;
-      });
-    },
-    [],
-  );
+  const setApiKey = useCallback((provider: ProviderName, value: string) => {
+    setSettings((prev) => {
+      const next: AgentSettings = {
+        ...prev,
+        apiKeys: { ...prev.apiKeys, [provider]: value || undefined },
+      };
+      save(next);
+      return next;
+    });
+  }, []);
 
   const setAgent = useCallback(
     (agent: AgentName, provider: ProviderName, model: string) => {
@@ -104,5 +103,21 @@ export function useSettings() {
     [],
   );
 
-  return { settings, setApiKey, setAgent };
+  const completeOnboarding = useCallback(() => {
+    setSettings((prev) => {
+      const next: AgentSettings = { ...prev, onboarded: true };
+      save(next);
+      return next;
+    });
+  }, []);
+
+  const resetOnboarding = useCallback(() => {
+    setSettings((prev) => {
+      const next: AgentSettings = { ...prev, onboarded: false };
+      save(next);
+      return next;
+    });
+  }, []);
+
+  return { settings, setApiKey, setAgent, completeOnboarding, resetOnboarding };
 }

@@ -20,6 +20,35 @@ import { createOpenAI } from "@ai-sdk/openai";
 import type { AgentSettings, AgentName, ProviderName } from "./types";
 import { MAIN_AGENT_TOOLS } from "./tools";
 import { buildInvokePlannerTool } from "./subagents";
+import { emitAgentEvent } from "./agent-events";
+
+/**
+ * Report token usage for an agent role to the UI event bus.
+ *
+ * The AI SDK exposes usage as a promise that resolves when streaming
+ * completes; we normalize it (handling both v5 and v6 field names) and
+ * emit a single event per finished call. Failures are ignored — usage is
+ * informational, never load-bearing.
+ */
+function reportUsage(role: "main" | "planner" | "writer", usage: unknown) {
+  try {
+    const u = (usage ?? {}) as Record<string, number | undefined>;
+    const promptTokens = u.promptTokens ?? u.inputTokens ?? 0;
+    const completionTokens = u.completionTokens ?? u.outputTokens ?? 0;
+    emitAgentEvent({
+      type: "usage",
+      role,
+      ts: Date.now(),
+      usage: {
+        promptTokens,
+        completionTokens,
+        totalTokens: u.totalTokens ?? promptTokens + completionTokens,
+      },
+    });
+  } catch (e) {
+    console.warn("[agent] usage report failed:", e);
+  }
+}
 
 /** Endpoint URLs per provider. */
 const PROVIDER_BASE_URL: Record<ProviderName, string> = {
@@ -99,9 +128,15 @@ export function createMainAgentTransport(
         system: systemPrompt,
         messages: modelMessages,
         tools,
-        stopWhen: stepCountIs(12),
+        // stopWhen: stepCountIs(12),
         abortSignal,
       });
+
+      // Surface cumulative token usage to the UI once the run settles.
+      // `totalUsage` is a PromiseLike on the streamText result.
+      Promise.resolve(result.totalUsage)
+        .then((u) => reportUsage("main", u))
+        .catch(() => {});
 
       return result.toUIMessageStream();
     },

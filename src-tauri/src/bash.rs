@@ -39,13 +39,57 @@ pub struct BashResult {
     pub exit_code: i32,
 }
 
+/// Outcome of a successful `edit_data_file` search-and-replace.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct EditResult {
+    pub path: String,
+    /// Number of matches that were replaced.
+    pub replacements: usize,
+    /// Length of the file after the edit, in bytes.
+    pub bytes: usize,
+}
+
+impl BashSandbox {
+    /// Execute a bash script in the sandbox and await the result.
+    ///
+    /// This is the single entry point everything goes through — the
+    /// `exec_bash` Tauri command, the activity-DB read/write helpers, and
+    /// startup bootstrap (schema init) all funnel here. Commands are
+    /// processed serially by the dedicated worker thread, so callers may
+    /// queue behind a long-running agent command.
+    pub async fn exec(&self, command: &str) -> Result<BashResult, String> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let tx = self.tx.lock().clone();
+        tx.send(ExecRequest {
+            command: command.to_string(),
+            reply: reply_tx,
+        })
+        .map_err(|e| format!("bash worker disconnected: {}", e))?;
+        let reply = reply_rx
+            .await
+            .map_err(|e| format!("bash worker dropped reply: {}", e))??;
+        Ok(BashResult {
+            stdout: reply.stdout,
+            stderr: reply.stderr,
+            exit_code: reply.exit_code,
+        })
+    }
+}
+
 /// Spawn a dedicated worker thread that owns the [`bashkit::Bash`] instance.
 ///
 /// `agent_dir` is the directory the bash sandbox mounts as its root `/`.
 /// This is `<app_data>/agent_data` — the agent's writable scratch space.
 /// App-managed dirs (prompts/, model/, tracks/) live outside the sandbox.
-pub fn create_bash_sandbox(agent_dir: &Path) -> anyhow::Result<BashSandbox> {
+///
+/// `state_dir` is the directory holding app-managed state that the agent
+/// must not access directly (`<app_data>/state`). Chastity and inventory
+/// live here; builtins reach them by absolute path. (Activity lives inside
+/// the sandbox root instead, so the agent can query it via the embedded
+/// `sqlite` builtin.)
+pub fn create_bash_sandbox(agent_dir: &Path, state_dir: &Path) -> anyhow::Result<BashSandbox> {
     let agent_dir_owned = agent_dir.to_path_buf();
+    let state_dir_owned = state_dir.to_path_buf();
     let (tx, mut rx) = mpsc::unbounded_channel::<ExecRequest>();
 
     let mount_path = agent_dir_owned.clone();
@@ -53,7 +97,15 @@ pub fn create_bash_sandbox(agent_dir: &Path) -> anyhow::Result<BashSandbox> {
         .name("bash-sandbox".into())
         .spawn(move || {
             // Inside this thread we own the runtime and the Bash instance.
-            let rt = tokio::runtime::Builder::new_current_thread()
+            //
+            // The `sqlite` feature requires a *multi-threaded* runtime:
+            // the VFS-backed Turso IO bridges Turso's sync `IO` trait to
+            // bashkit's async `FileSystem` via `tokio::task::block_in_place`,
+            // which panics on a current-thread runtime. `block_on` still
+            // drives our `!Send` Bash instance on this worker thread only
+            // — the pool just has to exist so `block_in_place` can hand
+            // off its blocked thread.
+            let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .expect("failed to build bash worker runtime");
@@ -62,8 +114,27 @@ pub fn create_bash_sandbox(agent_dir: &Path) -> anyhow::Result<BashSandbox> {
                 .mount_real_readwrite(&mount_path)
                 .username("agent")
                 .hostname("train-me")
-                .cwd("/");
-            let builder = crate::builtins::register_train_me_builtins(builder, &mount_path);
+                .cwd("/")
+                // Embedded SQLite (Turso). The runtime opt-in env var is
+                // also required — without it the `sqlite` builtin refuses
+                // to execute. We use the Vfs backend so that read-only
+                // queries don't write the DB file back (the Memory backend
+                // rewrites the whole file after every command, which would
+                // risk clobbering concurrent writes from the UI's rusqlite
+                // connection). `activity.db` lives at the sandbox root
+                // (`/activity.db`) and is queryable directly by the agent.
+                .sqlite_with_limits(
+                    bashkit::SqliteLimits::default().backend(bashkit::SqliteBackend::Vfs),
+                )
+                .env("BASHKIT_ALLOW_INPROCESS_SQLITE", "1");
+            let builder = crate::chastity::ChastityBuiltin::register(
+                builder,
+                state_dir_owned.join("chastity.json"),
+            );
+            let builder = crate::inventory::InventoryBuiltin::register(
+                builder,
+                state_dir_owned.join("inventory.db"),
+            );
             let mut bash = builder.build();
 
             rt.block_on(async move {
@@ -96,25 +167,7 @@ pub async fn exec_bash(
     command: String,
     state: State<'_, crate::AppState>,
 ) -> Result<BashResult, String> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-
-    let tx = state.bash.tx.lock().clone();
-
-    tx.send(ExecRequest {
-        command,
-        reply: reply_tx,
-    })
-    .map_err(|e| format!("bash worker disconnected: {}", e))?;
-
-    let reply = reply_rx
-        .await
-        .map_err(|e| format!("bash worker dropped reply: {}", e))??;
-
-    Ok(BashResult {
-        stdout: reply.stdout,
-        stderr: reply.stderr,
-        exit_code: reply.exit_code,
-    })
+    state.bash.exec(&command).await
 }
 
 /// Resolve a relative path inside `root`, rejecting traversal escapes.
@@ -168,6 +221,56 @@ pub fn write_data_file(
             .map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
     }
     std::fs::write(&p, content).map_err(|e| format!("write {}: {}", p.display(), e))
+}
+
+/// Tauri command: search-and-replace edit of a text file in the agent's
+/// writable data directory (`<app_data>/agent_data`).
+///
+/// `old_string` must occur at least once. When `replace_all` is `false`
+/// (the default) it must occur *exactly* once so the edit is unambiguous;
+/// pass `replace_all: true` to substitute every occurrence. The file is
+/// read, modified in memory, and written back in one operation.
+#[tauri::command]
+pub fn edit_data_file(
+    path: String,
+    old_string: String,
+    new_string: String,
+    replace_all: Option<bool>,
+    state: State<'_, crate::AppState>,
+) -> Result<EditResult, String> {
+    let p = resolve_under(&state.agent_dir, &path)?;
+    let content =
+        std::fs::read_to_string(&p).map_err(|e| format!("read {}: {}", p.display(), e))?;
+
+    let count = content.matches(&old_string).count();
+    if count == 0 {
+        return Err(format!(
+            "edit {}: old_string not found in file",
+            p.display()
+        ));
+    }
+    let replace_all = replace_all.unwrap_or(false);
+    if !replace_all && count > 1 {
+        return Err(format!(
+            "edit {}: old_string matches {} places; make it unique or set replace_all",
+            p.display(),
+            count
+        ));
+    }
+
+    let new_content = if replace_all {
+        content.replace(&old_string, &new_string)
+    } else {
+        content.replacen(&old_string, &new_string, 1)
+    };
+
+    std::fs::write(&p, &new_content).map_err(|e| format!("write {}: {}", p.display(), e))?;
+
+    Ok(EditResult {
+        path,
+        replacements: if replace_all { count } else { 1 },
+        bytes: new_content.len(),
+    })
 }
 
 /// Tauri command: list entries in a directory under the agent's writable
@@ -269,12 +372,14 @@ pub fn list_prompt_files(
 /// Ensure the prompts dir exists (called during startup).
 pub fn ensure_prompts_dir(data_dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(data_dir.join("prompts"))?;
-    std::fs::create_dir_all(data_dir.join("prompts").join("special"))?;
     Ok(())
 }
 
 /// Ensure the agent's writable data dir exists, with a few conventional
 /// subdirectories pre-created so the agent has obvious places to write.
+///
+/// Note: `inventory/` is intentionally NOT created here — inventory now
+/// lives in `<state_dir>/inventory.db` (outside the agent's writable area).
 pub fn ensure_agent_dir(data_dir: &Path) -> std::io::Result<()> {
     let agent = data_dir.join("agent_data");
     std::fs::create_dir_all(&agent)?;
@@ -282,16 +387,27 @@ pub fn ensure_agent_dir(data_dir: &Path) -> std::io::Result<()> {
     // them so the layout is discoverable on first run; the agent is free to
     // create others.
     for sub in [
+        "special",
         "conditioning",
         "rule",
         "routines",
-        "inventory",
         "journal",
         "voice",
     ] {
         std::fs::create_dir_all(agent.join(sub))?;
     }
     Ok(())
+}
+
+/// Ensure the app-managed state directory exists. Holds chastity and
+/// inventory databases — none of which the agent may touch directly.
+/// (Activity used to live here too, but now resides inside the agent
+/// sandbox so the agent can query it via the embedded `sqlite` builtin.)
+#[allow(dead_code)]
+pub fn ensure_state_dir(data_dir: &Path) -> std::io::Result<PathBuf> {
+    let state = data_dir.join("state");
+    std::fs::create_dir_all(&state)?;
+    Ok(state)
 }
 
 // Suppress unused-import warnings for symbols we once needed but no longer do.

@@ -27,6 +27,7 @@ import {
 } from "@/components/ui/tooltip";
 import type { FileEntry } from "@/lib/types";
 import { tauriErrorToString } from "@/lib/types";
+import type { View } from "@/lib/views";
 
 // ─── Types ──────────────────────────────────────────────────────────────
 
@@ -135,7 +136,11 @@ function cronToHuman(cron: string): string {
 
 // ─── Component ──────────────────────────────────────────────────────────
 
-export function RoutinesView() {
+interface RoutinesViewProps {
+  onNavigate: (view: View) => void;
+}
+
+export function RoutinesView({ onNavigate: _onNavigate }: RoutinesViewProps) {
   const [routines, setRoutines] = useState<Routine[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
