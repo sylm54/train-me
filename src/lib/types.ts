@@ -21,6 +21,8 @@ export type ApiKeys = Partial<Record<ProviderName, string>>;
 export interface AgentSettings {
   apiKeys: ApiKeys;
   agents: Record<AgentName, AgentModelConfig>;
+  /** Whether the user has completed the onboarding wizard. */
+  onboarded: boolean;
 }
 
 /** Result of a bash command execution. */
@@ -36,6 +38,15 @@ export interface FileEntry {
   name: string;
   isDir: boolean;
   size: number;
+}
+
+/** Result of a successful edit_file search-and-replace. */
+export interface EditResult {
+  path: string;
+  /** Number of matches that were replaced. */
+  replacements: number;
+  /** Length of the file after the edit, in bytes. */
+  bytes: number;
 }
 
 /** Custom error shape from Tauri command rejections. */

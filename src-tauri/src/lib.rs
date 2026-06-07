@@ -7,12 +7,15 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tauri::{Manager, State};
 
+mod activity_db;
 mod audio_renderer;
 mod bash;
-mod builtins;
+mod chastity;
 mod expression;
 mod helper;
+mod inventory;
 mod model_downloader;
+mod package_import;
 mod sounds;
 mod tag_parser;
 
@@ -22,19 +25,25 @@ mod tag_parser;
 
 /// Managed state shared across all Tauri commands.
 ///
-/// `data_dir`   = the app's full data directory
-/// `agent_dir`  = `<app_data>/agent_data` — the agent's writable scratch
-///                 space, also the bash sandbox root
-/// `model_dir`  = `<app_data>/model`
-/// `tracks_dir` = `<app_data>/tracks`
-/// `bash`       = bashkit sandbox mounted over `agent_dir`
+/// `data_dir`      = the app's full data directory
+/// `agent_dir`     = `<app_data>/agent_data` — the agent's writable scratch
+///                    space, also the bash sandbox root. The activity DB
+///                    (`activity.db`) lives here so the agent can query
+///                    it directly via the embedded `sqlite` builtin.
+/// `state_dir`     = `<app_data>/state` — app-managed state (chastity,
+///                    inventory) that the agent must not touch
+/// `model_dir`     = `<app_data>/model`
+/// `tracks_dir`    = `<app_data>/tracks`
+/// `bash`          = bashkit sandbox mounted over `agent_dir`
 pub struct AppState {
     pub data_dir: PathBuf,
     pub agent_dir: PathBuf,
+    pub state_dir: PathBuf,
     pub model_dir: PathBuf,
     pub tracks_dir: PathBuf,
     pub renderer: Arc<Mutex<Option<audio_renderer::AudioRenderer>>>,
     pub bash: Arc<bash::BashSandbox>,
+    pub inventory_db: Mutex<rusqlite::Connection>,
 }
 
 // ============================================================================
@@ -286,6 +295,156 @@ fn get_agent_dir(state: State<'_, AppState>) -> String {
     state.agent_dir.to_string_lossy().to_string()
 }
 
+/// Whether a framework has been imported: we treat the presence of
+/// `prompts/main_agent.md` as the signal that onboarding is complete.
+/// The frontend uses this to decide whether to show the onboarding flow.
+#[tauri::command]
+fn framework_installed(state: State<'_, AppState>) -> bool {
+    state
+        .data_dir
+        .join("prompts")
+        .join("main_agent.md")
+        .exists()
+}
+
+/// Result of a successful [`reset_app_data`] reset. Each flag names a
+/// category that was wiped, so the UI can report what happened.
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct ResetReport {
+    pub prompts: bool,
+    pub agent_data: bool,
+    pub activity: bool,
+    pub inventory: bool,
+    pub chastity: bool,
+    pub tracks: bool,
+}
+
+/// Tauri command: wipe all user data **except** the downloaded TTS model
+/// (in `<data_dir>/model/`) and the API keys / per-agent model selection
+/// (which live in the frontend's localStorage, never touched by the
+/// backend).
+///
+/// Reset categories:
+/// - `prompts/`   — cleared (no defaults re-seeded; re-import a framework)
+/// - `agent_data/` — scripts, conditioning, journal, routines, rules, …
+/// - `activity.db` — the activity log is emptied (autoincrement reset)
+/// - `inventory.db` — items + wishlist tables dropped & recreated
+/// - `chastity.json` — lock + countdown reset to defaults
+/// - `tracks/`     — rendered TTS audio removed
+///
+/// The TTS model directory and the frontend settings are intentionally
+/// preserved. After this returns, the frontend should reload so every
+/// view re-fetches from the now-empty backend.
+#[tauri::command]
+async fn reset_app_data(state: State<'_, AppState>) -> Result<ResetReport, String> {
+    let mut report = ResetReport::default();
+
+    // 1. Rendered tracks (plain files; safe to delete from the host).
+    wipe_dir_contents(&state.tracks_dir)?;
+    report.tracks = true;
+
+    // 2. Prompts — wipe (no defaults are re-seeded; the user re-imports
+    //    a framework, which the frontend will prompt for via onboarding).
+    wipe_dir_contents(&state.data_dir.join("prompts"))?;
+    report.prompts = true;
+
+    // 3. Chastity — reset to the default (unlocked, no countdown) state.
+    chastity::ChastityState::default().save(&state.state_dir.join("chastity.json"))?;
+    report.chastity = true;
+
+    // 4. Inventory — drop & recreate the tables on the held connection.
+    //    (We can't delete the DB file: the rusqlite connection in
+    //    AppState keeps it open, and on Windows that locks the file.)
+    {
+        let conn = state.inventory_db.lock();
+        inventory::reset_db(&conn)?;
+    }
+    report.inventory = true;
+
+    // 5. Agent feature data — wipe the writable scratch space, skipping
+    //    `activity.db*` (the sandbox's Turso engine owns those at runtime;
+    //    we reset the log through the sandbox in step 6 instead).
+    wipe_agent_data(&state.agent_dir)?;
+    bash::ensure_agent_dir(&state.data_dir).map_err(|e| e.to_string())?;
+    report.agent_data = true;
+
+    // 6. Activity log — route through the bash sandbox so Turso (the
+    //    sole runtime engine for `activity.db`) performs the wipe. We only
+    //    clear the rows: Turso refuses direct writes to its internal
+    //    `sqlite_sequence` table, so the autoincrement counter is left
+    //    as-is (purely cosmetic — ids simply continue from where they
+    //    left off rather than restarting at 1).
+    let res = state
+        .bash
+        .exec("sqlite activity.db \"DELETE FROM activity;\"")
+        .await?;
+    if res.exit_code != 0 {
+        let msg = res.stderr.trim();
+        return Err(if msg.is_empty() {
+            format!("activity reset exited {}", res.exit_code)
+        } else {
+            msg.to_string()
+        });
+    }
+    report.activity = true;
+
+    Ok(report)
+}
+
+/// Recursively remove every entry inside `dir`, keeping `dir` itself.
+fn wipe_dir_contents(dir: &std::path::Path) -> Result<(), String> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir).map_err(|e| format!("readdir {}: {}", dir.display(), e))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let r = if meta.is_dir() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        r.map_err(|e| format!("remove {}: {}", path.display(), e))?;
+    }
+    Ok(())
+}
+
+/// Wipe the agent's writable scratch space (`agent_data/`), skipping
+/// `activity.db` and its journal sidecars. Those are reset separately via
+/// the bash sandbox (see [`reset_app_data`]) because Turso holds them open
+/// at runtime.
+fn wipe_agent_data(agent_dir: &std::path::Path) -> Result<(), String> {
+    if !agent_dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(agent_dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // activity.db (+ any -wal/-shm sidecars) is owned by the sandbox's
+        // Turso engine at runtime; reset it via the sandbox instead.
+        if name_str == "activity.db" || name_str.starts_with("activity.db-") {
+            continue;
+        }
+        let path = entry.path();
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let r = if meta.is_dir() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        r.map_err(|e| format!("remove {}: {}", path.display(), e))?;
+    }
+    Ok(())
+}
+
 // ============================================================================
 // writeScript command (writer subagent)
 // ============================================================================
@@ -378,6 +537,7 @@ fn sanitize_track_name(name: &str) -> String {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // Resolve data directories
             let data_dir = app
@@ -386,37 +546,65 @@ pub fn run() {
                 .expect("Failed to resolve app data directory");
 
             let agent_dir = data_dir.join("agent_data");
+            let state_dir = data_dir.join("state");
             let model_dir = data_dir.join("model");
             let tracks_dir = data_dir.join("tracks");
 
             // Ensure they exist
             std::fs::create_dir_all(&data_dir).ok();
             std::fs::create_dir_all(&agent_dir).ok();
+            std::fs::create_dir_all(&state_dir).ok();
             std::fs::create_dir_all(&model_dir).ok();
             std::fs::create_dir_all(&tracks_dir).ok();
 
-            // Ensure prompts/ exists with a placeholder main_agent.md if missing.
+            // Ensure prompts/ exists (empty — no default prompts are
+            // shipped; the user imports a framework during onboarding).
             bash::ensure_prompts_dir(&data_dir).ok();
             // Ensure agent_data/ exists with conventional subdirs.
             bash::ensure_agent_dir(&data_dir).ok();
-            seed_default_prompts(&data_dir).ok();
+            // Migrate chastity.json from agent_data/ to state/ if needed.
+            chastity::migrate_from_agent_dir(
+                &state_dir.join("chastity.json"),
+                &agent_dir.join("chastity.json"),
+            );
+
+            // Initialize app-managed SQLite DBs. Inventory lives in
+            // state/ (agent-unreachable) and is owned by a libsqlite3
+            // connection here. Activity lives inside the agent sandbox
+            // (`agent_dir/activity.db`) and is accessed solely through the
+            // embedded Turso `sqlite` builtin (by both the agent and the
+            // UI commands), so it has no persistent connection here — we
+            // only bootstrap its schema once with a transient connection.
+            let inventory_db = inventory::init_db(&state_dir.join("inventory.db"))
+                .expect("failed to init inventory.db");
+            // Move any pre-existing activity.db out of state/ into the
+            // sandbox before opening it at its new location.
+            activity_db::migrate_into_sandbox(
+                &agent_dir.join("activity.db"),
+                &state_dir.join("activity.db"),
+            );
+            activity_db::ensure_schema(&agent_dir.join("activity.db"))
+                .expect("failed to init activity.db schema");
 
             log::info!("Data dir: {:?}", data_dir);
             log::info!("Agent dir: {:?}", agent_dir);
+            log::info!("State dir: {:?}", state_dir);
             log::info!("Model dir: {:?}", model_dir);
             log::info!("Tracks dir: {:?}", tracks_dir);
 
             // Build the bash sandbox scoped to the agent's writable area.
-            let bash_sandbox = bash::create_bash_sandbox(&agent_dir)
+            let bash_sandbox = bash::create_bash_sandbox(&agent_dir, &state_dir)
                 .expect("Failed to initialize bashkit sandbox");
 
             app.manage(AppState {
                 data_dir,
                 agent_dir,
+                state_dir,
                 model_dir,
                 tracks_dir,
                 renderer: Arc::new(Mutex::new(None)),
                 bash: Arc::new(bash_sandbox),
+                inventory_db: Mutex::new(inventory_db),
             });
 
             Ok(())
@@ -435,6 +623,7 @@ pub fn run() {
             bash::exec_bash,
             bash::read_data_file,
             bash::write_data_file,
+            bash::edit_data_file,
             bash::list_data_files,
             bash::read_prompt,
             bash::list_prompt_files,
@@ -442,32 +631,33 @@ pub fn run() {
             write_script,
             get_data_dir,
             get_agent_dir,
+            // Onboarding: has a framework been imported?
+            framework_installed,
+            // Package import
+            package_import::import_package,
+            // App-data reset (preserves model/ + API keys)
+            reset_app_data,
+            // Inventory (SQLite-backed)
+            inventory::inventory_list_items,
+            inventory::inventory_add_item,
+            inventory::inventory_update_item,
+            inventory::inventory_remove_item,
+            inventory::inventory_list_wishlist,
+            inventory::inventory_add_wishlist_item,
+            inventory::inventory_update_wishlist_item,
+            inventory::inventory_remove_wishlist_item,
+            // Activity (SQLite-backed)
+            activity_db::activity_list_entries,
+            activity_db::activity_get_entry,
+            activity_db::activity_log_entry,
+            // Chastity (state-dir-backed)
+            chastity::get_chastity_state,
+            chastity::chastity_lock,
+            chastity::chastity_unlock,
+            chastity::chastity_auto_unlock,
+            chastity::chastity_arm_countdown,
+            chastity::chastity_stop_countdown,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
-
-/// Write starter prompts if they're missing.
-///
-/// - `prompts/main_agent.md` is required for the chat view.
-/// - `prompts/hypno_planner.md` and `prompts/hypno_writer.md` are required
-///   for the subagent orchestration (Phase 2).
-fn seed_default_prompts(data_dir: &std::path::Path) -> std::io::Result<()> {
-    let main = data_dir.join("prompts").join("main_agent.md");
-    if !main.exists() {
-        fs::write(&main, DEFAULT_MAIN_AGENT_PROMPT)?;
-    }
-    let planner = data_dir.join("prompts").join("hypno_planner.md");
-    if !planner.exists() {
-        fs::write(&planner, DEFAULT_PLANNER_PROMPT)?;
-    }
-    let writer = data_dir.join("prompts").join("hypno_writer.md");
-    if !writer.exists() {
-        fs::write(&writer, DEFAULT_WRITER_PROMPT)?;
-    }
-    Ok(())
-}
-
-const DEFAULT_MAIN_AGENT_PROMPT: &str = include_str!("default_main_agent_prompt.md");
-const DEFAULT_PLANNER_PROMPT: &str = include_str!("default_hypno_planner_prompt.md");
-const DEFAULT_WRITER_PROMPT: &str = include_str!("default_hypno_writer_prompt.md");

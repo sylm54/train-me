@@ -12,4 +12,5 @@ export type View =
   | "inventory"
   | "chastity"
   | "journal"
-  | "voice";
+  | "voice"
+  | "activity";

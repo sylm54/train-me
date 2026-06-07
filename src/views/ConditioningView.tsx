@@ -23,10 +23,8 @@ import {
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  type FileEntry,
-  tauriErrorToString,
-} from "@/lib/types";
+import { type FileEntry, tauriErrorToString } from "@/lib/types";
+import { logActivity } from "@/lib/activity";
 
 // ──────────────────────────────────────────────────────────────────────────
 // Types
@@ -149,9 +147,10 @@ export function ConditioningView() {
           }
 
           // Find most recent matching track (sorted desc by created).
-          const match = existingTracks
-            .filter((t) => t.name === expectedName)
-            .sort((a, b) => (a.created < b.created ? 1 : -1))[0] ?? null;
+          const match =
+            existingTracks
+              .filter((t) => t.name === expectedName)
+              .sort((a, b) => (a.created < b.created ? 1 : -1))[0] ?? null;
 
           return {
             jsonPath,
@@ -180,50 +179,52 @@ export function ConditioningView() {
 
   // ── Handlers ───────────────────────────────────────────────────────────
 
-  const handleRender = useCallback(
-    async (script: ConditioningScript) => {
-      if (!script.meta) return; // can't render without metadata
-      const xmlPath = script.meta.script_path;
-      const trackName = deriveTrackName(script.jsonPath);
+  const handleRender = useCallback(async (script: ConditioningScript) => {
+    if (!script.meta) return; // can't render without metadata
+    const xmlPath = script.meta.script_path;
+    const trackName = deriveTrackName(script.jsonPath);
 
+    setRenderingIds((prev) => {
+      const next = new Set(prev);
+      next.add(script.id);
+      return next;
+    });
+    setRenderErrors((prev) => {
+      if (!(script.id in prev)) return prev;
+      const { [script.id]: _drop, ...rest } = prev;
+      return rest;
+    });
+
+    try {
+      const xml = await invoke<string>("read_data_file", { path: xmlPath });
+      const track = await invoke<TrackInfo>("synthesize", {
+        req: { text: xml, name: trackName },
+      });
+
+      // Update the script in-place with the freshly rendered track.
+      setScripts((prev) =>
+        prev.map((s) =>
+          s.id === script.id ? { ...s, renderedTrack: track } : s,
+        ),
+      );
+      await logActivity(
+        "conditioning",
+        "render",
+        `${script.id} → ${track.name}`,
+      );
+    } catch (e) {
+      setRenderErrors((prev) => ({
+        ...prev,
+        [script.id]: tauriErrorToString(e),
+      }));
+    } finally {
       setRenderingIds((prev) => {
         const next = new Set(prev);
-        next.add(script.id);
+        next.delete(script.id);
         return next;
       });
-      setRenderErrors((prev) => {
-        if (!(script.id in prev)) return prev;
-        const { [script.id]: _drop, ...rest } = prev;
-        return rest;
-      });
-
-      try {
-        const xml = await invoke<string>("read_data_file", { path: xmlPath });
-        const track = await invoke<TrackInfo>("synthesize", {
-          req: { text: xml, name: trackName },
-        });
-
-        // Update the script in-place with the freshly rendered track.
-        setScripts((prev) =>
-          prev.map((s) =>
-            s.id === script.id ? { ...s, renderedTrack: track } : s,
-          ),
-        );
-      } catch (e) {
-        setRenderErrors((prev) => ({
-          ...prev,
-          [script.id]: tauriErrorToString(e),
-        }));
-      } finally {
-        setRenderingIds((prev) => {
-          const next = new Set(prev);
-          next.delete(script.id);
-          return next;
-        });
-      }
-    },
-    [],
-  );
+    }
+  }, []);
 
   const handlePlay = useCallback(
     async (script: ConditioningScript) => {
@@ -281,11 +282,7 @@ export function ConditioningView() {
             onClick={refresh}
             disabled={loading}
           >
-            {loading ? (
-              <Loader2 className="animate-spin" />
-            ) : (
-              <RefreshCw />
-            )}
+            {loading ? <Loader2 className="animate-spin" /> : <RefreshCw />}
             Refresh
           </Button>
         </header>
@@ -294,8 +291,12 @@ export function ConditioningView() {
           <div className="flex items-start gap-2 rounded-lg border border-[var(--color-danger)] bg-[var(--color-pink-50)] p-3 text-sm text-[var(--color-danger)]">
             <AlertCircle size={16} className="mt-0.5 shrink-0" />
             <div className="flex-1">
-              <div className="font-medium">Couldn’t load conditioning scripts</div>
-              <div className="text-xs opacity-90 break-words">{globalError}</div>
+              <div className="font-medium">
+                Couldn’t load conditioning scripts
+              </div>
+              <div className="text-xs opacity-90 break-words">
+                {globalError}
+              </div>
             </div>
           </div>
         )}
@@ -306,7 +307,9 @@ export function ConditioningView() {
               className="mx-auto mb-3 text-[var(--color-pink-400)]"
               size={28}
             />
-            <h3 className="text-base font-medium">No conditioning scripts yet</h3>
+            <h3 className="text-base font-medium">
+              No conditioning scripts yet
+            </h3>
             <p className="text-sm text-[var(--color-muted-foreground)] mt-1">
               Ask the agent to create one in{" "}
               <code className="text-xs">conditioning/</code>.
@@ -402,7 +405,9 @@ function ScriptCard({
       {metaError && (
         <p className="text-xs text-[var(--color-danger)] flex items-start gap-1.5">
           <AlertCircle size={14} className="mt-0.5 shrink-0" />
-          <span className="break-words">Couldn’t load metadata: {metaError}</span>
+          <span className="break-words">
+            Couldn’t load metadata: {metaError}
+          </span>
         </p>
       )}
       {renderError && (
@@ -420,20 +425,12 @@ function ScriptCard({
           onClick={onRender}
           disabled={rendering || !meta}
         >
-          {rendering ? (
-            <Loader2 className="animate-spin" />
-          ) : (
-            <Sparkles />
-          )}
+          {rendering ? <Loader2 className="animate-spin" /> : <Sparkles />}
           {renderedTrack ? "Re-render" : "Render"}
         </Button>
 
         {renderedTrack && (
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={onPlay}
-          >
+          <Button variant="outline" size="sm" onClick={onPlay}>
             {playing ? <Square /> : <Play />}
             {playing ? "Stop" : "Play"}
             {!playing && <Volume2 className="opacity-60" />}

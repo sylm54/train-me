@@ -4,10 +4,6 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Streamdown } from "streamdown";
-import remarkGfm from "remark-gfm";
-import remarkMath from "remark-math";
-import rehypeKatex from "rehype-katex";
 import {
   AlertCircle,
   BookOpen,
@@ -16,8 +12,10 @@ import {
   RefreshCw,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { MarkdownBody } from "@/components/MarkdownBody";
 import type { FileEntry } from "@/lib/types";
 import { tauriErrorToString } from "@/lib/types";
+import type { View } from "@/lib/views";
 
 interface Rule {
   /** Path relative to agent_data, e.g., "rule/dress_code.md" */
@@ -40,7 +38,11 @@ function filenameToDisplayName(filename: string): string {
     .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
-export function RulesView() {
+interface RulesViewProps {
+  onNavigate: (view: View) => void;
+}
+
+export function RulesView({ onNavigate }: RulesViewProps) {
   const [rules, setRules] = useState<Rule[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -193,7 +195,7 @@ export function RulesView() {
             </h2>
             <div className="space-y-4">
               {rules.map((rule) => (
-                <RuleCard key={rule.path} rule={rule} />
+                <RuleCard key={rule.path} rule={rule} onNavigate={onNavigate} />
               ))}
             </div>
           </section>
@@ -205,9 +207,10 @@ export function RulesView() {
 
 interface RuleCardProps {
   rule: Rule;
+  onNavigate: (view: View) => void;
 }
 
-function RuleCard({ rule }: RuleCardProps) {
+function RuleCard({ rule, onNavigate }: RuleCardProps) {
   const bodyReady = rule.content !== null;
   const bodyError = rule.loadError !== null;
 
@@ -246,14 +249,9 @@ function RuleCard({ rule }: RuleCardProps) {
         )}
 
         {bodyReady && (
-          <div className="max-w-none text-sm text-[var(--color-foreground)] [&_a]:text-[var(--color-pink-700)] [&_a]:underline [&_h1]:font-semibold [&_h1]:text-base [&_h1]:mt-4 [&_h1]:mb-2 [&_h2]:font-semibold [&_h2]:text-base [&_h2]:mt-4 [&_h2]:mb-2 [&_h3]:font-semibold [&_h3]:mt-3 [&_h3]:mb-1.5 [&_h4]:font-semibold [&_h4]:mt-3 [&_h4]:mb-1 [&_strong]:text-[var(--color-pink-900)] [&_blockquote]:border-l-2 [&_blockquote]:border-[var(--color-pink-300)] [&_blockquote]:pl-3 [&_blockquote]:text-[var(--color-muted-foreground)] [&_code]:bg-[var(--color-pink-50)] [&_code]:px-1 [&_code]:py-0.5 [&_code]:rounded [&_ul]:list-disc [&_ul]:pl-5 [&_ol]:list-decimal [&_ol]:pl-5 [&_li]:my-0.5 [&_hr]:border-[var(--color-border)] [&_hr]:my-4 [&_table]:border-collapse [&_th]:border [&_th]:border-[var(--color-border)] [&_th]:px-2 [&_th]:py-1 [&_th]:bg-[var(--color-pink-50)] [&_td]:border [&_td]:border-[var(--color-border)] [&_td]:px-2 [&_td]:py-1">
-            <Streamdown
-              remarkPlugins={[remarkGfm, remarkMath]}
-              rehypePlugins={[rehypeKatex]}
-            >
-              {rule.content ?? ""}
-            </Streamdown>
-          </div>
+          <MarkdownBody onNavigate={onNavigate}>
+            {rule.content ?? ""}
+          </MarkdownBody>
         )}
       </div>
     </article>

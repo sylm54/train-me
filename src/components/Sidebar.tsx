@@ -15,6 +15,7 @@ import {
   MicVocal,
   PenLine,
   Sparkles,
+  Activity as ActivityIcon,
   type LucideIcon,
 } from "lucide-react";
 import type { View } from "@/lib/views";
@@ -32,10 +33,11 @@ const NAV_ITEMS: NavItem[] = [
   { view: "conditioning", label: "Conditioning", icon: Sparkles },
   { view: "rules", label: "Rules", icon: BookOpen },
   { view: "routines", label: "Routines", icon: ListChecks },
-  { view: "inventory", label: "Inventory", icon: PackageOpen, disabled: true },
-  { view: "chastity", label: "Chastity", icon: Lock, disabled: true },
-  { view: "journal", label: "Journal", icon: PenLine, disabled: true },
-  { view: "voice", label: "Voice", icon: MicVocal, disabled: true },
+  { view: "inventory", label: "Inventory", icon: PackageOpen },
+  { view: "chastity", label: "Chastity", icon: Lock },
+  { view: "journal", label: "Journal", icon: PenLine },
+  { view: "voice", label: "Voice", icon: MicVocal },
+  { view: "activity", label: "Activity", icon: ActivityIcon },
   { view: "tts", label: "TTS Studio", icon: AudioLines },
 ];
 

@@ -9,7 +9,7 @@
  *   {{{embed 'path/to/file.md'}}}     Inline the contents of `prompts/path/to/file.md`.
  *                                     Embeds can be nested; circular embeds are skipped.
  *
- *   {{special}}                       Scan `prompts/special/*.md` (recursive),
+ *   {{special}}                       Scan the agent's `special/*.md` (recursive),
  *                                     frontmatter from each file, and render a
  *                                     markdown summary table inline.
  */
@@ -74,9 +74,13 @@ async function processPrompt(
   return out;
 }
 
-/** Scan `prompts/special/` and render a markdown table of frontmatter. */
+/**
+ * Scan the agent's `special/` dir (skill-like files the agent owns and can
+ * read/write via `read_file`/`write_file`) and render a markdown table of
+ * each file's frontmatter.
+ */
 async function renderSpecial(): Promise<string> {
-  const entries = await invoke<FileEntry[]>("list_prompt_files", {
+  const entries = await invoke<FileEntry[]>("list_data_files", {
     path: "special",
   });
 
@@ -85,7 +89,7 @@ async function renderSpecial(): Promise<string> {
 
   const rows: Array<{ file: string; fields: Record<string, unknown> }> = [];
   for (const f of files) {
-    const content = await invoke<string>("read_prompt", { path: f }).catch(
+    const content = await invoke<string>("read_data_file", { path: f }).catch(
       () => "",
     );
     const { frontmatter } = parseFrontmatter(content);
@@ -123,7 +127,7 @@ async function collectMarkdownFiles(
   for (const e of entries) {
     if (e.isDir) {
       try {
-        const sub = await invoke<FileEntry[]>("list_prompt_files", {
+        const sub = await invoke<FileEntry[]>("list_data_files", {
           path: e.path,
         });
         out.push(...(await collectMarkdownFiles(e.path, sub)));

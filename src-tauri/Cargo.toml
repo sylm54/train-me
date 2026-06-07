@@ -20,6 +20,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -71,11 +72,30 @@ chrono = { version = "0.4", features = ["serde"] }
 # Singleton state management
 parking_lot = "0.12"
 
-# Bash sandbox for the agent
-bashkit = { version = "0.9", features = ["realfs"] }
+# SQLite for inventory/activity logs
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Force aegis (a transitive dep of bashkit's `sqlite` → turso_core) to use
+# its pure-Rust backend. aegis's build script otherwise compiles C with
+# `cc::Build::prefer_clang_cl_over_msvc(true)`, which picks up the Android
+# NDK `clang-cl` found on PATH in this dev environment and fails on
+# `<errno.h>`. The `pure-rust` feature switches to a Rust AES backend
+# (still AES-NI accelerated on x86_64) and skips the C build entirely.
+aegis = { version = "0.9", features = ["pure-rust"] }
+
+# Bash sandbox for the agent. The `sqlite` feature enables the embedded
+# Turso-backed `sqlite`/`sqlite3` builtin so the agent can query databases
+# inside its sandbox directly.
+bashkit = { version = "0.9", features = ["realfs", "sqlite"] }
 
 # Async runtime required by bashkit
 tokio = { version = "1", features = ["full"] }
+
+# ZIP archive support for package imports
+zip = "2"
+
+# Temp directory for extracting imported packages
+tempfile = "3"
 
 [dev-dependencies]
 tempfile = "3"
