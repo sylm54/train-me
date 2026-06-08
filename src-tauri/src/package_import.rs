@@ -23,7 +23,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
-use tauri::State;
+use tauri::{AppHandle, State};
 
 use crate::AppState;
 
@@ -74,18 +74,23 @@ pub struct ImportResult {
 ///
 /// `kind` must be `"framework"` or `"specialisation"`. See the module
 /// docs for the destination rules of each.
+///
+/// On Android the file picker returns a `content://` URI rather than a
+/// filesystem path. Such URIs are opened through the Android-aware FS
+/// plugin (`tauri-plugin-android-fs`); regular paths are read directly.
 #[tauri::command]
-pub fn import_package(
+pub async fn import_package(
+    app: AppHandle,
     zip_path: String,
     kind: String,
     state: State<'_, AppState>,
 ) -> Result<ImportResult, String> {
     let pkg_kind = PackageKind::parse(&kind)?;
 
-    let zip_file = PathBuf::from(&zip_path);
-    if !zip_file.exists() {
-        return Err(format!("ZIP file not found: {}", zip_path));
-    }
+    // Obtain a readable handle to the ZIP. On Android this may be a
+    // `content://` URI that has no filesystem representation and must be
+    // opened via the ContentResolver.
+    let zip_file = open_zip(&app, &zip_path).await?;
 
     let prompts_root = state.data_dir.join("prompts");
     let agent_root = state.agent_dir.clone();
@@ -96,53 +101,84 @@ pub fn import_package(
         PackageKind::Specialisation => agent_root.join("special"),
     };
 
-    // Extract to a temp directory first so we can validate/inspect before
-    // mutating the user's data folders.
-    let temp = tempfile::tempdir().map_err(|e| format!("Failed to create temp dir: {}", e))?;
-    extract_zip(&zip_file, temp.path()).map_err(|e| format!("Failed to extract ZIP: {}", e))?;
+    // The extraction and merging are synchronous, blocking I/O — run them
+    // on a blocking thread so we don't stall the async runtime.
+    let kind_str = pkg_kind.as_str().to_string();
+    tauri::async_runtime::spawn_blocking(move || -> Result<ImportResult, String> {
+        // Extract to a temp directory first so we can validate/inspect before
+        // mutating the user's data folders.
+        let temp =
+            tempfile::tempdir().map_err(|e| format!("Failed to create temp dir: {}", e))?;
+        extract_zip(zip_file, temp.path())
+            .map_err(|e| format!("Failed to extract ZIP: {}", e))?;
 
-    // Determine the "package root" — either the temp dir itself, or its
-    // sole sub-directory if the archive contains a single top-level folder
-    // (a common convention when zipping a project folder).
-    let pkg_root = resolve_package_root(temp.path());
+        // Determine the "package root" — either the temp dir itself, or its
+        // sole sub-directory if the archive contains a single top-level folder
+        // (a common convention when zipping a project folder).
+        let pkg_root = resolve_package_root(temp.path());
 
-    // Look for a `prompts/` folder inside the package root. If it's absent
-    // we still import the remaining files, but flag it in the result so
-    // the UI can warn the user.
-    let prompts_src = pkg_root.join("prompts");
-    let mut prompts_files = 0usize;
-    let mut note: Option<String> = None;
+        // Look for a `prompts/` folder inside the package root. If it's absent
+        // we still import the remaining files, but flag it in the result so
+        // the UI can warn the user.
+        let prompts_src = pkg_root.join("prompts");
+        let mut prompts_files = 0usize;
+        let mut note: Option<String> = None;
 
-    if prompts_src.is_dir() {
-        prompts_files = merge_dir(&prompts_src, &prompts_root)
-            .map_err(|e| format!("Failed to copy prompts: {}", e))?;
-    } else {
-        note = Some("No 'prompts/' folder found in package.".to_string());
-    }
+        if prompts_src.is_dir() {
+            prompts_files = merge_dir(&prompts_src, &prompts_root)
+                .map_err(|e| format!("Failed to copy prompts: {}", e))?;
+        } else {
+            note = Some("No 'prompts/' folder found in package.".to_string());
+        }
 
-    // Merge everything else (except the prompts/ folder we already handled)
-    // into the content root.
-    let agent_files = merge_package_into(&pkg_root, &content_root, &prompts_src)
-        .map_err(|e| format!("Failed to copy agent files: {}", e))?;
+        // Merge everything else (except the prompts/ folder we already handled)
+        // into the content root.
+        let agent_files = merge_package_into(&pkg_root, &content_root, &prompts_src)
+            .map_err(|e| format!("Failed to copy agent files: {}", e))?;
 
-    Ok(ImportResult {
-        kind: pkg_kind.as_str().to_string(),
-        prompts_files,
-        agent_files,
-        note,
+        Ok(ImportResult {
+            kind: kind_str,
+            prompts_files,
+            agent_files,
+            note,
+        })
     })
+    .await
+    .map_err(|e| format!("Import task failed: {}", e))?
 }
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Extract every entry from `zip_path` into `dest`, preserving directory
+/// Open the picked ZIP for reading.
+///
+/// A `content://` URI (returned by the Android file picker) is opened via
+/// the Android-aware FS plugin; any other value is treated as a regular
+/// filesystem path. The latter is validated to exist before opening so the
+/// error message stays helpful on desktop.
+async fn open_zip(app: &AppHandle, zip_path: &str) -> Result<fs::File, String> {
+    if zip_path.starts_with("content://") {
+        use tauri_plugin_android_fs::{AndroidFsExt, FileUri};
+        let uri = FileUri::from_uri(zip_path);
+        let api = app.android_fs_async();
+        api.open_file_readable(&uri)
+            .await
+            .map_err(|e| format!("Failed to open Android content URI '{}': {}", zip_path, e))
+    } else {
+        let path = PathBuf::from(zip_path);
+        if !path.exists() {
+            return Err(format!("ZIP file not found: {}", zip_path));
+        }
+        fs::File::open(&path).map_err(|e| format!("Failed to open '{}': {}", zip_path, e))
+    }
+}
+
+/// Extract every entry from `zip_file` into `dest`, preserving directory
 /// structure. Empty directory entries (`/`-suffixed names) are honoured.
-fn extract_zip(zip_path: &Path, dest: &Path) -> io::Result<()> {
+fn extract_zip(zip_file: fs::File, dest: &Path) -> io::Result<()> {
     fs::create_dir_all(dest)?;
-    let file = fs::File::open(zip_path)?;
-    let mut archive = zip::ZipArchive::new(file)
+    let mut archive = zip::ZipArchive::new(zip_file)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
     for i in 0..archive.len() {
