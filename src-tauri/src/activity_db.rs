@@ -223,32 +223,3 @@ pub async fn activity_log_entry(
         details,
     })
 }
-
-// ============================================================================
-// Migration
-// ============================================================================
-
-/// Move an existing `activity.db` (plus any WAL/SHM sidecars it accrued
-/// under the old WAL-mode config) from the legacy `<state_dir>/` location
-/// into the agent sandbox. No-op if the destination already exists or the
-/// source is absent, so it is safe to call on every startup.
-///
-/// After the move, [`ensure_schema`] opens the file (idempotently) and
-/// switches it to `journal_mode=DELETE`, checkpointing/absorbing any moved
-/// `-wal`.
-pub fn migrate_into_sandbox(new_db: &Path, old_db: &Path) {
-    if new_db.exists() || !old_db.exists() {
-        return;
-    }
-    if let Some(parent) = new_db.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let base = old_db.to_string_lossy();
-    for suffix in ["", "-wal", "-shm"] {
-        let from = format!("{base}{suffix}");
-        if std::path::Path::new(&from).exists() {
-            let to = format!("{}{suffix}", new_db.to_string_lossy());
-            let _ = std::fs::rename(&from, &to);
-        }
-    }
-}

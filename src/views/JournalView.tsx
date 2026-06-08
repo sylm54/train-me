@@ -34,7 +34,6 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import type { FileEntry } from "@/lib/types";
 import { tauriErrorToString } from "@/lib/types";
-import type { View } from "@/lib/views";
 import { logActivity } from "@/lib/activity";
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -107,11 +106,7 @@ function renderAnswer(prompt: string, value: string): string {
 // Component
 // ──────────────────────────────────────────────────────────────────────────
 
-interface JournalViewProps {
-  onNavigate: (view: View) => void;
-}
-
-export function JournalView({ onNavigate }: JournalViewProps) {
+export function JournalView() {
   // Format / fields
   const [fields, setFields] = useState<FieldSpec[]>([]);
   const [fieldsLoading, setFieldsLoading] = useState(true);
@@ -284,11 +279,6 @@ export function JournalView({ onNavigate }: JournalViewProps) {
             </div>
             <div>
               <h1 className="text-2xl font-semibold tracking-tight">Journal</h1>
-              <p className="text-sm text-[var(--color-muted-foreground)] mt-1">
-                Daily entries shaped by{" "}
-                <code className="text-xs">journal/format.json</code>. The agent
-                is read-only here.
-              </p>
             </div>
           </div>
           <Button
@@ -418,11 +408,7 @@ export function JournalView({ onNavigate }: JournalViewProps) {
           {entries.length > 0 && (
             <div className="space-y-4">
               {entries.map((entry) => (
-                <PastEntryCard
-                  key={entry.path}
-                  entry={entry}
-                  onNavigate={onNavigate}
-                />
+                <PastEntryCard key={entry.path} entry={entry} />
               ))}
             </div>
           )}
@@ -543,10 +529,9 @@ function FieldEditor({ field, value, onChange, disabled }: FieldEditorProps) {
 
 interface PastEntryCardProps {
   entry: PastEntry;
-  onNavigate: (view: View) => void;
 }
 
-function PastEntryCard({ entry, onNavigate }: PastEntryCardProps) {
+function PastEntryCard({ entry }: PastEntryCardProps) {
   const bodyReady = entry.body !== null;
   const bodyError = entry.loadError !== null;
 
@@ -593,11 +578,7 @@ function PastEntryCard({ entry, onNavigate }: PastEntryCardProps) {
           </div>
         )}
 
-        {bodyReady && (
-          <MarkdownBody onNavigate={onNavigate}>
-            {entry.body ?? ""}
-          </MarkdownBody>
-        )}
+        {bodyReady && <MarkdownBody>{entry.body ?? ""}</MarkdownBody>}
       </div>
     </article>
   );

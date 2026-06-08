@@ -17,7 +17,6 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import type { FileEntry } from "@/lib/types";
 import { tauriErrorToString } from "@/lib/types";
-import type { View } from "@/lib/views";
 
 // ──────────────────────────────────────────────────────────────────────────
 // Types
@@ -144,11 +143,7 @@ function renderScalar(v: unknown): React.ReactNode {
 // Component
 // ──────────────────────────────────────────────────────────────────────────
 
-interface VoiceTrainingViewProps {
-  onNavigate: (view: View) => void;
-}
-
-export function VoiceTrainingView({ onNavigate }: VoiceTrainingViewProps) {
+export function VoiceTrainingView() {
   // Config state
   const [configRaw, setConfigRaw] = useState<unknown>(null);
   const [configLoading, setConfigLoading] = useState(true);
@@ -270,11 +265,6 @@ export function VoiceTrainingView({ onNavigate }: VoiceTrainingViewProps) {
               <h1 className="text-2xl font-semibold tracking-tight">
                 Voice Training
               </h1>
-              <p className="text-sm text-[var(--color-muted-foreground)] mt-1">
-                Configuration and guidance from{" "}
-                <code className="text-xs">voice/config.json</code> and{" "}
-                <code className="text-xs">voice/*.md</code>.
-              </p>
             </div>
           </div>
           <Button
@@ -382,11 +372,7 @@ export function VoiceTrainingView({ onNavigate }: VoiceTrainingViewProps) {
           {docs.length > 0 && (
             <div className="space-y-4">
               {docs.map((doc) => (
-                <VoiceDocCard
-                  key={doc.path}
-                  doc={doc}
-                  onNavigate={onNavigate}
-                />
+                <VoiceDocCard key={doc.path} doc={doc} />
               ))}
             </div>
           )}
@@ -419,10 +405,9 @@ function ConfigRow({
 
 interface VoiceDocCardProps {
   doc: VoiceDoc;
-  onNavigate: (view: View) => void;
 }
 
-function VoiceDocCard({ doc, onNavigate }: VoiceDocCardProps) {
+function VoiceDocCard({ doc }: VoiceDocCardProps) {
   const bodyReady = doc.body !== null;
   const bodyError = doc.loadError !== null;
 
@@ -457,9 +442,7 @@ function VoiceDocCard({ doc, onNavigate }: VoiceDocCardProps) {
           </div>
         )}
 
-        {bodyReady && (
-          <MarkdownBody onNavigate={onNavigate}>{doc.body ?? ""}</MarkdownBody>
-        )}
+        {bodyReady && <MarkdownBody>{doc.body ?? ""}</MarkdownBody>}
       </div>
     </article>
   );

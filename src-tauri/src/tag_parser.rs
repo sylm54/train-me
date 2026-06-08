@@ -659,6 +659,7 @@ fn filter_empty_text(nodes: Vec<Node>) -> Vec<Node> {
 }
 
 /// Extract all plain text from a node tree (useful for getting the text to synthesize).
+#[cfg(test)]
 pub fn extract_text(nodes: &[Node]) -> String {
     let mut texts = Vec::new();
     for node in nodes {
@@ -667,6 +668,7 @@ pub fn extract_text(nodes: &[Node]) -> String {
     texts.join(" ")
 }
 
+#[cfg(test)]
 fn extract_text_recursive(node: &Node, texts: &mut Vec<String>) {
     match node {
         Node::Text(t) => {

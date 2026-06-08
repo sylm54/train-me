@@ -232,10 +232,6 @@ export function InventoryView() {
               <h1 className="text-2xl font-semibold tracking-tight">
                 Inventory
               </h1>
-              <p className="text-sm text-[var(--color-muted-foreground)] mt-1">
-                Items you own and items you want. The agent can suggest wishlist
-                entries; only you can change owned items.
-              </p>
             </div>
           </div>
           <Button

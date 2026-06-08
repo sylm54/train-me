@@ -15,7 +15,6 @@ import { Button } from "@/components/ui/button";
 import { MarkdownBody } from "@/components/MarkdownBody";
 import type { FileEntry } from "@/lib/types";
 import { tauriErrorToString } from "@/lib/types";
-import type { View } from "@/lib/views";
 
 interface Rule {
   /** Path relative to agent_data, e.g., "rule/dress_code.md" */
@@ -38,11 +37,7 @@ function filenameToDisplayName(filename: string): string {
     .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
-interface RulesViewProps {
-  onNavigate: (view: View) => void;
-}
-
-export function RulesView({ onNavigate }: RulesViewProps) {
+export function RulesView() {
   const [rules, setRules] = useState<Rule[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -195,7 +190,7 @@ export function RulesView({ onNavigate }: RulesViewProps) {
             </h2>
             <div className="space-y-4">
               {rules.map((rule) => (
-                <RuleCard key={rule.path} rule={rule} onNavigate={onNavigate} />
+                <RuleCard key={rule.path} rule={rule} />
               ))}
             </div>
           </section>
@@ -207,10 +202,9 @@ export function RulesView({ onNavigate }: RulesViewProps) {
 
 interface RuleCardProps {
   rule: Rule;
-  onNavigate: (view: View) => void;
 }
 
-function RuleCard({ rule, onNavigate }: RuleCardProps) {
+function RuleCard({ rule }: RuleCardProps) {
   const bodyReady = rule.content !== null;
   const bodyError = rule.loadError !== null;
 
@@ -248,11 +242,7 @@ function RuleCard({ rule, onNavigate }: RuleCardProps) {
           </div>
         )}
 
-        {bodyReady && (
-          <MarkdownBody onNavigate={onNavigate}>
-            {rule.content ?? ""}
-          </MarkdownBody>
-        )}
+        {bodyReady && <MarkdownBody>{rule.content ?? ""}</MarkdownBody>}
       </div>
     </article>
   );

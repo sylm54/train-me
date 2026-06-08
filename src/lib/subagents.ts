@@ -34,7 +34,6 @@
 import {
   streamText,
   convertToModelMessages,
-  stepCountIs,
   tool,
   type ToolSet,
   type UIMessage,

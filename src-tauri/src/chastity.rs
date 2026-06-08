@@ -91,21 +91,6 @@ pub(crate) fn parse_duration(s: &str) -> Option<u64> {
     Some(secs)
 }
 
-/// Move `chastity.json` from the old agent-writable location to the new
-/// state dir, if needed. Called once at startup.
-pub fn migrate_from_agent_dir(state_path: &Path, old_path: &Path) {
-    if state_path.exists() {
-        return;
-    }
-    if !old_path.exists() {
-        return;
-    }
-    if let Some(parent) = state_path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let _ = fs::rename(old_path, state_path);
-}
-
 // ============================================================================
 // Builtin (agent-facing)
 // ============================================================================
@@ -131,10 +116,7 @@ impl ChastityBuiltin {
     }
 
     /// Register this builtin on a [`bashkit::BashBuilder`].
-    pub fn register(
-        builder: bashkit::BashBuilder,
-        state_path: PathBuf,
-    ) -> bashkit::BashBuilder {
+    pub fn register(builder: bashkit::BashBuilder, state_path: PathBuf) -> bashkit::BashBuilder {
         builder.builtin("chastity", Box::new(Self::new(state_path)))
     }
 }
@@ -274,12 +256,8 @@ pub fn chastity_arm_countdown(
     duration: String,
     state: State<'_, crate::AppState>,
 ) -> Result<ChastityState, String> {
-    let secs = parse_duration(&duration).ok_or_else(|| {
-        format!(
-            "invalid duration '{}'. Examples: 30m, 2h, 3d, 1w",
-            duration
-        )
-    })?;
+    let secs = parse_duration(&duration)
+        .ok_or_else(|| format!("invalid duration '{}'. Examples: 30m, 2h, 3d, 1w", duration))?;
     let mut st = ChastityState::load(&state_path(&state));
     if !st.locked {
         return Err("Lock first before arming a countdown.".into());

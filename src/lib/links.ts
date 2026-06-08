@@ -16,6 +16,8 @@
  * renderer can call `setView(view)` and (optionally) scroll to a fragment.
  */
 
+import { useEffect, useRef } from "react";
+
 import type { View } from "./views";
 
 export interface AppLink {
@@ -119,4 +121,47 @@ export function resolveAppPath(href: string): AppLink | null {
   }
 
   return { view, anchor };
+}
+
+/**
+ * Install a single, app-wide click interceptor that routes in-app `<a>`
+ * links (see `resolveAppPath`) to `onNavigate`, suppressing the default
+ * navigation that would otherwise trigger Tauri's "Open external link?"
+ * confirmation.
+ *
+ * Uses the **capture** phase so the handler runs before the Tauri opener
+ * plugin's bubble-phase listener (which respects `defaultPrevented`) and
+ * before the webview initiates any navigation. This catches links no
+ * matter which renderer produced them (MarkdownBody, MessageResponse, …)
+ * without each component having to wire up its own `onClick`.
+ *
+ * External / unrecognised links are left untouched.
+ */
+export function useGlobalAppLinkNavigation(onNavigate: (view: View) => void) {
+  // Keep the latest callback without re-registering the listener.
+  const ref = useRef(onNavigate);
+  ref.current = onNavigate;
+
+  useEffect(() => {
+    const onClick = (e: MouseEvent) => {
+      // Only handle plain left-clicks without modifiers.
+      if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) {
+        return;
+      }
+      const target = e.target;
+      if (!(target instanceof Element)) return;
+      const a = target.closest("a");
+      if (!a) return;
+      const href = a.getAttribute("href") ?? "";
+      if (!href) return;
+      const link = resolveAppPath(href);
+      if (!link) return;
+      // It's an in-app link: navigate and suppress default navigation.
+      e.preventDefault();
+      ref.current(link.view);
+    };
+
+    document.addEventListener("click", onClick, true);
+    return () => document.removeEventListener("click", onClick, true);
+  }, []);
 }

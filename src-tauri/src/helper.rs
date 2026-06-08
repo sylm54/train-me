@@ -531,37 +531,6 @@ fn split_sentences(text: &str) -> Vec<String> {
 }
 
 // ============================================================================
-// Utility Functions
-// ============================================================================
-
-pub fn timer<F, T>(name: &str, f: F) -> Result<T>
-where
-    F: FnOnce() -> Result<T>,
-{
-    let start = std::time::Instant::now();
-    println!("{}...", name);
-    let result = f()?;
-    let elapsed = start.elapsed().as_secs_f64();
-    println!("  -> {} completed in {:.2} sec", name, elapsed);
-    Ok(result)
-}
-
-pub fn sanitize_filename(text: &str, max_len: usize) -> String {
-    // Take first max_len characters (Unicode code points, not bytes)
-    text.chars()
-        .take(max_len)
-        .map(|c| {
-            // is_alphanumeric() works with all Unicode letters and digits
-            if c.is_alphanumeric() {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-// ============================================================================
 // ONNX Runtime Integration
 // ============================================================================
 
@@ -766,17 +735,6 @@ impl TextToSpeech {
         }
 
         Ok((wav_cat, dur_cat))
-    }
-
-    pub fn batch(
-        &mut self,
-        text_list: &[String],
-        lang_list: &[String],
-        style: &Style,
-        total_step: usize,
-        speed: f32,
-    ) -> Result<(Vec<f32>, Vec<f32>)> {
-        self._infer(text_list, lang_list, style, total_step, speed)
     }
 }
 

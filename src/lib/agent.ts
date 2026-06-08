@@ -10,7 +10,6 @@
 import {
   streamText,
   convertToModelMessages,
-  stepCountIs,
   type UIMessage,
   type ChatTransport,
   type ToolSet,

@@ -53,11 +53,6 @@ function save(s: AgentSettings) {
   }
 }
 
-/** Read settings once (no subscription). */
-export function readSettings(): AgentSettings {
-  return load();
-}
-
 /**
  * React hook providing reactive settings + setters.
  * Syncs across components via the storage event.

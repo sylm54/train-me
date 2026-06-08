@@ -140,6 +140,7 @@ fn try_download(url: &str, dest: &Path) -> Result<()> {
 }
 
 /// Get the available voice style names and their file paths.
+#[cfg(test)]
 pub fn list_voice_styles(model_dir: &Path) -> Vec<(String, PathBuf)> {
     VOICE_STYLE_FILES
         .iter()

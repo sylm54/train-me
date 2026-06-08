@@ -24,11 +24,6 @@ import {
   type PackageKind,
 } from "@/lib/packages";
 
-interface SettingsViewProps {
-  /** Called when the user clicks the close/back button. */
-  onClose?: () => void;
-}
-
 interface ModelStatus {
   downloaded: boolean;
   loaded: boolean;
@@ -61,7 +56,7 @@ const MODEL_PRESETS: Record<ProviderName, string[]> = {
   openai: ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "o4-mini"],
 };
 
-export function SettingsView({ onClose }: SettingsViewProps) {
+export function SettingsView() {
   const { settings, setApiKey, setAgent, resetOnboarding } = useSettings();
   const [reveal, setReveal] = useState<Record<ProviderName, boolean>>({
     openrouter: false,
@@ -186,14 +181,6 @@ export function SettingsView({ onClose }: SettingsViewProps) {
               API keys, model selection, TTS engine, and packages.
             </p>
           </div>
-          {onClose && (
-            <button
-              onClick={onClose}
-              className="text-sm text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)]"
-            >
-              ← Back
-            </button>
-          )}
         </header>
 
         {/* ── API keys ─────────────────────────────────────────────── */}
@@ -230,10 +217,6 @@ export function SettingsView({ onClose }: SettingsViewProps) {
                   {reveal[p] ? <EyeOff size={14} /> : <Eye size={14} />}
                 </button>
               </div>
-              <p className="mt-2 text-xs text-[var(--color-muted-foreground)]">
-                Stored locally in your browser. Sent directly to{" "}
-                {PROVIDER_LABELS[p]} from this app.
-              </p>
             </div>
           ))}
         </section>
@@ -299,7 +282,7 @@ export function SettingsView({ onClose }: SettingsViewProps) {
           <PackageCard
             kind="framework"
             title="Framework"
-            description="A full agent framework. Its prompts/ folder becomes your prompt store; everything else lands in the agent sandbox root. Import again to update."
+            description="A full framework that specifies how the agent behaves."
             busy={importBusy.framework}
             result={importResult.framework}
             error={importError.framework}
@@ -308,7 +291,7 @@ export function SettingsView({ onClose }: SettingsViewProps) {
           <PackageCard
             kind="specialisation"
             title="Specialisation"
-            description="Layered on top of a framework. Its prompts/ folder still goes to your prompt store; everything else lands in special/ inside the sandbox. Import again to update."
+            description="Customisations for specifics."
             busy={importBusy.specialisation}
             result={importResult.specialisation}
             error={importError.specialisation}
@@ -333,12 +316,6 @@ export function SettingsView({ onClose }: SettingsViewProps) {
                 Engine: {modelStatus?.loaded ? "Loaded" : "Not loaded"}
               </span>
             </div>
-
-            {modelStatus?.speakers && modelStatus.speakers.length > 0 && (
-              <p className="text-xs text-[var(--color-muted-foreground)]">
-                Available speakers: {modelStatus.speakers.join(", ")}
-              </p>
-            )}
 
             {ttsError && (
               <p className="text-xs text-[var(--color-danger)]">{ttsError}</p>
