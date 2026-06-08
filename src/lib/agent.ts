@@ -9,6 +9,7 @@
 
 import {
   streamText,
+  isLoopFinished,
   convertToModelMessages,
   type UIMessage,
   type ChatTransport,
@@ -127,7 +128,7 @@ export function createMainAgentTransport(
         system: systemPrompt,
         messages: modelMessages,
         tools,
-        // stopWhen: stepCountIs(12),
+        stopWhen: isLoopFinished(),
         abortSignal,
       });
 

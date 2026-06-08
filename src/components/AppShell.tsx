@@ -1,4 +1,4 @@
-import { Sidebar } from "@/components/Sidebar";
+import { Sidebar, MobileBottomNav } from "@/components/Sidebar";
 import type { View } from "@/lib/views";
 
 interface AppShellProps {
@@ -23,9 +23,14 @@ export function AppShell({
         onSelect={onChangeView}
         hiddenViews={hiddenViews}
       />
-      <main className="flex-1 min-w-0 flex flex-col overflow-hidden">
+      <main className="flex-1 min-w-0 flex flex-col overflow-hidden pb-14 lg:pb-0">
         {children}
       </main>
+      <MobileBottomNav
+        currentView={currentView}
+        onSelect={onChangeView}
+        hiddenViews={hiddenViews}
+      />
     </div>
   );
 }

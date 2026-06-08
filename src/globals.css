@@ -109,3 +109,12 @@ body {
     background: var(--color-pink-200);
     color: var(--color-foreground);
 }
+
+/* Hide scrollbar utility (used by mobile bottom nav) */
+.scrollbar-none::-webkit-scrollbar {
+    display: none;
+}
+.scrollbar-none {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+}

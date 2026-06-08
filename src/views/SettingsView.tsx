@@ -173,7 +173,7 @@ export function SettingsView() {
 
   return (
     <div className="flex-1 overflow-y-auto">
-      <div className="max-w-3xl mx-auto px-6 py-8 space-y-8">
+      <div className="max-w-3xl mx-auto px-4 sm:px-6 py-6 sm:py-8 space-y-8">
         <header className="flex items-center justify-between">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">Settings</h1>
@@ -236,7 +236,7 @@ export function SettingsView() {
                 <label className="block text-sm font-medium mb-1.5">
                   {AGENT_LABELS[agent]}
                 </label>
-                <div className="flex items-center gap-2">
+                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
                   <select
                     value={cfg.provider}
                     onChange={(e) => {
@@ -261,7 +261,7 @@ export function SettingsView() {
                       flashSave();
                     }}
                     placeholder="model id, e.g. anthropic/claude-3.5-sonnet"
-                    className="flex-1 font-mono text-sm border border-[var(--color-border)] rounded-md px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-[var(--color-pink-300)]"
+                    className="w-full sm:flex-1 font-mono text-sm border border-[var(--color-border)] rounded-md px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-[var(--color-pink-300)]"
                   />
                   <datalist id={`presets-${agent}`}>
                     {MODEL_PRESETS[cfg.provider].map((m) => (

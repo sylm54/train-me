@@ -147,7 +147,7 @@ export function TtsView() {
 
   return (
     <div className="flex-1 overflow-y-auto">
-      <div className="max-w-4xl mx-auto p-6 space-y-6">
+      <div className="max-w-4xl mx-auto p-4 sm:p-6 space-y-6">
         <header>
           <h1 className="text-2xl font-semibold tracking-tight">TTS Studio</h1>
           <p className="text-sm text-[var(--color-muted-foreground)] mt-1">
@@ -159,12 +159,9 @@ export function TtsView() {
         <section className="border border-[var(--color-border)] rounded-lg p-4 bg-[var(--color-surface)] text-sm space-y-2">
           <div className="flex items-center gap-4">
             <span>
-              Model:{" "}
-              {modelStatus?.downloaded ? "Downloaded" : "Not downloaded"}
+              Model: {modelStatus?.downloaded ? "Downloaded" : "Not downloaded"}
             </span>
-            <span>
-              Engine: {modelStatus?.loaded ? "Loaded" : "Not loaded"}
-            </span>
+            <span>Engine: {modelStatus?.loaded ? "Loaded" : "Not loaded"}</span>
           </div>
           {!modelStatus?.downloaded && (
             <button
