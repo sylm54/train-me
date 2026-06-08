@@ -19,7 +19,7 @@
 //! unrelated files are left untouched. Directories are created on demand.
 
 use std::fs;
-use std::io;
+use std::io::{self, Cursor, Read, Seek};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -76,8 +76,10 @@ pub struct ImportResult {
 /// docs for the destination rules of each.
 ///
 /// On Android the file picker returns a `content://` URI rather than a
-/// filesystem path. Such URIs are opened through the Android-aware FS
-/// plugin (`tauri-plugin-android-fs`); regular paths are read directly.
+/// filesystem path. Such URIs are fully read into memory through the
+/// Android-aware FS plugin (`tauri-plugin-android-fs`) and then presented
+/// as a seekable `Cursor<Vec<u8>>`. This avoids relying on the raw file
+/// descriptor being seekable or staying valid across threads.
 #[tauri::command]
 pub async fn import_package(
     app: AppHandle,
@@ -87,10 +89,10 @@ pub async fn import_package(
 ) -> Result<ImportResult, String> {
     let pkg_kind = PackageKind::parse(&kind)?;
 
-    // Obtain a readable handle to the ZIP. On Android this may be a
-    // `content://` URI that has no filesystem representation and must be
-    // opened via the ContentResolver.
-    let zip_file = open_zip(&app, &zip_path).await?;
+    // Obtain a readable handle to the ZIP. On Android the entire file is
+    // read into memory via the ContentResolver so we get a seekable reader
+    // that is independent of the Android file descriptor's lifetime.
+    let zip_input = open_zip(&app, &zip_path).await?;
 
     let prompts_root = state.data_dir.join("prompts");
     let agent_root = state.agent_dir.clone();
@@ -107,10 +109,8 @@ pub async fn import_package(
     tauri::async_runtime::spawn_blocking(move || -> Result<ImportResult, String> {
         // Extract to a temp directory first so we can validate/inspect before
         // mutating the user's data folders.
-        let temp =
-            tempfile::tempdir().map_err(|e| format!("Failed to create temp dir: {}", e))?;
-        extract_zip(zip_file, temp.path())
-            .map_err(|e| format!("Failed to extract ZIP: {}", e))?;
+        let temp = tempfile::tempdir().map_err(|e| format!("Failed to create temp dir: {}", e))?;
+        extract_zip(zip_input, temp.path()).map_err(|e| format!("Failed to extract ZIP: {}", e))?;
 
         // Determine the "package root" — either the temp dir itself, or its
         // sole sub-directory if the archive contains a single top-level folder
@@ -151,34 +151,69 @@ pub async fn import_package(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Open the picked ZIP for reading.
+/// Open the picked ZIP for reading, returning a seekable reader.
 ///
-/// A `content://` URI (returned by the Android file picker) is opened via
-/// the Android-aware FS plugin; any other value is treated as a regular
-/// filesystem path. The latter is validated to exist before opening so the
-/// error message stays helpful on desktop.
-async fn open_zip(app: &AppHandle, zip_path: &str) -> Result<fs::File, String> {
+/// A `content://` URI (returned by the Android file picker) is fully read
+/// into memory via the Android-aware FS plugin and wrapped in a `Cursor`.
+/// This avoids depending on the raw file descriptor being seekable or
+/// remaining valid when later read on a blocking thread — both of which
+/// are unreliable for Android content-provider file descriptors.
+///
+/// Any other value is treated as a regular filesystem path and opened
+/// directly.
+async fn open_zip(app: &AppHandle, zip_path: &str) -> Result<ZipInput, String> {
     if zip_path.starts_with("content://") {
         use tauri_plugin_android_fs::{AndroidFsExt, FileUri};
         let uri = FileUri::from_uri(zip_path);
         let api = app.android_fs_async();
-        api.open_file_readable(&uri)
+        let bytes = api
+            .read(&uri)
             .await
-            .map_err(|e| format!("Failed to open Android content URI '{}': {}", zip_path, e))
+            .map_err(|e| format!("Failed to read Android content URI '{}': {}", zip_path, e))?;
+        log::info!("Read {} bytes from content URI", bytes.len());
+        Ok(ZipInput::Memory(Cursor::new(bytes)))
     } else {
         let path = PathBuf::from(zip_path);
         if !path.exists() {
             return Err(format!("ZIP file not found: {}", zip_path));
         }
-        fs::File::open(&path).map_err(|e| format!("Failed to open '{}': {}", zip_path, e))
+        let file =
+            fs::File::open(&path).map_err(|e| format!("Failed to open '{}': {}", zip_path, e))?;
+        Ok(ZipInput::File(file))
     }
 }
 
-/// Extract every entry from `zip_file` into `dest`, preserving directory
-/// structure. Empty directory entries (`/`-suffixed names) are honoured.
-fn extract_zip(zip_file: fs::File, dest: &Path) -> io::Result<()> {
+/// Seekable reader that abstracts over a real file (desktop) or an
+/// in-memory buffer (Android content:// URI).
+enum ZipInput {
+    File(fs::File),
+    Memory(Cursor<Vec<u8>>),
+}
+
+impl Read for ZipInput {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            ZipInput::File(f) => f.read(buf),
+            ZipInput::Memory(c) => c.read(buf),
+        }
+    }
+}
+
+impl Seek for ZipInput {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        match self {
+            ZipInput::File(f) => f.seek(pos),
+            ZipInput::Memory(c) => c.seek(pos),
+        }
+    }
+}
+
+/// Extract every entry from a seekable ZIP reader into `dest`, preserving
+/// directory structure. Empty directory entries (`/`-suffixed names) are
+/// honoured.
+fn extract_zip(reader: impl Read + Seek, dest: &Path) -> io::Result<()> {
     fs::create_dir_all(dest)?;
-    let mut archive = zip::ZipArchive::new(zip_file)
+    let mut archive = zip::ZipArchive::new(reader)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
     for i in 0..archive.len() {
