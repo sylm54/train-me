@@ -27,6 +27,7 @@ pub enum SoundType {
 
 impl SoundType {
     /// All available sound types.
+    #[cfg(test)]
     pub fn all() -> &'static [SoundType] {
         &[
             SoundType::Beep,

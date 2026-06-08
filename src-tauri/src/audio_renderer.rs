@@ -14,9 +14,6 @@ use crate::model_downloader;
 use crate::sounds::SoundType;
 use crate::tag_parser::{self, Node, OverlayPart};
 
-/// Default sample rate for generated audio (overridden by TTS model).
-const DEFAULT_SAMPLE_RATE: u32 = 24000;
-
 // ============================================================================
 // Value resolution helpers
 // ============================================================================
@@ -1168,7 +1165,7 @@ mod tests {
         // Silence
         assert!((rms_energy(&[0.0; 100])).abs() < 0.0001);
         // Full-scale sine-ish
-        let signal: Vec<f32> = (0..100).map(|i| ((i as f32 / 100.0) * 2.0 - 1.0)).collect();
+        let signal: Vec<f32> = (0..100).map(|i| (i as f32 / 100.0) * 2.0 - 1.0).collect();
         let rms = rms_energy(&signal);
         assert!(
             rms > 0.5,

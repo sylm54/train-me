@@ -158,9 +158,6 @@ export function ActivityView() {
               <h1 className="text-2xl font-semibold tracking-tight">
                 Activity
               </h1>
-              <p className="text-sm text-[var(--color-muted-foreground)] mt-1">
-                Things the agent (and you) have done. Newest first.
-              </p>
             </div>
           </div>
           <Button
@@ -236,7 +233,7 @@ export function ActivityView() {
               <ActivityIcon size={20} />
             </div>
             <p className="text-sm text-[var(--color-muted-foreground)]">
-              No activity yet. The agent logs events here as it works.
+              No activity yet.
             </p>
           </div>
         )}

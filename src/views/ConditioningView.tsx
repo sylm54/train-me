@@ -272,9 +272,6 @@ export function ConditioningView() {
               <Sparkles className="text-[var(--color-pink-500)]" size={22} />
               Conditioning
             </h1>
-            <p className="text-sm text-[var(--color-muted-foreground)] mt-1">
-              Hypno / conditioning scripts. Render to WAV and play back.
-            </p>
           </div>
           <Button
             variant="outline"
@@ -310,10 +307,6 @@ export function ConditioningView() {
             <h3 className="text-base font-medium">
               No conditioning scripts yet
             </h3>
-            <p className="text-sm text-[var(--color-muted-foreground)] mt-1">
-              Ask the agent to create one in{" "}
-              <code className="text-xs">conditioning/</code>.
-            </p>
           </div>
         )}
 

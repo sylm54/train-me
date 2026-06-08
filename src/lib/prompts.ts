@@ -9,6 +9,8 @@
  *   {{{embed 'path/to/file.md'}}}     Inline the contents of `prompts/path/to/file.md`.
  *                                     Embeds can be nested; circular embeds are skipped.
  *
+ *   {{features}}                      Inline the inbuilt app-features rundown.
+ *   {{ttsTags}}                       Inline the inbuilt TTS tag system reference.
  *   {{special}}                       Scan the agent's `special/*.md` (recursive),
  *                                     frontmatter from each file, and render a
  *                                     markdown summary table inline.
@@ -16,6 +18,217 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import type { FileEntry } from "./types";
+
+const featureEmbed = `
+## Features Overview
+### 1. Conditioning (\`conditioning/*.md\`)
+- Each .json file corresponds to one audio file.
+- File contents describe the associated audio.
+- Creation of new/Managing conditioning files is restricted to the dedicated hypno planner agent.
+
+### 2. Rules (\`rule/*.md\`)
+- Each file represents one rule that the user is expected to follow.
+- Refer to \`examples/rule.md\` for the correct formatting standard.
+
+### 3. Routines (\`routines/*.md\`)
+- Each file defines one routine for the user.
+- Refer to \`examples/routine.md\` for the proper formatting standard.
+
+### 4. Inventory
+- **Items**: records items owned by the user. Only the user may add or update entries (via the Inventory UI). You may read entries using the \`inventory\` builtin.
+- **Wishlist**: follows the same schema as items (with \`priority\` instead of \`quantity\`). You may read AND write wishlist entries.
+- Use the \`inventory\` builtin for all access:
+  - \`inventory items\` — list items.
+  - \`inventory items <id>\` — show one item.
+  - \`inventory wishlist\` — list wishlist.
+  - \`inventory wishlist <id>\` — show one wishlist item.
+  - \`inventory wishlist add <name> [category] [priority] [notes...]\` — add a wishlist entry.
+  - \`inventory wishlist remove <id>\` — remove a wishlist entry.
+- Never attempt to add, update, or remove owned items yourself — instruct the user to do it via the Inventory view.
+
+### 5. Chastity
+- Command: \`chastity\`
+- Capabilities:
+  - \`chastity info\` — Displays current lock status.
+  - \`chastity unlock\` — Unlocks the user.
+- The user is responsible for locking themselves. Once locked, you can only unlock them by providing the correct secret string.
+
+### 6. Journal (\`journal/*.md\`, \`journal/format.json\`)
+- The user may maintain personal journal entries in the \`.md\` files (read-only for you).
+- You may customize prompts and related settings by editing \`format.json\`.
+- Refer to \`example/format.json\` for the expected structure.
+
+### 7. Activity Tracking
+- Stored in \`activity.db\` SQLite
+- Use sqlite to query it directly (read-only by convention).
+`.trim();
+
+const ttsTagsEmbed = `
+## TTS Tag System
+
+The TTS tag markup is an XML-like language used inside the train-me app to author spoken-word audio scripts — speech, pauses, sound effects, tones, DSP effects, concurrent layering, loops, and interactive pauses. The \`writeScript\` tool parses, validates, and saves a script, returning \`{ valid, path, error, node_count }\`.
+
+### Conventions
+
+- Tags are case-sensitive and lowercase.
+- Self-closing tags end with \`/>\`; container tags require children and a matching \`</tag>\`.
+- Whitespace inside tags is ignored. Text nodes are trimmed; empty text nodes are filtered.
+- \`<!-- comments -->\` are supported and must be terminated with \`-->\`.
+- Attribute values may be single- or double-quoted (unquoted is also accepted).
+- Unknown tags are a parse error. Unknown attribute values (e.g. invalid sound/tone/effect names) are tolerated where noted but produce no/degraded audio.
+
+### Tags
+
+#### \`<voice>\` — container (children required)
+Selects the speaking voice and applies volume/speed to inner content.
+- \`speaker\` — default \`male\`.
+- \`pitch\` — optional. Parsed but currently NOT applied to synthesis.
+- \`volume\` — optional; scalar or \`@\` expression.
+- \`speed\` — optional; scalar, clamped to 0.5–1.5.
+
+#### \`<speed>\` — container (children required)
+- \`value\` — default \`1.0\`; scalar, clamped to 0.5–1.5. Multiplies the inherited speed scale.
+
+#### \`<volume>\` — container (children required)
+- \`value\` — default \`1.0\`; scalar (clamped 0.0–1.5) or \`@\` expression (evaluated as a per-sample curve over the content).
+
+#### \`<pause>\` — self-closing
+- \`duration\` — default \`0.5\`; seconds. Inserts silence.
+
+#### \`<sound>\` — self-closing
+Plays a one-shot embedded sound effect into the foreground.
+- \`type\` — default \`beep\`; see Sound types.
+- \`volume\` — optional; scalar, default 1.0.
+- \`speed\` — optional; parsed but ignored.
+
+#### \`<tone>\` — self-closing
+A BACKGROUND layer. Starts at the current position and loops/extends until the end of the enclosing scope, then is summed with the foreground.
+- \`type\` — default \`wave\`; informational, ignored by synthesis.
+- \`preset\` — default \`sine\`; determines the waveform (see Tone presets).
+- \`frequency\` — default \`440\`; Hz.
+- \`volume\` — optional; scalar, default 0.3.
+
+#### \`<effect>\` — container (children required)
+Applies an audio effect to the rendered inner content.
+- \`type\` — default \`echo\`; see Effects.
+- \`preset\` — optional.
+- \`cutoff\` — optional; Hz, used only by \`filter\`.
+
+#### \`<overlay>\` — container; mixes its parts concurrently
+Children are \`<part>\` elements; any non-part tag or text is wrapped in an implicit part.
+- \`duration\` — optional; parsed but NOT used by current rendering.
+
+##### \`<part>\` — container (children required), valid only inside \`<overlay>\`
+- \`looped\` — optional; bool. When true, the part repeats to fill ~5 seconds.
+- \`volume\` — optional; scalar.
+- \`speed\` — optional; scalar.
+
+#### \`<loop>\` — container (children required)
+- \`loops\` — default \`2\`; non-negative integer. Repeats inner content sequentially (not concurrently).
+
+#### \`<background>\` — container (children required)
+A BACKGROUND layer aligned to its start position; non-tone backgrounds extend with silence to match foreground length, then sum with the foreground.
+- \`volume\` — optional; scalar (clamped 0.0–1.5) or \`@\` expression.
+- \`speed\` — optional; scalar, clamped to 0.5–1.5.
+
+#### \`<until>\` — container (children required)
+Interactive pause. In pre-rendered mode the inner content renders once; an optional waiting sound renders once as a background layer. NOTE: attribute names use hyphens.
+- \`button\` — default \`Continue\`.
+- \`waiting-sound\` — optional; a sound type name.
+- \`waiting-sound-volume\` — optional; scalar, default 0.5.
+- \`pre-pause\` — optional; seconds.
+- \`post-pause\` — optional; seconds.
+
+#### \`<include>\` — self-closing (requires \`src\`)
+- \`src\` — required. Pulls in another XML file by path. Nested includes are supported with circular-include detection; resolved before rendering (an unresolved \`Include\` node is silently ignored at render time).
+
+### Sound types
+
+Valid \`<sound type>\` values: \`beep\`, \`pop\`, \`bubble_pop\`, \`camera_shutter\`, \`censor_beep\`, \`heart_beat\`, \`padlock\`, \`snap\`, \`ding\`, \`swoosh\`, \`click\`, \`error\`, \`success\`, \`bell\`, \`water_drop\`.
+
+### Tone presets
+
+Valid \`<tone preset>\` values (determine the waveform): \`sine\`, \`square\`, \`sawtooth\`, \`triangle\`, \`whitenoise\`, \`pinknoise\`, \`brownnoise\`. Any other value (e.g. \`binaural\`, \`theta\`) falls back to \`sine\`. \`frequency\` sets pitch in Hz; \`type\` is informational only.
+
+### Effects
+
+Valid \`<effect type>\` values and presets (delay/decay/room in seconds):
+
+- \`echo\` — presets: \`light\`/default (0.1s, decay 0.4), \`medium\` (0.2s, 0.5), \`heavy\` (0.3s, 0.6).
+- \`reverb\` — presets: \`small_room\` (0.5, 0.3), \`large_hall\` (1.5, 0.5), \`cathedral\` (3.0, 0.7), \`plate\` (0.8, 0.4), \`medium\`/default (1.0, 0.4).
+- \`filter\` — low-pass using \`cutoff\` (Hz, default 1000). No preset.
+- Unknown \`type\` values pass through unchanged (no processing).
+
+### Expression language
+
+Volume/speed/pitch attribute values are either a bare scalar number or an expression beginning with \`@\`. Binary operators \`+ - * /\` are supported (division is guarded against divide-by-zero). Time-dependent expressions are evaluated per-sample across the duration of their content.
+
+Examples: \`0.5\`, \`@fadein(2.0)\`, \`@ramp(0.3, 1.0)\`, \`@sin(2) * 0.5 + 0.5\`, \`@min(1.0, @max(0.3, @beat(60, 0.5)))\`.
+
+Functions (unknown functions evaluate to 0):
+
+| Function | Signature | Meaning |
+|---|---|---|
+| \`@fadein\` | \`(d)\` | Ramp 0 → 1 over \`d\` seconds |
+| \`@fadeout\` | \`(d)\` | Ramp 1 → 0 over the last \`d\` seconds |
+| \`@fade\` | \`(d)\` | Combined fade-in/fade-out over \`d\` seconds |
+| \`@ramp\` | \`(start, end)\` | Linear ramp from \`start\` to \`end\` across the segment |
+| \`@env\` | \`(attack, decay, sustain, release)\` | ADSR envelope |
+| \`@beat\` | \`(bpm, duty=0.5)\` | Square-wave beat gate (1 during duty, else 0) |
+| \`@sin\` | \`(freq, phase=0)\` | Sine wave mapped to [0,1] |
+| \`@tri\` | \`(freq, duty=0.5)\` | Triangle wave mapped to [0,1] |
+| \`@saw\` | \`(freq)\` | Sawtooth wave in [0,1) |
+| \`@noise\` | \`(seed)\` | Deterministic pseudo-random per sample in [0,1] |
+| \`@max\` | \`(a, b)\` | Maximum |
+| \`@min\` | \`(a, b)\` | Minimum |
+| \`@step\` | \`(val, step)\` | Quantize \`val\` to nearest multiple of \`step\` |
+| \`@round\` | \`(val, decimals)\` | Round \`val\` to \`decimals\` places |
+
+Constant folding: literals, binops of constants, and \`@max\`/\`@min\`/\`@step\`/\`@round\` (when all args are constant) fold to a scalar; all other functions are time-dependent. \`pitch\` is parsed but not applied to synthesis.
+
+### Authoring notes
+
+- Speed is clamped to 0.5–1.5 at every layer and multiplies the inherited scale.
+- Scalar volume is clamped to 0.0–1.5; expression volume is applied as a per-sample curve. The final mix is clamped to [-1.0, 1.0].
+- \`<tone>\` and \`<background>\` are background layers: aligned to their start position, then looped (tones) or silence-extended (non-tone backgrounds) to the enclosing scope's foreground length, then summed.
+- \`<overlay>\` mixes all parts concurrently (all start together). \`<loop>\` repeats sequentially.
+- \`<include>\` is resolved before rendering; included content becomes part of the node tree (nesting + cycle detection supported).
+
+### Example
+
+\`\`\`xml
+<background volume='0.2'>
+  <tone preset='pinknoise' volume='0.4'/>
+</background>
+<voice speaker='male' speed='1.1'>
+  Welcome to session one. <pause duration='0.4'/>
+  <sound type='ding'/>
+  <volume value='@fadein(1.5)'>Let us begin with a short warm-up.</volume>
+  <effect type='reverb' preset='small_room'>Focus on your breath.</effect>
+</voice>
+<loop loops='3'>
+  <voice speaker='female'>Inhale. <pause/> Exhale.</voice>
+</loop>
+<overlay>
+  <part volume='0.8'>And rest.</part>
+  <part volume='0.5' looped='true'>breathe</part>
+</overlay>
+\`\`\`
+`.trim();
+
+/**
+ * Inbuilt static embeds exposed as `{{name}}` directives. Add a key here to
+ * register a new `{{name}}` directive that inlines the mapped content.
+ */
+const STATIC_EMBEDS: Record<string, string> = {
+  features: featureEmbed,
+  ttsTags: ttsTagsEmbed,
+};
+
+const STATIC_EMBED_RE = new RegExp(
+  "\\{\\{\\s*(" + Object.keys(STATIC_EMBEDS).join("|") + ")\\s*\\}\\}",
+  "g",
+);
 
 const EMBED_RE = new RegExp(
   "\\{\\{\\{embed\\s+['\"]([^'\"]+)['\"]\\s*\\}\\}\\}",
@@ -60,6 +273,12 @@ async function processPrompt(
       return "";
     }
   });
+
+  // Process inbuilt static directives ({{features}}, {{ttsTags}}, ...).
+  out = out.replace(
+    STATIC_EMBED_RE,
+    (_m: string, name: string) => STATIC_EMBEDS[name] ?? "",
+  );
 
   // Process special directives.
   out = await replaceAsync(out, SPECIAL_RE, async () => {

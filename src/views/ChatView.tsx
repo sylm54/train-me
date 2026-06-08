@@ -34,7 +34,6 @@ import {
   Brain,
   ChevronDown,
   Loader2,
-  Settings as SettingsIcon,
   Wrench,
   Check,
   X,
@@ -183,37 +182,6 @@ function ChatViewInner({
 
   return (
     <div className="flex flex-col h-full">
-      {/* ── Header ─────────────────────────────────────────────── */}
-      <header className="border-b border-[var(--color-border)] px-4 py-3 flex items-center gap-3 bg-[var(--color-surface)]">
-        <div>
-          <h2 className="text-sm font-semibold">Agent</h2>
-          <div className="text-[11px] text-[var(--color-muted-foreground)]">
-            <span>
-              {settings.agents.main.provider} · {settings.agents.main.model}
-            </span>
-          </div>
-        </div>
-        <div className="ml-auto flex items-center gap-2">
-          {messages.length > 0 && (
-            <button
-              onClick={clearChat}
-              className="text-xs text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)]"
-            >
-              Clear
-            </button>
-          )}
-          {onOpenSettings && (
-            <button
-              onClick={onOpenSettings}
-              className="size-8 grid place-items-center rounded-md text-[var(--color-muted-foreground)] hover:bg-[var(--color-pink-50)] hover:text-[var(--color-foreground)]"
-              title="Settings"
-            >
-              <SettingsIcon size={14} />
-            </button>
-          )}
-        </div>
-      </header>
-
       {/* ── Errors ─────────────────────────────────────────────── */}
       {(promptError || error) && (
         <div className="m-3 px-3 py-2 rounded-md bg-[var(--color-pink-100)] border border-[var(--color-danger)] text-[var(--color-danger)] text-xs flex items-start gap-2">
@@ -273,30 +241,11 @@ function ChatViewInner({
               <h3 className="text-lg font-semibold tracking-tight">
                 Welcome to Train-Me
               </h3>
-              <div className="text-sm text-[var(--color-muted-foreground)] max-w-md">
-                Your AI agent has its own writable scratch space at{" "}
-                <code className="font-mono text-xs bg-[var(--color-surface-muted)] px-1 py-0.5 rounded">
-                  agent_data/
-                </code>{" "}
-                inside the app data dir. Drop prompt files into{" "}
-                <code className="font-mono text-xs bg-[var(--color-surface-muted)] px-1 py-0.5 rounded">
-                  prompts/
-                </code>{" "}
-                to teach it new skills.
-              </div>
               {!systemPrompt && (
                 <p className="text-xs text-[var(--color-warning)] mt-2">
                   <code className="font-mono">prompts/main_agent.md</code> not
                   found — create it to give the agent a personality.
                 </p>
-              )}
-              {onOpenSettings && (
-                <button
-                  onClick={onOpenSettings}
-                  className="text-xs underline hover:no-underline text-[var(--color-pink-500)] mt-3"
-                >
-                  Configure API keys →
-                </button>
               )}
             </ConversationEmptyState>
           )}
@@ -380,6 +329,14 @@ function ChatViewInner({
             <span className="opacity-60">Idle</span>
           )}
         </div>
+        {messages.length > 0 && (
+          <button
+            onClick={clearChat}
+            className="text-xs text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)]"
+          >
+            Clear
+          </button>
+        )}
         <div className="ml-auto flex items-center gap-3 shrink-0 tabular-nums">
           <span>
             ↑ {totals.promptTokens.toLocaleString()} ↓{" "}
@@ -491,7 +448,10 @@ function ActivityParts({ message }: { message: UIMessage }) {
   parts.forEach((part, i) => {
     if (part.type === "text") {
       textChildren.push(
-        <MessageResponse key={`text-${message.id}-${i}`}>
+        <MessageResponse
+          key={`text-${message.id}-${i}`}
+          linkSafety={{ enabled: false }}
+        >
           {part.text}
         </MessageResponse>,
       );

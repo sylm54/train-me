@@ -562,11 +562,6 @@ pub fn run() {
             bash::ensure_prompts_dir(&data_dir).ok();
             // Ensure agent_data/ exists with conventional subdirs.
             bash::ensure_agent_dir(&data_dir).ok();
-            // Migrate chastity.json from agent_data/ to state/ if needed.
-            chastity::migrate_from_agent_dir(
-                &state_dir.join("chastity.json"),
-                &agent_dir.join("chastity.json"),
-            );
 
             // Initialize app-managed SQLite DBs. Inventory lives in
             // state/ (agent-unreachable) and is owned by a libsqlite3
@@ -577,12 +572,6 @@ pub fn run() {
             // only bootstrap its schema once with a transient connection.
             let inventory_db = inventory::init_db(&state_dir.join("inventory.db"))
                 .expect("failed to init inventory.db");
-            // Move any pre-existing activity.db out of state/ into the
-            // sandbox before opening it at its new location.
-            activity_db::migrate_into_sandbox(
-                &agent_dir.join("activity.db"),
-                &state_dir.join("activity.db"),
-            );
             activity_db::ensure_schema(&agent_dir.join("activity.db"))
                 .expect("failed to init activity.db schema");
 

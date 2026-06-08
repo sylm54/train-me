@@ -7,7 +7,7 @@
  * current.
  *
  * UX:
- *   - User can lock (with a secret string) and arm/stop a countdown.
+ *   - User can lock (with a secret string).
  *   - The user CANNOT self-unlock — only the agent (via the `chastity unlock`
  *     bash builtin) or the countdown auto-unlock can release the lock.
  *   - When the countdown expires we call `chastity_auto_unlock`, which
@@ -88,23 +88,6 @@ function formatTimestamp(s: string | null): string {
   }
 }
 
-/** Parse a duration like "2h", "30m", "3d", "1w" into milliseconds. */
-function parseDurationToMs(s: string): number | null {
-  const m = s.trim().match(/^(\d+)\s*([smhdw]?)$/);
-  if (!m) return null;
-  const n = parseInt(m[1], 10);
-  if (Number.isNaN(n)) return null;
-  const unit = m[2] || "s";
-  const multipliers: Record<string, number> = {
-    s: 1000,
-    m: 60_000,
-    h: 3_600_000,
-    d: 86_400_000,
-    w: 604_800_000,
-  };
-  return n * multipliers[unit];
-}
-
 // ──────────────────────────────────────────────────────────────────────────
 // Component
 // ──────────────────────────────────────────────────────────────────────────
@@ -121,9 +104,6 @@ export function ChastityView() {
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionFlash, setActionFlash] = useState<string | null>(null);
-
-  // Countdown form
-  const [duration, setDuration] = useState("");
 
   // Track whether the auto-unlock rewrite for the *current* lock has already
   // been issued, so we don't fight the user's manual edits in a loop.
@@ -215,48 +195,6 @@ export function ChastityView() {
       setBusy(false);
     }
   }, [secret]);
-
-  const handleArmCountdown = useCallback(async () => {
-    const ms = parseDurationToMs(duration);
-    if (ms === null || ms <= 0) {
-      setActionError("Enter a duration like 30m, 2h, 3d, or 1w.");
-      return;
-    }
-    setBusy(true);
-    setActionError(null);
-    try {
-      const next = await invoke<ChastityState>("chastity_arm_countdown", {
-        duration,
-      });
-      // Reset the auto-unlock guard since this is a new countdown — we
-      // want it to fire when this new timer expires.
-      lastAutoUnlockAtRef.current = null;
-      setState(next);
-      setNow(Date.now());
-      setDuration("");
-      flash(`Countdown armed (${formatRemaining(ms)}).`);
-      await logActivity("chastity", "arm_countdown", duration);
-    } catch (e) {
-      setActionError(tauriErrorToString(e));
-    } finally {
-      setBusy(false);
-    }
-  }, [duration]);
-
-  const handleStopCountdown = useCallback(async () => {
-    setBusy(true);
-    setActionError(null);
-    try {
-      const next = await invoke<ChastityState>("chastity_stop_countdown");
-      setState(next);
-      flash("Countdown stopped.");
-      await logActivity("chastity", "stop_countdown");
-    } catch (e) {
-      setActionError(tauriErrorToString(e));
-    } finally {
-      setBusy(false);
-    }
-  }, []);
 
   // ── Derived flags ────────────────────────────────────────────────────
 
@@ -416,42 +354,6 @@ export function ChastityView() {
               <p className="text-xs text-[var(--color-muted-foreground)] w-full">
                 Only the agent can unlock you.
               </p>
-
-              {/*{state.countdown_active ? (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={handleStopCountdown}
-                  disabled={busy}
-                >
-                  <TimerOff />
-                  Stop countdown
-                </Button>
-              ) : (
-                <div className="flex items-center gap-1.5">
-                  <Input
-                    value={duration}
-                    onChange={(e) => setDuration(e.target.value)}
-                    placeholder="30m, 2h, 3d, 1w"
-                    className="w-32 h-8 text-xs"
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        e.preventDefault();
-                        handleArmCountdown();
-                      }
-                    }}
-                  />
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={handleArmCountdown}
-                    disabled={busy}
-                  >
-                    <Timer />
-                    Arm
-                  </Button>
-                </div>
-              )}*/}
             </div>
           )}
         </section>
@@ -463,21 +365,17 @@ export function ChastityView() {
               <h2 className="text-base font-semibold">
                 Lock with a new secret
               </h2>
-              <p className="text-xs text-[var(--color-muted-foreground)] mt-0.5">
-                The secret is saved locally and shown to you (only) once the
-                lock opens. The agent sees only <code>hidden</code>.
-              </p>
             </header>
             <div className="px-5 py-4 flex flex-wrap items-end gap-3">
               <div className="flex-1 min-w-[200px] space-y-1.5">
                 <label className="text-xs text-[var(--color-muted-foreground)]">
-                  Secret string
+                  Code
                 </label>
                 <Input
                   type={revealSecret ? "text" : "password"}
                   value={secret}
                   onChange={(e) => setSecret(e.target.value)}
-                  placeholder="Anything only you would know"
+                  placeholder="Lockbox pin"
                   autoComplete="off"
                   spellCheck={false}
                   disabled={busy}
