@@ -21,6 +21,7 @@
 use std::fs;
 use std::io::{self, Cursor, Read, Seek};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use serde::Serialize;
 use tauri::{AppHandle, State};
@@ -87,12 +88,15 @@ pub async fn import_package(
     kind: String,
     state: State<'_, AppState>,
 ) -> Result<ImportResult, String> {
+    let t0 = Instant::now();
     let pkg_kind = PackageKind::parse(&kind)?;
+    log::info!("[import] command invoked, zip_path={}", zip_path);
 
     // Obtain a readable handle to the ZIP. On Android the entire file is
     // read into memory via the ContentResolver so we get a seekable reader
     // that is independent of the Android file descriptor's lifetime.
     let zip_input = open_zip(&app, &zip_path).await?;
+    log::info!("[import] open_zip took {:.2}s", t0.elapsed().as_secs_f64());
 
     let prompts_root = state.data_dir.join("prompts");
     let agent_root = state.agent_dir.clone();
@@ -106,11 +110,19 @@ pub async fn import_package(
     // The extraction and merging are synchronous, blocking I/O — run them
     // on a blocking thread so we don't stall the async runtime.
     let kind_str = pkg_kind.as_str().to_string();
-    tauri::async_runtime::spawn_blocking(move || -> Result<ImportResult, String> {
+    let result = tauri::async_runtime::spawn_blocking(move || -> Result<ImportResult, String> {
+        let bt0 = Instant::now();
+
         // Extract to a temp directory first so we can validate/inspect before
         // mutating the user's data folders.
         let temp = tempfile::tempdir().map_err(|e| format!("Failed to create temp dir: {}", e))?;
+        log::info!("[import] tempdir took {:.2}s", bt0.elapsed().as_secs_f64());
+
         extract_zip(zip_input, temp.path()).map_err(|e| format!("Failed to extract ZIP: {}", e))?;
+        log::info!(
+            "[import] extract_zip took {:.2}s",
+            bt0.elapsed().as_secs_f64()
+        );
 
         // Determine the "package root" — either the temp dir itself, or its
         // sole sub-directory if the archive contains a single top-level folder
@@ -127,6 +139,11 @@ pub async fn import_package(
         if prompts_src.is_dir() {
             prompts_files = merge_dir(&prompts_src, &prompts_root)
                 .map_err(|e| format!("Failed to copy prompts: {}", e))?;
+            log::info!(
+                "[import] merge prompts ({}) took {:.2}s",
+                prompts_files,
+                bt0.elapsed().as_secs_f64()
+            );
         } else {
             note = Some("No 'prompts/' folder found in package.".to_string());
         }
@@ -135,6 +152,11 @@ pub async fn import_package(
         // into the content root.
         let agent_files = merge_package_into(&pkg_root, &content_root, &prompts_src)
             .map_err(|e| format!("Failed to copy agent files: {}", e))?;
+        log::info!(
+            "[import] merge agent files ({}) took {:.2}s",
+            agent_files,
+            bt0.elapsed().as_secs_f64()
+        );
 
         Ok(ImportResult {
             kind: kind_str,
@@ -144,7 +166,10 @@ pub async fn import_package(
         })
     })
     .await
-    .map_err(|e| format!("Import task failed: {}", e))?
+    .map_err(|e| format!("Import task failed: {}", e))?;
+
+    log::info!("[import] total took {:.2}s", t0.elapsed().as_secs_f64());
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -166,11 +191,36 @@ async fn open_zip(app: &AppHandle, zip_path: &str) -> Result<ZipInput, String> {
         use tauri_plugin_android_fs::{AndroidFsExt, FileUri};
         let uri = FileUri::from_uri(zip_path);
         let api = app.android_fs_async();
-        let bytes = api
-            .read(&uri)
+
+        // Step 1: open the file descriptor via the Kotlin plugin IPC.
+        let t_fd = Instant::now();
+        let file = api
+            .open_file_readable(&uri)
             .await
-            .map_err(|e| format!("Failed to read Android content URI '{}': {}", zip_path, e))?;
-        log::info!("Read {} bytes from content URI", bytes.len());
+            .map_err(|e| format!("Failed to open Android content URI '{}': {}", zip_path, e))?;
+        log::info!(
+            "[import] open_file_readable took {:.2}s",
+            t_fd.elapsed().as_secs_f64()
+        );
+
+        // Step 2: read the entire file into memory on a blocking thread.
+        // We do this ourselves instead of using `api.read()` so we can
+        // time the IPC and the I/O independently.
+        let t_read = Instant::now();
+        let bytes = tauri::async_runtime::spawn_blocking(move || {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::BufReader::new(file), &mut buf)?;
+            Ok::<Vec<u8>, std::io::Error>(buf)
+        })
+        .await
+        .map_err(|e| format!("Read task panicked: {}", e))?
+        .map_err(|e| format!("Failed to read content URI '{}': {}", zip_path, e))?;
+        log::info!(
+            "[import] read {} bytes took {:.2}s",
+            bytes.len(),
+            t_read.elapsed().as_secs_f64()
+        );
+
         Ok(ZipInput::Memory(Cursor::new(bytes)))
     } else {
         let path = PathBuf::from(zip_path);
