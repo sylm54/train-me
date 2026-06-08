@@ -538,6 +538,10 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // Android-aware FS: lets package imports read `content://` URIs
+        // returned by the Android file picker. On non-Android targets the
+        // plugin initialises as a no-op stub.
+        .plugin(tauri_plugin_android_fs::init())
         .setup(|app| {
             // Resolve data directories
             let data_dir = app
