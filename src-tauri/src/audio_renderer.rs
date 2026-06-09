@@ -225,7 +225,8 @@ impl AudioRenderer {
                     // Tones are background — they play from here until the end of
                     // the enclosing scope.  Generate a short base segment that will
                     // be loop-extended later to match the final foreground length.
-                    let vol = resolve_scalar(volume.as_deref(), 0.3) * volume_scale;
+                    let vol =
+                        (resolve_scalar(volume.as_deref(), 0.3) * volume_scale).clamp(0.0, 1.5);
                     let freq = frequency.unwrap_or(440.0);
                     let base_duration = 0.5; // base segment for looping
                     let base_samples =
@@ -328,9 +329,14 @@ impl AudioRenderer {
                     }
                 }
 
-                Node::Overlay { duration: _, parts } => {
-                    let (samples, dur) =
-                        self.render_overlay(parts, default_speaker, volume_scale, speed_scale)?;
+                Node::Overlay { duration, parts } => {
+                    let (samples, dur) = self.render_overlay(
+                        parts,
+                        default_speaker,
+                        volume_scale,
+                        speed_scale,
+                        *duration,
+                    )?;
                     foreground.extend_from_slice(&samples);
                     _total_duration += dur;
                 }
@@ -369,11 +375,11 @@ impl AudioRenderer {
                     foreground.extend_from_slice(&samples);
                     _total_duration += dur;
 
-                    // Optional waiting sound loop (render once as background)
+                    // Optional waiting sound (render once as background layer)
                     if let Some(ws) = waiting_sound {
                         let ws_vol = waiting_sound_volume.unwrap_or(0.5) * volume_scale;
                         let (ws_samples, _) = self.render_sound(ws, ws_vol)?;
-                        let mut aligned = vec![0.0f32; foreground.len() - ws_samples.len()];
+                        let mut aligned = vec![0.0f32; foreground.len()];
                         aligned.extend_from_slice(&ws_samples);
                         bg_layers.push(BgLayer::background(aligned));
                     }
@@ -509,43 +515,74 @@ impl AudioRenderer {
         default_speaker: &str,
         volume_scale: f32,
         speed_scale: f32,
+        fixed_duration: Option<f32>,
     ) -> Result<(Vec<f32>, f32)> {
-        let mut rendered_parts = Vec::new();
-        let mut max_len = 0usize;
+        let mut rendered_parts: Vec<(Vec<f32>, bool)> = Vec::new();
 
+        // Render all parts
         for part in parts {
-            let part_vol = volume_scale * resolve_scalar(part.volume.as_deref(), 1.0);
+            let part_vol =
+                (volume_scale * resolve_scalar(part.volume.as_deref(), 1.0)).clamp(0.0, 1.5);
             let part_speed =
                 speed_scale * resolve_scalar(part.speed.as_deref(), 1.0).clamp(0.5, 1.5);
 
             let (samples, _dur) =
                 self.render_nodes(&part.children, default_speaker, part_vol, part_speed)?;
 
-            let samples = if part.looped.unwrap_or(false) {
-                // Loop the samples to fill a reasonable duration
-                let target_len = (5.0 * self.sample_rate as f32) as usize; // 5 seconds max
-                if samples.is_empty() {
-                    samples
-                } else {
-                    let mut looped = Vec::with_capacity(target_len);
-                    while looped.len() < target_len {
-                        looped.extend_from_slice(&samples);
-                    }
-                    looped.truncate(target_len);
-                    looped
-                }
-            } else {
-                samples
-            };
-
-            max_len = max_len.max(samples.len());
-            rendered_parts.push(samples);
+            rendered_parts.push((samples, part.looped.unwrap_or(false)));
         }
 
+        // Determine target length from fixed duration or longest non-looped part
+        let target_len = if let Some(dur) = fixed_duration {
+            (dur * self.sample_rate as f32) as usize
+        } else {
+            // Use the longest non-looped part as the target length
+            let non_looped_max = rendered_parts
+                .iter()
+                .filter(|(_, looped)| !*looped)
+                .map(|(s, _)| s.len())
+                .max()
+                .unwrap_or(0);
+
+            if non_looped_max > 0 {
+                non_looped_max
+            } else {
+                // All parts are looped — fall back to longest part
+                rendered_parts
+                    .iter()
+                    .map(|(s, _)| s.len())
+                    .max()
+                    .unwrap_or(0)
+            }
+        };
+
+        // Extend looped parts to fill target length
+        for (samples, looped) in &mut rendered_parts {
+            if *looped && target_len > 0 && !samples.is_empty() {
+                let mut extended = Vec::with_capacity(target_len);
+                while extended.len() < target_len {
+                    extended.extend_from_slice(samples);
+                }
+                extended.truncate(target_len);
+                *samples = extended;
+            }
+        }
+
+        // Final length: if fixed duration, cap to target; otherwise use longest part
+        let final_len = if fixed_duration.is_some() {
+            target_len
+        } else {
+            rendered_parts
+                .iter()
+                .map(|(s, _)| s.len())
+                .max()
+                .unwrap_or(0)
+        };
+
         // Mix all parts
-        let mut mixed = vec![0.0f32; max_len];
-        for part in &rendered_parts {
-            for (i, &s) in part.iter().enumerate() {
+        let mut mixed = vec![0.0f32; final_len];
+        for (samples, _) in &rendered_parts {
+            for (i, &s) in samples.iter().enumerate() {
                 if i < mixed.len() {
                     mixed[i] += s;
                 }
@@ -943,7 +980,23 @@ fn generate_tone(
                 samples.push((state * boost * volume).clamp(-1.0, 1.0));
             }
         }
-        // Binaural / isochronic / wave — generate sine as default
+        "binaural_theta" | "binaural_alpha" | "binaural_beta" | "binaural_delta" => {
+            // Amplitude-modulated sine at brainwave entrainment frequency
+            let beat_freq = match preset {
+                "binaural_theta" => 6.0,
+                "binaural_alpha" => 10.0,
+                "binaural_beta" => 20.0,
+                "binaural_delta" => 2.0,
+                _ => 6.0,
+            };
+            for i in 0..num_samples {
+                let t = i as f32 / sample_rate as f32;
+                let carrier = (2.0 * std::f32::consts::PI * frequency * t).sin();
+                let modulation = 0.5 * (1.0 + (2.0 * std::f32::consts::PI * beat_freq * t).sin());
+                samples.push(carrier * modulation * volume);
+            }
+        }
+        // Unknown preset — generate sine as default
         _ => {
             for i in 0..num_samples {
                 let t = i as f32 / sample_rate as f32;
