@@ -12,6 +12,7 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   AlertCircle,
+  Check,
   Loader2,
   PackageOpen,
   Pencil,
@@ -188,31 +189,20 @@ export function InventoryView() {
     [refresh],
   );
 
-  const updateWishlist = useCallback(
-    async (
-      id: number,
-      name: string,
-      category: string,
-      priority: string,
-      notes: string,
-    ) => {
-      await invoke("inventory_update_wishlist_item", {
-        id,
-        name,
-        category: category || null,
-        priority: priority || null,
-        notes: notes || null,
+  const buyWishlistItem = useCallback(
+    async (item: WishlistItem) => {
+      await invoke<InventoryItem>("inventory_add_item", {
+        name: item.name,
+        category: item.category,
+        quantity: 1,
+        notes: item.notes,
       });
-      await logActivity("inventory", "update_wishlist", `#${id} ${name}`);
-      await refresh();
-    },
-    [refresh],
-  );
-
-  const removeWishlist = useCallback(
-    async (id: number) => {
-      await invoke("inventory_remove_wishlist_item", { id });
-      await logActivity("inventory", "remove_wishlist", `#${id}`);
+      await invoke("inventory_remove_wishlist_item", { id: item.id });
+      await logActivity(
+        "inventory",
+        "buy_wishlist",
+        `#${item.id} ${item.name}`,
+      );
       await refresh();
     },
     [refresh],
@@ -274,8 +264,7 @@ export function InventoryView() {
             <WishlistSection
               wishlist={wishlist}
               onAdd={addWishlist}
-              onUpdate={updateWishlist}
-              onRemove={removeWishlist}
+              onBuy={buyWishlistItem}
               disabled={busy}
             />
           </>
@@ -450,26 +439,17 @@ interface WishlistSectionProps {
     priority: string,
     notes: string,
   ) => Promise<void>;
-  onUpdate: (
-    id: number,
-    name: string,
-    category: string,
-    priority: string,
-    notes: string,
-  ) => Promise<void>;
-  onRemove: (id: number) => Promise<void>;
+  onBuy: (item: WishlistItem) => Promise<void>;
   disabled: boolean;
 }
 
 function WishlistSection({
   wishlist,
   onAdd,
-  onUpdate,
-  onRemove,
+  onBuy,
   disabled,
 }: WishlistSectionProps) {
   const [showAdd, setShowAdd] = useState(false);
-  const [editing, setEditing] = useState<number | null>(null);
 
   return (
     <section className="border border-[var(--color-border)] rounded-lg bg-[var(--color-surface)] overflow-hidden">
@@ -534,57 +514,32 @@ function WishlistSection({
                         : "bg-[var(--color-surface-muted)]"
                     }
                   >
-                    {editing === item.id ? (
-                      <EditWishlistRow
-                        item={item}
-                        onCancel={() => setEditing(null)}
-                        onSubmit={async (n, c, p, no) => {
-                          await onUpdate(item.id, n, c, p, no);
-                          setEditing(null);
-                        }}
-                      />
-                    ) : (
-                      <>
-                        <td className="border-b border-[var(--color-border)] px-3 py-1.5 align-top whitespace-nowrap font-medium">
-                          {item.name}
-                        </td>
-                        <td className="border-b border-[var(--color-border)] px-3 py-1.5 align-top whitespace-nowrap">
-                          {item.category ?? "—"}
-                        </td>
-                        <td className="border-b border-[var(--color-border)] px-3 py-1.5 align-top whitespace-nowrap">
-                          <Badge {...priorityBadgeTone(item.priority)}>
-                            {item.priority ?? "—"}
-                          </Badge>
-                        </td>
-                        <td className="border-b border-[var(--color-border)] px-3 py-1.5 align-top max-w-md whitespace-normal">
-                          {item.notes ?? ""}
-                        </td>
-                        <td className="border-b border-[var(--color-border)] px-3 py-1.5 align-top whitespace-nowrap">
-                          <div className="flex gap-1">
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className="h-7 w-7 p-0"
-                              onClick={() => setEditing(item.id)}
-                              disabled={disabled}
-                              aria-label="Edit"
-                            >
-                              <Pencil size={14} />
-                            </Button>
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className="h-7 w-7 p-0 text-[var(--color-danger)] hover:text-[var(--color-danger)]"
-                              onClick={() => onRemove(item.id)}
-                              disabled={disabled}
-                              aria-label="Remove"
-                            >
-                              <Trash2 size={14} />
-                            </Button>
-                          </div>
-                        </td>
-                      </>
-                    )}
+                    <td className="border-b border-[var(--color-border)] px-3 py-1.5 align-top whitespace-nowrap font-medium">
+                      {item.name}
+                    </td>
+                    <td className="border-b border-[var(--color-border)] px-3 py-1.5 align-top whitespace-nowrap">
+                      {item.category ?? "\u2014"}
+                    </td>
+                    <td className="border-b border-[var(--color-border)] px-3 py-1.5 align-top whitespace-nowrap">
+                      <Badge {...priorityBadgeTone(item.priority)}>
+                        {item.priority ?? "\u2014"}
+                      </Badge>
+                    </td>
+                    <td className="border-b border-[var(--color-border)] px-3 py-1.5 align-top max-w-md whitespace-normal">
+                      {item.notes ?? ""}
+                    </td>
+                    <td className="border-b border-[var(--color-border)] px-3 py-1.5 align-top whitespace-nowrap">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-7"
+                        onClick={() => onBuy(item)}
+                        disabled={disabled}
+                      >
+                        <Check size={14} />
+                        Bought
+                      </Button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -839,81 +794,5 @@ function AddWishlistForm({ onCancel, onSubmit }: AddWishlistFormProps) {
         </Button>
       </div>
     </div>
-  );
-}
-
-interface EditWishlistRowProps {
-  item: WishlistItem;
-  onCancel: () => void;
-  onSubmit: (
-    name: string,
-    category: string,
-    priority: string,
-    notes: string,
-  ) => Promise<void>;
-}
-
-function EditWishlistRow({ item, onCancel, onSubmit }: EditWishlistRowProps) {
-  const [name, setName] = useState(item.name);
-  const [category, setCategory] = useState(item.category ?? "");
-  const [priority, setPriority] = useState(item.priority ?? "");
-  const [notes, setNotes] = useState(item.notes ?? "");
-  const [busy, setBusy] = useState(false);
-
-  const submit = async () => {
-    setBusy(true);
-    try {
-      await onSubmit(
-        name.trim() || item.name,
-        category.trim(),
-        priority.trim(),
-        notes.trim(),
-      );
-    } catch {
-      // surface via state if needed
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <td colSpan={5} className="bg-[var(--color-surface-muted)] p-2">
-      <div className="grid grid-cols-1 sm:grid-cols-[2fr_1fr_1fr] gap-2 mb-2">
-        <Input
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          disabled={busy}
-          placeholder="Name"
-        />
-        <Input
-          value={category}
-          onChange={(e) => setCategory(e.target.value)}
-          disabled={busy}
-          placeholder="Category"
-        />
-        <Input
-          value={priority}
-          onChange={(e) => setPriority(e.target.value)}
-          disabled={busy}
-          placeholder="Priority"
-        />
-      </div>
-      <Input
-        value={notes}
-        onChange={(e) => setNotes(e.target.value)}
-        disabled={busy}
-        placeholder="Notes"
-        className="mb-2"
-      />
-      <div className="flex gap-2 justify-end">
-        <Button variant="outline" size="sm" onClick={onCancel} disabled={busy}>
-          Cancel
-        </Button>
-        <Button size="sm" onClick={submit} disabled={busy}>
-          {busy ? <Loader2 className="animate-spin" /> : null}
-          Save
-        </Button>
-      </div>
-    </td>
   );
 }

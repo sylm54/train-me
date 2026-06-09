@@ -110,6 +110,17 @@ body {
     color: var(--color-foreground);
 }
 
+/* Subtle pulse for active subagent indicators */
+@keyframes pulse-subtle {
+    0%,
+    100% {
+        opacity: 0.5;
+    }
+    50% {
+        opacity: 1;
+    }
+}
+
 /* Hide scrollbar utility (used by mobile bottom nav) */
 .scrollbar-none::-webkit-scrollbar {
     display: none;
