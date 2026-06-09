@@ -16,6 +16,7 @@ import {
   type ToolSet,
 } from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
+import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 
 import type { AgentSettings, AgentName, ProviderName } from "./types";
 import { MAIN_AGENT_TOOLS } from "./tools";
@@ -50,34 +51,43 @@ function reportUsage(role: "main" | "planner" | "writer", usage: unknown) {
   }
 }
 
-/** Endpoint URLs per provider. */
+/** Endpoint URLs per provider (used by the OpenAI provider only). */
 const PROVIDER_BASE_URL: Record<ProviderName, string> = {
   openrouter: "https://openrouter.ai/api/v1",
   openai: "https://api.openai.com/v1",
 };
 
 /**
- * Build a configured OpenAI-compatible provider client for the given agent.
- * Returns null if the API key is missing.
+ * Build a configured provider client for the given agent.
+ * Uses the official OpenRouter provider for OpenRouter and the OpenAI
+ * provider for OpenAI. Returns null if the API key is missing.
  */
-export function getProvider(
-  settings: AgentSettings,
-  agent: AgentName,
-): { provider: ReturnType<typeof createOpenAI>; model: string } | null {
+export function getProvider(settings: AgentSettings, agent: AgentName) {
   const cfg = settings.agents[agent];
   const apiKey = settings.apiKeys[cfg.provider];
   if (!apiKey) return null;
+
+  if (cfg.provider === "openrouter") {
+    const provider = createOpenRouter({ apiKey });
+    return {
+      provider,
+      model: cfg.model,
+      modelSettings: cfg.reasoningEffort
+        ? { includeReasoning: true }
+        : undefined,
+    };
+  }
+
   const baseURL = PROVIDER_BASE_URL[cfg.provider];
   const provider = createOpenAI({ baseURL, apiKey });
-  return { provider, model: cfg.model };
+  return { provider, model: cfg.model, modelSettings: undefined };
 }
 
 /**
  * Build `providerOptions` for the AI SDK's streamText/generateText calls.
- * If the agent has a `reasoningEffort` configured, passes it through
- * the `openai` provider key along with `forceReasoning: true` (needed
- * for non-OpenAI models routed through OpenRouter that aren't
- * auto-detected as reasoning models by the provider).
+ * If the agent has a `reasoningEffort` configured:
+ * - OpenRouter: passes `reasoning.effort` via the `openrouter` provider key
+ * - OpenAI: passes `reasoningEffort` + `forceReasoning` via the `openai` key
  */
 export function buildProviderOptions(
   settings: AgentSettings,
@@ -85,6 +95,15 @@ export function buildProviderOptions(
 ) {
   const effort = settings.agents[agent].reasoningEffort;
   if (!effort) return undefined;
+
+  if (settings.agents[agent].provider === "openrouter") {
+    return {
+      openrouter: {
+        reasoning: { effort },
+      },
+    };
+  }
+
   return {
     openai: {
       reasoningEffort: effort,
@@ -104,6 +123,47 @@ export function buildMainAgentTools(settings: AgentSettings): ToolSet {
     ...MAIN_AGENT_TOOLS,
     invoke_planner: buildInvokePlannerTool(settings),
   };
+}
+
+/**
+ * TransformStream that removes reasoning events from the UIMessage stream
+ * so the model's thinking is never shown in the UI. Reasoning text is
+ * logged to the browser console for debugging instead.
+ */
+function stripReasoningFromStream() {
+  let reasoningText = "";
+  return new TransformStream({
+    transform(
+      chunk: Record<string, unknown>,
+      controller: TransformStreamDefaultController,
+    ) {
+      const type = chunk.type as string;
+      if (
+        type === "reasoning-start" ||
+        type === "reasoning-delta" ||
+        type === "reasoning-end"
+      ) {
+        if (type === "reasoning-delta") {
+          reasoningText += (chunk as { delta?: string }).delta ?? "";
+        }
+        if (type === "reasoning-end") {
+          if (reasoningText) {
+            console.log(
+              "%c[main] 💭 reasoning",
+              "color: #888",
+              reasoningText.length > 200
+                ? reasoningText.slice(0, 200) + "…"
+                : reasoningText,
+            );
+          }
+          reasoningText = "";
+        }
+        // Drop the chunk so reasoning never reaches the UI.
+        return;
+      }
+      controller.enqueue(chunk);
+    },
+  });
 }
 
 /**
@@ -145,13 +205,15 @@ export function createMainAgentTransport(
       // text, tool calls, and tool results are silently dropped, causing
       // the agent to appear to "forget" everything after a tool call.
       const result = streamText({
-        model: cfg.provider.chat(cfg.model),
+        model: cfg.provider.chat(cfg.model, cfg.modelSettings),
         system: systemPrompt,
         messages: modelMessages,
         tools,
         stopWhen: isLoopFinished(),
         abortSignal,
-        providerOptions: buildProviderOptions(settings, agent),
+        providerOptions: buildProviderOptions(settings, agent) as Parameters<
+          typeof streamText
+        >[0]["providerOptions"],
       });
 
       // Surface cumulative token usage to the UI once the run settles.
@@ -160,7 +222,7 @@ export function createMainAgentTransport(
         .then((u) => reportUsage("main", u))
         .catch(() => {});
 
-      return result.toUIMessageStream();
+      return result.toUIMessageStream().pipeThrough(stripReasoningFromStream());
     },
 
     // Reconnection is not supported for client-side streaming.
