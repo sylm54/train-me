@@ -117,14 +117,18 @@ pub fn create_bash_sandbox(agent_dir: &Path, state_dir: &Path) -> anyhow::Result
                 .cwd("/")
                 // Embedded SQLite (Turso). The runtime opt-in env var is
                 // also required — without it the `sqlite` builtin refuses
-                // to execute. We use the Vfs backend so that read-only
-                // queries don't write the DB file back (the Memory backend
-                // rewrites the whole file after every command, which would
-                // risk clobbering concurrent writes from the UI's rusqlite
-                // connection). `activity.db` lives at the sandbox root
-                // (`/activity.db`) and is queryable directly by the agent.
+                // to execute.
+                //
+                // Memory backend: loads the whole DB file at the start of
+                // each `sqlite` invocation and writes it back after. This
+                // guarantees that both the agent (via the builtin) and
+                // external tools always see a consistent on-disk image.
+                // The earlier Vfs backend kept pages in memory and flushed
+                // via flush_dirty(), which proved unreliable — the UI could
+                // read rows back through the cached engine, but the disk
+                // file stayed empty and was invisible to DB browsers.
                 .sqlite_with_limits(
-                    bashkit::SqliteLimits::default().backend(bashkit::SqliteBackend::Vfs),
+                    bashkit::SqliteLimits::default().backend(bashkit::SqliteBackend::Memory),
                 )
                 .env("BASHKIT_ALLOW_INPROCESS_SQLITE", "1");
             let builder = crate::chastity::ChastityBuiltin::register(
