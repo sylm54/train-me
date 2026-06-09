@@ -269,6 +269,7 @@ export function ConditioningView() {
 
       setAudioUrl(convertFileSrc(track.path));
       setPlayingScriptId(script.id);
+      await logActivity("conditioning", "play", `${script.id} → ${track.name}`);
     },
     [playingScriptId],
   );

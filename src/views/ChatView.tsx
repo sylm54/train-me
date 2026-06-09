@@ -175,10 +175,18 @@ function ChatViewInner({
 
   // ── Derive usage totals + active subagent from the event stream ───────
   // Totals are cumulative across the session.
-  const { totals, activeSubagent } = useMemo(
+  const { totals, activeSubagent, subagentStack } = useMemo(
     () => deriveStats(events),
     [events],
   );
+
+  // Tick every second while generating so elapsed-time counters update.
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (!isGenerating) return;
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [isGenerating]);
 
   return (
     <div className="flex flex-col h-full">
@@ -258,23 +266,16 @@ function ChatViewInner({
             </Message>
           ))}
 
-          {/* Persistent "agent is running" indicator. Visible whenever the
-              agent is generating (before the first token *and* during
-              streaming), so the user can always tell it's still working. */}
+          {/* Persistent "agent is running" indicator with subagent
+              hierarchy. Shows the full delegation stack (planner → writer)
+              with elapsed time on the active innermost agent. The ticking
+              seconds prove the system is alive even during long generations. */}
           {isGenerating && (
-            <div className="flex items-center gap-2 text-xs text-[var(--color-muted-foreground)] pl-1">
-              <Loader2
-                size={13}
-                className="animate-spin text-[var(--color-pink-500)]"
-              />
-              <span>
-                {activeSubagent
-                  ? `${activeSubagent.agent === "writer" ? "Writer" : "Planner"} · ${activeSubagent.label}`
-                  : status === "submitted"
-                    ? "Thinking…"
-                    : "Working…"}
-              </span>
-            </div>
+            <SubagentProgressIndicator
+              stack={subagentStack}
+              status={status}
+              now={now}
+            />
           )}
         </ConversationContent>
         <ConversationScrollButton />
@@ -306,19 +307,31 @@ function ChatViewInner({
         </PromptInputFooter>
       </PromptInput>
 
-      {/* ── Status footer: subagent progress + tokens ─────── */}
+      {/* ── Status footer: subagent breadcrumb + tokens ─────── */}
       <div className="px-4 py-1.5 text-[11px] text-[var(--color-muted-foreground)] border-t border-[var(--color-border)] bg-[var(--color-surface-muted)] flex items-center gap-3 min-h-[28px]">
-        <div className="flex items-center gap-2 min-w-0">
-          {activeSubagent ? (
-            <span className="flex items-center gap-1.5 truncate">
-              <span
-                className="size-1.5 rounded-full shrink-0"
-                style={{ background: SUBAGENT_COLOR[activeSubagent.agent] }}
-              />
-              <Loader2 size={11} className="animate-spin shrink-0" />
-              <span className="capitalize">{activeSubagent.agent}</span>
-              <span className="opacity-60">·</span>
-              <span className="truncate">{activeSubagent.label}</span>
+        <div className="flex items-center gap-1.5 min-w-0">
+          {subagentStack.length > 0 ? (
+            <span className="flex items-center gap-1 truncate">
+              {subagentStack.map((sa, i) => (
+                <span key={sa.agent} className="flex items-center gap-1">
+                  {i > 0 && <span className="opacity-30 mx-0.5">›</span>}
+                  <span
+                    className="size-1.5 rounded-full shrink-0"
+                    style={{ background: SUBAGENT_COLOR[sa.agent] }}
+                  />
+                  <span
+                    className={`capitalize ${
+                      i === subagentStack.length - 1
+                        ? "font-medium"
+                        : "opacity-50"
+                    }`}
+                  >
+                    {sa.agent}
+                  </span>
+                </span>
+              ))}
+              <span className="opacity-40">·</span>
+              <span className="truncate">{activeSubagent?.label}</span>
             </span>
           ) : isGenerating ? (
             <span className="flex items-center gap-1.5">
@@ -359,6 +372,7 @@ const SUBAGENT_COLOR: Record<"planner" | "writer", string> = {
 interface ActiveSubagent {
   agent: "planner" | "writer";
   label: string;
+  startedAt: number;
 }
 
 interface Totals {
@@ -377,6 +391,7 @@ interface Totals {
 function deriveStats(events: AgentEvent[]): {
   totals: Totals;
   activeSubagent: ActiveSubagent | null;
+  subagentStack: ActiveSubagent[];
 } {
   let promptTokens = 0;
   let completionTokens = 0;
@@ -390,6 +405,10 @@ function deriveStats(events: AgentEvent[]): {
     planner: "",
     writer: "",
   };
+  const startedAt: Record<"planner" | "writer", number> = {
+    planner: 0,
+    writer: 0,
+  };
 
   for (const e of events) {
     switch (e.type) {
@@ -401,6 +420,7 @@ function deriveStats(events: AgentEvent[]): {
       case "subagent-start":
         open[e.agent] = true;
         label[e.agent] = e.label;
+        startedAt[e.agent] = e.ts;
         break;
       case "subagent-step":
         label[e.agent] = e.label;
@@ -411,19 +431,123 @@ function deriveStats(events: AgentEvent[]): {
     }
   }
 
-  // The active subagent is the innermost running one. Because writer runs
-  // nested inside planner, prefer writer when both are open.
-  let activeSubagent: ActiveSubagent | null = null;
-  if (open.writer) {
-    activeSubagent = { agent: "writer", label: label.writer || "Writing" };
-  } else if (open.planner) {
-    activeSubagent = { agent: "planner", label: label.planner || "Planning" };
+  // Build the stack outer → inner (planner before writer when both open).
+  const subagentStack: ActiveSubagent[] = [];
+  if (open.planner) {
+    subagentStack.push({
+      agent: "planner",
+      label: label.planner || "Planning",
+      startedAt: startedAt.planner,
+    });
   }
+  if (open.writer) {
+    subagentStack.push({
+      agent: "writer",
+      label: label.writer || "Writing",
+      startedAt: startedAt.writer,
+    });
+  }
+
+  // The active subagent is the innermost running one.
+  const activeSubagent =
+    subagentStack.length > 0 ? subagentStack[subagentStack.length - 1] : null;
 
   return {
     totals: { promptTokens, completionTokens },
     activeSubagent,
+    subagentStack,
   };
+}
+
+// ── Subagent progress indicator (conversation area) ─────────────────
+
+/** Format elapsed seconds as "5s" or "1m 30s". */
+function formatElapsed(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return `${m}m ${s}s`;
+}
+
+/**
+ * Stacked progress indicator showing the full subagent delegation chain.
+ *
+ * Renders one row per active subagent (outer → inner). The innermost
+ * (currently running) agent gets a colored spinner, an elapsed-time
+ * counter that ticks every second, and a subtle pulse animation — so the
+ * user always knows *which* agent is running and can see time passing
+ * even when no step events arrive (e.g. during long text generation).
+ */
+function SubagentProgressIndicator({
+  stack,
+  status,
+  now,
+}: {
+  stack: ActiveSubagent[];
+  status: string;
+  now: number;
+}) {
+  // No subagent active — show generic working indicator.
+  if (stack.length === 0) {
+    return (
+      <div className="flex items-center gap-2 text-xs text-[var(--color-muted-foreground)] pl-1">
+        <Loader2
+          size={13}
+          className="animate-spin text-[var(--color-pink-500)]"
+        />
+        <span>{status === "submitted" ? "Thinking…" : "Working…"}</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-0.5 pl-1 py-1">
+      {stack.map((sa, i) => {
+        const isInnermost = i === stack.length - 1;
+        const elapsed = Math.max(0, Math.round((now - sa.startedAt) / 1000));
+
+        return (
+          <div
+            key={sa.agent}
+            className={`flex items-center gap-1.5 text-xs ${
+              i > 0 ? "ml-3" : ""
+            } ${
+              isInnermost
+                ? "text-[var(--color-foreground)]"
+                : "text-[var(--color-muted-foreground)]"
+            }`}
+          >
+            {/* Color dot */}
+            <span
+              className="size-1.5 rounded-full shrink-0"
+              style={{ background: SUBAGENT_COLOR[sa.agent] }}
+            />
+            {/* Spinner (innermost) or dim dot (outer / waiting) */}
+            {isInnermost ? (
+              <Loader2
+                size={12}
+                className="shrink-0 animate-spin"
+                style={{ color: SUBAGENT_COLOR[sa.agent] }}
+              />
+            ) : (
+              <span className="size-3 shrink-0 flex items-center justify-center">
+                <span className="size-1 rounded-full bg-current opacity-30" />
+              </span>
+            )}
+            <span className="capitalize font-medium">{sa.agent}</span>
+            <span className="opacity-40">·</span>
+            <span className={isInnermost ? "" : "opacity-70"}>{sa.label}</span>
+            {/* Elapsed time + pulse on the active (innermost) agent */}
+            {isInnermost && (
+              <span className="tabular-nums opacity-50 animate-[pulse-subtle_2s_ease-in-out_infinite]">
+                {formatElapsed(elapsed)}
+              </span>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 // ── Per-message rendering: tools + thinking, collapsed except latest ──
