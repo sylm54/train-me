@@ -9,6 +9,8 @@
 import { useEffect, useState, useCallback } from "react";
 import type { AgentSettings, AgentName, ProviderName } from "./types";
 
+import { ensureNotificationPermission } from "./notifications";
+
 const STORAGE_KEY = "train-me.settings.v1";
 
 /** Sensible default model choices. */
@@ -104,6 +106,8 @@ export function useSettings() {
       save(next);
       return next;
     });
+    // Request notification permission while the user is engaged.
+    ensureNotificationPermission();
   }, []);
 
   const resetOnboarding = useCallback(() => {

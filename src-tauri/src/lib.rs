@@ -530,6 +530,30 @@ fn sanitize_track_name(name: &str) -> String {
 }
 
 // ============================================================================
+// Cron helpers
+// ============================================================================
+
+/// Compute the next `count` fire times for a 5-field cron expression.
+///
+/// Returns RFC 3339 strings. If the expression is invalid or produces
+/// fewer matches, returns a shorter (or empty) vec.
+#[tauri::command]
+fn next_cron_times(expr: &str, count: usize) -> Vec<String> {
+    use chrono::Utc;
+    use cron::Schedule as CronSchedule;
+    use std::str::FromStr;
+
+    let Ok(schedule) = CronSchedule::from_str(expr) else {
+        return Vec::new();
+    };
+    schedule
+        .upcoming(Utc)
+        .take(count)
+        .map(|t| t.to_rfc3339())
+        .collect()
+}
+
+// ============================================================================
 // App entrypoint
 // ============================================================================
 
@@ -538,6 +562,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         // Android-aware FS: lets package imports read `content://` URIs
         // returned by the Android file picker. On non-Android targets the
         // plugin initialises as a no-op stub.
@@ -630,6 +655,8 @@ pub fn run() {
             package_import::import_package,
             // App-data reset (preserves model/ + API keys)
             reset_app_data,
+            // Cron computation for routine scheduling
+            next_cron_times,
             // Inventory (SQLite-backed)
             inventory::inventory_list_items,
             inventory::inventory_add_item,

@@ -20,6 +20,7 @@ import { OnboardingView } from "@/views/OnboardingView";
 import { useSettings } from "@/lib/settings";
 import { useFeatureVisibility } from "@/lib/features";
 import { useGlobalAppLinkNavigation } from "@/lib/links";
+import { useRoutineNotifier } from "@/lib/use-routine-notifier";
 import type { View } from "@/lib/views";
 
 export default function App() {
@@ -31,6 +32,9 @@ export default function App() {
   // (Declared before the onboarding early-return so hooks always run in
   // the same order — see React's Rules of Hooks.)
   const navigate = useCallback((next: View) => setView(next), []);
+
+  // Keep routine notifications alive for the lifetime of the app.
+  useRoutineNotifier();
 
   // Intercept clicks on in-app links (e.g. `conditioning/foo.json`)
   // anywhere in the app — chat messages, rules, routines, journal, voice —

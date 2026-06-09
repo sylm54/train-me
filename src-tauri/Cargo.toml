@@ -101,6 +101,8 @@ zip = "2"
 
 # Temp directory for extracting imported packages
 tempfile = "3"
+tauri-plugin-notification = "2.3.3"
+cron = "0.16.0"
 
 [dev-dependencies]
 tempfile = "3"
