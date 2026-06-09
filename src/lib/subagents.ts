@@ -37,6 +37,7 @@ import {
   tool,
   type ToolSet,
   type UIMessage,
+  isLoopFinished,
 } from "ai";
 import { z } from "zod";
 import { invoke } from "@tauri-apps/api/core";
@@ -233,6 +234,7 @@ async function runSubagent(opts: {
       system: opts.systemPrompt,
       messages: modelMessages,
       tools: opts.tools,
+      stopWhen: isLoopFinished(),
       // stopWhen: stepCountIs(8),
     });
 
