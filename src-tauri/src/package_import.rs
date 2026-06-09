@@ -110,12 +110,19 @@ pub async fn import_package(
     // The extraction and merging are synchronous, blocking I/O — run them
     // on a blocking thread so we don't stall the async runtime.
     let kind_str = pkg_kind.as_str().to_string();
+    // Use the app's own data directory as the temp base so we don't
+    // depend on /data/local/tmp being writable (it isn't on Android
+    // emulators and some devices).
+    let tmp_base = state.data_dir.join(".tmp");
+
     let result = tauri::async_runtime::spawn_blocking(move || -> Result<ImportResult, String> {
         let bt0 = Instant::now();
 
         // Extract to a temp directory first so we can validate/inspect before
         // mutating the user's data folders.
-        let temp = tempfile::tempdir().map_err(|e| format!("Failed to create temp dir: {}", e))?;
+        fs::create_dir_all(&tmp_base).ok();
+        let temp = tempfile::tempdir_in(&tmp_base)
+            .map_err(|e| format!("Failed to create temp dir: {}", e))?;
         log::info!("[import] tempdir took {:.2}s", bt0.elapsed().as_secs_f64());
 
         extract_zip(zip_input, temp.path()).map_err(|e| format!("Failed to extract ZIP: {}", e))?;
