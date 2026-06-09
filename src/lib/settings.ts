@@ -7,7 +7,12 @@
  */
 
 import { useEffect, useState, useCallback } from "react";
-import type { AgentSettings, AgentName, ProviderName } from "./types";
+import type {
+  AgentSettings,
+  AgentName,
+  ProviderName,
+  ReasoningEffort,
+} from "./types";
 
 import { ensureNotificationPermission } from "./notifications";
 
@@ -84,13 +89,23 @@ export function useSettings() {
   }, []);
 
   const setAgent = useCallback(
-    (agent: AgentName, provider: ProviderName, model: string) => {
+    (
+      agent: AgentName,
+      provider: ProviderName,
+      model: string,
+      extras?: { reasoningEffort?: ReasoningEffort },
+    ) => {
       setSettings((prev) => {
         const next: AgentSettings = {
           ...prev,
           agents: {
             ...prev.agents,
-            [agent]: { provider, model },
+            [agent]: {
+              provider,
+              model,
+              reasoningEffort:
+                extras?.reasoningEffort ?? prev.agents[agent].reasoningEffort,
+            },
           },
         };
         save(next);

@@ -6,7 +6,7 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { Loader2, Play, Square, Trash2, Volume2 } from "lucide-react";
 
 interface TrackInfo {
@@ -110,13 +110,8 @@ export function TtsView() {
       setAudioUrl(null);
       return;
     }
-    try {
-      const url = await invoke<string>("get_track_audio", { path: track.path });
-      setAudioUrl(url);
-      setPlayingTrack(track.path);
-    } catch (e) {
-      setError(String(e));
-    }
+    setAudioUrl(convertFileSrc(track.path));
+    setPlayingTrack(track.path);
   };
 
   const handleDelete = async (track: TrackInfo) => {
@@ -260,6 +255,10 @@ export function TtsView() {
             autoPlay
             src={audioUrl}
             onEnded={() => {
+              setAudioUrl(null);
+              setPlayingTrack(null);
+            }}
+            onError={() => {
               setAudioUrl(null);
               setPlayingTrack(null);
             }}

@@ -7,6 +7,7 @@
 use anyhow::{bail, Context, Result};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::expression::{self, Expr};
 use crate::helper::{load_text_to_speech, load_voice_style, write_wav_file, TextToSpeech};
@@ -96,6 +97,62 @@ impl BgLayer {
 }
 
 // ============================================================================
+// Progress tracking
+// ============================================================================
+
+/// Progress tracker for synthesis rendering.
+///
+/// Passed through `render_nodes_tracked` to emit progress after each
+/// "speakable" (leaf) node is rendered.
+pub struct ProgressTracker {
+    pub step: usize,
+    pub total: usize,
+    pub callback: Box<dyn Fn(usize, usize, &str) + Send>,
+}
+
+impl ProgressTracker {
+    fn emit(&mut self, label: &str) {
+        (self.callback)(self.step, self.total, label);
+    }
+}
+
+/// Count the number of "speakable" (leaf) nodes in an AST.
+///
+/// Speakable nodes are those that produce audio: `Text` (with non-empty
+/// content), `Pause`, `Sound`, `Tone`. Container nodes (`Voice`, `Speed`,
+/// `Volume`, `Effect`, `Background`, `Until`) recurse into children but are
+/// not counted themselves. `Overlay` counts each part's children. `Loop`
+/// multiplies by the loop count.
+pub fn count_speakable_nodes(nodes: &[Node]) -> usize {
+    let mut count = 0;
+    for node in nodes {
+        match node {
+            Node::Text(t) if !t.is_empty() => count += 1,
+            Node::Text(_) => {}
+            Node::Pause { .. } | Node::Sound { .. } | Node::Tone { .. } => count += 1,
+            Node::Voice { children, .. }
+            | Node::Speed { children, .. }
+            | Node::Volume { children, .. }
+            | Node::Effect { children, .. }
+            | Node::Background { children, .. }
+            | Node::Until { children, .. } => {
+                count += count_speakable_nodes(children);
+            }
+            Node::Loop { loops, children } => {
+                count += count_speakable_nodes(children) * (*loops as usize);
+            }
+            Node::Overlay { parts, .. } => {
+                for part in parts {
+                    count += count_speakable_nodes(&part.children);
+                }
+            }
+            Node::Include { .. } => {}
+        }
+    }
+    count
+}
+
+// ============================================================================
 // Audio Renderer
 // ============================================================================
 
@@ -128,6 +185,27 @@ impl AudioRenderer {
         let (samples, duration) = self.render_nodes(nodes, "male", 1.0, 1.0)?;
         write_wav_file(output_path, &samples, self.sample_rate as i32)
             .context("Failed to write WAV file")?;
+        Ok(duration)
+    }
+
+    /// Render a full AST to a WAV file, emitting progress events via the
+    /// provided tracker after each speakable node is rendered.
+    ///
+    /// Returns the duration in seconds.
+    pub fn render_to_file_with_progress(
+        &mut self,
+        nodes: &[Node],
+        output_path: &Path,
+        tracker: Arc<Mutex<ProgressTracker>>,
+    ) -> Result<f32> {
+        let (samples, duration) = self.render_nodes_tracked(nodes, "male", 1.0, 1.0, &tracker)?;
+        write_wav_file(output_path, &samples, self.sample_rate as i32)
+            .context("Failed to write WAV file")?;
+        // Emit final 100% event
+        if let Ok(mut t) = tracker.lock() {
+            t.step = t.total;
+            t.emit("Writing WAV…");
+        }
         Ok(duration)
     }
 
@@ -596,6 +674,456 @@ impl AudioRenderer {
 
         let duration = mixed.len() as f32 / self.sample_rate as f32;
         Ok((mixed, duration))
+    }
+
+    // ================================================================
+    // Tracked variants (emit progress after each leaf node)
+    // ================================================================
+
+    /// Same as `render_nodes` but emits progress after each leaf node.
+    fn render_nodes_tracked(
+        &mut self,
+        nodes: &[Node],
+        default_speaker: &str,
+        volume_scale: f32,
+        speed_scale: f32,
+        tracker: &Arc<Mutex<ProgressTracker>>,
+    ) -> Result<(Vec<f32>, f32)> {
+        let mut foreground = Vec::new();
+        let mut bg_layers: Vec<BgLayer> = Vec::new();
+        let mut _total_duration = 0.0f32;
+
+        for node in nodes {
+            let fg_before = foreground.len();
+
+            match node {
+                Node::Text(text) => {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let (samples, dur) =
+                        self.synthesize_text(text, default_speaker, speed_scale)?;
+                    let scaled = apply_volume(&samples, volume_scale);
+                    foreground.extend_from_slice(&scaled);
+                    _total_duration += dur;
+                    self.emit_progress(tracker, &truncate_label(text, 30));
+                }
+
+                Node::Voice {
+                    speaker,
+                    pitch: _,
+                    volume,
+                    speed,
+                    children,
+                } => {
+                    let child_speed =
+                        speed_scale * resolve_scalar(speed.as_deref(), 1.0).clamp(0.5, 1.5);
+                    let vol_value = resolve_value(volume.as_deref(), 1.0);
+
+                    match vol_value {
+                        ValueOrExpr::Scalar(v) => {
+                            let child_vol = volume_scale * v.clamp(0.0, 1.5);
+                            let (samples, dur) = self.render_nodes_tracked(
+                                children,
+                                speaker,
+                                child_vol,
+                                child_speed,
+                                tracker,
+                            )?;
+                            foreground.extend_from_slice(&samples);
+                            _total_duration += dur;
+                        }
+                        ValueOrExpr::Expr(expr) => {
+                            let (samples, dur) = self.render_nodes_tracked(
+                                children,
+                                speaker,
+                                volume_scale,
+                                child_speed,
+                                tracker,
+                            )?;
+                            let curve =
+                                expression::eval_curve(&expr, samples.len(), self.sample_rate);
+                            let samples = apply_volume_curve(&samples, &curve);
+                            foreground.extend_from_slice(&samples);
+                            _total_duration += dur;
+                        }
+                    }
+                }
+
+                Node::Pause { duration } => {
+                    let num_samples = (*duration * self.sample_rate as f32) as usize;
+                    foreground.extend(std::iter::repeat(0.0f32).take(num_samples));
+                    _total_duration += *duration;
+                    self.emit_progress(tracker, "Pause");
+                }
+
+                Node::Sound {
+                    sound_type,
+                    volume,
+                    speed: _,
+                } => {
+                    let sound_vol = resolve_scalar(volume.as_deref(), 1.0);
+                    let (samples, dur) = self.render_sound(sound_type, sound_vol * volume_scale)?;
+                    foreground.extend_from_slice(&samples);
+                    _total_duration += dur;
+                    self.emit_progress(tracker, &format!("Sound: {}", sound_type));
+                }
+
+                Node::Tone {
+                    tone_type: _,
+                    preset,
+                    frequency,
+                    volume,
+                } => {
+                    let vol =
+                        (resolve_scalar(volume.as_deref(), 0.3) * volume_scale).clamp(0.0, 1.5);
+                    let base_duration = 0.5;
+                    let base_samples = generate_tone(
+                        preset,
+                        frequency.unwrap_or(440.0),
+                        base_duration,
+                        self.sample_rate,
+                        vol,
+                    );
+                    bg_layers.push(BgLayer::tone(base_samples, foreground.len()));
+                    self.emit_progress(tracker, &format!("Tone: {}", preset));
+                }
+
+                Node::Speed { value, children } => {
+                    let child_speed =
+                        speed_scale * resolve_scalar(Some(value.as_str()), 1.0).clamp(0.5, 1.5);
+                    let (samples, dur) = self.render_nodes_tracked(
+                        children,
+                        default_speaker,
+                        volume_scale,
+                        child_speed,
+                        tracker,
+                    )?;
+                    foreground.extend_from_slice(&samples);
+                    _total_duration += dur;
+                }
+
+                Node::Volume { value, children } => {
+                    let vol_value = resolve_value(Some(value.as_str()), 1.0);
+                    match vol_value {
+                        ValueOrExpr::Scalar(v) => {
+                            let child_vol = volume_scale * v.clamp(0.0, 1.5);
+                            let (samples, dur) = self.render_nodes_tracked(
+                                children,
+                                default_speaker,
+                                child_vol,
+                                speed_scale,
+                                tracker,
+                            )?;
+                            foreground.extend_from_slice(&samples);
+                            _total_duration += dur;
+                        }
+                        ValueOrExpr::Expr(expr) => {
+                            let (samples, dur) = self.render_nodes_tracked(
+                                children,
+                                default_speaker,
+                                volume_scale,
+                                speed_scale,
+                                tracker,
+                            )?;
+                            let curve =
+                                expression::eval_curve(&expr, samples.len(), self.sample_rate);
+                            let samples = apply_volume_curve(&samples, &curve);
+                            foreground.extend_from_slice(&samples);
+                            _total_duration += dur;
+                        }
+                    }
+                }
+
+                Node::Effect {
+                    effect_type,
+                    preset,
+                    cutoff,
+                    children,
+                } => {
+                    let (samples, dur) = self.render_nodes_tracked(
+                        children,
+                        default_speaker,
+                        volume_scale,
+                        speed_scale,
+                        tracker,
+                    )?;
+                    let processed = apply_effect(
+                        &samples,
+                        effect_type,
+                        preset.as_deref(),
+                        *cutoff,
+                        self.sample_rate,
+                    );
+                    foreground.extend_from_slice(&processed);
+                    _total_duration += dur;
+                }
+
+                Node::Background {
+                    volume,
+                    speed,
+                    children,
+                } => {
+                    let child_speed =
+                        speed_scale * resolve_scalar(speed.as_deref(), 1.0).clamp(0.5, 1.5);
+                    let vol_value = resolve_value(volume.as_deref(), 1.0);
+
+                    match vol_value {
+                        ValueOrExpr::Scalar(v) => {
+                            let vol = v.clamp(0.0, 1.5) * volume_scale;
+                            let (bg_samples, _dur) = self.render_nodes_tracked(
+                                children,
+                                default_speaker,
+                                vol,
+                                child_speed,
+                                tracker,
+                            )?;
+                            let mut aligned = vec![0.0f32; fg_before];
+                            aligned.extend_from_slice(&bg_samples);
+                            bg_layers.push(BgLayer::background(aligned));
+                        }
+                        ValueOrExpr::Expr(expr) => {
+                            let (bg_samples, _dur) = self.render_nodes_tracked(
+                                children,
+                                default_speaker,
+                                volume_scale,
+                                child_speed,
+                                tracker,
+                            )?;
+                            let curve =
+                                expression::eval_curve(&expr, bg_samples.len(), self.sample_rate);
+                            let bg_samples = apply_volume_curve(&bg_samples, &curve);
+                            let mut aligned = vec![0.0f32; fg_before];
+                            aligned.extend_from_slice(&bg_samples);
+                            bg_layers.push(BgLayer::background(aligned));
+                        }
+                    }
+                }
+
+                Node::Overlay { duration, parts } => {
+                    let (samples, dur) = self.render_overlay_tracked(
+                        parts,
+                        default_speaker,
+                        volume_scale,
+                        speed_scale,
+                        *duration,
+                        tracker,
+                    )?;
+                    foreground.extend_from_slice(&samples);
+                    _total_duration += dur;
+                }
+
+                Node::Loop { loops, children } => {
+                    for _ in 0..*loops {
+                        let (samples, dur) = self.render_nodes_tracked(
+                            children,
+                            default_speaker,
+                            volume_scale,
+                            speed_scale,
+                            tracker,
+                        )?;
+                        foreground.extend_from_slice(&samples);
+                        _total_duration += dur;
+                    }
+                }
+
+                Node::Until {
+                    button: _,
+                    waiting_sound,
+                    waiting_sound_volume,
+                    pre_pause,
+                    post_pause,
+                    children,
+                } => {
+                    if let Some(pp) = pre_pause {
+                        let num_samples = (*pp * self.sample_rate as f32) as usize;
+                        foreground.extend(std::iter::repeat(0.0f32).take(num_samples));
+                        _total_duration += *pp;
+                    }
+
+                    let (samples, dur) = self.render_nodes_tracked(
+                        children,
+                        default_speaker,
+                        volume_scale,
+                        speed_scale,
+                        tracker,
+                    )?;
+                    foreground.extend_from_slice(&samples);
+                    _total_duration += dur;
+
+                    if let Some(ws) = waiting_sound {
+                        let ws_vol = waiting_sound_volume.unwrap_or(0.5) * volume_scale;
+                        let (ws_samples, _) = self.render_sound(ws, ws_vol)?;
+                        let mut aligned = vec![0.0f32; foreground.len()];
+                        aligned.extend_from_slice(&ws_samples);
+                        bg_layers.push(BgLayer::background(aligned));
+                    }
+
+                    if let Some(pp) = post_pause {
+                        let num_samples = (*pp * self.sample_rate as f32) as usize;
+                        foreground.extend(std::iter::repeat(0.0f32).take(num_samples));
+                        _total_duration += *pp;
+                    }
+                }
+
+                Node::Include { .. } => {}
+            }
+        }
+
+        // Post-processing: extend bg_layers to match foreground length
+        for bg in &mut bg_layers {
+            if bg.is_tone {
+                if let Some(ref content) = bg.tone_content {
+                    if !content.is_empty() {
+                        while bg.samples.len() < foreground.len() {
+                            bg.samples.extend_from_slice(content);
+                        }
+                        bg.samples.truncate(foreground.len());
+                    }
+                }
+            } else {
+                if bg.samples.len() < foreground.len() {
+                    bg.samples.extend(
+                        std::iter::repeat(0.0f32).take(foreground.len() - bg.samples.len()),
+                    );
+                }
+            }
+        }
+
+        // Mix foreground with all background layers
+        let mixed = if bg_layers.is_empty() {
+            foreground
+        } else {
+            let mut mixed = foreground;
+            for bg in &bg_layers {
+                if bg.samples.len() > mixed.len() {
+                    mixed.extend(std::iter::repeat(0.0f32).take(bg.samples.len() - mixed.len()));
+                }
+            }
+            for bg in &bg_layers {
+                for (i, &s) in bg.samples.iter().enumerate() {
+                    if i < mixed.len() {
+                        mixed[i] += s;
+                    }
+                }
+            }
+            for s in mixed.iter_mut() {
+                *s = s.clamp(-1.0, 1.0);
+            }
+            mixed
+        };
+
+        let duration = mixed.len() as f32 / self.sample_rate as f32;
+        Ok((mixed, duration))
+    }
+
+    /// Tracked variant of `render_overlay`.
+    fn render_overlay_tracked(
+        &mut self,
+        parts: &[OverlayPart],
+        default_speaker: &str,
+        volume_scale: f32,
+        speed_scale: f32,
+        fixed_duration: Option<f32>,
+        tracker: &Arc<Mutex<ProgressTracker>>,
+    ) -> Result<(Vec<f32>, f32)> {
+        let mut rendered_parts: Vec<(Vec<f32>, bool)> = Vec::new();
+
+        for part in parts {
+            let part_vol =
+                (volume_scale * resolve_scalar(part.volume.as_deref(), 1.0)).clamp(0.0, 1.5);
+            let part_speed =
+                speed_scale * resolve_scalar(part.speed.as_deref(), 1.0).clamp(0.5, 1.5);
+
+            let (samples, _dur) = self.render_nodes_tracked(
+                &part.children,
+                default_speaker,
+                part_vol,
+                part_speed,
+                tracker,
+            )?;
+
+            rendered_parts.push((samples, part.looped.unwrap_or(false)));
+        }
+
+        let target_len = if let Some(dur) = fixed_duration {
+            (dur * self.sample_rate as f32) as usize
+        } else {
+            let non_looped_max = rendered_parts
+                .iter()
+                .filter(|(_, looped)| !*looped)
+                .map(|(s, _)| s.len())
+                .max()
+                .unwrap_or(0);
+
+            if non_looped_max > 0 {
+                non_looped_max
+            } else {
+                rendered_parts
+                    .iter()
+                    .map(|(s, _)| s.len())
+                    .max()
+                    .unwrap_or(0)
+            }
+        };
+
+        for (samples, looped) in &mut rendered_parts {
+            if *looped && target_len > 0 && !samples.is_empty() {
+                let mut extended = Vec::with_capacity(target_len);
+                while extended.len() < target_len {
+                    extended.extend_from_slice(samples);
+                }
+                extended.truncate(target_len);
+                *samples = extended;
+            }
+        }
+
+        let final_len = if fixed_duration.is_some() {
+            target_len
+        } else {
+            rendered_parts
+                .iter()
+                .map(|(s, _)| s.len())
+                .max()
+                .unwrap_or(0)
+        };
+
+        let mut mixed = vec![0.0f32; final_len];
+        for (samples, _) in &rendered_parts {
+            for (i, &s) in samples.iter().enumerate() {
+                if i < mixed.len() {
+                    mixed[i] += s;
+                }
+            }
+        }
+
+        for s in mixed.iter_mut() {
+            *s = s.clamp(-1.0, 1.0);
+        }
+
+        let duration = mixed.len() as f32 / self.sample_rate as f32;
+        Ok((mixed, duration))
+    }
+
+    /// Increment the progress counter and emit a progress event.
+    fn emit_progress(&self, tracker: &Arc<Mutex<ProgressTracker>>, label: &str) {
+        if let Ok(mut t) = tracker.lock() {
+            t.step += 1;
+            t.emit(label);
+        }
+    }
+}
+
+/// Truncate a text label to `max_len` characters, appending "…" if truncated.
+fn truncate_label(text: &str, max_len: usize) -> String {
+    if text.len() <= max_len {
+        text.to_string()
+    } else {
+        let mut end = max_len;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &text[..end])
     }
 }
 
