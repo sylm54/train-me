@@ -43,7 +43,7 @@ import { z } from "zod";
 import { invoke } from "@tauri-apps/api/core";
 
 import { loadPrompt } from "./prompts";
-import { getProvider } from "./agent";
+import { getProvider, buildProviderOptions } from "./agent";
 import { bashTool, readFileTool, writeFileTool, listFilesTool } from "./tools";
 import type { AgentSettings } from "./types";
 import { emitAgentEvent, type AgentRole } from "./agent-events";
@@ -235,7 +235,7 @@ async function runSubagent(opts: {
       messages: modelMessages,
       tools: opts.tools,
       stopWhen: isLoopFinished(),
-      // stopWhen: stepCountIs(8),
+      providerOptions: buildProviderOptions(opts.settings, opts.agent),
     });
 
     // Track per-step text so we can flush it when a tool call or finish

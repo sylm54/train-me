@@ -2,10 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use base64::Engine;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 
 mod activity_db;
 mod audio_renderer;
@@ -142,6 +141,7 @@ async fn load_model(state: State<'_, AppState>) -> Result<String, String> {
 async fn synthesize(
     req: SynthesizeRequest,
     state: State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> Result<TrackInfo, String> {
     let tracks_dir = state.tracks_dir.clone();
     let agent_dir = state.agent_dir.clone();
@@ -160,6 +160,28 @@ async fn synthesize(
         // Missing/circular/invalid includes are silently skipped here.
         let nodes = audio_renderer::resolve_includes(nodes, &agent_dir);
 
+        // Count speakable nodes for progress tracking
+        let total = audio_renderer::count_speakable_nodes(&nodes);
+
+        // Build progress callback that emits Tauri events
+        let app_handle = app.clone();
+        let progress_callback = Box::new(move |step: usize, total: usize, label: &str| {
+            let _ = app_handle.emit(
+                "synthesize-progress",
+                serde_json::json!({
+                    "step": step,
+                    "total": total,
+                    "label": label,
+                }),
+            );
+        });
+
+        let tracker = Arc::new(std::sync::Mutex::new(audio_renderer::ProgressTracker {
+            step: 0,
+            total,
+            callback: progress_callback,
+        }));
+
         // Lock renderer
         let mut guard = renderer_arc.lock();
         let renderer = guard
@@ -176,9 +198,9 @@ async fn synthesize(
         let filename = format!("{}.wav", safe_name);
         let output_path = tracks_dir.join(&filename);
 
-        // Render
+        // Render with progress
         let duration = renderer
-            .render_to_file(&nodes, &output_path)
+            .render_to_file_with_progress(&nodes, &output_path, tracker)
             .map_err(|e| format!("Render error: {}", e))?;
 
         let metadata = fs::metadata(&output_path).map_err(|e| e.to_string())?;
@@ -257,14 +279,6 @@ fn list_tracks(state: State<'_, AppState>) -> Result<Vec<TrackInfo>, String> {
     // Sort newest first
     tracks.sort_by(|a, b| b.created.cmp(&a.created));
     Ok(tracks)
-}
-
-/// Return a track's WAV data as a base64 data-URL.
-#[tauri::command]
-fn get_track_audio(path: String) -> Result<String, String> {
-    let bytes = fs::read(&path).map_err(|e| format!("Failed to read track: {}", e))?;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    Ok(format!("data:audio/wav;base64,{}", b64))
 }
 
 /// Delete a track by file path.
@@ -634,7 +648,6 @@ pub fn run() {
             load_model,
             synthesize,
             list_tracks,
-            get_track_audio,
             delete_track,
             get_sound_names,
             // Agent / bash / file commands

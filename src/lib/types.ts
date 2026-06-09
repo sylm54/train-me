@@ -8,10 +8,21 @@ export type AgentName = "main" | "planner" | "writer";
 /** Provider identifier (OpenAI-compatible endpoints). */
 export type ProviderName = "openrouter" | "openai";
 
+/** Reasoning effort levels supported by the AI SDK's OpenAI provider. */
+export type ReasoningEffort =
+  | "xhigh"
+  | "high"
+  | "medium"
+  | "low"
+  | "minimal"
+  | "none";
+
 /** Per-agent provider/model configuration. */
 export interface AgentModelConfig {
   provider: ProviderName;
   model: string;
+  /** Reasoning effort level. When set, enables thinking/reasoning via providerOptions. */
+  reasoningEffort?: ReasoningEffort;
 }
 
 /** API keys indexed by provider. */

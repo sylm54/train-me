@@ -17,7 +17,7 @@ import {
   Save,
 } from "lucide-react";
 import { useSettings, DEFAULT_MODELS } from "@/lib/settings";
-import type { AgentName, ProviderName } from "@/lib/types";
+import type { AgentName, ProviderName, ReasoningEffort } from "@/lib/types";
 import {
   pickAndImportPackage,
   type ImportResult,
@@ -55,6 +55,19 @@ const MODEL_PRESETS: Record<ProviderName, string[]> = {
   ],
   openai: ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "o4-mini"],
 };
+
+const REASONING_OPTIONS: {
+  value: ReasoningEffort | "";
+  label: string;
+}[] = [
+  { value: "", label: "Disabled" },
+  { value: "high", label: "High" },
+  { value: "medium", label: "Medium" },
+  { value: "low", label: "Low" },
+  { value: "xhigh", label: "Extra High" },
+  { value: "minimal", label: "Minimal" },
+  { value: "none", label: "None" },
+];
 
 export function SettingsView() {
   const { settings, setApiKey, setAgent, resetOnboarding } = useSettings();
@@ -268,6 +281,30 @@ export function SettingsView() {
                       <option key={m} value={m} />
                     ))}
                   </datalist>
+                </div>
+                <div className="flex items-center gap-2 mt-2">
+                  <label className="text-xs text-[var(--color-muted-foreground)] shrink-0">
+                    Reasoning:
+                  </label>
+                  <select
+                    value={cfg.reasoningEffort ?? ""}
+                    onChange={(e) => {
+                      const effort = (e.target.value || undefined) as
+                        | ReasoningEffort
+                        | undefined;
+                      setAgent(agent, cfg.provider, cfg.model, {
+                        reasoningEffort: effort,
+                      });
+                      flashSave();
+                    }}
+                    className="text-sm border border-[var(--color-border)] rounded-md px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-[var(--color-pink-300)]"
+                  >
+                    {REASONING_OPTIONS.map((opt) => (
+                      <option key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
                 </div>
               </div>
             );

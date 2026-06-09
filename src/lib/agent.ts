@@ -73,6 +73,27 @@ export function getProvider(
 }
 
 /**
+ * Build `providerOptions` for the AI SDK's streamText/generateText calls.
+ * If the agent has a `reasoningEffort` configured, passes it through
+ * the `openai` provider key along with `forceReasoning: true` (needed
+ * for non-OpenAI models routed through OpenRouter that aren't
+ * auto-detected as reasoning models by the provider).
+ */
+export function buildProviderOptions(
+  settings: AgentSettings,
+  agent: AgentName,
+) {
+  const effort = settings.agents[agent].reasoningEffort;
+  if (!effort) return undefined;
+  return {
+    openai: {
+      reasoningEffort: effort,
+      forceReasoning: true,
+    },
+  };
+}
+
+/**
  * Build the main agent's toolset. Includes the base tools (bash, files,
  * prompts) plus the `invoke_planner` subagent tool. The planner tool is
  * rebuilt whenever `settings` change because it captures the settings to
@@ -130,6 +151,7 @@ export function createMainAgentTransport(
         tools,
         stopWhen: isLoopFinished(),
         abortSignal,
+        providerOptions: buildProviderOptions(settings, agent),
       });
 
       // Surface cumulative token usage to the UI once the run settles.

@@ -339,8 +339,8 @@ function ChatViewInner({
         )}
         <div className="ml-auto hidden sm:flex items-center gap-3 shrink-0 tabular-nums">
           <span>
-            ↑ {totals.promptTokens.toLocaleString()} ↓{" "}
-            {totals.completionTokens.toLocaleString()} tokens
+            {(totals.promptTokens + totals.completionTokens).toLocaleString()}{" "}
+            ctx
           </span>
         </div>
       </div>

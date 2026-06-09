@@ -9,7 +9,8 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   AlertCircle,
   Loader2,
@@ -37,6 +38,12 @@ interface TrackInfo {
   duration: number;
   created: string;
   size_bytes: number;
+}
+
+interface RenderProgress {
+  step: number;
+  total: number;
+  label: string;
 }
 
 interface ConditioningMeta {
@@ -95,6 +102,9 @@ export function ConditioningView() {
   // Per-script render-in-flight tracking. Keyed by script id.
   const [renderingIds, setRenderingIds] = useState<Set<string>>(new Set());
   const [renderErrors, setRenderErrors] = useState<Record<string, string>>({});
+  const [renderProgress, setRenderProgress] = useState<
+    Record<string, RenderProgress>
+  >({});
 
   // Audio playback — same pattern as TtsView.tsx
   const [playingScriptId, setPlayingScriptId] = useState<string | null>(null);
@@ -194,8 +204,22 @@ export function ConditioningView() {
       const { [script.id]: _drop, ...rest } = prev;
       return rest;
     });
+    setRenderProgress((prev) => {
+      if (!(script.id in prev)) return prev;
+      const { [script.id]: _drop, ...rest } = prev;
+      return rest;
+    });
 
+    // Listen for progress events during this render.
+    let unlisten: UnlistenFn | undefined;
     try {
+      unlisten = await listen<RenderProgress>("synthesize-progress", (e) => {
+        setRenderProgress((prev) => ({
+          ...prev,
+          [script.id]: e.payload,
+        }));
+      });
+
       const xml = await invoke<string>("read_data_file", { path: xmlPath });
       const track = await invoke<TrackInfo>("synthesize", {
         req: { text: xml, name: trackName },
@@ -218,10 +242,15 @@ export function ConditioningView() {
         [script.id]: tauriErrorToString(e),
       }));
     } finally {
+      unlisten?.();
       setRenderingIds((prev) => {
         const next = new Set(prev);
         next.delete(script.id);
         return next;
+      });
+      setRenderProgress((prev) => {
+        const { [script.id]: _drop, ...rest } = prev;
+        return rest;
       });
     }
   }, []);
@@ -238,18 +267,8 @@ export function ConditioningView() {
         return;
       }
 
-      try {
-        const url = await invoke<string>("get_track_audio", {
-          path: track.path,
-        });
-        setAudioUrl(url);
-        setPlayingScriptId(script.id);
-      } catch (e) {
-        setRenderErrors((prev) => ({
-          ...prev,
-          [script.id]: tauriErrorToString(e),
-        }));
-      }
+      setAudioUrl(convertFileSrc(track.path));
+      setPlayingScriptId(script.id);
     },
     [playingScriptId],
   );
@@ -317,6 +336,7 @@ export function ConditioningView() {
               script={script}
               rendering={renderingIds.has(script.id)}
               renderError={renderErrors[script.id] ?? null}
+              progress={renderProgress[script.id] ?? null}
               playing={playingScriptId === script.id}
               onRender={() => handleRender(script)}
               onPlay={() => handlePlay(script)}
@@ -329,6 +349,10 @@ export function ConditioningView() {
             autoPlay
             src={audioUrl}
             onEnded={() => {
+              setAudioUrl(null);
+              setPlayingScriptId(null);
+            }}
+            onError={() => {
               setAudioUrl(null);
               setPlayingScriptId(null);
             }}
@@ -348,6 +372,7 @@ interface ScriptCardProps {
   script: ConditioningScript;
   rendering: boolean;
   renderError: string | null;
+  progress: RenderProgress | null;
   playing: boolean;
   onRender: () => void;
   onPlay: () => void;
@@ -357,6 +382,7 @@ function ScriptCard({
   script,
   rendering,
   renderError,
+  progress,
   playing,
   onRender,
   onPlay,
@@ -399,7 +425,7 @@ function ScriptCard({
         <p className="text-xs text-[var(--color-danger)] flex items-start gap-1.5">
           <AlertCircle size={14} className="mt-0.5 shrink-0" />
           <span className="break-words">
-            Couldn’t load metadata: {metaError}
+            Couldn't load metadata: {metaError}
           </span>
         </p>
       )}
@@ -408,6 +434,26 @@ function ScriptCard({
           <AlertCircle size={14} className="mt-0.5 shrink-0" />
           <span className="break-words">Render failed: {renderError}</span>
         </p>
+      )}
+
+      {/* Render progress */}
+      {rendering && progress && progress.total > 0 && (
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between text-[11px] text-[var(--color-muted-foreground)]">
+            <span className="truncate min-w-0">{progress.label}</span>
+            <span className="shrink-0 ml-2 tabular-nums">
+              {progress.step}/{progress.total}
+            </span>
+          </div>
+          <div className="h-1.5 rounded-full bg-[var(--color-border)] overflow-hidden">
+            <div
+              className="h-full rounded-full bg-[var(--color-pink-500)] transition-all duration-200 ease-out"
+              style={{
+                width: `${Math.round((progress.step / progress.total) * 100)}%`,
+              }}
+            />
+          </div>
+        </div>
       )}
 
       {/* Actions */}
