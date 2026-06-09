@@ -230,12 +230,15 @@ async function runSubagent(opts: {
     // Use `.chat()` to force the Chat Completions API — see agent.ts for
     // the full rationale (OpenRouter doesn't support the Responses API).
     result = streamText({
-      model: cfg.provider.chat(cfg.model),
+      model: cfg.provider.chat(cfg.model, cfg.modelSettings),
       system: opts.systemPrompt,
       messages: modelMessages,
       tools: opts.tools,
       stopWhen: isLoopFinished(),
-      providerOptions: buildProviderOptions(opts.settings, opts.agent),
+      providerOptions: buildProviderOptions(
+        opts.settings,
+        opts.agent,
+      ) as Parameters<typeof streamText>[0]["providerOptions"],
     });
 
     // Track per-step text so we can flush it when a tool call or finish
