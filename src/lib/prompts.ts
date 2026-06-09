@@ -24,15 +24,17 @@ const featureEmbed = `
 ### 1. Conditioning (\`conditioning/*.md\`)
 - Each .json file corresponds to one audio file.
 - File contents describe the associated audio.
-- Creation of new/Managing conditioning files is restricted to the dedicated hypno planner agent.
+- Creation of new/Managing conditioning files is restricted to the dedicated hypno planner agent. The main agent should never modify these files directly; instead, it should instruct the HypnoPlanner subagent to create or update conditioning entries as needed as it has the necessary context.
 
 ### 2. Rules (\`rule/*.md\`)
 - Each file represents one rule that the user is expected to follow.
 - Refer to \`examples/rule.md\` for the correct formatting standard.
+- Create one rule file for each distinct rule you want to enforce.
 
 ### 3. Routines (\`routines/*.md\`)
 - Each file defines one routine for the user.
 - Refer to \`examples/routine.md\` for the proper formatting standard.
+- Create one routine file for each distinct routine you want to establish. For routines that vary by day, time, or other conditions, create separate files with clear naming to indicate their context (e.g., \`morning_routine.md\`, \`evening_routine.md\`, \`weekend_routine.md\`).
 
 ### 4. Inventory
 - **Items**: records items owned by the user. Only the user may add or update entries (via the Inventory UI). You may read entries using the \`inventory\` builtin.
@@ -51,7 +53,7 @@ const featureEmbed = `
 - Capabilities:
   - \`chastity info\` — Displays current lock status.
   - \`chastity unlock\` — Unlocks the user.
-- The user is responsible for locking themselves. Once locked, you can only unlock them by providing the correct secret string.
+- The user is responsible for locking themselves. Once locked, you can only unlock them by using the \`chastity unlock\` command.
 
 ### 6. Journal (\`journal/*.md\`, \`journal/format.json\`)
 - The user may maintain personal journal entries in the \`.md\` files (read-only for you).
@@ -69,20 +71,17 @@ const ttsTagsEmbed = `
 The TTS tag markup is an XML-like language used inside the train-me app to author spoken-word audio scripts — speech, pauses, sound effects, tones, DSP effects, concurrent layering, loops, and interactive pauses. The \`writeScript\` tool parses, validates, and saves a script, returning \`{ valid, path, error, node_count }\`.
 
 ### Conventions
-
 - Tags are case-sensitive and lowercase.
 - Self-closing tags end with \`/>\`; container tags require children and a matching \`</tag>\`.
 - Whitespace inside tags is ignored. Text nodes are trimmed; empty text nodes are filtered.
 - \`<!-- comments -->\` are supported and must be terminated with \`-->\`.
-- Attribute values may be single- or double-quoted (unquoted is also accepted).
+- Attribute values may be single- or double-quoted.
 - Unknown tags are a parse error. Unknown attribute values (e.g. invalid sound/tone/effect names) are tolerated where noted but produce no/degraded audio.
 
 ### Tags
-
 #### \`<voice>\` — container (children required)
 Selects the speaking voice and applies volume/speed to inner content.
 - \`speaker\` — default \`male\`.
-- \`pitch\` — optional. Parsed but currently NOT applied to synthesis.
 - \`volume\` — optional; scalar or \`@\` expression.
 - \`speed\` — optional; scalar, clamped to 0.5–1.5.
 
@@ -116,18 +115,18 @@ Applies an audio effect to the rendered inner content.
 
 #### \`<overlay>\` — container; mixes its parts concurrently
 Children are \`<part>\` elements; any non-part tag or text is wrapped in an implicit part.
-- \`duration\` — optional; parsed but NOT used by current rendering.
+- \`duration\` — optional; If specified, the overlay's length is fixed to this duration (seconds). Otherwise, it extends to the longest part.
 
 ##### \`<part>\` — container (children required), valid only inside \`<overlay>\`
-- \`looped\` — optional; bool. When true, the part repeats to fill ~5 seconds.
+- \`looped\` — optional; bool. When true, the part repeats until the longest part ends. One part must be non-looped or the overlay must have a fixed duration to prevent infinite loops.
 - \`volume\` — optional; scalar.
 - \`speed\` — optional; scalar.
 
 #### \`<loop>\` — container (children required)
-- \`loops\` — default \`2\`; non-negative integer. Repeats inner content sequentially (not concurrently).
+- \`loops\` — default \`2\`; integer >1. Repeats inner content sequentially (not concurrently).
 
 #### \`<background>\` — container (children required)
-A BACKGROUND layer aligned to its start position; non-tone backgrounds extend with silence to match foreground length, then sum with the foreground.
+A BACKGROUND layer aligned to its start position; At the position of the tag, the background starts and continues until the end of the content of the tag.
 - \`volume\` — optional; scalar (clamped 0.0–1.5) or \`@\` expression.
 - \`speed\` — optional; scalar, clamped to 0.5–1.5.
 
@@ -140,7 +139,7 @@ Interactive pause. In pre-rendered mode the inner content renders once; an optio
 - \`post-pause\` — optional; seconds.
 
 #### \`<include>\` — self-closing (requires \`src\`)
-- \`src\` — required. Pulls in another XML file by path. Nested includes are supported with circular-include detection; resolved before rendering (an unresolved \`Include\` node is silently ignored at render time).
+- \`src\` — required. Pulls in another XML file by path. Nested includes are supported with circular-include detection; resolved before rendering (an unresolved \`Include\` node is silently ignored).
 
 ### Sound types
 
@@ -148,7 +147,7 @@ Valid \`<sound type>\` values: \`beep\`, \`pop\`, \`bubble_pop\`, \`camera_shutt
 
 ### Tone presets
 
-Valid \`<tone preset>\` values (determine the waveform): \`sine\`, \`square\`, \`sawtooth\`, \`triangle\`, \`whitenoise\`, \`pinknoise\`, \`brownnoise\`. Any other value (e.g. \`binaural\`, \`theta\`) falls back to \`sine\`. \`frequency\` sets pitch in Hz; \`type\` is informational only.
+Valid \`<tone preset>\` values (determine the waveform): \`sine\`, \`square\`, \`sawtooth\`, \`triangle\`, \`whitenoise\`, \`pinknoise\`, \`brownnoise\` \`binaural_theta\`, \`binaural_alpha\`, \`binaural_beta\`, \`binaural_delta\`. Any other value falls back to \`sine\`. \`frequency\` sets pitch in Hz
 
 ### Effects
 
@@ -184,34 +183,55 @@ Functions (unknown functions evaluate to 0):
 | \`@step\` | \`(val, step)\` | Quantize \`val\` to nearest multiple of \`step\` |
 | \`@round\` | \`(val, decimals)\` | Round \`val\` to \`decimals\` places |
 
-Constant folding: literals, binops of constants, and \`@max\`/\`@min\`/\`@step\`/\`@round\` (when all args are constant) fold to a scalar; all other functions are time-dependent. \`pitch\` is parsed but not applied to synthesis.
+Constant folding: literals, binops of constants, and \`@max\`/\`@min\`/\`@step\`/\`@round\` (when all args are constant) fold to a scalar; all other functions are time-dependent.
 
 ### Authoring notes
-
 - Speed is clamped to 0.5–1.5 at every layer and multiplies the inherited scale.
 - Scalar volume is clamped to 0.0–1.5; expression volume is applied as a per-sample curve. The final mix is clamped to [-1.0, 1.0].
-- \`<tone>\` and \`<background>\` are background layers: aligned to their start position, then looped (tones) or silence-extended (non-tone backgrounds) to the enclosing scope's foreground length, then summed.
+- \`<tone>\` and \`<background>\` are background layers: aligned to their start position, then looped (tones) to the enclosing scope's foreground length.
 - \`<overlay>\` mixes all parts concurrently (all start together). \`<loop>\` repeats sequentially.
 - \`<include>\` is resolved before rendering; included content becomes part of the node tree (nesting + cycle detection supported).
 
 ### Example
 
 \`\`\`xml
-<background volume='0.2'>
-  <tone preset='pinknoise' volume='0.4'/>
-</background>
+<!-- This tone will be played in the background for the entire thing -->
+<tone preset='pinknoise' volume='0.4'/>
 <voice speaker='male' speed='1.1'>
+  <!-- This tone will be layered in the background, starting from here until the end of the voice block -->
+  <tone preset='binaural_theta' frequency='220' volume='0.3'/>
   Welcome to session one. <pause duration='0.4'/>
   <sound type='ding'/>
   <volume value='@fadein(1.5)'>Let us begin with a short warm-up.</volume>
   <effect type='reverb' preset='small_room'>Focus on your breath.</effect>
 </voice>
-<loop loops='3'>
-  <voice speaker='female'>Inhale. <pause/> Exhale.</voice>
+<loop loops='5'>
+  <voice speaker='female'>
+    <background volume='0.3'>
+      Deeper.
+    </background>
+    Inhale.
+    <!-- In the above case the Deep and Inhale will be played at the same time -->
+    <pause duration='1'/>
+    <background volume='0.3'>
+      Sink.
+    </background>
+    Exhale.
+  </voice>
 </loop>
 <overlay>
-  <part volume='0.8'>And rest.</part>
-  <part volume='0.5' looped='true'>breathe</part>
+  <!-- This part determines how long this overlay is -->
+  <part>
+    And
+    <pause duration='2'/>
+    now
+    <speed value='0.8'>we will</speed>
+    <background><sound type='heart_beat' volume='0.5'/></background>
+    rest.
+  </part>
+  <!-- This part will be played concurrently with the above, but at a lower volume and looped to fill the whole time -->
+  <part volume='0.3' speed='1.4' looped='true'>slower and slower</part>
+  <part volume='0.2' looped='true'><tone preset='binaural_alpha' frequency='120'/></part>
 </overlay>
 \`\`\`
 `.trim();
