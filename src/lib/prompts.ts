@@ -37,16 +37,15 @@ const featureEmbed = `
 - Create one routine file for each distinct routine you want to establish. For routines that vary by day, time, or other conditions, create separate files with clear naming to indicate their context (e.g., \`morning_routine.md\`, \`evening_routine.md\`, \`weekend_routine.md\`).
 
 ### 4. Inventory
-- **Items**: records items owned by the user. Only the user may add or update entries (via the Inventory UI). You may read entries using the \`inventory\` builtin.
-- **Wishlist**: follows the same schema as items (with \`priority\` instead of \`quantity\`). You may read AND write wishlist entries.
-- Use the \`inventory\` builtin for all access:
-  - \`inventory items\` — list items.
-  - \`inventory items <id>\` — show one item.
-  - \`inventory wishlist\` — list wishlist.
-  - \`inventory wishlist <id>\` — show one wishlist item.
-  - \`inventory wishlist add <name> [category] [priority] [notes...]\` — add a wishlist entry.
-  - \`inventory wishlist remove <id>\` — remove a wishlist entry.
-- Never attempt to add, update, or remove owned items yourself — instruct the user to do it via the Inventory view.
+- **Items**: records items owned by the user (\`items\` table).
+- **Wishlist**: follows the same schema as items but with \`priority\` instead of \`quantity\` (\`wishlist\` table).
+- Both tables live in \`inventory.db\` inside your sandbox. You have full read/write access via the \`sqlite\` builtin:
+  - \`sqlite -json inventory.db "SELECT * FROM items"\` — list items as JSON.
+  - \`sqlite -json inventory.db "SELECT * FROM wishlist"\` — list wishlist as JSON.
+  - \`sqlite inventory.db "INSERT INTO items (name, category, quantity, notes, created_at, updated_at) VALUES ('...', NULL, 1, NULL, datetime('now'), datetime('now'));"\` — add an item.
+  - \`sqlite inventory.db "DELETE FROM items WHERE id = 3;"\` — remove an item.
+  - Use \`-json\` for SELECT queries to get machine-readable output. Omit it for INSERT/UPDATE/DELETE.
+- Use single quotes for SQL string literals; double any single quote inside a value (e.g. \`'O''Brien'\`).
 
 ### 5. Chastity
 - Command: \`chastity\`

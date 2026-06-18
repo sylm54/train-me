@@ -1,11 +1,12 @@
 /**
  * Inventory view: display + manage items and wishlist (backed by SQLite).
  *
- * Data lives in `<app_data>/state/inventory.db` (outside the agent's
- * writable area) and is accessed via the `inventory_*` Tauri commands.
+ * Data lives in `<app_data>/agent_data/inventory.db` (inside the agent
+ * sandbox) and is accessed via the `inventory_*` Tauri commands, which
+ * route through the bash sandbox's embedded `sqlite` engine.
  *
- * The agent may only read items; the user may add/remove/update items
- * from this view. Both the user and the agent may modify the wishlist.
+ * Both the user (via this view) and the agent (via the `sqlite` builtin)
+ * have full read/write access to both the `items` and `wishlist` tables.
  */
 
 import { useCallback, useEffect, useState } from "react";
