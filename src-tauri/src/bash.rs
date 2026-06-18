@@ -83,10 +83,10 @@ impl BashSandbox {
 /// App-managed dirs (prompts/, model/, tracks/) live outside the sandbox.
 ///
 /// `state_dir` is the directory holding app-managed state that the agent
-/// must not access directly (`<app_data>/state`). Chastity and inventory
-/// live here; builtins reach them by absolute path. (Activity lives inside
-/// the sandbox root instead, so the agent can query it via the embedded
-/// `sqlite` builtin.)
+/// must not access directly (`<app_data>/state`). Chastity lives here; the
+/// chastity builtin reaches it by absolute path. (Activity and inventory
+/// live inside the sandbox root instead, so the agent can query them via
+/// the embedded `sqlite` builtin.)
 pub fn create_bash_sandbox(agent_dir: &Path, state_dir: &Path) -> anyhow::Result<BashSandbox> {
     let agent_dir_owned = agent_dir.to_path_buf();
     let state_dir_owned = state_dir.to_path_buf();
@@ -134,10 +134,6 @@ pub fn create_bash_sandbox(agent_dir: &Path, state_dir: &Path) -> anyhow::Result
             let builder = crate::chastity::ChastityBuiltin::register(
                 builder,
                 state_dir_owned.join("chastity.json"),
-            );
-            let builder = crate::inventory::InventoryBuiltin::register(
-                builder,
-                state_dir_owned.join("inventory.db"),
             );
             let mut bash = builder.build();
 
@@ -382,8 +378,9 @@ pub fn ensure_prompts_dir(data_dir: &Path) -> std::io::Result<()> {
 /// Ensure the agent's writable data dir exists, with a few conventional
 /// subdirectories pre-created so the agent has obvious places to write.
 ///
-/// Note: `inventory/` is intentionally NOT created here — inventory now
-/// lives in `<state_dir>/inventory.db` (outside the agent's writable area).
+/// Note: `inventory/` is intentionally NOT created here — inventory lives
+/// in `<agent_dir>/inventory.db`, accessed via the embedded `sqlite`
+/// builtin.
 pub fn ensure_agent_dir(data_dir: &Path) -> std::io::Result<()> {
     let agent = data_dir.join("agent_data");
     std::fs::create_dir_all(&agent)?;
@@ -403,10 +400,10 @@ pub fn ensure_agent_dir(data_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Ensure the app-managed state directory exists. Holds chastity and
-/// inventory databases — none of which the agent may touch directly.
-/// (Activity used to live here too, but now resides inside the agent
-/// sandbox so the agent can query it via the embedded `sqlite` builtin.)
+/// Ensure the app-managed state directory exists. Holds chastity state
+/// (which the agent must not touch directly). Activity and inventory used
+/// to live here too, but now reside inside the agent sandbox so the agent
+/// can query them via the embedded `sqlite` builtin.
 #[allow(dead_code)]
 pub fn ensure_state_dir(data_dir: &Path) -> std::io::Result<PathBuf> {
     let state = data_dir.join("state");

@@ -18,8 +18,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   AlertCircle,
-  Eye,
-  EyeOff,
   Loader2,
   Lock,
   Unlock,
@@ -100,7 +98,6 @@ export function ChastityView() {
 
   // Lock form
   const [secret, setSecret] = useState("");
-  const [revealSecret, setRevealSecret] = useState(false);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionFlash, setActionFlash] = useState<string | null>(null);
@@ -131,10 +128,10 @@ export function ChastityView() {
   // ── Live tick (for the countdown) ────────────────────────────────────
 
   useEffect(() => {
-    if (!state.countdown_active) return;
+    if (!state.locked) return;
     const id = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(id);
-  }, [state.countdown_active]);
+  }, [state.locked]);
 
   // ── Derived countdown state ──────────────────────────────────────────
 
@@ -198,8 +195,9 @@ export function ChastityView() {
 
   // ── Derived flags ────────────────────────────────────────────────────
 
-  const lockTime = formatTimestamp(state.locked_at);
-  const showSecret = !state.locked;
+  const lockedAtMs = parseIso(state.locked_at);
+  const lockedForMs =
+    state.locked && lockedAtMs !== null ? now - lockedAtMs : null;
   const headline = useMemo(() => {
     if (state.locked) {
       if (state.countdown_active && countdownRemaining !== null) {
@@ -276,7 +274,20 @@ export function ChastityView() {
           </header>
 
           <div className="px-5 py-4 space-y-3">
-            <Row label="Locked since" value={lockTime} />
+            <Row
+              label="Locked for"
+              value={
+                state.locked && lockedForMs !== null ? (
+                  <span className="font-mono">
+                    {formatRemaining(lockedForMs)}
+                  </span>
+                ) : (
+                  <span className="text-[var(--color-muted-foreground)]">
+                    —
+                  </span>
+                )
+              }
+            />
 
             {state.countdown_active && countdownRemaining !== null && (
               <Row
@@ -313,39 +324,6 @@ export function ChastityView() {
                 value={formatTimestamp(state.countdown_end)}
               />
             )}
-
-            <Row
-              label="Secret"
-              value={
-                showSecret && state.hidden_string ? (
-                  <span className="font-mono text-[var(--color-foreground)]">
-                    {revealSecret
-                      ? state.hidden_string
-                      : "•".repeat(Math.min(state.hidden_string.length, 12))}
-                  </span>
-                ) : state.locked ? (
-                  <span className="text-[var(--color-muted-foreground)]">
-                    hidden
-                  </span>
-                ) : (
-                  <span className="text-[var(--color-muted-foreground)]">
-                    —
-                  </span>
-                )
-              }
-              extra={
-                showSecret && state.hidden_string ? (
-                  <button
-                    type="button"
-                    onClick={() => setRevealSecret((v) => !v)}
-                    className="text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)]"
-                    aria-label={revealSecret ? "Hide" : "Reveal"}
-                  >
-                    {revealSecret ? <EyeOff size={14} /> : <Eye size={14} />}
-                  </button>
-                ) : null
-              }
-            />
           </div>
 
           {/* ── Locked actions ──────────────────────────────────────── */}
@@ -372,7 +350,7 @@ export function ChastityView() {
                   Code
                 </label>
                 <Input
-                  type={revealSecret ? "text" : "password"}
+                  type="password"
                   value={secret}
                   onChange={(e) => setSecret(e.target.value)}
                   placeholder="Lockbox pin"
