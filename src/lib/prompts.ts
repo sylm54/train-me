@@ -9,6 +9,15 @@
  *   {{{embed 'path/to/file.md'}}}     Inline the contents of `prompts/path/to/file.md`.
  *                                     Embeds can be nested; circular embeds are skipped.
  *
+ *   {{include './USER.md'}}           Inline a file from the agent's writable directory
+ *                                     (`agent_data/`). The path is relative to that dir;
+ *                                     a leading `./` is allowed. The first read in a
+ *                                     session is snapshotted, so later writes by the
+ *                                     agent don't change the inlined text. Files over
+ *                                     1000 words are truncated with a note. Missing
+ *                                     files inline the literal `File does not exist`.
+ *                                     Call `resetIncludeSnapshots()` at session start.
+ *
  *   {{features}}                      Inline the inbuilt app-features rundown.
  *   {{ttsTags}}                       Inline the inbuilt TTS tag system reference.
  *   {{special}}                       Scan the agent's `special/*.md` (recursive),
@@ -307,7 +316,72 @@ const EMBED_RE = new RegExp(
   "\\{\\{\\{embed\\s+['\"]([^'\"]+)['\"]\\s*\\}\\}\\}",
   "g",
 );
+const INCLUDE_RE = new RegExp(
+  "\\{\\{\\s*include\\s+['\"]([^'\"]+)['\"]\\s*\\}\\}",
+  "g",
+);
 const SPECIAL_RE = new RegExp("\\{\\{\\s*special\\s*\\}\\}", "g");
+
+/** Word cap for `{{include}}` snapshots; longer files are truncated. */
+const INCLUDE_WORD_LIMIT = 1000;
+
+/** Literal inlined when an `{{include}}` target is missing. */
+const INCLUDE_MISSING = "File does not exist";
+
+/**
+ * Session-level snapshot cache for `{{include}}` directives. The first
+ * read of a given path populates this map; subsequent reads (from any
+ * `loadPrompt` call) reuse the cached value so files the agent rewrites
+ * mid-session don't leak into the prompt. Values are already
+ * truncated / missing-marked, so callers can use them verbatim.
+ * Use `resetIncludeSnapshots()` to start a fresh session.
+ */
+const includeSnapshot = new Map<string, string>();
+
+/** Clear the `{{include}}` snapshot cache. Call at session start. */
+export function resetIncludeSnapshots(): void {
+  includeSnapshot.clear();
+}
+
+/** Normalize an include path (`./USER.md`, `/USER.md`, `USER.md`) for cache keying. */
+function normalizeIncludePath(raw: string): string {
+  return raw.replace(/^\.\//, "").replace(/^\/+/, "").trim();
+}
+
+/** Cap content at `INCLUDE_WORD_LIMIT` words, appending a note when truncated. */
+function capIncludeWords(content: string): string {
+  const words = content.split(/\s+/).filter((w) => w.length > 0);
+  if (words.length <= INCLUDE_WORD_LIMIT) return content;
+  return (
+    words.slice(0, INCLUDE_WORD_LIMIT).join(" ") +
+    `\n\n[... file truncated at ${INCLUDE_WORD_LIMIT} words ...]`
+  );
+}
+
+/**
+ * Resolve an `{{include}}` against the agent's writable directory, taking a
+ * session-scoped snapshot. Reads go through the `read_data_file` Tauri command
+ * (scoped under `agent_data/` by the backend), so traversal outside that dir
+ * is rejected server-side.
+ */
+async function renderInclude(rawPath: string): Promise<string> {
+  const key = normalizeIncludePath(rawPath);
+  const cached = includeSnapshot.get(key);
+  if (cached !== undefined) return cached;
+
+  let value: string;
+  try {
+    const content = await invoke<string>("read_data_file", { path: key });
+    value = capIncludeWords(content);
+  } catch (e) {
+    // Missing or unreadable: snapshot as the missing marker so a later
+    // mid-session write doesn't retroactively populate the prompt.
+    console.warn(`[prompts] Include "${key}" failed, treating as missing:`, e);
+    value = INCLUDE_MISSING;
+  }
+  includeSnapshot.set(key, value);
+  return value;
+}
 
 /**
  * Load a prompt file from `<app_data>/prompts/<relPath>` and process directives.
@@ -343,6 +417,18 @@ async function processPrompt(
       return await processPrompt(subPath, visited);
     } catch (e) {
       console.warn(`[prompts] Failed to embed "${subPath}":`, e);
+      return "";
+    }
+  });
+
+  // Process includes from the agent's writable dir. These are snapshotted
+  // for the session (see `renderInclude`) and inlined verbatim — no further
+  // directive expansion happens on the included text.
+  out = await replaceAsync(out, INCLUDE_RE, async (_m, inner: string) => {
+    try {
+      return await renderInclude(inner.trim());
+    } catch (e) {
+      console.warn(`[prompts] Failed to render include:`, e);
       return "";
     }
   });

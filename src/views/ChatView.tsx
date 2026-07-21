@@ -40,7 +40,10 @@ import {
 } from "lucide-react";
 
 import { useSettings } from "@/lib/settings";
-import { loadPrompt } from "@/lib/prompts";
+import {
+  loadPrompt,
+  resetIncludeSnapshots,
+} from "@/lib/prompts";
 import { createMainAgentTransport } from "@/lib/agent";
 import type { AgentSettings } from "@/lib/types";
 import { useAgentEvents, type AgentEvent } from "@/lib/agent-events";
@@ -85,6 +88,10 @@ export function ChatView({ onOpenSettings }: ChatViewProps) {
   const refreshPrompt = async () => {
     setPromptLoading(true);
     setPromptError(null);
+    // Start a fresh include snapshot window for this session: any
+    // `{{include './...'}}` directive in the prompt will read from disk on
+    // first reference and lock that content for the life of the session.
+    resetIncludeSnapshots();
     try {
       const content = await loadPrompt("main_agent.md");
       setSystemPrompt(content);
