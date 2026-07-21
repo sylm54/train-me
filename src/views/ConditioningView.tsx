@@ -3,28 +3,24 @@
  *
  * Each script has two files in the agent's writable data dir:
  *   - conditioning/<id>.json   (metadata: title, description, script_path, tags)
- *   - conditioning/<id>.xml    (TTS markup rendered via the `synthesize` command)
+ *   - the referenced script     (TTS markup, rendered by `render_manifest`)
  *
  * Three-phase flow:
  *   1. List    — a grid of cards showing only the title + tags.
  *   2. Detail  — expanded view with full description and a single primary
  *                action that adapts to state: download the model, enable the
  *                engine + render, re-render, or play.
- *   3. Player  — a full-screen, progress-less listening surface. Surfaces
- *                interactive `<until>` prompts ("click to continue") when the
- *                script contains them, otherwise stays empty. A play event is
- *                logged only when the track finishes naturally.
+ *   3. Player  — a full-screen listening surface driven by a manifest
+ *                segment tree (see `lib/manifestPlayer`). Prompts (`<until>`
+ *                and `<choice>`) come from the engine, not parsed markup.
+ *
+ * Scripts are rendered to a *manifest* (a tree of audio segments plus a
+ * directory of WAVs) rather than a single flat WAV. The player walks the
+ * tree, allocating one `HTMLAudioElement` per concurrent track.
  */
 
-import {
-  forwardRef,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   AlertCircle,
@@ -44,19 +40,11 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { type FileEntry, tauriErrorToString } from "@/lib/types";
 import { logActivity } from "@/lib/activity";
+import { ActivePrompt, ManifestPlayer, Segment } from "@/lib/manifestPlayer";
 
 // ──────────────────────────────────────────────────────────────────────────
 // Types
 // ──────────────────────────────────────────────────────────────────────────
-
-interface TrackInfo {
-  name: string;
-  filename: string;
-  path: string;
-  duration: number;
-  created: string;
-  size_bytes: number;
-}
 
 interface RenderProgress {
   step: number;
@@ -71,6 +59,30 @@ interface ConditioningMeta {
   tags: string[];
 }
 
+interface RenderedManifest {
+  id: string;
+  manifest_path: string;
+  script: string;
+  duration: number;
+  created: string;
+}
+
+interface ManifestStatus {
+  rendered: boolean;
+  stale: boolean;
+  duration: number | null;
+  created: string | null;
+  manifest_path: string | null;
+}
+
+/** Shape of `read_manifest`'s return — we only use `root`. */
+interface ReadManifestResult {
+  version: number;
+  hash: string;
+  script: string;
+  root: Segment;
+}
+
 interface ConditioningScript {
   /** Path relative to agent_data, e.g., "conditioning/foo.json" */
   jsonPath: string;
@@ -78,8 +90,10 @@ interface ConditioningScript {
   id: string;
   meta: ConditioningMeta | null;
   metaError: string | null;
-  /** Most recently rendered track for this script (if any). */
-  renderedTrack: TrackInfo | null;
+  /** Rendered manifest, if any. */
+  manifest: { path: string; duration: number; created: string } | null;
+  /** True when the script changed since the manifest was rendered. */
+  stale: boolean;
 }
 
 interface ModelStatus {
@@ -89,25 +103,9 @@ interface ModelStatus {
   speakers: string[];
 }
 
-/** An interactive "click to continue" prompt parsed from a script's XML. */
-interface UntilPrompt {
-  button: string;
-  text: string;
-}
-
 // ──────────────────────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────
-
-/**
- * Derive a stable track name from a JSON path so renders are idempotent and
- * can be looked up later from the global track list.
- *   "conditioning/foo.json" -> "conditioning_foo"
- */
-function deriveTrackName(jsonPath: string): string {
-  const stem = jsonPath.replace(/\.json$/, "").replace(/[\\/]/g, "_");
-  return stem;
-}
 
 /** "conditioning/foo.json" -> "foo" */
 function deriveId(jsonPath: string): string {
@@ -119,32 +117,6 @@ function formatDuration(s: number): string {
   const m = Math.floor(s / 60);
   const ss = Math.floor(s % 60);
   return `${m}:${ss.toString().padStart(2, "0")}`;
-}
-
-/**
- * Extract interactive `<until>` prompts from a script's TTS markup.
- *
- * Uses a regex scan rather than DOMParser because the markup mixes custom
- * self-closing tags (e.g. `<pause/>`) that HTML parsing rules would
- * mis-handle, swallowing siblings. We only need the `button` attribute and
- * a tag-stripped preview of the inner text for display.
- */
-function extractUntilPrompts(xml: string): UntilPrompt[] {
-  const re = /<until\b([^>]*)>([\s\S]*?)<\/until>/gi;
-  const out: UntilPrompt[] = [];
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(xml)) !== null) {
-    const attrs = m[1];
-    const inner = m[2];
-    const btnMatch = attrs.match(/button\s*=\s*"([^"]*)"/i);
-    const button = btnMatch ? btnMatch[1] : "Continue";
-    const text = inner
-      .replace(/<[^>]+>/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-    out.push({ button, text });
-  }
-  return out;
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -171,13 +143,14 @@ export function ConditioningView() {
   // Navigation phase: null = list, otherwise the expanded script.
   const [selectedId, setSelectedId] = useState<string | null>(null);
 
-  // Full-screen player. Set only while a track is actively playing.
+  // Full-screen player. Set only while a manifest is playing.
   const [playingScript, setPlayingScript] = useState<ConditioningScript | null>(
     null,
   );
-  const [prompts, setPrompts] = useState<UntilPrompt[]>([]);
+  const [activePrompt, setActivePrompt] = useState<ActivePrompt | null>(null);
   const [isPlaying, setIsPlaying] = useState(true);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [playerError, setPlayerError] = useState<string | null>(null);
+  const playerRef = useRef<ManifestPlayer | null>(null);
 
   // ── Loaders ────────────────────────────────────────────────────────────
 
@@ -191,9 +164,10 @@ export function ConditioningView() {
   }, []);
 
   /**
-   * Fetch conditioning JSONs and previously-rendered tracks, and stitch
-   * them together: a script's `renderedTrack` is the most recent track
-   * whose name matches `conditioning_${id}`.
+   * Fetch conditioning JSONs and per-script manifest status in parallel.
+   * A script's `manifest`/`stale` come from `manifest_status` (which does
+   * NOT trigger a render), so cards can show a badge without paying for a
+   * full render.
    */
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -207,21 +181,11 @@ export function ConditioningView() {
         (e) => !e.isDir && e.name.toLowerCase().endsWith(".json"),
       );
 
-      // Fetch existing tracks in parallel so we can pre-populate cards.
-      let existingTracks: TrackInfo[] = [];
-      try {
-        existingTracks = await invoke<TrackInfo[]>("list_tracks");
-      } catch (e) {
-        // Non-fatal: render still works, just no pre-populated tracks.
-        console.warn("list_tracks failed:", e);
-      }
-
-      // Read all metadata files in parallel.
+      // Read metadata + manifest status in parallel (both per-script).
       const loaded = await Promise.all(
         jsonEntries.map(async (entry): Promise<ConditioningScript> => {
           const id = deriveId(entry.path);
           const jsonPath = entry.path;
-          const expectedName = deriveTrackName(jsonPath);
 
           let meta: ConditioningMeta | null = null;
           let metaError: string | null = null;
@@ -234,19 +198,28 @@ export function ConditioningView() {
             metaError = tauriErrorToString(e);
           }
 
-          // Find most recent matching track (sorted desc by created).
-          const match =
-            existingTracks
-              .filter((t) => t.name === expectedName)
-              .sort((a, b) => (a.created < b.created ? 1 : -1))[0] ?? null;
+          // status defaults to "not rendered" on failure — non-fatal.
+          let manifest: ConditioningScript["manifest"] = null;
+          let stale = false;
+          if (meta) {
+            try {
+              const status = await invoke<ManifestStatus>("manifest_status", {
+                scriptPath: meta.script_path,
+              });
+              if (status.rendered && status.manifest_path) {
+                manifest = {
+                  path: status.manifest_path,
+                  duration: status.duration ?? 0,
+                  created: status.created ?? "",
+                };
+                stale = status.stale;
+              }
+            } catch (e) {
+              console.warn("manifest_status failed:", e);
+            }
+          }
 
-          return {
-            jsonPath,
-            id,
-            meta,
-            metaError,
-            renderedTrack: match,
-          };
+          return { jsonPath, id, meta, metaError, manifest, stale };
         }),
       );
 
@@ -262,8 +235,8 @@ export function ConditioningView() {
   }, []);
 
   useEffect(() => {
-    refresh();
-    refreshModelStatus();
+    void refresh();
+    void refreshModelStatus();
   }, [refresh, refreshModelStatus]);
 
   // ── Engine helpers ─────────────────────────────────────────────────────
@@ -295,13 +268,17 @@ export function ConditioningView() {
     }
   }, [refreshModelStatus]);
 
-  // ── Handlers ───────────────────────────────────────────────────────────
+  // ── Render flow (shared by explicit render + auto-render-on-play) ──────
 
-  const handleRender = useCallback(
-    async (script: ConditioningScript) => {
-      if (!script.meta) return; // can't render without metadata
-      const xmlPath = script.meta.script_path;
-      const trackName = deriveTrackName(script.jsonPath);
+  /**
+   * Render (or re-render) a script's manifest. Idempotent on the backend:
+   * skips work if the hash is fresh. Returns the updated script object on
+   * success, or null on failure (error recorded in `renderErrors`). Also
+   * used as a precondition by `handlePlay` (auto re-render on play).
+   */
+  const renderScript = useCallback(
+    async (script: ConditioningScript): Promise<ConditioningScript | null> => {
+      if (!script.meta) return null;
 
       setRenderingIds((prev) => {
         const next = new Set(prev);
@@ -319,12 +296,10 @@ export function ConditioningView() {
         return rest;
       });
 
-      // Listen for progress events during this render.
+      // render_manifest emits no progress events today, but keep the
+      // listener attached in case the backend grows them.
       let unlisten: UnlistenFn | undefined;
       try {
-        // Offer to load the engine if it isn't loaded yet — rendering
-        // requires a loaded model, otherwise synthesize rejects with
-        // "Model not loaded".
         const ready = await ensureModelLoaded();
         if (!ready) {
           throw new Error(
@@ -339,27 +314,34 @@ export function ConditioningView() {
           }));
         });
 
-        const xml = await invoke<string>("read_data_file", { path: xmlPath });
-        const track = await invoke<TrackInfo>("synthesize", {
-          req: { text: xml, name: trackName },
+        const m = await invoke<RenderedManifest>("render_manifest", {
+          scriptPath: script.meta.script_path,
         });
 
-        // Update the script in-place with the freshly rendered track.
+        const updated: ConditioningScript = {
+          ...script,
+          manifest: {
+            path: m.manifest_path,
+            duration: m.duration,
+            created: m.created,
+          },
+          stale: false,
+        };
         setScripts((prev) =>
-          prev.map((s) =>
-            s.id === script.id ? { ...s, renderedTrack: track } : s,
-          ),
+          prev.map((s) => (s.id === script.id ? updated : s)),
         );
-        await logActivity(
+        void logActivity(
           "conditioning",
           "render",
-          `${script.id} → ${track.name}`,
+          `${script.id} → ${m.manifest_path}`,
         );
+        return updated;
       } catch (e) {
         setRenderErrors((prev) => ({
           ...prev,
           [script.id]: tauriErrorToString(e),
         }));
+        return null;
       } finally {
         unlisten?.();
         setRenderingIds((prev) => {
@@ -368,6 +350,7 @@ export function ConditioningView() {
           return next;
         });
         setRenderProgress((prev) => {
+          if (!(script.id in prev)) return prev;
           const { [script.id]: _drop, ...rest } = prev;
           return rest;
         });
@@ -376,59 +359,101 @@ export function ConditioningView() {
     [ensureModelLoaded],
   );
 
-  /**
-   * Enter the full-screen player for a script. Reads the source XML so the
-   * interactive `<until>` prompts can be surfaced in the player. A play
-   * event is logged only when the track ends naturally (see onEnded).
-   */
-  const handlePlay = useCallback(async (script: ConditioningScript) => {
-    if (!script.renderedTrack) return;
-    setPlayingScript(script);
-    setIsPlaying(true);
+  const handleRender = useCallback(
+    (script: ConditioningScript) => void renderScript(script),
+    [renderScript],
+  );
 
-    // Surface interactive prompts, if the script has any.
-    if (script.meta) {
-      try {
-        const xml = await invoke<string>("read_data_file", {
-          path: script.meta.script_path,
-        });
-        setPrompts(extractUntilPrompts(xml));
-      } catch {
-        setPrompts([]);
-      }
-    } else {
-      setPrompts([]);
-    }
+  // ── Player lifecycle ───────────────────────────────────────────────────
+
+  /** Tear down the current player instance (if any) and clear UI state. */
+  const teardownPlayer = useCallback(() => {
+    playerRef.current?.destroy();
+    playerRef.current = null;
+    setActivePrompt(null);
+    setPlayerError(null);
   }, []);
 
-  /** Natural end of the track: log a play and return to the detail view. */
-  const handleEnded = useCallback(() => {
-    const script = playingScript;
-    const track = script?.renderedTrack;
-    setPlayingScript(null);
-    setPrompts([]);
-    setIsPlaying(true);
-    if (script && track) {
-      // Fire-and-forget — logging must never block the UX.
-      void logActivity("conditioning", "play", `${script.id} → ${track.name}`);
-    }
-  }, [playingScript]);
+  /**
+   * Enter the full-screen player for a script. Auto re-renders first if the
+   * manifest is missing or stale (confirmed implicitly by the user clicking
+   * Play). Then reads the manifest tree and starts the engine.
+   */
+  const handlePlay = useCallback(
+    async (script: ConditioningScript) => {
+      let current = script;
+      if (!current.manifest || current.stale) {
+        const rendered = await renderScript(current);
+        if (!rendered || !rendered.manifest) return; // render failed; error is on the detail card
+        current = rendered;
+      }
+      const manifestPath = current.manifest?.path;
+      if (!manifestPath) return;
+
+      // Clear any stale play/render error so the detail card is clean while
+      // we attempt playback.
+      setRenderErrors((prev) => {
+        if (!(script.id in prev)) return prev;
+        const { [script.id]: _drop, ...rest } = prev;
+        return rest;
+      });
+
+      try {
+        const tree = await invoke<ReadManifestResult>("read_manifest", {
+          manifestPath,
+        });
+
+        // Fresh player state.
+        teardownPlayer();
+        setIsPlaying(true);
+        setPlayingScript(current);
+
+        const player = new ManifestPlayer({
+          onPrompt: (p) => setActivePrompt(p),
+          onPlayingChange: (playing) => setIsPlaying(playing),
+          onEnded: () => {
+            void logActivity(
+              "conditioning",
+              "play",
+              `${current.id} → ${current.manifest?.path ?? ""}`,
+            );
+            setPlayingScript(null);
+            teardownPlayer();
+          },
+          onError: (e) => {
+            setPlayerError(e.message || String(e));
+          },
+          readImport: async (manifestPath: string) => {
+            const res = await invoke<ReadManifestResult>("read_manifest", {
+              manifestPath,
+            });
+            return res.root;
+          },
+        });
+        playerRef.current = player;
+        void player.start(tree.root);
+      } catch (e) {
+        // read_manifest failed before the player could open. Surface the
+        // error on the detail card (the Player overlay — where `playerError`
+        // renders — isn't mounted yet, so it would otherwise be invisible).
+        const msg = tauriErrorToString(e);
+        setRenderErrors((prev) => ({ ...prev, [script.id]: msg }));
+      }
+    },
+    [renderScript, teardownPlayer],
+  );
 
   const handleClosePlayer = useCallback(() => {
     setPlayingScript(null);
-    setPrompts([]);
-    setIsPlaying(true);
-  }, []);
+    teardownPlayer();
+  }, [teardownPlayer]);
 
   const togglePlayPause = useCallback(() => {
-    const el = audioRef.current;
-    if (!el) return;
-    if (el.paused) {
-      void el.play();
-    } else {
-      el.pause();
-    }
-  }, []);
+    const player = playerRef.current;
+    if (!player) return;
+    if (isPlaying) player.pause();
+    else player.resume();
+  }, [isPlaying]);
 
   // ── Derived state ──────────────────────────────────────────────────────
 
@@ -441,10 +466,6 @@ export function ConditioningView() {
     () => !loading && scripts.length === 0 && !globalError,
     [loading, scripts.length, globalError],
   );
-
-  const audioUrl = playingScript?.renderedTrack
-    ? convertFileSrc(playingScript.renderedTrack.path)
-    : null;
 
   // ── Render ─────────────────────────────────────────────────────────────
 
@@ -509,7 +530,7 @@ export function ConditioningView() {
             downloading={downloading}
             downloadError={downloadError}
             onBack={() => setSelectedId(null)}
-            onRender={() => void handleRender(selected)}
+            onRender={() => handleRender(selected)}
             onDownload={() => void handleDownload()}
             onPlay={() => void handlePlay(selected)}
           />
@@ -528,18 +549,16 @@ export function ConditioningView() {
       </div>
 
       {/* ── Full-screen player overlay ─────────────────────────────── */}
-      {playingScript && audioUrl && (
+      {playingScript && (
         <Player
-          ref={audioRef}
           title={playingScript.meta?.title ?? playingScript.id}
-          audioUrl={audioUrl}
           isPlaying={isPlaying}
-          prompts={prompts}
+          prompt={activePrompt}
+          error={playerError}
           onTogglePlayPause={togglePlayPause}
-          onEnded={handleEnded}
           onClose={handleClosePlayer}
-          onPlaying={() => setIsPlaying(true)}
-          onPause={() => setIsPlaying(false)}
+          onContinueUntil={() => playerRef.current?.continueUntil()}
+          onChoose={(i) => playerRef.current?.choose(i)}
         />
       )}
     </div>
@@ -624,12 +643,12 @@ function ScriptDetail({
   onDownload,
   onPlay,
 }: ScriptDetailProps) {
-  const { meta, metaError, renderedTrack } = script;
+  const { meta, metaError, manifest, stale } = script;
 
   // Resolve the primary action from current state.
   const modelDownloaded = modelStatus?.downloaded ?? false;
   const modelLoaded = modelStatus?.loaded ?? false;
-  const hasTrack = !!renderedTrack;
+  const hasManifest = !!manifest;
 
   let primary: {
     label: string;
@@ -638,7 +657,7 @@ function ScriptDetail({
     disabled: boolean;
     variant: "default" | "outline";
   };
-  if (hasTrack) {
+  if (hasManifest) {
     primary = {
       label: "Play",
       icon: <Play />,
@@ -689,11 +708,21 @@ function ScriptDetail({
           <h2 className="text-xl font-semibold leading-tight">
             {meta?.title ?? script.id}
           </h2>
-          {hasTrack && (
-            <span className="text-xs text-[var(--color-muted-foreground)] shrink-0 mt-1 inline-flex items-center gap-1">
-              <Volume2 size={12} />
-              {formatDuration(renderedTrack!.duration)}
-            </span>
+          {hasManifest && (
+            <div className="flex items-center gap-2 shrink-0 mt-1">
+              {stale && (
+                <Badge
+                  variant="outline"
+                  className="text-[var(--color-pink-700)] border-[var(--color-pink-300)] bg-[var(--color-pink-50)] text-xs gap-1"
+                >
+                  <RefreshCw size={10} />
+                  Out of date
+                </Badge>
+              )}
+              <span className="text-xs text-[var(--color-muted-foreground)] inline-flex items-center gap-1">
+                <Volume2 size={12} />~{formatDuration(manifest!.duration)}
+              </span>
+            </div>
           )}
         </div>
 
@@ -742,7 +771,7 @@ function ScriptDetail({
           </p>
         )}
 
-        {/* Render progress */}
+        {/* Render progress (only shown when the backend reports a step) */}
         {rendering && progress && progress.total > 0 && (
           <div className="space-y-1.5">
             <div className="flex items-center justify-between text-[11px] text-[var(--color-muted-foreground)]">
@@ -774,8 +803,8 @@ function ScriptDetail({
             {primary.label}
           </Button>
 
-          {/* Re-render is offered once a track exists (requires engine). */}
-          {hasTrack && (
+          {/* Re-render is offered once a manifest exists (requires engine). */}
+          {hasManifest && (
             <Button
               variant="outline"
               size="lg"
@@ -798,36 +827,33 @@ function ScriptDetail({
 
 interface PlayerProps {
   title: string;
-  audioUrl: string;
   isPlaying: boolean;
-  prompts: UntilPrompt[];
+  prompt: ActivePrompt | null;
+  error: string | null;
   onTogglePlayPause: () => void;
-  onEnded: () => void;
   onClose: () => void;
-  onPlaying: () => void;
-  onPause: () => void;
+  /** Advance past an active `until` prompt. */
+  onContinueUntil: () => void;
+  /** Resolve an active `choice` prompt with an option index. */
+  onChoose: (index: number) => void;
 }
 
 /**
- * Immersive, progress-less listening surface. Deliberately empty except for
- * a back control, the title, the play/pause control, and any interactive
- * `<until>` prompts the script declares. On natural end it logs a play and
- * hands control back to the detail view via `onEnded`.
+ * Immersive, progress-less listening surface driven by the manifest engine.
+ * Renders whatever prompt the engine surfaces (an `<until>` "continue"
+ * control or a `<choice>` option list); otherwise it stays minimal. The
+ * engine itself owns audio playback, so there's no `<audio>` element here.
  */
-const Player = forwardRef<HTMLAudioElement, PlayerProps>(function Player(
-  {
-    title,
-    audioUrl,
-    isPlaying,
-    prompts,
-    onTogglePlayPause,
-    onEnded,
-    onClose,
-    onPlaying,
-    onPause,
-  },
-  ref,
-) {
+function Player({
+  title,
+  isPlaying,
+  prompt,
+  error,
+  onTogglePlayPause,
+  onClose,
+  onContinueUntil,
+  onChoose,
+}: PlayerProps) {
   // Keyboard: space toggles play/pause, escape exits.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -883,28 +909,43 @@ const Player = forwardRef<HTMLAudioElement, PlayerProps>(function Player(
           {title}
         </h2>
 
-        {/* Interactive prompts ("click to continue") — only if present. */}
-        {prompts.length > 0 && (
-          <div className="mt-10 w-full max-w-md space-y-3">
-            <p className="text-center text-[11px] uppercase tracking-[0.2em] text-[var(--color-pink-200)]/50">
-              Choice points
-            </p>
-            {prompts.map((p, i) => (
-              <div
-                key={i}
-                className="rounded-xl border border-white/10 bg-white/5 backdrop-blur-sm p-4"
-              >
-                {p.text && (
-                  <p className="text-sm text-[var(--color-pink-100)]/90 leading-relaxed">
-                    {p.text}
-                  </p>
-                )}
-                <span className="mt-3 inline-flex items-center gap-1.5 rounded-full bg-[var(--color-pink-500)]/20 px-3 py-1 text-xs text-[var(--color-pink-100)] ring-1 ring-[var(--color-pink-400)]/30">
-                  <Sparkles size={12} />
-                  {p.button}
-                </span>
+        {/* Playback error surfaced by the engine. */}
+        {error && (
+          <div className="mt-8 max-w-md rounded-xl border border-red-400/30 bg-red-500/10 p-4 text-sm text-red-100 flex items-start gap-2">
+            <AlertCircle size={16} className="mt-0.5 shrink-0" />
+            <div className="flex-1">
+              <div className="font-medium">Playback problem</div>
+              <div className="text-xs opacity-90 break-words mt-0.5">
+                {error}
               </div>
-            ))}
+            </div>
+          </div>
+        )}
+
+        {/* Interactive prompt surfaced by the engine. */}
+        {prompt && (
+          <div className="mt-10 w-full max-w-md space-y-3">
+            {prompt.kind === "choice" && (
+              <p className="text-center text-[11px] uppercase tracking-[0.2em] text-[var(--color-pink-200)]/50">
+                {prompt.prompt ?? "Choose"}
+              </p>
+            )}
+            {prompt.kind === "until" && prompt.text && (
+              <p className="text-center text-sm text-[var(--color-pink-100)]/90 leading-relaxed">
+                {prompt.text}
+              </p>
+            )}
+            {prompt.kind === "choice" &&
+              (prompt.options ?? []).map((opt, i) => (
+                <button
+                  key={i}
+                  type="button"
+                  onClick={() => onChoose(i)}
+                  className="w-full rounded-xl border border-white/10 bg-white/5 backdrop-blur-sm p-4 text-left text-sm text-white hover:bg-white/10 transition-colors"
+                >
+                  {opt.label ?? `Option ${i + 1}`}
+                </button>
+              ))}
           </div>
         )}
       </div>
@@ -925,19 +966,20 @@ const Player = forwardRef<HTMLAudioElement, PlayerProps>(function Player(
         </button>
       </div>
 
-      <audio
-        ref={ref}
-        autoPlay
-        src={audioUrl}
-        onEnded={onEnded}
-        onPlaying={onPlaying}
-        onPause={onPause}
-        onError={() => {
-          // A playback failure shouldn't strand the user in the player.
-          onClose();
-        }}
-        style={{ display: "none" }}
-      />
+      {/* The `until` button lives at the bottom (above controls) so it's
+          reachable as a deliberate "advance" gesture. */}
+      {prompt && prompt.kind === "until" && (
+        <div className="relative z-10 flex justify-center pb-4">
+          <button
+            type="button"
+            onClick={onContinueUntil}
+            className="inline-flex items-center gap-1.5 rounded-full bg-[var(--color-pink-500)]/20 px-5 py-2 text-sm text-[var(--color-pink-100)] ring-1 ring-[var(--color-pink-400)]/30 hover:bg-[var(--color-pink-500)]/30 transition-colors"
+          >
+            <Sparkles size={14} />
+            {prompt.button ?? "Continue"}
+          </button>
+        </div>
+      )}
     </div>
   );
-});
+}
