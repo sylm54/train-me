@@ -39,14 +39,25 @@ const featureEmbed = `
 ### 4. Inventory
 - **Items**: records items owned by the user (\`items\` table).
 - **Wishlist**: follows the same schema as items but with \`priority\` instead of \`quantity\` (\`wishlist\` table).
-- Both tables live in \`inventory.db\` inside your sandbox. You have full read/write access via the \`sqlite\` builtin:
-  - \`sqlite -json inventory.db "SELECT * FROM items"\` — list items as JSON.
-  - \`sqlite -json inventory.db "SELECT * FROM wishlist"\` — list wishlist as JSON.
-  - \`sqlite inventory.db "INSERT INTO items (name, category, quantity, notes, created_at, updated_at) VALUES ('...', NULL, 1, NULL, datetime('now'), datetime('now'));"\` — add an item.
-  - \`sqlite inventory.db "DELETE FROM items WHERE id = 3;"\` — remove an item.
-  - Use \`-json\` for SELECT queries to get machine-readable output. Omit it for INSERT/UPDATE/DELETE.
-- Use single quotes for SQL string literals; double any single quote inside a value (e.g. \`'O''Brien'\`).
-
+- Both tables live in \`inventory.db\` inside your sandbox. You have full read/write access via the \`sqlite\` builtin. Schema:
+CREATE TABLE IF NOT EXISTS items (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT    NOT NULL,
+    category    TEXT,
+    quantity    INTEGER NOT NULL DEFAULT 1,
+    notes       TEXT,
+    created_at  TEXT    NOT NULL,
+    updated_at  TEXT    NOT NULL
+);
+CREATE TABLE IF NOT EXISTS wishlist (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT    NOT NULL,
+    category    TEXT,
+    priority    TEXT,
+    notes       TEXT,
+    created_at  TEXT    NOT NULL,
+    updated_at  TEXT    NOT NULL
+);
 ### 5. Chastity
 - Command: \`chastity\`
 - Capabilities:
@@ -62,12 +73,20 @@ const featureEmbed = `
 ### 7. Activity Tracking
 - Stored in \`activity.db\` SQLite
 - Use sqlite to query it directly (read-only by convention).
+- Schema:
+CREATE TABLE IF NOT EXISTS activity (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts       TEXT    NOT NULL,
+    feature  TEXT    NOT NULL,
+    action   TEXT    NOT NULL,
+    details  TEXT    NOT NULL DEFAULT ''
+);
 `.trim();
 
 const ttsTagsEmbed = `
 ## TTS Tag System
 
-The TTS tag markup is an XML-like language used inside the train-me app to author spoken-word audio scripts — speech, pauses, sound effects, tones, DSP effects, concurrent layering, loops, and interactive pauses. The \`writeScript\` tool parses, validates, and saves a script, returning \`{ valid, path, error, node_count }\`.
+The TTS tag markup is an XML-like language used inside the train-me app to author spoken-word audio scripts — speech, pauses, sound effects, tones, DSP effects, concurrent layering, loops, and interactive pauses (button-waits, random picks, shuffled order, and listener-driven branches). Scripts render to a segment manifest so interactive tags are resolved per-playback. The \`writeScript\` tool parses, validates, and saves a script, returning \`{ valid, path, error, node_count }\`.
 
 ### Conventions
 - Tags are case-sensitive and lowercase.
@@ -116,10 +135,11 @@ Applies an audio effect to the rendered inner content.
 Children are \`<part>\` elements; any non-part tag or text is wrapped in an implicit part.
 - \`duration\` — optional; If specified, the overlay's length is fixed to this duration (seconds). Otherwise, it extends to the longest part.
 
-##### \`<part>\` — container (children required), valid only inside \`<overlay>\`
-- \`looped\` — optional; bool. When true, the part repeats until the longest part ends. One part must be non-looped or the overlay must have a fixed duration to prevent infinite loops.
+##### \`<part>\` — container (children required), valid inside \`<overlay>\`, \`<random>\`, \`<scramble>\`, and \`<choice>\`
+- \`looped\` — optional; bool (\`<overlay>\` only). When true, the part repeats until the longest part ends. One part must be non-looped or the overlay must have a fixed duration to prevent infinite loops.
 - \`volume\` — optional; scalar.
 - \`speed\` — optional; scalar.
+- \`label\` — optional; string (\`<choice>\` only). The button text shown for this option at the choice point.
 
 #### \`<loop>\` — container (children required)
 - \`loops\` — default \`2\`; integer >1. Repeats inner content sequentially (not concurrently).
@@ -130,15 +150,24 @@ A BACKGROUND layer aligned to its start position; At the position of the tag, th
 - \`speed\` — optional; scalar, clamped to 0.5–1.5.
 
 #### \`<until>\` — container (children required)
-Interactive pause. In pre-rendered mode the inner content renders once; an optional waiting sound renders once as a background layer. NOTE: attribute names use hyphens.
+Interactive pause. Scripts render to a segment manifest rather than one flat WAV, so the inner content becomes its own segment: at playback the listener hears it once, then the player pauses and shows the \`button\` until pressed (looping the optional \`waiting-sound\` while waiting). NOTE: attribute names use hyphens. Not allowed inside a \`<background>\` layer or an \`<overlay>\` part (it would block a concurrently-mixed stream).
 - \`button\` — default \`Continue\`.
-- \`waiting-sound\` — optional; a sound type name.
+- \`waiting-sound\` — optional; a sound type name, looped by the player while the button is shown.
 - \`waiting-sound-volume\` — optional; scalar, default 0.5.
-- \`pre-pause\` — optional; seconds.
-- \`post-pause\` — optional; seconds.
+- \`pre-pause\` / \`post-pause\` — optional; seconds. (Folded into the rendered segment in manifest mode.)
+
+#### \`<random>\` — container; \`<part>\` children
+At each playback, exactly ONE part is chosen uniformly at random and played; the others are skipped. Parts may themselves contain nested tags (including other interactive tags).
+
+#### \`<scramble>\` — container; \`<part>\` children
+At each playback, ALL parts are played once in a freshly-shuffled order.
+
+#### \`<choice>\` — container; \`<part label="…">\` children
+Interactive branch. At playback the player pauses and shows one button per part (using each part's \`label\`); the part the listener picks is the one that plays. \`prompt\` is an optional shared question shown above the buttons. Like \`<until>\`, not allowed inside a \`<background>\` layer or \`<overlay>\` part.
+- \`prompt\` — optional; string.
 
 #### \`<include>\` — self-closing (requires \`src\`)
-- \`src\` — required. Pulls in another XML file by path. Nested includes are supported with circular-include detection; resolved before rendering (an unresolved \`Include\` node is silently ignored).
+- \`src\` — required. Pulls in another XML file by path. Nested includes are supported with circular-include detection. In manifest mode, an include is rendered as its OWN manifest (deduped on disk by source path, so the same file included twice is stored and rendered once) and referenced by the parent; context (voice/speed/volume) is RESET at the include boundary, so an included file should declare its own \`<voice>\`. Each included file has its own content hash, so editing a sub-file re-renders only that sub-manifest.
 
 ### Sound types
 
@@ -189,7 +218,8 @@ Constant folding: literals, binops of constants, and \`@max\`/\`@min\`/\`@step\`
 - Scalar volume is clamped to 0.0–1.5; expression volume is applied as a per-sample curve. The final mix is clamped to [-1.0, 1.0].
 - \`<tone>\` and \`<background>\` are background layers: aligned to their start position, then looped (tones) to the enclosing scope's foreground length.
 - \`<overlay>\` mixes all parts concurrently (all start together). \`<loop>\` repeats sequentially.
-- \`<include>\` is resolved before rendering; included content becomes part of the node tree (nesting + cycle detection supported).
+- \`<include>\` renders to a deduped sub-manifest (context resets at the boundary); each file is hashed separately for incremental re-rendering.
+- Interactive tags \`<until>\`/\`<random>\`/\`<scramble>\`/\`<choice>\` produce segment boundaries; decisions for \`<random>\`/\`<scramble>\`/\`<choice>\` happen per-playback, so each listen can differ. \`<until>\` and \`<choice>\` are rejected inside \`<background>\`/\`<overlay>\` (they would block a concurrent stream); \`<random>\`/\`<scramble>\`/\`<loop>\`/\`<include>\` are allowed there. A \`<background>\` whose layer contains no interactive tag is baked into its surrounding segment; one with an interactive layer plays on a parallel track scoped to its enclosing sequence.
 
 ### Example
 
@@ -232,6 +262,30 @@ Constant folding: literals, binops of constants, and \`@max\`/\`@min\`/\`@step\`
   <part volume='0.3' speed='1.4' looped='true'>slower and slower</part>
   <part volume='0.2' looped='true'><tone preset='binaural_alpha' frequency='120'/></part>
 </overlay>
+
+<!-- Interactive segment boundaries (decisions happen per-playback in the player) -->
+<until button="I'm ready" waiting-sound='heart_beat' waiting-sound-volume='0.4'>
+  Breathe in, and out. Take your time.
+</until>
+
+<!-- Each listen plays exactly one of these -->
+<random>
+  <part>You feel a warm glow spreading through you.</part>
+  <part>A cool heaviness settles over you.</part>
+</random>
+
+<!-- Order is reshuffled every listen -->
+<scramble>
+  <part>Deeper.</part>
+  <part>Calmer.</part>
+  <part>Heavier.</part>
+</scramble>
+
+<!-- The listener picks a branch -->
+<choice prompt="Where do you drift?">
+  <part label="Down">Down, sinking further with every breath.</part>
+  <part label="Further">Further away, letting go completely.</part>
+</choice>
 \`\`\`
 `.trim();
 

@@ -6,14 +6,23 @@
 
 use anyhow::{bail, Context, Result};
 use std::collections::HashSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::expression::{self, Expr};
 use crate::helper::{load_text_to_speech, load_voice_style, write_wav_file, TextToSpeech};
+use crate::manifest::{
+    self, nominal_duration, relative_path, sha8_of_path, ChoiceOption, Manifest,
+    OverlayPartSegment, Segment, WalkCtx,
+};
 use crate::model_downloader;
 use crate::sounds::SoundType;
 use crate::tag_parser::{self, Node, OverlayPart};
+use crate::RenderedManifest;
+
+use rand::seq::SliceRandom;
+use rand::Rng;
 
 // ============================================================================
 // Value resolution helpers
@@ -56,7 +65,7 @@ fn resolve_value(value: Option<&str>, default: f32) -> ValueOrExpr {
 
 /// Resolve an attribute to a scalar f32 value.
 /// Used for speed/pitch where dynamic expressions aren't applied per-sample.
-fn resolve_scalar(value: Option<&str>, default: f32) -> f32 {
+pub(crate) fn resolve_scalar(value: Option<&str>, default: f32) -> f32 {
     match resolve_value(value, default) {
         ValueOrExpr::Scalar(v) => v,
         ValueOrExpr::Expr(expr) => expression::eval_constant(&expr).unwrap_or(default),
@@ -143,6 +152,18 @@ pub fn count_speakable_nodes(nodes: &[Node]) -> usize {
             }
             Node::Overlay { parts, .. } => {
                 for part in parts {
+                    count += count_speakable_nodes(&part.children);
+                }
+            }
+            Node::Random { parts } | Node::Scramble { parts } => {
+                // Upper-bound estimate: count all parts (only one will be picked
+                // for Random, but we can't know which at count time).
+                for part in parts {
+                    count += count_speakable_nodes(&part.children);
+                }
+            }
+            Node::Choice { options, .. } => {
+                for part in options {
                     count += count_speakable_nodes(&part.children);
                 }
             }
@@ -417,6 +438,63 @@ impl AudioRenderer {
                     )?;
                     foreground.extend_from_slice(&samples);
                     _total_duration += dur;
+                }
+
+                Node::Random { parts } => {
+                    if !parts.is_empty() {
+                        let idx = rand::thread_rng().gen_range(0..parts.len());
+                        let part = &parts[idx];
+                        let part_vol = (volume_scale * resolve_scalar(part.volume.as_deref(), 1.0))
+                            .clamp(0.0, 1.5);
+                        let part_speed = speed_scale
+                            * resolve_scalar(part.speed.as_deref(), 1.0).clamp(0.5, 1.5);
+                        let (samples, dur) = self.render_nodes(
+                            &part.children,
+                            default_speaker,
+                            part_vol,
+                            part_speed,
+                        )?;
+                        foreground.extend_from_slice(&samples);
+                        _total_duration += dur;
+                    }
+                }
+
+                Node::Scramble { parts } => {
+                    let mut order: Vec<usize> = (0..parts.len()).collect();
+                    order.shuffle(&mut rand::thread_rng());
+                    for idx in order {
+                        let part = &parts[idx];
+                        let part_vol = (volume_scale * resolve_scalar(part.volume.as_deref(), 1.0))
+                            .clamp(0.0, 1.5);
+                        let part_speed = speed_scale
+                            * resolve_scalar(part.speed.as_deref(), 1.0).clamp(0.5, 1.5);
+                        let (samples, dur) = self.render_nodes(
+                            &part.children,
+                            default_speaker,
+                            part_vol,
+                            part_speed,
+                        )?;
+                        foreground.extend_from_slice(&samples);
+                        _total_duration += dur;
+                    }
+                }
+
+                Node::Choice { prompt: _, options } => {
+                    // Flat-path fallback: render the first option only.
+                    if let Some(part) = options.first() {
+                        let part_vol = (volume_scale * resolve_scalar(part.volume.as_deref(), 1.0))
+                            .clamp(0.0, 1.5);
+                        let part_speed = speed_scale
+                            * resolve_scalar(part.speed.as_deref(), 1.0).clamp(0.5, 1.5);
+                        let (samples, dur) = self.render_nodes(
+                            &part.children,
+                            default_speaker,
+                            part_vol,
+                            part_speed,
+                        )?;
+                        foreground.extend_from_slice(&samples);
+                        _total_duration += dur;
+                    }
                 }
 
                 Node::Loop { loops, children } => {
@@ -913,6 +991,69 @@ impl AudioRenderer {
                     _total_duration += dur;
                 }
 
+                Node::Random { parts } => {
+                    if !parts.is_empty() {
+                        let idx = rand::thread_rng().gen_range(0..parts.len());
+                        let part = &parts[idx];
+                        let part_vol = (volume_scale * resolve_scalar(part.volume.as_deref(), 1.0))
+                            .clamp(0.0, 1.5);
+                        let part_speed = speed_scale
+                            * resolve_scalar(part.speed.as_deref(), 1.0).clamp(0.5, 1.5);
+                        let (samples, dur) = self.render_nodes_tracked(
+                            &part.children,
+                            default_speaker,
+                            part_vol,
+                            part_speed,
+                            tracker,
+                        )?;
+                        foreground.extend_from_slice(&samples);
+                        _total_duration += dur;
+                        self.emit_progress(tracker, "Random branch");
+                    }
+                }
+
+                Node::Scramble { parts } => {
+                    let mut order: Vec<usize> = (0..parts.len()).collect();
+                    order.shuffle(&mut rand::thread_rng());
+                    for idx in order {
+                        let part = &parts[idx];
+                        let part_vol = (volume_scale * resolve_scalar(part.volume.as_deref(), 1.0))
+                            .clamp(0.0, 1.5);
+                        let part_speed = speed_scale
+                            * resolve_scalar(part.speed.as_deref(), 1.0).clamp(0.5, 1.5);
+                        let (samples, dur) = self.render_nodes_tracked(
+                            &part.children,
+                            default_speaker,
+                            part_vol,
+                            part_speed,
+                            tracker,
+                        )?;
+                        foreground.extend_from_slice(&samples);
+                        _total_duration += dur;
+                        self.emit_progress(tracker, "Scramble part");
+                    }
+                }
+
+                Node::Choice { prompt: _, options } => {
+                    // Flat-path fallback: render the first option only.
+                    if let Some(part) = options.first() {
+                        let part_vol = (volume_scale * resolve_scalar(part.volume.as_deref(), 1.0))
+                            .clamp(0.0, 1.5);
+                        let part_speed = speed_scale
+                            * resolve_scalar(part.speed.as_deref(), 1.0).clamp(0.5, 1.5);
+                        let (samples, dur) = self.render_nodes_tracked(
+                            &part.children,
+                            default_speaker,
+                            part_vol,
+                            part_speed,
+                            tracker,
+                        )?;
+                        foreground.extend_from_slice(&samples);
+                        _total_duration += dur;
+                        self.emit_progress(tracker, "Choice option");
+                    }
+                }
+
                 Node::Loop { loops, children } => {
                     for _ in 0..*loops {
                         let (samples, dur) = self.render_nodes_tracked(
@@ -1112,6 +1253,469 @@ impl AudioRenderer {
             t.emit(label);
         }
     }
+
+    // ============================================================
+    // Recursive segment manifest walker
+    // ============================================================
+
+    /// Render `script_rel` (relative to `agent_dir`) to a manifest directory
+    /// under `tracks_dir/<id>/`. Idempotent: re-rendering an unchanged script
+    /// reuses the existing manifest (see [`Self::render_manifest_file`]).
+    pub fn render_manifest(
+        &mut self,
+        script_rel: &str,
+        agent_dir: &Path,
+        tracks_dir: &Path,
+    ) -> Result<RenderedManifest> {
+        let source_abs = normalize_path(&agent_dir.join(script_rel));
+        if !source_abs.exists() {
+            bail!("Script not found: {}", source_abs.display());
+        }
+        let out_dir = tracks_dir.join(manifest::manifest_id(script_rel));
+        fs::create_dir_all(&out_dir)?;
+        let script_dir = source_abs
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        // Seed the visited set with the top-level file so a descendant
+        // `<include>` that points back at it becomes a reference, not a
+        // re-render.
+        let mut visited: HashSet<PathBuf> = HashSet::new();
+        visited.insert(source_abs.clone());
+        self.render_manifest_file(
+            &source_abs,
+            script_rel,
+            &out_dir,
+            agent_dir,
+            tracks_dir,
+            &script_dir,
+            &mut visited,
+        )
+    }
+
+    /// Render (or reuse) a single manifest for `source_abs` into `out_dir`.
+    ///
+    /// Freshness: if `out_dir/manifest.json` already exists and its stored
+    /// hash matches the SHA-256 of the current source bytes (and at least one
+    /// `.wav` is present), the existing manifest is reused as-is. This is what
+    /// deduplicates `<include>` targets under `tracks/imports/<sha8>/`.
+    fn render_manifest_file(
+        &mut self,
+        source_abs: &Path,
+        script_rel: &str,
+        out_dir: &Path,
+        agent_dir: &Path,
+        tracks_dir: &Path,
+        script_dir: &Path,
+        visited: &mut HashSet<PathBuf>,
+    ) -> Result<RenderedManifest> {
+        fs::create_dir_all(out_dir)?;
+        let bytes = fs::read(source_abs)
+            .with_context(|| format!("read script {}", source_abs.display()))?;
+        let hash = manifest::hash_bytes(&bytes);
+        let manifest_path = out_dir.join("manifest.json");
+
+        // Freshness shortcut.
+        if manifest_path.exists() {
+            if let Ok(existing_str) = fs::read_to_string(&manifest_path) {
+                if let Ok(existing) = serde_json::from_str::<Manifest>(&existing_str) {
+                    if existing.hash == hash && has_any_wav(out_dir) {
+                        let duration = nominal_duration(&existing.root);
+                        return Ok(RenderedManifest {
+                            id: manifest::manifest_id(script_rel),
+                            manifest_path: manifest_path.to_string_lossy().to_string(),
+                            script: existing.script.clone(),
+                            duration,
+                            created: mtime_rfc3339(&manifest_path),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Stale or missing — rebuild.
+        clean_manifest_dir(out_dir)?;
+        let source = std::str::from_utf8(&bytes)
+            .with_context(|| format!("script {} is not UTF-8", source_abs.display()))?;
+        let nodes =
+            tag_parser::parse(source).with_context(|| format!("parse {}", source_abs.display()))?;
+        let mut counter = 0usize;
+        let root = self.walk(
+            &nodes,
+            &WalkCtx::root(),
+            out_dir,
+            script_dir,
+            agent_dir,
+            tracks_dir,
+            &mut counter,
+            visited,
+        )?;
+        let manifest = Manifest {
+            version: 2,
+            hash: hash.clone(),
+            script: script_rel.to_string(),
+            root,
+        };
+        fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+        let duration = nominal_duration(&manifest.root);
+        Ok(RenderedManifest {
+            id: manifest::manifest_id(script_rel),
+            manifest_path: manifest_path.to_string_lossy().to_string(),
+            script: script_rel.to_string(),
+            duration,
+            created: mtime_rfc3339(&manifest_path),
+        })
+    }
+
+    /// Core recursive walker. Returns a `Sequence` whose children alternate
+    /// between `Static` segments (flat-rendered runs of non-interactive nodes)
+    /// and interactive constructs (`Until`/`Random`/`Scramble`/`Choice`/
+    /// `Import`/`Loop`/`Background`/`Overlay`/scoped `Voice`/`Speed`/`Volume`).
+    ///
+    /// `counter` is the per-manifest WAV naming counter (`seg-NNN.wav`).
+    fn walk(
+        &mut self,
+        nodes: &[Node],
+        ctx: &WalkCtx,
+        out_dir: &Path,
+        script_dir: &Path,
+        agent_dir: &Path,
+        tracks_dir: &Path,
+        counter: &mut usize,
+        visited: &mut HashSet<PathBuf>,
+    ) -> Result<Segment> {
+        let mut static_buf: Vec<Node> = Vec::new();
+        let mut children: Vec<Segment> = Vec::new();
+
+        for node in nodes {
+            if manifest::contains_split(node) {
+                self.flush_static(&mut static_buf, ctx, out_dir, counter, &mut children)?;
+                let seg = self.emit_split(
+                    node, ctx, out_dir, script_dir, agent_dir, tracks_dir, counter, visited,
+                )?;
+                children.push(seg);
+            } else {
+                static_buf.push(node.clone());
+            }
+        }
+        self.flush_static(&mut static_buf, ctx, out_dir, counter, &mut children)?;
+        Ok(Segment::Sequence { children })
+    }
+
+    /// Render the accumulated `static_buf` to a single `Static` segment (if
+    /// non-empty) and append it to `children`.
+    fn flush_static(
+        &mut self,
+        buf: &mut Vec<Node>,
+        ctx: &WalkCtx,
+        out_dir: &Path,
+        counter: &mut usize,
+        children: &mut Vec<Segment>,
+    ) -> Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let (samples, _dur) =
+            self.render_nodes(buf, &ctx.speaker, ctx.volume_scale, ctx.speed_scale)?;
+        let file = self.write_seg(out_dir, counter, &samples)?;
+        let duration = samples.len() as f32 / self.sample_rate as f32;
+        children.push(Segment::Static { file, duration });
+        buf.clear();
+        Ok(())
+    }
+
+    /// Render a single split node into one `Segment`. The caller appends the
+    /// returned segment to its `children`.
+    //
+    // v1 limitation: a `<background>` whose layer has NO interactive
+    // descendant is flat-rendered into its enclosing `Static` segment (so it
+    // only layers under that one segment's content, not across subsequent
+    // interactive boundaries). Backgrounds WITH interactive descendants
+    // become real `Background` constructs here. Acceptable for v1.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_split(
+        &mut self,
+        node: &Node,
+        ctx: &WalkCtx,
+        out_dir: &Path,
+        script_dir: &Path,
+        agent_dir: &Path,
+        tracks_dir: &Path,
+        counter: &mut usize,
+        visited: &mut HashSet<PathBuf>,
+    ) -> Result<Segment> {
+        match node {
+            Node::Until {
+                button,
+                waiting_sound,
+                waiting_sound_volume,
+                pre_pause: _,
+                post_pause: _,
+                children,
+            } => {
+                if ctx.forbid_pause {
+                    bail!("<until> is not allowed inside <background> or <overlay>");
+                }
+                // pre/post_pause are folded into the content render (render_nodes
+                // already handles them); the manifest model doesn't surface them.
+                let (samples, _dur) =
+                    self.render_nodes(children, &ctx.speaker, ctx.volume_scale, ctx.speed_scale)?;
+                let file = self.write_seg(out_dir, counter, &samples)?;
+                let duration = samples.len() as f32 / self.sample_rate as f32;
+                let text = tag_parser::extract_text(children);
+                let mut ws_file = None;
+                let mut ws_vol_out = None;
+                if let Some(ws) = waiting_sound {
+                    let ws_vol = waiting_sound_volume.unwrap_or(0.5) * ctx.volume_scale;
+                    let (ws_samples, _) = self.render_sound(ws, ws_vol)?;
+                    ws_file = Some(self.write_seg(out_dir, counter, &ws_samples)?);
+                    ws_vol_out = Some(ws_vol);
+                }
+                Ok(Segment::Until {
+                    file,
+                    duration,
+                    button: button.clone(),
+                    text: Some(text),
+                    waiting_sound: ws_file,
+                    waiting_sound_volume: ws_vol_out,
+                })
+            }
+
+            Node::Random { parts } => {
+                let options = parts
+                    .iter()
+                    .map(|p| {
+                        self.walk_part(
+                            p, ctx, out_dir, script_dir, agent_dir, tracks_dir, counter, visited,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Segment::Random { options })
+            }
+
+            Node::Scramble { parts } => {
+                let options = parts
+                    .iter()
+                    .map(|p| {
+                        self.walk_part(
+                            p, ctx, out_dir, script_dir, agent_dir, tracks_dir, counter, visited,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Segment::Scramble { options })
+            }
+
+            Node::Choice { prompt, options } => {
+                if ctx.forbid_pause {
+                    bail!("<choice> is not allowed inside <background> or <overlay>");
+                }
+                let options = options
+                    .iter()
+                    .map(|p| {
+                        let seg = self.walk_part(
+                            p, ctx, out_dir, script_dir, agent_dir, tracks_dir, counter, visited,
+                        )?;
+                        Ok(ChoiceOption {
+                            label: p.label.clone(),
+                            segment: seg,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Segment::Choice {
+                    prompt: prompt.clone(),
+                    options,
+                })
+            }
+
+            Node::Include { src } => {
+                self.emit_include(src, out_dir, script_dir, agent_dir, tracks_dir, visited)
+            }
+
+            Node::Loop { loops, children } => {
+                let child = self.walk(
+                    children, ctx, out_dir, script_dir, agent_dir, tracks_dir, counter, visited,
+                )?;
+                Ok(Segment::Loop {
+                    loops: *loops,
+                    child: Box::new(child),
+                })
+            }
+
+            Node::Background {
+                volume,
+                speed,
+                children,
+            } => {
+                let layer_ctx = ctx
+                    .clone()
+                    .with_vol(volume.as_deref())
+                    .with_speed(speed.as_deref())
+                    .with_forbid_pause(true);
+                let layer = self.walk(
+                    children, &layer_ctx, out_dir, script_dir, agent_dir, tracks_dir, counter,
+                    visited,
+                )?;
+                Ok(Segment::Background {
+                    volume: volume.clone(),
+                    speed: speed.clone(),
+                    layer: Box::new(layer),
+                })
+            }
+
+            Node::Overlay { duration, parts } => {
+                let part_ctx = ctx.clone().with_forbid_pause(true);
+                let seg_parts = parts
+                    .iter()
+                    .map(|p| {
+                        let seg = self.walk_part(
+                            p, &part_ctx, out_dir, script_dir, agent_dir, tracks_dir, counter,
+                            visited,
+                        )?;
+                        Ok(OverlayPartSegment {
+                            looped: p.looped,
+                            volume: p.volume.clone(),
+                            speed: p.speed.clone(),
+                            segment: seg,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Segment::Overlay {
+                    duration: *duration,
+                    parts: seg_parts,
+                })
+            }
+
+            // Voice/Speed/Volume reached here only because they contain a split.
+            // Recurse with the inherited context and splice the resulting
+            // Sequence directly into the parent (keeps background/overlay
+            // scoping local to this voice's subtree).
+            Node::Voice {
+                speaker,
+                volume,
+                speed,
+                children,
+                ..
+            } => {
+                let sub = ctx
+                    .clone()
+                    .with_speaker(speaker)
+                    .with_vol(volume.as_deref())
+                    .with_speed(speed.as_deref());
+                self.walk(
+                    children, &sub, out_dir, script_dir, agent_dir, tracks_dir, counter, visited,
+                )
+            }
+
+            Node::Speed { value, children } => {
+                let sub = ctx.clone().with_speed(Some(value.as_str()));
+                self.walk(
+                    children, &sub, out_dir, script_dir, agent_dir, tracks_dir, counter, visited,
+                )
+            }
+
+            Node::Volume { value, children } => {
+                let sub = ctx.clone().with_vol(Some(value.as_str()));
+                self.walk(
+                    children, &sub, out_dir, script_dir, agent_dir, tracks_dir, counter, visited,
+                )
+            }
+
+            // Leaves never reach here (contains_split is false for them).
+            other => bail!("emit_split reached non-split node: {:?}", other),
+        }
+    }
+
+    /// Walk one overlay/choice/random/scramble part: inherit the part's
+    /// volume/speed and recurse into its children.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_part(
+        &mut self,
+        part: &OverlayPart,
+        ctx: &WalkCtx,
+        out_dir: &Path,
+        script_dir: &Path,
+        agent_dir: &Path,
+        tracks_dir: &Path,
+        counter: &mut usize,
+        visited: &mut HashSet<PathBuf>,
+    ) -> Result<Segment> {
+        let pc = ctx
+            .clone()
+            .with_vol(part.volume.as_deref())
+            .with_speed(part.speed.as_deref());
+        self.walk(
+            &part.children,
+            &pc,
+            out_dir,
+            script_dir,
+            agent_dir,
+            tracks_dir,
+            counter,
+            visited,
+        )
+    }
+
+    /// Resolve a `<include src>` to a deduplicated `Import` segment.
+    ///
+    /// The target is rendered (or reused) under
+    /// `tracks/imports/<sha8(abs_path)>/`. Cycle protection: if the target is
+    /// already on the active recursion stack, we emit the reference without
+    /// descending — the manifest file will exist on disk by the time the
+    /// top-level render finishes writing.
+    fn emit_include(
+        &mut self,
+        src: &str,
+        out_dir: &Path,
+        script_dir: &Path,
+        agent_dir: &Path,
+        tracks_dir: &Path,
+        visited: &mut HashSet<PathBuf>,
+    ) -> Result<Segment> {
+        let joined = script_dir.join(src);
+        let included_abs = normalize_path(&joined);
+        if !included_abs.exists() {
+            bail!("Include not found: {}", included_abs.display());
+        }
+        let sha8 = sha8_of_path(&included_abs);
+        let import_dir = tracks_dir.join("imports").join(&sha8);
+        let manifest_abs = import_dir.join("manifest.json");
+
+        if !visited.contains(&included_abs) {
+            visited.insert(included_abs.clone());
+            fs::create_dir_all(&import_dir)?;
+            // Store the import's `script` field relative to agent_dir when
+            // possible (nicer for display), else as an absolute path.
+            let included_script_rel = script_relative_to(&included_abs, agent_dir);
+            let included_dir = included_abs
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf();
+            self.render_manifest_file(
+                &included_abs,
+                &included_script_rel,
+                &import_dir,
+                agent_dir,
+                tracks_dir,
+                &included_dir,
+                visited,
+            )?;
+            visited.remove(&included_abs);
+        }
+
+        let rel = relative_path(out_dir, &manifest_abs);
+        Ok(Segment::Import {
+            manifest: rel.to_string_lossy().to_string(),
+        })
+    }
+
+    /// Write a WAV named `seg-NNN.wav` to `out_dir`, incrementing `counter`.
+    /// Returns the bare filename (relative to `out_dir`).
+    fn write_seg(&self, out_dir: &Path, counter: &mut usize, samples: &[f32]) -> Result<String> {
+        let filename = format!("seg-{:03}.wav", *counter);
+        *counter += 1;
+        write_wav_file(out_dir.join(&filename), samples, self.sample_rate as i32)?;
+        Ok(filename)
+    }
 }
 
 /// Truncate a text label to `max_len` characters, appending "…" if truncated.
@@ -1125,6 +1729,63 @@ fn truncate_label(text: &str, max_len: usize) -> String {
         }
         format!("{}…", &text[..end])
     }
+}
+
+// ============================================================================
+// Manifest walker free helpers
+// ============================================================================
+
+/// True if `dir` contains at least one `.wav` file (freshness precondition).
+fn has_any_wav(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries.filter_map(|e| e.ok()).any(|e| {
+        e.path()
+            .extension()
+            .and_then(|x| x.to_str())
+            .map(|x| x.eq_ignore_ascii_case("wav"))
+            .unwrap_or(false)
+    })
+}
+
+/// Remove old `manifest.json` + `seg-*.wav` files from a manifest dir before
+/// a rebuild. Leaves any other contents (e.g. unexpected subdirs) untouched.
+fn clean_manifest_dir(dir: &Path) -> Result<()> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name == "manifest.json" || name.ends_with(".wav") {
+            let _ = fs::remove_file(&path);
+        }
+    }
+    Ok(())
+}
+
+/// RFC 3339 timestamp of a path's last-modified time (falls back to "now" if
+/// the filesystem doesn't expose mtime).
+fn mtime_rfc3339(path: &Path) -> String {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(|t| {
+            let dt: chrono::DateTime<chrono::Local> = t.into();
+            dt.to_rfc3339()
+        })
+        .unwrap_or_else(|_| chrono::Local::now().to_rfc3339())
+}
+
+/// Render `abs` as a path relative to `base` when possible (forward-slash
+/// normalised), otherwise as an absolute path. Used for the stored `script`
+/// field of (imported) manifests.
+fn script_relative_to(abs: &Path, base: &Path) -> String {
+    let raw = match abs.strip_prefix(base) {
+        Ok(rel) => rel.to_string_lossy().to_string(),
+        Err(_) => abs.to_string_lossy().to_string(),
+    };
+    raw.replace('\\', "/")
 }
 
 // ============================================================================
@@ -1251,21 +1912,48 @@ fn resolve_includes_in_node(
         }
 
         Node::Overlay { duration, parts } => {
-            let parts = parts
-                .into_iter()
-                .map(|part| OverlayPart {
-                    looped: part.looped,
-                    volume: part.volume,
-                    speed: part.speed,
-                    children: resolve_includes_inner(part.children, base_dir, visited),
-                })
-                .collect();
+            let parts = resolve_overlay_parts(parts, base_dir, visited);
             vec![Node::Overlay { duration, parts }]
+        }
+
+        Node::Random { parts } => {
+            let parts = resolve_overlay_parts(parts, base_dir, visited);
+            vec![Node::Random { parts }]
+        }
+
+        Node::Scramble { parts } => {
+            let parts = resolve_overlay_parts(parts, base_dir, visited);
+            vec![Node::Scramble { parts }]
+        }
+
+        Node::Choice { prompt, options } => {
+            let options = resolve_overlay_parts(options, base_dir, visited);
+            vec![Node::Choice { prompt, options }]
         }
 
         // Leaves with no nested children — pass through unchanged.
         Node::Text(_) | Node::Pause { .. } | Node::Sound { .. } | Node::Tone { .. } => vec![node],
     }
+}
+
+/// Resolve includes within a list of `OverlayPart`s, preserving each part's
+/// scalar attributes (`looped`, `volume`, `speed`, `label`) and recursing into
+/// its children.
+fn resolve_overlay_parts(
+    parts: Vec<OverlayPart>,
+    base_dir: &Path,
+    visited: &mut HashSet<PathBuf>,
+) -> Vec<OverlayPart> {
+    parts
+        .into_iter()
+        .map(|part| OverlayPart {
+            looped: part.looped,
+            volume: part.volume,
+            speed: part.speed,
+            label: part.label,
+            children: resolve_includes_inner(part.children, base_dir, visited),
+        })
+        .collect()
 }
 
 /// Resolve a single `<include src="...">` reference.
@@ -2471,6 +3159,15 @@ mod tests {
                     }
                 }
             }
+            Node::Random { parts }
+            | Node::Scramble { parts }
+            | Node::Choice { options: parts, .. } => {
+                for part in parts {
+                    for child in &part.children {
+                        collect_text_recursive(child, texts);
+                    }
+                }
+            }
             Node::Pause { .. } | Node::Sound { .. } | Node::Tone { .. } | Node::Include { .. } => {}
         }
     }
@@ -2496,6 +3193,11 @@ mod tests {
             | Node::Background { children, .. }
             | Node::Until { children, .. } => children.iter().any(contains_include_recursive),
             Node::Overlay { parts, .. } => parts
+                .iter()
+                .any(|p| p.children.iter().any(contains_include_recursive)),
+            Node::Random { parts }
+            | Node::Scramble { parts }
+            | Node::Choice { options: parts, .. } => parts
                 .iter()
                 .any(|p| p.children.iter().any(contains_include_recursive)),
             _ => false,

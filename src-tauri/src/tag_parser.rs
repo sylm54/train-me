@@ -2,7 +2,7 @@
 //!
 //! Parses XML-like tags into an AST that can be rendered to audio.
 //! Supports: voice, pause, sound, tone, effect, overlay, loop, background, until,
-//! speed, volume tags.
+//! speed, volume, random, scramble, choice tags.
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -76,6 +76,21 @@ pub enum Node {
     /// Repeat inner content N times.
     Loop { loops: u32, children: Vec<Node> },
 
+    /// Render exactly one randomly-selected part (chosen at render time in the
+    /// flat path; per-playback in the manifest path).
+    Random { parts: Vec<OverlayPart> },
+
+    /// Render all parts in a randomly-shuffled order (render time in flat path).
+    Scramble { parts: Vec<OverlayPart> },
+
+    /// Interactive branch. Flat-path fallback renders the first option; the
+    /// manifest path (later stage) makes it a real per-playback choice.
+    Choice {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+        options: Vec<OverlayPart>,
+    },
+
     /// Background audio layer (plays concurrently with following foreground).
     Background {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -114,6 +129,8 @@ pub struct OverlayPart {
     pub volume: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speed: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     pub children: Vec<Node>,
 }
 
@@ -200,6 +217,9 @@ impl TagParser {
             "loop" => self.parse_loop_tag(),
             "background" => self.parse_background_tag(),
             "until" => self.parse_until_tag(),
+            "random" => self.parse_random_tag(),
+            "scramble" => self.parse_scramble_tag(),
+            "choice" => self.parse_choice_tag(),
             other => bail!("Unknown tag: <{}>", other),
         }
     }
@@ -365,26 +385,35 @@ impl TagParser {
         let duration = attrs.get("duration").and_then(|v| v.parse::<f32>().ok());
 
         self.expect_str(">")?;
+        let parts = self.parse_parts_container("overlay")?;
+        Ok(Node::Overlay { duration, parts })
+    }
+
+    /// Collect `<part>` children (wrapping stray tags/text in implicit parts)
+    /// until the closing tag. Assumes the opening tag's `>` has already been
+    /// consumed and any container-level attributes already read.
+    fn parse_parts_container(&mut self, closing_tag: &str) -> Result<Vec<OverlayPart>> {
         let mut parts = Vec::new();
 
         while self.pos < self.input.len() {
             self.skip_ws();
-            if self.peek_str("</overlay>") {
+            if self.peek_str(&format!("</{}>", closing_tag)) {
                 break;
             }
             if self.peek_str("<part") {
                 parts.push(self.parse_overlay_part()?);
             } else if self.peek_str("<") {
-                // Non-part tags inside overlay are wrapped in an implicit part
+                // Non-part tags are wrapped in an implicit part
                 let node = self.parse_tag()?;
                 parts.push(OverlayPart {
                     looped: None,
                     volume: None,
                     speed: None,
+                    label: None,
                     children: vec![node],
                 });
             } else {
-                // Text inside overlay is wrapped in an implicit part
+                // Text is wrapped in an implicit part
                 let node = self.parse_text()?;
                 if let Node::Text(t) = &node {
                     if t.trim().is_empty() {
@@ -395,13 +424,36 @@ impl TagParser {
                     looped: None,
                     volume: None,
                     speed: None,
+                    label: None,
                     children: vec![node],
                 });
             }
         }
 
-        self.expect_closing("overlay")?;
-        Ok(Node::Overlay { duration, parts })
+        self.expect_closing(closing_tag)?;
+        Ok(parts)
+    }
+
+    fn parse_random_tag(&mut self) -> Result<Node> {
+        let _attrs = self.read_attributes();
+        self.expect_str(">")?;
+        let parts = self.parse_parts_container("random")?;
+        Ok(Node::Random { parts })
+    }
+
+    fn parse_scramble_tag(&mut self) -> Result<Node> {
+        let _attrs = self.read_attributes();
+        self.expect_str(">")?;
+        let parts = self.parse_parts_container("scramble")?;
+        Ok(Node::Scramble { parts })
+    }
+
+    fn parse_choice_tag(&mut self) -> Result<Node> {
+        let attrs = self.read_attributes();
+        let prompt = attrs.get("prompt").cloned();
+        self.expect_str(">")?;
+        let options = self.parse_parts_container("choice")?;
+        Ok(Node::Choice { prompt, options })
     }
 
     fn parse_overlay_part(&mut self) -> Result<OverlayPart> {
@@ -410,6 +462,7 @@ impl TagParser {
         let looped = attrs.get("looped").and_then(|v| v.parse::<bool>().ok());
         let volume = attrs.get("volume").cloned();
         let speed = attrs.get("speed").cloned();
+        let label = attrs.get("label").cloned();
 
         self.expect_str(">")?;
         let children = self.parse_nodes()?;
@@ -419,6 +472,7 @@ impl TagParser {
             looped,
             volume,
             speed,
+            label,
             children: filter_empty_text(children),
         })
     }
@@ -658,8 +712,8 @@ fn filter_empty_text(nodes: Vec<Node>) -> Vec<Node> {
         .collect()
 }
 
-/// Extract all plain text from a node tree (useful for getting the text to synthesize).
-#[cfg(test)]
+/// Extract all plain text from a node tree (useful for getting the text to
+/// synthesize, or the inner label of an `<until>` segment).
 pub fn extract_text(nodes: &[Node]) -> String {
     let mut texts = Vec::new();
     for node in nodes {
@@ -668,7 +722,6 @@ pub fn extract_text(nodes: &[Node]) -> String {
     texts.join(" ")
 }
 
-#[cfg(test)]
 fn extract_text_recursive(node: &Node, texts: &mut Vec<String>) {
     match node {
         Node::Text(t) => {
@@ -688,6 +741,13 @@ fn extract_text_recursive(node: &Node, texts: &mut Vec<String>) {
             }
         }
         Node::Overlay { parts, .. } => {
+            for part in parts {
+                for child in &part.children {
+                    extract_text_recursive(child, texts);
+                }
+            }
+        }
+        Node::Random { parts } | Node::Scramble { parts } | Node::Choice { options: parts, .. } => {
             for part in parts {
                 for child in &part.children {
                     extract_text_recursive(child, texts);
@@ -1022,5 +1082,82 @@ mod tests {
             "Non-self-closing <include> should error; got {:?}",
             result,
         );
+    }
+
+    #[test]
+    fn test_parse_random() {
+        let input = r#"<random>
+  <part>You feel a warm glow.</part>
+  <part>A cool breeze sweeps over you.</part>
+</random>"#;
+        let nodes = parse(input).unwrap();
+        match &nodes[0] {
+            Node::Random { parts } => {
+                assert_eq!(parts.len(), 2);
+                assert_eq!(parts[0].children.len(), 1);
+                assert_eq!(parts[1].children.len(), 1);
+                assert!(parts.iter().all(|p| p.label.is_none()));
+            }
+            _ => panic!("Expected Random node"),
+        }
+    }
+
+    #[test]
+    fn test_parse_scramble() {
+        let input = r#"<scramble>
+  <part>Inhale deeply.</part>
+  <part>Hold for a moment.</part>
+  <part>Exhale slowly.</part>
+</scramble>"#;
+        let nodes = parse(input).unwrap();
+        match &nodes[0] {
+            Node::Scramble { parts } => {
+                assert_eq!(parts.len(), 3);
+                for part in parts {
+                    assert_eq!(part.children.len(), 1);
+                }
+            }
+            _ => panic!("Expected Scramble node"),
+        }
+    }
+
+    #[test]
+    fn test_parse_choice() {
+        let input = r#"<choice prompt="Which path?">
+  <part label="Left">You drift to the left, sinking deeper.</part>
+  <part label="Right">You float to the right, letting go.</part>
+</choice>"#;
+        let nodes = parse(input).unwrap();
+        match &nodes[0] {
+            Node::Choice { prompt, options } => {
+                assert_eq!(prompt.as_deref(), Some("Which path?"));
+                assert_eq!(options.len(), 2);
+                assert_eq!(options[0].label.as_deref(), Some("Left"));
+                assert_eq!(options[1].label.as_deref(), Some("Right"));
+                assert_eq!(options[0].children.len(), 1);
+                assert_eq!(options[1].children.len(), 1);
+            }
+            _ => panic!("Expected Choice node"),
+        }
+    }
+
+    #[test]
+    fn test_parse_random_implicit_part() {
+        let input = r#"<random>
+  Bare text here
+  <part>Explicit part</part>
+  <sound type="beep"/>
+</random>"#;
+        let nodes = parse(input).unwrap();
+        match &nodes[0] {
+            Node::Random { parts } => {
+                // Implicit text part, explicit part, implicit tag-wrapped part
+                assert_eq!(parts.len(), 3);
+                assert_eq!(parts[0].children.len(), 1);
+                assert_eq!(parts[1].children.len(), 1);
+                assert!(matches!(parts[2].children[0], Node::Sound { .. }));
+            }
+            _ => panic!("Expected Random node"),
+        }
     }
 }

@@ -13,6 +13,7 @@ mod chastity;
 mod expression;
 mod helper;
 mod inventory;
+mod manifest;
 mod model_downloader;
 mod package_import;
 mod sounds;
@@ -78,6 +79,32 @@ pub struct FileEntry {
     pub name: String,
     pub is_dir: bool,
     pub size: u64,
+}
+
+/// Result of rendering (or reusing) a script manifest.
+/// Returned by `render_manifest` and `list_manifests`.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct RenderedManifest {
+    /// Sanitised script path (the on-disk manifest dir name under `tracks/`).
+    pub id: String,
+    /// Absolute path to `manifest.json`.
+    pub manifest_path: String,
+    /// Script path relative to `agent_dir` (forward-slash normalised).
+    pub script: String,
+    /// Best-effort nominal duration in seconds.
+    pub duration: f32,
+    /// RFC 3339 creation timestamp (manifest.json mtime).
+    pub created: String,
+}
+
+/// Status of a script's manifest, returned by `manifest_status`.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ManifestStatus {
+    pub rendered: bool,
+    pub stale: bool,
+    pub duration: Option<f32>,
+    pub created: Option<String>,
+    pub manifest_path: Option<String>,
 }
 
 // ============================================================================
@@ -536,6 +563,148 @@ fn write_script(
 }
 
 // ============================================================================
+// Manifest commands (recursive segment manifest backend)
+// ============================================================================
+
+/// Render (or reuse) a recursive segment manifest for `script_path` (relative
+/// to `agent_dir`). Runs on a blocking thread; idempotent via freshness hash.
+#[tauri::command]
+async fn render_manifest(
+    script_path: String,
+    state: State<'_, AppState>,
+    _app: tauri::AppHandle,
+) -> Result<RenderedManifest, String> {
+    let agent_dir = state.agent_dir.clone();
+    let tracks_dir = state.tracks_dir.clone();
+    let renderer_arc = state.renderer.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut guard = renderer_arc.lock();
+        let renderer = guard
+            .as_mut()
+            .ok_or_else(|| "Model not loaded. Please load the model first.".to_string())?;
+        renderer
+            .render_manifest(&script_path, &agent_dir, &tracks_dir)
+            .map_err(|e| format!("Render error: {}", e))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Report whether a manifest exists for `script_path` and whether it is stale.
+#[tauri::command]
+fn manifest_status(
+    script_path: String,
+    state: State<'_, AppState>,
+) -> Result<ManifestStatus, String> {
+    let manifest_path = state
+        .tracks_dir
+        .join(manifest::manifest_id(&script_path))
+        .join("manifest.json");
+
+    if !manifest_path.exists() {
+        return Ok(ManifestStatus {
+            rendered: false,
+            stale: false,
+            duration: None,
+            created: None,
+            manifest_path: None,
+        });
+    }
+
+    let existing_str = fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?;
+    let existing: manifest::Manifest =
+        serde_json::from_str(&existing_str).map_err(|e| e.to_string())?;
+
+    let source_abs = state.agent_dir.join(&script_path);
+    let stale = match fs::read(&source_abs) {
+        Ok(bytes) => existing.hash != manifest::hash_bytes(&bytes),
+        // Source file missing — surface as stale so the UI re-renders.
+        Err(_) => true,
+    };
+
+    Ok(ManifestStatus {
+        rendered: true,
+        stale,
+        duration: Some(manifest::nominal_duration(&existing.root)),
+        created: Some(mtime_rfc3339_pub(&manifest_path)),
+        manifest_path: Some(manifest_path.to_string_lossy().to_string()),
+    })
+}
+
+/// Read a manifest.json and return it as JSON with every relative `file` /
+/// `manifest` path resolved to an absolute path (relative to the manifest's
+/// own dir). Imports are resolved to an absolute path but NOT recursed — the
+/// frontend loads them lazily by calling `read_manifest` again.
+#[tauri::command]
+fn read_manifest(manifest_path: String) -> Result<serde_json::Value, String> {
+    let path = PathBuf::from(&manifest_path);
+    let base_dir = path
+        .parent()
+        .ok_or_else(|| "invalid manifest path".to_string())?
+        .to_path_buf();
+    let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let mut value: serde_json::Value = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+    manifest::resolve_paths_recursive(&mut value, &base_dir);
+    Ok(value)
+}
+
+/// List every top-level manifest under `tracks/` (one level deep, excluding
+/// the shared `imports/` subdir).
+#[tauri::command]
+fn list_manifests(state: State<'_, AppState>) -> Result<Vec<RenderedManifest>, String> {
+    let mut out = Vec::new();
+    if !state.tracks_dir.exists() {
+        return Ok(out);
+    }
+    for entry in fs::read_dir(&state.tracks_dir)
+        .map_err(|e| e.to_string())?
+        .flatten()
+    {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == "imports" {
+            continue;
+        }
+        let mp = path.join("manifest.json");
+        if !mp.exists() {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(&mp) else {
+            continue;
+        };
+        let Ok(m): std::result::Result<manifest::Manifest, _> = serde_json::from_str(&content)
+        else {
+            continue;
+        };
+        out.push(RenderedManifest {
+            id: name,
+            manifest_path: mp.to_string_lossy().to_string(),
+            script: m.script,
+            duration: manifest::nominal_duration(&m.root),
+            created: mtime_rfc3339_pub(&mp),
+        });
+    }
+    // Newest first.
+    out.sort_by(|a, b| b.created.cmp(&a.created));
+    Ok(out)
+}
+
+/// RFC 3339 mtime of a path ("now" fallback). Thin pub(crate) wrapper so
+/// command functions in lib.rs can reuse the helper living in audio_renderer.
+fn mtime_rfc3339_pub(path: &std::path::Path) -> String {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(|t| {
+            let dt: chrono::DateTime<chrono::Local> = t.into();
+            dt.to_rfc3339()
+        })
+        .unwrap_or_else(|_| chrono::Local::now().to_rfc3339())
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
@@ -661,6 +830,11 @@ pub fn run() {
             list_tracks,
             delete_track,
             get_sound_names,
+            // Recursive segment manifest commands
+            render_manifest,
+            manifest_status,
+            read_manifest,
+            list_manifests,
             // Agent / bash / file commands
             bash::exec_bash,
             bash::read_data_file,

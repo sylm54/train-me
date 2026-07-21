@@ -96,6 +96,9 @@ tokio = { version = "1", features = ["full"] }
 # ZIP archive support for package imports
 zip = "2"
 
+# Content hashing for manifest staleness checks
+sha2 = "0.10"
+
 # Temp directory for extracting imported packages
 tempfile = "3"
 tauri-plugin-notification = "2.3.3"
