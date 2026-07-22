@@ -9,20 +9,33 @@ import {
   AlertCircle,
   AlertTriangle,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
+  Copy,
   Eye,
   EyeOff,
+  FileCode2,
+  FileText,
+  Folder,
+  FolderOpen,
   Loader2,
   PackageOpen,
   RotateCcw,
   Save,
 } from "lucide-react";
 import { useSettings, DEFAULT_MODELS } from "@/lib/settings";
-import type { AgentName, ProviderName, ReasoningEffort } from "@/lib/types";
+import type {
+  AgentName,
+  FileEntry,
+  ProviderName,
+  ReasoningEffort,
+} from "@/lib/types";
 import {
   pickAndImportPackage,
   type ImportResult,
   type PackageKind,
 } from "@/lib/packages";
+import { loadPrompt } from "@/lib/prompts";
 
 interface ModelStatus {
   downloaded: boolean;
@@ -69,6 +82,15 @@ const REASONING_OPTIONS: {
   { value: "none", label: "None" },
 ];
 
+/** System-prompt files that back each agent, shown in the debug section. */
+const AGENT_PROMPTS: { agent: AgentName; file: string; label: string }[] = [
+  { agent: "main", file: "main_agent.md", label: "Main agent" },
+  { agent: "planner", file: "hypno_planner.md", label: "Hypno planner" },
+  { agent: "writer", file: "hypno_writer.md", label: "Hypno writer" },
+];
+
+type PromptMode = "rendered" | "raw";
+
 export function SettingsView() {
   const { settings, setApiKey, setAgent, resetOnboarding } = useSettings();
   const [reveal, setReveal] = useState<Record<ProviderName, boolean>>({
@@ -106,6 +128,14 @@ export function SettingsView() {
   const [resetBusy, setResetBusy] = useState(false);
   const [resetError, setResetError] = useState<string | null>(null);
   const [resetDone, setResetDone] = useState(false);
+
+  // Debug: system-prompt inspector
+  const [debugOpen, setDebugOpen] = useState(false);
+  const [promptContent, setPromptContent] = useState<
+    Record<string, { rendered: string; raw: string }>
+  >({});
+  const [promptBusy, setPromptBusy] = useState(false);
+  const [promptError, setPromptError] = useState<string | null>(null);
 
   useEffect(() => {
     invoke<ModelStatus>("get_model_status")
@@ -181,6 +211,37 @@ export function SettingsView() {
       setResetError(String(e));
     } finally {
       setResetBusy(false);
+    }
+  };
+
+  // Load every agent prompt (raw source + rendered/expanded form).
+  const loadPrompts = async () => {
+    setPromptBusy(true);
+    setPromptError(null);
+    const next: Record<string, { rendered: string; raw: string }> = {};
+    try {
+      await Promise.all(
+        AGENT_PROMPTS.map(async ({ file }) => {
+          const [rendered, raw] = await Promise.all([
+            loadPrompt(file),
+            invoke<string>("read_prompt", { path: file }).catch(() => ""),
+          ]);
+          next[file] = { rendered, raw };
+        }),
+      );
+      setPromptContent(next);
+    } catch (e) {
+      setPromptError(String(e));
+    } finally {
+      setPromptBusy(false);
+    }
+  };
+
+  const toggleDebug = async () => {
+    const next = !debugOpen;
+    setDebugOpen(next);
+    if (next && Object.keys(promptContent).length === 0) {
+      await loadPrompts();
     }
   };
 
@@ -383,6 +444,66 @@ export function SettingsView() {
           </div>
         </section>
 
+        {/* ── Debug: system-prompt inspector ───────────────────── */}
+        <section className="space-y-4">
+          <button
+            onClick={toggleDebug}
+            className="w-full flex items-center gap-2 text-sm uppercase tracking-wider text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)]"
+          >
+            {debugOpen ? (
+              <ChevronDown size={16} />
+            ) : (
+              <ChevronRight size={16} />
+            )}
+            Debug
+          </button>
+
+          {debugOpen && (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between">
+                <p className="text-xs text-[var(--color-muted-foreground)]">
+                  System prompts sent to each agent. Rendered shows the
+                  expanded prompt (after embeds/includes); Raw shows the source
+                  file.
+                </p>
+                <button
+                  onClick={loadPrompts}
+                  disabled={promptBusy}
+                  className="shrink-0 px-2.5 py-1.5 text-xs rounded-md border border-[var(--color-border)] hover:bg-[var(--color-pink-50)] disabled:opacity-50 inline-flex items-center gap-1.5"
+                >
+                  {promptBusy && <Loader2 size={12} className="animate-spin" />}
+                  Refresh
+                </button>
+              </div>
+
+              {promptError && (
+                <p className="text-xs text-[var(--color-danger)] flex items-start gap-1.5">
+                  <AlertCircle size={14} className="mt-0.5 shrink-0" />
+                  <span className="break-words">{promptError}</span>
+                </p>
+              )}
+
+              {AGENT_PROMPTS.map(({ file, label }) => (
+                <PromptDebugCard
+                  key={file}
+                  file={file}
+                  label={label}
+                  data={promptContent[file]}
+                  busy={promptBusy}
+                />
+              ))}
+
+              {/* ── Agent files ── */}
+              <div className="pt-2 border-t border-[var(--color-border)]">
+                <h3 className="text-xs font-semibold uppercase tracking-wider text-[var(--color-muted-foreground)] mb-2">
+                  Agent files
+                </h3>
+                <AgentFileTree />
+              </div>
+            </div>
+          )}
+        </section>
+
         {/* ── Danger zone ─────────────────────────────────────────── */}
         <section className="space-y-4">
           <h2 className="text-sm uppercase tracking-wider text-[var(--color-danger)]">
@@ -542,6 +663,304 @@ function PackageCard({
             )}
           </span>
         </p>
+      )}
+    </div>
+  );
+}
+
+/** A card that inspects one agent's system prompt (rendered + raw). */
+function PromptDebugCard({
+  file,
+  label,
+  data,
+  busy,
+}: {
+  file: string;
+  label: string;
+  data?: { rendered: string; raw: string };
+  busy: boolean;
+}) {
+  const [mode, setMode] = useState<PromptMode>("rendered");
+  const [open, setOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  const content = data ? (mode === "rendered" ? data.rendered : data.raw) : "";
+  const missing = data != null && !data.raw;
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(content);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  return (
+    <div className="border border-[var(--color-border)] rounded-lg p-4 bg-[var(--color-surface)] space-y-3">
+      <div className="flex items-center justify-between gap-3">
+        <button
+          onClick={() => setOpen((o) => !o)}
+          className="flex items-center gap-2 text-sm font-medium hover:text-[var(--color-pink-500)]"
+        >
+          {open ? (
+            <ChevronDown size={14} />
+          ) : (
+            <ChevronRight size={14} />
+          )}
+          <FileCode2 size={14} className="text-[var(--color-muted-foreground)]" />
+          {label}
+        </button>
+        <code className="font-mono text-[10px] text-[var(--color-muted-foreground)] truncate max-w-[50%]">
+          prompts/{file}
+        </code>
+      </div>
+
+      {open && (
+        <>
+          {busy && !data ? (
+            <div className="flex items-center gap-2 text-xs text-[var(--color-muted-foreground)]">
+              <Loader2 size={12} className="animate-spin" /> Loading…
+            </div>
+          ) : missing ? (
+            <p className="text-xs text-[var(--color-warning)] flex items-center gap-1.5">
+              <AlertCircle size={14} className="shrink-0" />
+              <code className="font-mono">prompts/{file}</code> not found —
+              import a framework to populate it.
+            </p>
+          ) : (
+            <>
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex rounded-md border border-[var(--color-border)] overflow-hidden text-xs">
+                  {(["rendered", "raw"] as PromptMode[]).map((m) => (
+                    <button
+                      key={m}
+                      onClick={() => setMode(m)}
+                      className={`px-2.5 py-1 capitalize ${mode === m ? "bg-[var(--color-pink-400)] text-[var(--color-primary-foreground)]" : "hover:bg-[var(--color-pink-50)]"}`}
+                    >
+                      {m}
+                    </button>
+                  ))}
+                </div>
+                <button
+                  onClick={copy}
+                  className="px-2 py-1 text-xs rounded-md border border-[var(--color-border)] hover:bg-[var(--color-pink-50)] inline-flex items-center gap-1.5"
+                >
+                  {copied ? (
+                    <CheckCircle2 size={12} className="text-[var(--color-success)]" />
+                  ) : (
+                    <Copy size={12} />
+                  )}
+                  {copied ? "Copied" : "Copy"}
+                </button>
+              </div>
+              <pre className="max-h-80 overflow-auto text-xs font-mono whitespace-pre-wrap break-words bg-[var(--color-pink-50)] border border-[var(--color-border)] rounded-md p-3 text-[var(--color-foreground)]">
+                {content || "(empty)"}
+              </pre>
+              <p className="text-[10px] text-[var(--color-muted-foreground)] text-right">
+                {content.length.toLocaleString()} characters
+              </p>
+            </>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+/** Format a byte count as a compact human-readable string. */
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * Read-only tree of the agent's writable environment
+ * (`<app_data>/agent_data/`). Lazily loads each directory on expand.
+ */
+function AgentFileTree() {
+  const [entries, setEntries] = useState<FileEntry[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const e = await invoke<FileEntry[]>("list_data_files", { path: "" });
+      setEntries(e);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  return (
+    <div className="border border-[var(--color-border)] rounded-lg p-3 bg-[var(--color-surface)] space-y-2">
+      <div className="flex items-center justify-between">
+        <code className="font-mono text-[10px] text-[var(--color-muted-foreground)]">
+          agent_data/
+        </code>
+        <button
+          onClick={load}
+          disabled={loading}
+          className="shrink-0 px-2 py-1 text-xs rounded-md border border-[var(--color-border)] hover:bg-[var(--color-pink-50)] disabled:opacity-50 inline-flex items-center gap-1.5"
+        >
+          {loading && <Loader2 size={12} className="animate-spin" />}
+          Refresh
+        </button>
+      </div>
+
+      {error && (
+        <p className="text-xs text-[var(--color-danger)] flex items-start gap-1.5">
+          <AlertCircle size={14} className="mt-0.5 shrink-0" />
+          <span className="break-words">{error}</span>
+        </p>
+      )}
+
+      {loading && entries === null ? (
+        <div className="flex items-center gap-2 text-xs text-[var(--color-muted-foreground)]">
+          <Loader2 size={12} className="animate-spin" /> Loading…
+        </div>
+      ) : entries && entries.length === 0 ? (
+        <p className="text-xs text-[var(--color-muted-foreground)]">
+          Empty — no files in the agent environment yet.
+        </p>
+      ) : (
+        <div className="space-y-0.5">
+          {entries?.map((e) => (
+            <FileTreeNode
+              key={e.path}
+              path={e.path}
+              name={e.name}
+              isDir={e.isDir}
+              size={e.size}
+              depth={0}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** A single node in the agent file tree (directory or file). */
+function FileTreeNode({
+  path,
+  name,
+  isDir,
+  size,
+  depth,
+}: {
+  path: string;
+  name: string;
+  isDir: boolean;
+  size: number;
+  depth: number;
+}) {
+  const [open, setOpen] = useState(false);
+  const [children, setChildren] = useState<FileEntry[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const toggle = async () => {
+    if (!isDir) return;
+    const next = !open;
+    setOpen(next);
+    if (next && children === null) {
+      setLoading(true);
+      setError(null);
+      try {
+        const entries = await invoke<FileEntry[]>("list_data_files", {
+          path,
+        });
+        setChildren(entries);
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        setLoading(false);
+      }
+    }
+  };
+
+  return (
+    <div>
+      <div
+        onClick={isDir ? toggle : undefined}
+        className={`flex items-center gap-1.5 py-0.5 pr-2 rounded ${isDir ? "cursor-pointer hover:bg-[var(--color-pink-50)]" : ""}`}
+        style={{ paddingLeft: depth * 14 + 4 }}
+      >
+        {isDir ? (
+          <>
+            {open ? (
+              <ChevronDown size={12} className="shrink-0 text-[var(--color-muted-foreground)]" />
+            ) : (
+              <ChevronRight size={12} className="shrink-0 text-[var(--color-muted-foreground)]" />
+            )}
+            {open ? (
+              <FolderOpen size={13} className="shrink-0 text-[var(--color-muted-foreground)]" />
+            ) : (
+              <Folder size={13} className="shrink-0 text-[var(--color-muted-foreground)]" />
+            )}
+          </>
+        ) : (
+          <>
+            <span className="w-3 shrink-0" />
+            <FileText size={13} className="shrink-0 text-[var(--color-muted-foreground)]" />
+          </>
+        )}
+        <span className="text-xs truncate">{name}</span>
+        {!isDir && (
+          <span className="text-[10px] text-[var(--color-muted-foreground)] ml-auto pl-2 shrink-0">
+            {formatSize(size)}
+          </span>
+        )}
+      </div>
+
+      {isDir && open && (
+        <>
+          {loading && children === null && (
+            <div
+              className="flex items-center gap-2 text-[10px] text-[var(--color-muted-foreground)] py-0.5"
+              style={{ paddingLeft: (depth + 1) * 14 + 4 }}
+            >
+              <Loader2 size={10} className="animate-spin" /> Loading…
+            </div>
+          )}
+          {error && (
+            <p
+              className="text-[10px] text-[var(--color-danger)] py-0.5"
+              style={{ paddingLeft: (depth + 1) * 14 + 4 }}
+            >
+              {error}
+            </p>
+          )}
+          {children?.map((c) => (
+            <FileTreeNode
+              key={c.path}
+              path={c.path}
+              name={c.name}
+              isDir={c.isDir}
+              size={c.size}
+              depth={depth + 1}
+            />
+          ))}
+          {children && children.length === 0 && !loading && (
+            <p
+              className="text-[10px] text-[var(--color-muted-foreground)] py-0.5"
+              style={{ paddingLeft: (depth + 1) * 14 + 4 }}
+            >
+              empty
+            </p>
+          )}
+        </>
       )}
     </div>
   );

@@ -193,7 +193,17 @@ export function ConditioningView() {
             const raw = await invoke<string>("read_data_file", {
               path: jsonPath,
             });
+            if (!raw) throw new Error("empty file");
             meta = JSON.parse(raw) as ConditioningMeta;
+            if (!meta.title || !meta.description || !meta.script_path) {
+              throw new Error("missing required fields");
+            }
+            if (!Array.isArray(meta.tags)) {
+              throw new Error("tags must be an array");
+            }
+            if (!meta.tags.every((t) => typeof t === "string")) {
+              throw new Error("tags must be an array of strings");
+            }
           } catch (e) {
             metaError = tauriErrorToString(e);
           }
