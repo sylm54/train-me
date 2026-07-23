@@ -1,10 +1,10 @@
 /**
  * Activity view: list / filter / inspect activity log entries.
  *
- * The log lives in `<app_data>/state/activity.db` (outside the agent's
- * writable area). Entries are appended automatically from the UI (lock,
+ * The log lives in `<app_data>/agent_data/activity.db` (inside the agent's
+ * sandbox). Entries are appended automatically from the UI (lock,
  * countdown, inventory CRUD, journal save, conditioning render, etc.);
- * the agent's bash builtin is read-only.
+ * the agent may read them via the `sqlite` builtin.
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";

@@ -789,7 +789,8 @@ function AgentFileTree() {
     setLoading(true);
     setError(null);
     try {
-      const e = await invoke<FileEntry[]>("list_data_files", { path: "" });
+      const e = await invoke<FileEntry[]>("list_data_files", { path: "." });
+      console.log("agent_data entries:", e);
       setEntries(e);
     } catch (e) {
       setError(String(e));
@@ -840,7 +841,7 @@ function AgentFileTree() {
               key={e.path}
               path={e.path}
               name={e.name}
-              isDir={e.isDir}
+              isDir={e.is_dir}
               size={e.size}
               depth={0}
             />
@@ -947,7 +948,7 @@ function FileTreeNode({
               key={c.path}
               path={c.path}
               name={c.name}
-              isDir={c.isDir}
+              isDir={c.is_dir}
               size={c.size}
               depth={depth + 1}
             />

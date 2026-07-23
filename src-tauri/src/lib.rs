@@ -392,47 +392,32 @@ async fn reset_app_data(state: State<'_, AppState>) -> Result<ResetReport, Strin
     chastity::ChastityState::default().save(&state.state_dir.join("chastity.json"))?;
     report.chastity = true;
 
-    // 4. Inventory — route through the bash sandbox so Turso (the
-    //    sole runtime engine for `inventory.db`) performs the wipe.
-    let res = state
-        .bash
-        .exec("sqlite inventory.db \"DELETE FROM items; DELETE FROM wishlist;\"")
-        .await?;
-    if res.exit_code != 0 {
-        let msg = res.stderr.trim();
-        return Err(if msg.is_empty() {
-            format!("inventory reset exited {}", res.exit_code)
-        } else {
-            msg.to_string()
-        });
+    // 4. Inventory — wipe via rusqlite. The DB is at state_dir/inventory.db.
+    {
+        let state_dir = state.state_dir.clone();
+        rusqlite::Connection::open(state_dir.join("inventory.db"))
+            .map_err(|e| e.to_string())?
+            .execute_batch("DELETE FROM items; DELETE FROM wishlist;")
+            .map_err(|e| e.to_string())?;
     }
     report.inventory = true;
 
     // 5. Agent feature data — wipe the writable scratch space, skipping
-    //    `activity.db*` and `inventory.db*` (the sandbox's Turso engine
-    //    owns those at runtime; we reset them through the sandbox in
-    //    steps 4 and 6 instead).
+    //    `activity.db*` (reset in step 6). inventory.db lives in state_dir,
+    //    not agent_dir, so it's not affected by this wipe.
     wipe_agent_data(&state.agent_dir)?;
     bash::ensure_agent_dir(&state.data_dir).map_err(|e| e.to_string())?;
     report.agent_data = true;
 
-    // 6. Activity log — route through the bash sandbox so Turso (the
-    //    sole runtime engine for `activity.db`) performs the wipe. We only
-    //    clear the rows: Turso refuses direct writes to its internal
-    //    `sqlite_sequence` table, so the autoincrement counter is left
-    //    as-is (purely cosmetic — ids simply continue from where they
-    //    left off rather than restarting at 1).
-    let res = state
-        .bash
-        .exec("sqlite activity.db \"DELETE FROM activity;\"")
-        .await?;
-    if res.exit_code != 0 {
-        let msg = res.stderr.trim();
-        return Err(if msg.is_empty() {
-            format!("activity reset exited {}", res.exit_code)
-        } else {
-            msg.to_string()
-        });
+    // 6. Activity log — wipe via rusqlite. We only clear the rows; the
+    //    autoincrement counter is left as-is (cosmetic — ids continue
+    //    from where they left off rather than restarting at 1).
+    {
+        let agent_dir = state.agent_dir.clone();
+        rusqlite::Connection::open(agent_dir.join("activity.db"))
+            .map_err(|e| e.to_string())?
+            .execute_batch("DELETE FROM activity;")
+            .map_err(|e| e.to_string())?;
     }
     report.activity = true;
 
@@ -463,8 +448,8 @@ fn wipe_dir_contents(dir: &std::path::Path) -> Result<(), String> {
 
 /// Wipe the agent's writable scratch space (`agent_data/`), skipping
 /// `activity.db` and its journal sidecars. Those are reset separately via
-/// the bash sandbox (see [`reset_app_data`]) because Turso holds them open
-/// at runtime.
+/// rusqlite in [`reset_app_data`]. (inventory.db lives in `state_dir/`,
+/// not `agent_dir/`, so it's not affected by this wipe.)
 fn wipe_agent_data(agent_dir: &std::path::Path) -> Result<(), String> {
     if !agent_dir.exists() {
         return Ok(());
@@ -473,13 +458,9 @@ fn wipe_agent_data(agent_dir: &std::path::Path) -> Result<(), String> {
         let entry = entry.map_err(|e| e.to_string())?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        // activity.db and inventory.db (+ any sidecars) are owned by the
-        // sandbox's Turso engine at runtime; reset them via the sandbox
-        // instead.
+        // activity.db (+ sidecars) is reset via rusqlite in reset_app_data.
         if name_str == "activity.db"
             || name_str.starts_with("activity.db-")
-            || name_str == "inventory.db"
-            || name_str.starts_with("inventory.db-")
         {
             continue;
         }
@@ -787,16 +768,18 @@ pub fn run() {
             // Ensure agent_data/ exists with conventional subdirs.
             bash::ensure_agent_dir(&data_dir).ok();
 
-            // Bootstrap the SQLite DB schemas. Both the activity DB and
-            // the inventory DB live inside the agent sandbox
-            // (`agent_dir/*.db`) and are accessed solely through the
-            // embedded Turso `sqlite` builtin (by both the agent and the
-            // UI commands), so neither has a persistent connection here —
-            // we only bootstrap the schema once with a transient
-            // connection that is closed before the sandbox reads the file.
+            // Bootstrap the SQLite DB schemas.
+            //
+            // activity.db lives inside the agent sandbox (agent_dir/) so
+            // the agent can query it via the embedded `sqlite` builtin.
+            // The UI reads/writes it via rusqlite directly.
+            //
+            // inventory.db lives outside the sandbox (state_dir/) and is
+            // accessed only via rusqlite — the UI commands and the
+            // `inventory` bashkit builtin both use transient connections.
             activity_db::ensure_schema(&agent_dir.join("activity.db"))
                 .expect("failed to init activity.db schema");
-            inventory::ensure_schema(&agent_dir.join("inventory.db"))
+            inventory::ensure_schema(&state_dir.join("inventory.db"))
                 .expect("failed to init inventory.db schema");
 
             log::info!("Data dir: {:?}", data_dir);

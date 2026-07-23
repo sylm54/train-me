@@ -178,7 +178,7 @@ export function ConditioningView() {
       });
 
       const jsonEntries = entries.filter(
-        (e) => !e.isDir && e.name.toLowerCase().endsWith(".json"),
+        (e) => !e.is_dir && e.name.toLowerCase().endsWith(".json"),
       );
 
       // Read metadata + manifest status in parallel (both per-script).
