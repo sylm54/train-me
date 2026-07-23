@@ -1,0 +1,42 @@
+{
+  "title": "Voice Training",
+  "defaultTrackers": [
+    { "id": "pitch", "config": { "minHz": 165, "maxHz": 220, "targetHz": 185 } }
+  ],
+  "lessons": {
+    "pitch": {
+      "title": "Pitch Control & Elevation",
+      "trackers": [
+        {
+          "id": "pitch",
+          "config": { "minHz": 165, "maxHz": 220, "targetHz": 185 },
+          "displayText": "Keep your speaking pitch inside the highlighted band."
+        },
+        { "id": "intonation", "displayText": "Let your pitch move — avoid a monotone." }
+      ]
+    },
+    "resonance": {
+      "title": "Resonance & Brightness",
+      "trackers": [
+        { "id": "resonance", "config": { "targetCentroid": 1500 }, "displayText": "Aim for a brighter, more forward tone (higher centroid)." },
+        { "id": "genderspace", "displayText": "Drift toward the top-right (bright + high) quadrant." }
+      ]
+    },
+    "weight": {
+      "title": "Vocal Weight & Lightness",
+      "trackers": [
+        { "id": "weight", "config": { "targetDb": 18 }, "displayText": "Phonate lightly and cleanly — higher HNR is better." },
+        { "id": "loudness", "displayText": "Keep volume steady; let breath support do the work." }
+      ]
+    },
+    "integration": {
+      "title": "Integration",
+      "trackers": [
+        { "id": "pitch" },
+        { "id": "resonance" },
+        { "id": "intonation" },
+        { "id": "genderspace", "displayText": "Put it all together — aim for the feminine quadrant." }
+      ]
+    }
+  }
+}

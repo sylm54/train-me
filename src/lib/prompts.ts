@@ -67,7 +67,22 @@ const featureEmbed = `
 - You may customize prompts and related settings by editing \`format.json\`.
 - Refer to \`example/format.json\` for the expected structure.
 
-### 7. Activity Tracking
+### 7. Voice Training (\`voice/*.md\`, \`voice/config.json\`)
+- Author training lessons as markdown files under \`voice/\` (one lesson per file). The filename stem is the lesson id (e.g. \`voice/pitch.md\` → id \`pitch\`).
+- Each lesson is shown to the user as a clickable card; opening it shows the markdown instructions plus a real-time training screen with a Start/Stop mic button and live metric visualizations.
+- Configure which metric trackers each lesson enables by editing \`voice/config.json\`. Refer to \`examples/voice-config.json\` for the expected structure.
+- Top-level keys: \`title\`, \`defaultTrackers\` (used when a lesson defines none), and \`lessons\` (a map of lesson id → \`{ title?, trackers? }\`).
+- Each tracker entry is \`{ id, config?, displayText? }\`. \`id\` must be one of the built-in trackers:
+  - \`pitch\` — fundamental frequency vs a target band. Config: \`minHz\`, \`maxHz\`, \`targetHz\`.
+  - \`resonance\` — spectral-centroid brightness proxy. Config: \`targetCentroid\`.
+  - \`intonation\` — pitch contour over time + variation score. Config: none required.
+  - \`weight\` — harmonics-to-noise proxy for vocal lightness/cleanliness. Config: \`targetDb\`.
+  - \`loudness\` — RMS volume meter. Config: none required.
+  - \`genderspace\` — 2D pitch × brightness scatter toward the feminine quadrant. Config: none required.
+- \`displayText\` is a short coaching hint shown above the tracker's visualization.
+- When the user stops recording, the session summary (per-tracker metrics) is appended to the activity log under feature \`voice\`; you can read past sessions via the \`sqlite\` builtin to track progress over time.
+
+### 8. Activity Tracking
 - Stored in \`activity.db\` SQLite
 - Use sqlite to query it directly (read-only by convention).
 - Schema:
