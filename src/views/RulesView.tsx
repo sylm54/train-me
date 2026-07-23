@@ -59,7 +59,7 @@ export function RulesView() {
 
     // Filter to markdown files only, skip directories, sort alphabetically.
     const mdEntries = entries
-      .filter((e) => !e.isDir && /\.md$/i.test(e.name))
+      .filter((e) => !e.is_dir && /\.md$/i.test(e.name))
       .sort((a, b) => a.name.localeCompare(b.name));
 
     const initial: Rule[] = mdEntries.map((e) => {

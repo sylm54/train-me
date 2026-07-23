@@ -169,7 +169,7 @@ export function JournalView() {
     }
 
     const mdEntries = list
-      .filter((e) => !e.isDir && /\.md$/i.test(e.name))
+      .filter((e) => !e.is_dir && /\.md$/i.test(e.name))
       .sort((a, b) => b.name.localeCompare(a.name)); // newest first
 
     const initial: PastEntry[] = mdEntries.map((e) => ({

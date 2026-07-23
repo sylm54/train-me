@@ -46,27 +46,15 @@ const featureEmbed = `
 - Create one routine file for each distinct routine you want to establish. For routines that vary by day, time, or other conditions, create separate files with clear naming to indicate their context (e.g., \`morning_routine.md\`, \`evening_routine.md\`, \`weekend_routine.md\`).
 
 ### 4. Inventory
-- **Items**: records items owned by the user (\`items\` table).
-- **Wishlist**: follows the same schema as items but with \`priority\` instead of \`quantity\` (\`wishlist\` table).
-- Both tables live in \`inventory.db\` inside your sandbox. You have full read/write access via the \`sqlite\` builtin. Schema:
-CREATE TABLE IF NOT EXISTS items (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    name        TEXT    NOT NULL,
-    category    TEXT,
-    quantity    INTEGER NOT NULL DEFAULT 1,
-    notes       TEXT,
-    created_at  TEXT    NOT NULL,
-    updated_at  TEXT    NOT NULL
-);
-CREATE TABLE IF NOT EXISTS wishlist (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    name        TEXT    NOT NULL,
-    category    TEXT,
-    priority    TEXT,
-    notes       TEXT,
-    created_at  TEXT    NOT NULL,
-    updated_at  TEXT    NOT NULL
-);
+- **Items**: records items owned by the user.
+  - Read-only for you: use \`inventory items\` to list all, \`inventory items <id>\` to show one.
+  - Managed by the user via the UI.
+- **Wishlist**: things the user should acquire.
+  - \`inventory wishlist\` — list all entries.
+  - \`inventory wishlist <id>\` — show one entry.
+  - \`inventory wishlist add <name> [category] [priority] [notes...]\` — add an entry.
+  - \`inventory wishlist remove <id>\` — remove an entry.
+  - You have full read/write access to the wishlist.
 ### 5. Chastity
 - Command: \`chastity\`
 - Capabilities:
@@ -461,19 +449,23 @@ async function renderSpecial(): Promise<string> {
   const entries = await invoke<FileEntry[]>("list_data_files", {
     path: "special",
   });
-
+  console.log("A: ",entries);
   // Recursively walk special/ to find all .md files.
   const files = await collectMarkdownFiles("special", entries);
-
+  console.log("B: ",files);
   const rows: Array<{ file: string; fields: Record<string, unknown> }> = [];
   for (const f of files) {
     const content = await invoke<string>("read_data_file", { path: f }).catch(
       () => "",
     );
     const { frontmatter } = parseFrontmatter(content);
-    if (Object.keys(frontmatter).length === 0) continue;
+    if (Object.keys(frontmatter).length === 0) {
+      console.warn(`[prompts] Special file "${f}" has no frontmatter, skipping.`);
+      continue;
+    }
     rows.push({ file: f.replace(/^special\//, ""), fields: frontmatter });
   }
+  console.log("C: ",rows);
 
   if (rows.length === 0) return "";
 
@@ -503,7 +495,7 @@ async function collectMarkdownFiles(
 ): Promise<string[]> {
   const out: string[] = [];
   for (const e of entries) {
-    if (e.isDir) {
+    if (e.is_dir) {
       try {
         const sub = await invoke<FileEntry[]>("list_data_files", {
           path: e.path,
@@ -538,11 +530,16 @@ export function parseFrontmatter(content: string): {
   frontmatter: Record<string, unknown>;
   body: string;
 } {
+  content = content.replaceAll("\r\n", "\n");
   if (!content.startsWith("---\n")) {
+    console.warn(`[prompts] No frontmatter found.`);
     return { frontmatter: {}, body: content };
   }
   const end = content.indexOf("\n---\n", 4);
-  if (end < 0) return { frontmatter: {}, body: content };
+  if (end < 0) {
+    console.warn(`[prompts] Frontmatter block not terminated with "---".`);
+    return { frontmatter: {}, body: content };
+  }
 
   const yaml = content.slice(4, end);
   const body = content.slice(end + 5);
@@ -551,7 +548,10 @@ export function parseFrontmatter(content: string): {
   let currentKey = "";
   let currentArr: string[] | null = null;
   for (const line of yaml.split(/\r?\n/)) {
-    if (!line.trim()) continue;
+    if (!line.trim()) {
+      console.warn(`[prompts] Skipping empty line in frontmatter.`);
+      continue;
+    }
     // Array item.
     if (/^\s+-\s+/.test(line) && currentKey) {
       const v = line.replace(/^\s+-\s+/, "").trim();
@@ -564,7 +564,10 @@ export function parseFrontmatter(content: string): {
     }
     // key: value
     const m = line.match(/^([A-Za-z0-9_-]+)\s*:\s*(.*)$/);
-    if (!m) continue;
+    if (!m) {
+      console.warn(`[prompts] Skipping invalid line in frontmatter: "${line}"`);
+      continue;
+    }
     currentKey = m[1];
     const value = m[2].trim();
     currentArr = null;

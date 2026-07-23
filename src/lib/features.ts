@@ -34,7 +34,7 @@ export async function dataFileExists(path: string): Promise<boolean> {
   const name = slash >= 0 ? path.slice(slash + 1) : path;
   try {
     const entries = await invoke<FileEntry[]>("list_data_files", { path: dir });
-    return entries.some((e) => !e.isDir && e.name === name);
+    return entries.some((e) => !e.is_dir && e.name === name);
   } catch {
     return false;
   }

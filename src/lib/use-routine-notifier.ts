@@ -43,7 +43,7 @@ async function loadScheduledRoutines(): Promise<ScheduledRoutine[]> {
   }
 
   const mdEntries = entries
-    .filter((e) => !e.isDir && /\.md$/i.test(e.name))
+    .filter((e) => !e.is_dir && /\.md$/i.test(e.name))
     .sort((a, b) => a.name.localeCompare(b.name));
 
   const routines: ScheduledRoutine[] = [];

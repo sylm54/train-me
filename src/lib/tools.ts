@@ -98,7 +98,7 @@ export const listFilesTool = tool({
     if (entries.length === 0) {
       return `No files in directory "${path}".`;
     }
-    return `Directory "${path}" contains:\n${entries.map((e) => `  - ${e.isDir ? "[DIR]" : "[FILE]" + e.path}`).join("\n")}`;
+    return `Directory "${path}" contains:\n${entries.map((e) => `  - ${e.is_dir ? "[DIR]" : "[FILE]" + e.path}`).join("\n")}`;
   },
 });
 

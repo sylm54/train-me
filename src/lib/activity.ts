@@ -2,17 +2,14 @@
  * UI-side activity logger.
  *
  * Activity is logged to `<app_data>/agent_data/activity.db` (SQLite),
- * which lives inside the agent's sandbox. A single engine — the embedded
- * Turso `sqlite` builtin — touches it from both sides: the agent runs
- * `sqlite` queries directly, and this UI write path (and the ActivityView
- * reads) go through the same sandbox. Entries are appended by the app as
- * the user interacts with it; the agent is expected to treat the log as
- * read-only. Failures are silently swallowed so a logging hiccup never
- * breaks the user's flow.
+ * which lives inside the agent's sandbox. The agent reads it via the
+ * embedded `sqlite` builtin; the UI write path (and the ActivityView reads)
+ * go through Tauri commands backed by rusqlite for reliable persistence.
+ * Entries are appended by the app as the user interacts with it; the agent
+ * is expected to treat the log as read-only. Failures are silently
+ * swallowed so a logging hiccup never breaks the user's flow.
  *
- * Note: the returned entry's `id` is a placeholder (0) — writes are
- * fire-and-forget and no caller consumes it; ActivityView reads real ids
- * back via `activity_list_entries`.
+ * The returned entry includes the real `id` assigned by the DB.
  */
 
 import { invoke } from "@tauri-apps/api/core";

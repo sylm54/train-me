@@ -47,7 +47,7 @@ export interface BashResult {
 export interface FileEntry {
   path: string;
   name: string;
-  isDir: boolean;
+  is_dir: boolean;
   size: number;
 }
 
