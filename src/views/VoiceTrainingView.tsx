@@ -1,37 +1,58 @@
 /**
- * Voice Training view: display voice training config (`voice/config.json`)
- * and markdown guidance files (`voice/*.md`).
+ * Voice Training view.
+ *
+ * Two screens:
+ *  1. Lessons — lists every `voice/*.md` guidance file as a clickable card,
+ *     showing which trackers the agent configured for it.
+ *  2. Training — shows the lesson's markdown instructions, the live metric
+ *     visualizations for the enabled trackers, and a Start/Stop button. When
+ *     the user stops, the session is summarized and written to the activity
+ *     log so the agent can review progress.
+ *
+ * Trackers are fully pluggable (see `@/lib/voice`); the agent picks which to
+ * enable per lesson via `voice/config.json`.
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { MarkdownBody } from "@/components/MarkdownBody";
 import {
+  Activity as ActivityIcon,
   AlertCircle,
+  ArrowLeft,
   FileText,
   Loader2,
   MicVocal,
+  Play,
   RefreshCw,
+  Square,
 } from "lucide-react";
+import { MarkdownBody } from "@/components/MarkdownBody";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import type { FileEntry } from "@/lib/types";
 import { tauriErrorToString } from "@/lib/types";
+import { logActivity } from "@/lib/activity";
+import {
+  FrameBus,
+  TRACKERS,
+  getTracker,
+  parseVoiceConfig,
+  resolveTrackers,
+  specToConfig,
+  useVoiceSession,
+  type TrackerSummary,
+  type VoiceConfig,
+} from "@/lib/voice";
 
 // ──────────────────────────────────────────────────────────────────────────
-// Types
+// Types & constants
 // ──────────────────────────────────────────────────────────────────────────
 
 interface VoiceDoc {
-  /** Path relative to agent_data, e.g., "voice/breathing.md" */
   path: string;
-  /** Filename stem, e.g., "breathing" */
   id: string;
-  /** Display name, e.g., "Breathing" */
   displayName: string;
-  /** Markdown body, or null while loading. */
   body: string | null;
-  /** Per-file load error. */
   loadError: string | null;
 }
 
@@ -53,108 +74,21 @@ function isMissingFileError(msg: string): boolean {
   return /not found|no such file/i.test(msg);
 }
 
-/** Render an arbitrary JSON value as a small read-only key/value table. */
-function renderConfigRows(value: unknown, keyPrefix = ""): React.ReactNode[] {
-  const out: React.ReactNode[] = [];
-
-  if (value === null || value === undefined) {
-    return [
-      <ConfigRow
-        key={keyPrefix || "root"}
-        label={keyPrefix || "value"}
-        value={<span className="text-[var(--color-muted-foreground)]">—</span>}
-      />,
-    ];
-  }
-
-  if (Array.isArray(value)) {
-    value.forEach((item, i) => {
-      const key = `${keyPrefix}[${i}]`;
-      if (item !== null && typeof item === "object") {
-        out.push(
-          <ConfigRow
-            key={key}
-            label={key}
-            value={
-              <span className="text-[var(--color-muted-foreground)]">
-                {"{ … }"}
-              </span>
-            }
-          />,
-        );
-        out.push(...renderConfigRows(item, key));
-      } else {
-        out.push(
-          <ConfigRow key={key} label={key} value={renderScalar(item)} />,
-        );
-      }
-    });
-    return out;
-  }
-
-  if (typeof value === "object") {
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      const key = keyPrefix ? `${keyPrefix}.${k}` : k;
-      if (v !== null && typeof v === "object") {
-        out.push(
-          <ConfigRow
-            key={key}
-            label={key}
-            value={
-              <span className="text-[var(--color-muted-foreground)]">
-                {Array.isArray(v) ? "[ … ]" : "{ … }"}
-              </span>
-            }
-          />,
-        );
-        out.push(...renderConfigRows(v, key));
-      } else {
-        out.push(<ConfigRow key={key} label={key} value={renderScalar(v)} />);
-      }
-    }
-    return out;
-  }
-
-  // Primitive at root.
-  out.push(
-    <ConfigRow
-      key={keyPrefix || "value"}
-      label={keyPrefix || "value"}
-      value={renderScalar(value)}
-    />,
-  );
-  return out;
-}
-
-function renderScalar(v: unknown): React.ReactNode {
-  if (v === null || v === undefined) {
-    return <span className="text-[var(--color-muted-foreground)]">—</span>;
-  }
-  if (typeof v === "boolean") {
-    return <Badge variant={v ? "default" : "secondary"}>{String(v)}</Badge>;
-  }
-  if (typeof v === "number") {
-    return <span className="font-mono">{String(v)}</span>;
-  }
-  return <span>{String(v)}</span>;
-}
-
 // ──────────────────────────────────────────────────────────────────────────
 // Component
 // ──────────────────────────────────────────────────────────────────────────
 
 export function VoiceTrainingView() {
-  // Config state
-  const [configRaw, setConfigRaw] = useState<unknown>(null);
+  const [config, setConfig] = useState<VoiceConfig | null>(null);
   const [configLoading, setConfigLoading] = useState(true);
   const [configError, setConfigError] = useState<string | null>(null);
-  const [configPresent, setConfigPresent] = useState(false);
 
-  // Docs list
   const [docs, setDocs] = useState<VoiceDoc[]>([]);
   const [docsLoading, setDocsLoading] = useState(true);
   const [docsError, setDocsError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+
+  const [selectedId, setSelectedId] = useState<string | null>(null);
 
   // ── Loaders ──────────────────────────────────────────────────────────
 
@@ -163,17 +97,16 @@ export function VoiceTrainingView() {
     setConfigError(null);
     try {
       const raw = await invoke<string>("read_data_file", { path: CONFIG_PATH });
-      setConfigPresent(true);
       try {
-        setConfigRaw(JSON.parse(raw));
+        setConfig(parseVoiceConfig(JSON.parse(raw)));
       } catch {
-        setConfigRaw(raw);
+        // Not JSON → treat as empty config (docs still show).
+        setConfig(parseVoiceConfig(null));
       }
     } catch (e) {
       const msg = tauriErrorToString(e);
       if (isMissingFileError(msg)) {
-        setConfigPresent(false);
-        setConfigRaw(null);
+        setConfig(parseVoiceConfig(null));
       } else {
         setConfigError(msg);
       }
@@ -188,9 +121,7 @@ export function VoiceTrainingView() {
 
     let entries: FileEntry[];
     try {
-      entries = await invoke<FileEntry[]>("list_data_files", {
-        path: VOICE_DIR,
-      });
+      entries = await invoke<FileEntry[]>("list_data_files", { path: VOICE_DIR });
     } catch (e) {
       setDocsError(tauriErrorToString(e));
       setDocsLoading(false);
@@ -218,18 +149,14 @@ export function VoiceTrainingView() {
     await Promise.all(
       initial.map(async (doc) => {
         try {
-          const body = await invoke<string>("read_data_file", {
-            path: doc.path,
-          });
+          const body = await invoke<string>("read_data_file", { path: doc.path });
           setDocs((prev) =>
             prev.map((d) => (d.path === doc.path ? { ...d, body } : d)),
           );
         } catch (e) {
           setDocs((prev) =>
             prev.map((d) =>
-              d.path === doc.path
-                ? { ...d, loadError: tauriErrorToString(e) }
-                : d,
+              d.path === doc.path ? { ...d, loadError: tauriErrorToString(e) } : d,
             ),
           );
         }
@@ -253,6 +180,27 @@ export function VoiceTrainingView() {
 
   const listBusy = docsLoading || refreshing;
 
+  const selectedDoc = useMemo(
+    () => (selectedId ? docs.find((d) => d.id === selectedId) ?? null : null),
+    [selectedId, docs],
+  );
+
+  // ── Render: training screen ──────────────────────────────────────────
+
+  if (selectedDoc) {
+    return (
+      <TrainingScreen
+        doc={selectedDoc}
+        config={config ?? {}}
+        onBack={() => setSelectedId(null)}
+      />
+    );
+  }
+
+  // ── Render: lessons list ─────────────────────────────────────────────
+
+  const heading = config?.title ?? "Voice Training";
+
   return (
     <div className="flex-1 overflow-y-auto">
       <div className="max-w-3xl mx-auto px-4 sm:px-6 py-6 sm:py-8 space-y-8">
@@ -262,9 +210,7 @@ export function VoiceTrainingView() {
               <MicVocal size={18} />
             </div>
             <div>
-              <h1 className="text-2xl font-semibold tracking-tight">
-                Voice Training
-              </h1>
+              <h1 className="text-2xl font-semibold tracking-tight">{heading}</h1>
             </div>
           </div>
           <Button
@@ -282,63 +228,22 @@ export function VoiceTrainingView() {
           </Button>
         </header>
 
-        {/* ── Config ─────────────────────────────────────────────── */}
-        <section className="border border-[var(--color-border)] rounded-lg bg-[var(--color-surface)] overflow-hidden">
-          <header className="flex items-baseline justify-between gap-3 px-5 py-3 border-b border-[var(--color-border)] bg-[var(--color-pink-50)]">
-            <div className="flex items-baseline gap-2 min-w-0">
-              <h2 className="text-base font-semibold">Configuration</h2>
-              <code className="text-xs text-[var(--color-muted-foreground)] truncate">
-                {CONFIG_PATH}
-              </code>
-            </div>
-            {configPresent && (
-              <Badge variant="secondary" className="shrink-0">
-                loaded
-              </Badge>
-            )}
-          </header>
-
-          <div className="px-5 py-4">
-            {configLoading && (
-              <div className="flex items-center gap-2 text-sm text-[var(--color-muted-foreground)] py-3">
-                <Loader2 size={14} className="animate-spin" />
-                Loading…
-              </div>
-            )}
-
-            {configError && (
-              <div className="flex items-start gap-2 text-sm text-[var(--color-danger)]">
-                <AlertCircle size={14} className="mt-0.5 shrink-0" />
-                <span className="break-words">{configError}</span>
-              </div>
-            )}
-
-            {!configLoading && !configError && !configPresent && (
-              <div className="text-sm text-[var(--color-muted-foreground)] py-2">
-                No config yet. Ask the agent to populate{" "}
-                <code className="text-xs">{CONFIG_PATH}</code>.
-              </div>
-            )}
-
-            {!configLoading && !configError && configPresent && (
-              <div className="overflow-x-auto">
-                <table className="w-full border-collapse text-sm">
-                  <tbody>{renderConfigRows(configRaw)}</tbody>
-                </table>
-              </div>
-            )}
+        {configError && (
+          <div className="flex items-start gap-2 text-sm text-[var(--color-danger)]">
+            <AlertCircle size={14} className="mt-0.5 shrink-0" />
+            <span className="break-words">{configError}</span>
           </div>
-        </section>
+        )}
 
-        {/* ── Docs ──────────────────────────────────────────────── */}
+        {/* Lessons */}
         <section className="space-y-4">
           <div className="flex items-baseline justify-between">
             <h2 className="text-sm uppercase tracking-wider text-[var(--color-muted-foreground)]">
-              Guidance
+              Lessons
             </h2>
             {!docsLoading && docs.length > 0 && (
               <span className="text-xs text-[var(--color-muted-foreground)]">
-                {docs.length} {docs.length === 1 ? "doc" : "docs"}
+                {docs.length} {docs.length === 1 ? "lesson" : "lessons"}
               </span>
             )}
           </div>
@@ -353,7 +258,7 @@ export function VoiceTrainingView() {
           {docsLoading && docs.length === 0 && (
             <div className="flex items-center justify-center gap-2 text-sm text-[var(--color-muted-foreground)] py-8">
               <Loader2 size={14} className="animate-spin" />
-              Loading docs…
+              Loading lessons…
             </div>
           )}
 
@@ -363,16 +268,22 @@ export function VoiceTrainingView() {
                 <FileText size={20} />
               </div>
               <p className="text-sm text-[var(--color-muted-foreground)]">
-                No guidance docs yet. Ask the agent to write some under{" "}
-                <code className="text-xs">voice/</code>.
+                No lessons yet. Ask the agent to write guidance under{" "}
+                <code className="text-xs">voice/</code> and configure trackers in{" "}
+                <code className="text-xs">{CONFIG_PATH}</code>.
               </p>
             </div>
           )}
 
           {docs.length > 0 && (
-            <div className="space-y-4">
+            <div className="space-y-3">
               {docs.map((doc) => (
-                <VoiceDocCard key={doc.path} doc={doc} />
+                <LessonCard
+                  key={doc.path}
+                  doc={doc}
+                  config={config ?? {}}
+                  onOpen={() => setSelectedId(doc.id)}
+                />
               ))}
             </div>
           )}
@@ -383,67 +294,363 @@ export function VoiceTrainingView() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Sub-components
+// Lesson card (list item)
 // ──────────────────────────────────────────────────────────────────────────
 
-function ConfigRow({
-  label,
-  value,
-}: {
-  label: string;
-  value: React.ReactNode;
-}) {
-  return (
-    <tr className="border-b border-[var(--color-border)] last:border-b-0">
-      <td className="px-3 py-1.5 align-top text-xs text-[var(--color-muted-foreground)] font-mono whitespace-nowrap">
-        {label}
-      </td>
-      <td className="px-3 py-1.5 align-top text-sm">{value}</td>
-    </tr>
-  );
-}
-
-interface VoiceDocCardProps {
+interface LessonCardProps {
   doc: VoiceDoc;
+  config: VoiceConfig;
+  onOpen: () => void;
 }
 
-function VoiceDocCard({ doc }: VoiceDocCardProps) {
-  const bodyReady = doc.body !== null;
-  const bodyError = doc.loadError !== null;
+function LessonCard({ doc, config, onOpen }: LessonCardProps) {
+  const specs = resolveTrackers(config, doc.id);
+  const trackerIds = specs
+    .map((s) => s.id)
+    .filter((id) => TRACKERS[id]);
+
+  const titleOverride = config.lessons?.[doc.id]?.title;
 
   return (
-    <article className="border border-[var(--color-pink-200)] rounded-lg bg-[var(--color-surface)] overflow-hidden">
-      <header className="flex items-baseline justify-between gap-3 px-5 py-3 border-b border-[var(--color-border)] bg-[var(--color-pink-50)]">
-        <div className="min-w-0">
-          <h3 className="text-base font-semibold text-[var(--color-foreground)] truncate">
-            {doc.displayName}
+    <button
+      type="button"
+      onClick={onOpen}
+      className="w-full text-left border border-[var(--color-pink-200)] rounded-lg bg-[var(--color-surface)] overflow-hidden hover:border-[var(--color-pink-400)] hover:shadow-sm transition-all"
+    >
+      <div className="flex items-start justify-between gap-3 px-5 py-4">
+        <div className="min-w-0 flex-1">
+          <h3 className="text-base font-semibold text-[var(--color-foreground)]">
+            {titleOverride ?? doc.displayName}
           </h3>
-          <p className="text-xs text-[var(--color-muted-foreground)] mt-0.5 truncate">
+          <p className="text-xs text-[var(--color-muted-foreground)] mt-0.5">
             <code>{doc.id}.md</code>
           </p>
         </div>
-        <FileText size={16} className="text-[var(--color-pink-400)] shrink-0" />
-      </header>
-
-      <div className="px-5 py-4">
-        {bodyError && (
-          <div className="flex items-start gap-2 text-sm text-[var(--color-danger)]">
-            <AlertCircle size={14} className="mt-0.5 shrink-0" />
-            <span className="text-xs opacity-80 break-words">
-              {doc.loadError}
-            </span>
-          </div>
-        )}
-
-        {!bodyReady && !bodyError && (
-          <div className="flex items-center gap-2 text-sm text-[var(--color-muted-foreground)] py-2">
-            <Loader2 size={14} className="animate-spin" />
-            Loading…
-          </div>
-        )}
-
-        {bodyReady && <MarkdownBody>{doc.body ?? ""}</MarkdownBody>}
+        <FileText size={18} className="text-[var(--color-pink-400)] shrink-0 mt-0.5" />
       </div>
-    </article>
+      {trackerIds.length > 0 && (
+        <div className="px-5 pb-4 flex flex-wrap gap-1.5">
+          {trackerIds.map((id) => (
+            <Badge
+              key={id}
+              variant="secondary"
+              className="font-mono text-[var(--color-pink-700)]"
+            >
+              {TRACKERS[id].name}
+            </Badge>
+          ))}
+        </div>
+      )}
+    </button>
+  );
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Training screen (lesson detail)
+// ──────────────────────────────────────────────────────────────────────────
+
+interface TrainingScreenProps {
+  doc: VoiceDoc;
+  config: VoiceConfig;
+  onBack: () => void;
+}
+
+function TrainingScreen({ doc, config, onBack }: TrainingScreenProps) {
+  const busRef = useRef<FrameBus | null>(null);
+  if (busRef.current === null) busRef.current = new FrameBus();
+  const bus = busRef.current;
+
+  // Stable subscribe function so tracker effects don't churn on re-render.
+  const subscribe = useCallback(bus.subscribe.bind(bus), [bus]);
+
+  const session = useVoiceSession(bus);
+  const active = session.state === "active";
+
+  const specs = useMemo(
+    () => resolveTrackers(config, doc.id),
+    [config, doc.id],
+  );
+
+  // Resolved tracker instances to render (drop unknown ids).
+  const resolvedTrackers = useMemo(
+    () =>
+      specs
+        .map((spec) => {
+          const tracker = getTracker(spec.id);
+          return tracker ? { spec, tracker } : null;
+        })
+        .filter((x): x is { spec: (typeof specs)[number]; tracker: NonNullable<ReturnType<typeof getTracker>> } => x !== null),
+    [specs],
+  );
+
+  const titleOverride = config.lessons?.[doc.id]?.title;
+  const title = titleOverride ?? doc.displayName;
+
+  // Summary collectors registered by each mounted tracker.
+  const summaryFnsRef = useRef<Array<() => TrackerSummary | null>>([]);
+  const registerSummary = useCallback(
+    (fn: () => TrackerSummary | null) => {
+      summaryFnsRef.current.push(fn);
+    },
+    [],
+  );
+
+  const [savedSummary, setSavedSummary] = useState<TrackerSummary[] | null>(null);
+  const [sessionDuration, setSessionDuration] = useState<number | null>(null);
+  const sessionStartRef = useRef<number | null>(null);
+
+  const handleStart = useCallback(async () => {
+    setSavedSummary(null);
+    setSessionDuration(null);
+    sessionStartRef.current = performance.now();
+    await session.start();
+  }, [session]);
+
+  const handleStop = useCallback(async () => {
+    const startedAt = sessionStartRef.current;
+    const durationSec =
+      startedAt != null ? Math.round((performance.now() - startedAt) / 1000) : 0;
+
+    // Collect summaries *before* tearing down, while trackers still hold data.
+    const summaries = summaryFnsRef.current
+      .map((fn) => {
+        try {
+          return fn();
+        } catch {
+          return null;
+        }
+      })
+      .filter((s): s is TrackerSummary => s !== null);
+
+    session.stop();
+    setSessionDuration(durationSec);
+    setSavedSummary(summaries);
+
+    // Log to activity so the agent can review progress.
+    const lines: string[] = [];
+    lines.push(`Lesson: ${title}`);
+    lines.push(`Duration: ${durationSec}s`);
+    const metrics: Record<string, number | string> = {
+      lesson: doc.id,
+      durationSec,
+      trackers: summaries.length,
+    };
+    for (let i = 0; i < resolvedTrackers.length; i++) {
+      const { spec } = resolvedTrackers[i];
+      const s = summaries[i];
+      if (!s) continue;
+      lines.push("");
+      lines.push(`${TRACKERS[spec.id]?.name ?? spec.id}:`);
+      for (const line of s.lines) lines.push(`  • ${line}`);
+      for (const [k, v] of Object.entries(s.metrics)) {
+        metrics[`${spec.id}.${k}`] = v;
+      }
+    }
+    const details = lines.join("\n");
+    void logActivity("voice", `Trained: ${title}`, details);
+  }, [resolvedTrackers, session, title, doc.id]);
+
+  return (
+    <div className="flex-1 overflow-y-auto">
+      <div className="max-w-3xl mx-auto px-4 sm:px-6 py-6 sm:py-8 space-y-6">
+        <header className="flex items-center justify-between gap-3">
+          <Button variant="ghost" size="sm" onClick={onBack}>
+            <ArrowLeft size={14} />
+            Lessons
+          </Button>
+        </header>
+
+        <div className="flex items-start gap-3">
+          <div className="size-10 rounded-xl bg-[var(--color-pink-100)] grid place-items-center text-[var(--color-pink-600)] shrink-0">
+            <MicVocal size={18} />
+          </div>
+          <div className="min-w-0">
+            <h1 className="text-2xl font-semibold tracking-tight truncate">
+              {title}
+            </h1>
+            <p className="text-xs text-[var(--color-muted-foreground)] mt-0.5">
+              <code>{doc.id}.md</code>
+            </p>
+          </div>
+        </div>
+
+        {/* Instructions */}
+        <section className="border border-[var(--color-border)] rounded-lg bg-[var(--color-surface)] overflow-hidden">
+          <header className="px-5 py-2.5 border-b border-[var(--color-border)] bg-[var(--color-pink-50)]">
+            <h2 className="text-sm font-semibold">Instructions</h2>
+          </header>
+          <div className="px-5 py-4">
+            {doc.loadError && (
+              <div className="flex items-start gap-2 text-sm text-[var(--color-danger)]">
+                <AlertCircle size={14} className="mt-0.5 shrink-0" />
+                <span className="text-xs opacity-80 break-words">{doc.loadError}</span>
+              </div>
+            )}
+            {doc.body === null && !doc.loadError && (
+              <div className="flex items-center gap-2 text-sm text-[var(--color-muted-foreground)] py-2">
+                <Loader2 size={14} className="animate-spin" />
+                Loading…
+              </div>
+            )}
+            {doc.body !== null && <MarkdownBody>{doc.body}</MarkdownBody>}
+          </div>
+        </section>
+
+        {/* Metrics */}
+        {resolvedTrackers.length === 0 ? (
+          <div className="text-sm text-[var(--color-muted-foreground)] border border-dashed border-[var(--color-border)] rounded-lg px-5 py-6 text-center">
+            No metrics configured for this lesson. Ask the agent to enable
+            trackers in <code className="text-xs">{CONFIG_PATH}</code>.
+          </div>
+        ) : (
+          <section className="space-y-3">
+            <div className="flex items-center justify-between">
+              <h2 className="text-sm uppercase tracking-wider text-[var(--color-muted-foreground)]">
+                Metrics
+              </h2>
+              <span className="text-xs text-[var(--color-muted-foreground)]">
+                {resolvedTrackers.length} active
+              </span>
+            </div>
+
+            {/* Start / Stop control */}
+            <div className="flex flex-col items-stretch gap-3 border border-[var(--color-border)] rounded-lg bg-[var(--color-surface)] px-5 py-4">
+              {session.error && (
+                <div className="flex items-start gap-2 text-sm text-[var(--color-danger)]">
+                  <AlertCircle size={14} className="mt-0.5 shrink-0" />
+                  <span className="break-words">{session.error}</span>
+                </div>
+              )}
+              <div className="flex items-center gap-3">
+                {active ? (
+                  <Button variant="destructive" onClick={handleStop}>
+                    <Square size={14} />
+                    Stop &amp; Save
+                  </Button>
+                ) : (
+                  <Button onClick={handleStart} disabled={session.state === "requesting"}>
+                    {session.state === "requesting" ? (
+                      <Loader2 size={14} className="animate-spin" />
+                    ) : (
+                      <Play size={14} />
+                    )}
+                    {session.state === "requesting" ? "Requesting mic…" : "Start"}
+                  </Button>
+                )}
+                <StatusPill state={session.state} />
+              </div>
+              <p className="text-xs text-[var(--color-muted-foreground)]">
+                Starting requests microphone access. Your audio is analyzed
+                locally in real time and is never sent anywhere.
+              </p>
+            </div>
+
+            {/* Tracker visualizations */}
+            <div className="grid gap-3 sm:grid-cols-2">
+              {resolvedTrackers.map(({ spec, tracker }) => {
+                const Comp = tracker.Component;
+                return (
+                  <Comp
+                    key={spec.id}
+                    config={specToConfig(spec)}
+                    subscribe={subscribe}
+                    active={active}
+                    registerSummary={registerSummary}
+                  />
+                );
+              })}
+            </div>
+          </section>
+        )}
+
+        {/* Saved session summary */}
+        {savedSummary && (
+          <SessionSummary
+            summaries={savedSummary}
+            trackers={resolvedTrackers}
+            durationSec={sessionDuration}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Sub-components
+// ──────────────────────────────────────────────────────────────────────────
+
+function StatusPill({ state }: { state: string }) {
+  if (state === "active") {
+    return (
+      <Badge variant="default" className="gap-1 bg-[var(--color-success)]">
+        <span className="size-1.5 rounded-full bg-white animate-pulse" />
+        Recording
+      </Badge>
+    );
+  }
+  if (state === "requesting") {
+    return (
+      <Badge variant="secondary" className="gap-1">
+        <Loader2 size={10} className="animate-spin" />
+        Requesting
+      </Badge>
+    );
+  }
+  if (state === "error") {
+    return <Badge variant="destructive">Error</Badge>;
+  }
+  return <Badge variant="secondary">Idle</Badge>;
+}
+
+function SessionSummary({
+  summaries,
+  trackers,
+  durationSec,
+}: {
+  summaries: TrackerSummary[];
+  trackers: Array<{ spec: { id: string }; tracker: { name: string } }>;
+  durationSec: number | null;
+}) {
+  return (
+    <section className="border border-[var(--color-border)] rounded-lg bg-[var(--color-surface)] overflow-hidden">
+      <header className="flex items-center gap-2 px-5 py-2.5 border-b border-[var(--color-border)] bg-[var(--color-pink-50)]">
+        <ActivityIcon size={14} className="text-[var(--color-pink-600)]" />
+        <h2 className="text-sm font-semibold">Session Saved</h2>
+        {durationSec != null && (
+          <span className="text-xs text-[var(--color-muted-foreground)] ml-auto">
+            {durationSec}s
+          </span>
+        )}
+      </header>
+      <div className="px-5 py-4 space-y-3 text-sm">
+        {summaries.length === 0 && (
+          <p className="text-[var(--color-muted-foreground)]">
+            No metrics captured (was there enough voiced audio?).
+          </p>
+        )}
+        {summaries.map((s, i) => {
+          const t = trackers[i];
+          const name = t?.tracker.name ?? "Metric";
+          return (
+            <div key={i}>
+              <div className="text-xs font-semibold uppercase tracking-wider text-[var(--color-muted-foreground)]">
+                {name}
+              </div>
+              <ul className="mt-0.5 space-y-0.5 text-[var(--color-foreground)]">
+                {s.lines.map((line, j) => (
+                  <li key={j} className="font-mono text-xs">
+                    {line}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          );
+        })}
+        <p className="text-xs text-[var(--color-muted-foreground)] pt-1">
+          Logged to your activity feed.
+        </p>
+      </div>
+    </section>
   );
 }
