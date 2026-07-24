@@ -223,11 +223,13 @@ class MediaService : Service() {
     private fun buildNotification(): Notification {
         val contentIntent = packageManager.getLaunchIntentForPackage(packageName)
             ?.let { PendingIntent.getActivity(this, 0, it, PendingIntent.FLAG_IMMUTABLE) }
-        val style = MediaStyle().apply {
-            // Surface transport controls on the lock screen.
-            (session?.sessionToken)?.let { setMediaSession(it) }
-            setShowActionsInCompactView(0)
-        }
+        // Build the MediaStyle fluently — `setMediaSession`/`setShowActionsInCompactView`
+        // are builder methods on androidx MediaStyle that return the style itself, so we
+        // chain them instead of using an `apply {}` block (whose receiver resolution
+        // trips the Kotlin compiler here).
+        val style = MediaStyle()
+            .setShowActionsInCompactView(0)
+        session?.sessionToken?.let { style.setMediaSession(it) }
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(title)
             .setContentText(if (playing) "Playing" else "Paused")
