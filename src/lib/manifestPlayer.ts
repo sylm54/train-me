@@ -284,6 +284,7 @@ export class ManifestPlayer {
       waitingTrack = this.allocateTrack();
       const el = this.pool[waitingTrack];
       el.loop = true;
+      console.log("Convert",seg.waiting_sound,"to",convertFileSrc(seg.waiting_sound));
       el.src = convertFileSrc(seg.waiting_sound);
       el.volume = clampVolume(seg.waiting_sound_volume);
       this.active.add(el);
@@ -407,6 +408,7 @@ export class ManifestPlayer {
     const el = this.elementFor(trackIndex);
     el.loop = false;
     el.volume = 1;
+    console.log("Convert",absPath,"to",convertFileSrc(absPath));
     el.src = convertFileSrc(absPath);
     try {
       el.currentTime = 0;

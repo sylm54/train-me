@@ -29,7 +29,7 @@ use crate::tag_parser::Node;
 /// contain `..`). The `read_manifest` command resolves them to absolute paths
 /// before handing the tree to the frontend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Segment {
     Sequence {
         children: Vec<Segment>,
@@ -375,6 +375,16 @@ pub(crate) fn resolve_paths_recursive(value: &mut serde_json::Value, base_dir: &
             {
                 let abs = normalize_lexical(&base_dir.join(&f));
                 value["file"] = json!(abs.to_string_lossy().to_string());
+            }
+            if ty.as_deref() == Some("until") {
+                if let Some(w) = value
+                    .get("waiting_sound")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string())
+                {
+                    let abs = normalize_lexical(&base_dir.join(&w));
+                    value["waiting_sound"] = json!(abs.to_string_lossy().to_string());
+                }
             }
         }
         Some("import") => {

@@ -104,5 +104,9 @@ tempfile = "3"
 tauri-plugin-notification = "2.3.3"
 cron = "0.16.0"
 
+# Local plugin: Android foreground media service that keeps conditioning
+# audio alive when the app is backgrounded. On desktop it compiles as a no-op.
+tauri-plugin-fgmedia = { path = "../plugins/tauri-plugin-fgmedia" }
+
 [dev-dependencies]
 tempfile = "3"

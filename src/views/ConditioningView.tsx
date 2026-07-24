@@ -47,6 +47,11 @@ import { ActivePrompt, ManifestPlayer, Segment } from "@/lib/manifestPlayer";
 // ──────────────────────────────────────────────────────────────────────────
 
 interface RenderProgress {
+  /** Script path (relative to agent_dir) this tick is for. Used to scope
+   * progress to the script currently being rendered — the backend emits one
+   * global event, so without this filter two concurrent renders would
+   * cross-feed each other's bars. */
+  script: string;
   step: number;
   total: number;
   label: string;
@@ -151,6 +156,11 @@ export function ConditioningView() {
   const [isPlaying, setIsPlaying] = useState(true);
   const [playerError, setPlayerError] = useState<string | null>(null);
   const playerRef = useRef<ManifestPlayer | null>(null);
+  // True while this view instance is mounted. Long-running async flows
+  // (renders) consult this before touching React state, so navigating away
+  // mid-render doesn't push updates at an unmounted tree (which can freeze
+  // the window once the render's spawn_blocking releases the renderer mutex).
+  const isMountedRef = useRef(true);
 
   // ── Loaders ────────────────────────────────────────────────────────────
 
@@ -249,6 +259,22 @@ export function ConditioningView() {
     void refreshModelStatus();
   }, [refresh, refreshModelStatus]);
 
+  // Tear down the player when this view unmounts (the user navigates to
+  // another screen). Without this, the ManifestPlayer's async playback loop
+  // keeps running with orphaned audio elements and fires IPC into a dead
+  // React tree, which freezes the window. App.tsx unmounts non-chat views on
+  // navigation (`{view !== "chat" && body}`), so this effect is the cleanup.
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      playerRef.current?.destroy();
+      playerRef.current = null;
+      // Best-effort; no-op on desktop.
+      void invoke("stop_media_service").catch(() => {});
+    };
+  }, []);
+
   // ── Engine helpers ─────────────────────────────────────────────────────
 
   /** Ensure the TTS engine is loaded, loading it first if necessary. */
@@ -306,8 +332,9 @@ export function ConditioningView() {
         return rest;
       });
 
-      // render_manifest emits no progress events today, but keep the
-      // listener attached in case the backend grows them.
+      // The backend emits a single global `render-manifest-progress` event
+      // carrying the script path; filter by it so concurrent renders don't
+      // cross-feed each other's progress bars.
       let unlisten: UnlistenFn | undefined;
       try {
         const ready = await ensureModelLoaded();
@@ -317,16 +344,26 @@ export function ConditioningView() {
           );
         }
 
-        unlisten = await listen<RenderProgress>("synthesize-progress", (e) => {
-          setRenderProgress((prev) => ({
-            ...prev,
-            [script.id]: e.payload,
-          }));
-        });
+        unlisten = await listen<RenderProgress>(
+          "render-manifest-progress",
+          (e) => {
+            if (e.payload.script !== script.meta?.script_path) return;
+            // Ignore progress for a render whose view instance has unmounted.
+            if (!isMountedRef.current) return;
+            setRenderProgress((prev) => ({
+              ...prev,
+              [script.id]: e.payload,
+            }));
+          },
+        );
 
         const m = await invoke<RenderedManifest>("render_manifest", {
           scriptPath: script.meta.script_path,
         });
+
+        // If the view unmounted while the render was in flight, drop the
+        // result without touching React state.
+        if (!isMountedRef.current) return null;
 
         const updated: ConditioningScript = {
           ...script,
@@ -347,6 +384,8 @@ export function ConditioningView() {
         );
         return updated;
       } catch (e) {
+        console.error("render_manifest failed:", e);
+        if (!isMountedRef.current) return null;
         setRenderErrors((prev) => ({
           ...prev,
           [script.id]: tauriErrorToString(e),
@@ -354,16 +393,18 @@ export function ConditioningView() {
         return null;
       } finally {
         unlisten?.();
-        setRenderingIds((prev) => {
-          const next = new Set(prev);
-          next.delete(script.id);
-          return next;
-        });
-        setRenderProgress((prev) => {
-          if (!(script.id in prev)) return prev;
-          const { [script.id]: _drop, ...rest } = prev;
-          return rest;
-        });
+        if (isMountedRef.current) {
+          setRenderingIds((prev) => {
+            const next = new Set(prev);
+            next.delete(script.id);
+            return next;
+          });
+          setRenderProgress((prev) => {
+            if (!(script.id in prev)) return prev;
+            const { [script.id]: _drop, ...rest } = prev;
+            return rest;
+          });
+        }
       }
     },
     [ensureModelLoaded],
@@ -400,6 +441,10 @@ export function ConditioningView() {
       const manifestPath = current.manifest?.path;
       if (!manifestPath) return;
 
+      // If the view unmounted during the (possibly long) render, bail out
+      // before touching React state or starting a player.
+      if (!isMountedRef.current) return;
+
       // Clear any stale play/render error so the detail card is clean while
       // we attempt playback.
       setRenderErrors((prev) => {
@@ -412,15 +457,35 @@ export function ConditioningView() {
         const tree = await invoke<ReadManifestResult>("read_manifest", {
           manifestPath,
         });
+        if (!isMountedRef.current) return;
 
         // Fresh player state.
         teardownPlayer();
         setIsPlaying(true);
         setPlayingScript(current);
 
+        // Title surfaced in the "Now playing" foreground notification.
+        const mediaTitle = current.meta?.title ?? current.id;
+
+        // The player fires `onPlayingChange(true)` on EVERY segment start,
+        // which would flood the IPC channel with redundant
+        // `update_media_state` calls (one per segment — hundreds for a long
+        // script). Track the last reported value and only push to the backend
+        // on a real transition.
+        let lastReportedPlaying = true;
+
         const player = new ManifestPlayer({
           onPrompt: (p) => setActivePrompt(p),
-          onPlayingChange: (playing) => setIsPlaying(playing),
+          onPlayingChange: (playing) => {
+            setIsPlaying(playing);
+            // Only mirror to the foreground service when the state actually
+            // changes (play↔pause), never on redundant per-segment `true`.
+            if (playing === lastReportedPlaying) return;
+            lastReportedPlaying = playing;
+            void invoke("update_media_state", {
+              args: { title: mediaTitle, playing },
+            }).catch(() => {});
+          },
           onEnded: () => {
             void logActivity(
               "conditioning",
@@ -429,6 +494,9 @@ export function ConditioningView() {
             );
             setPlayingScript(null);
             teardownPlayer();
+            // Playback finished — tear down the foreground service so the
+            // process can be backgrounded/killed normally again.
+            void invoke("stop_media_service").catch(() => {});
           },
           onError: (e) => {
             setPlayerError(e.message || String(e));
@@ -441,13 +509,21 @@ export function ConditioningView() {
           },
         });
         playerRef.current = player;
+        // Start the foreground media service so conditioning audio keeps
+        // playing (and the process stays alive) when the app is backgrounded.
+        // Best effort; no-op on desktop.
+        void invoke("start_media_service", {
+          args: { title: mediaTitle },
+        }).catch(() => {});
         void player.start(tree.root);
       } catch (e) {
         // read_manifest failed before the player could open. Surface the
         // error on the detail card (the Player overlay — where `playerError`
         // renders — isn't mounted yet, so it would otherwise be invisible).
-        const msg = tauriErrorToString(e);
-        setRenderErrors((prev) => ({ ...prev, [script.id]: msg }));
+        if (isMountedRef.current) {
+          const msg = tauriErrorToString(e);
+          setRenderErrors((prev) => ({ ...prev, [script.id]: msg }));
+        }
       }
     },
     [renderScript, teardownPlayer],
@@ -456,6 +532,8 @@ export function ConditioningView() {
   const handleClosePlayer = useCallback(() => {
     setPlayingScript(null);
     teardownPlayer();
+    // User exited the player mid-play — stop the foreground media service.
+    void invoke("stop_media_service").catch(() => {});
   }, [teardownPlayer]);
 
   const togglePlayPause = useCallback(() => {
@@ -794,7 +872,12 @@ function ScriptDetail({
               <div
                 className="h-full rounded-full bg-[var(--color-pink-500)] transition-all duration-200 ease-out"
                 style={{
-                  width: `${Math.round((progress.step / progress.total) * 100)}%`,
+                  // Clamp to 100%: step can overshoot total slightly when
+                  // includes/loops add work discovered after counting.
+                  width: `${Math.min(
+                    100,
+                    Math.round((progress.step / progress.total) * 100),
+                  )}%`,
                 }}
               />
             </div>
@@ -883,7 +966,7 @@ function Player({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex flex-col"
+      className="fixed inset-0 z-100 flex flex-col"
       style={{
         background:
           "radial-gradient(120% 80% at 50% 0%, #3a1f33 0%, #1f1426 55%, #14090f 100%)",

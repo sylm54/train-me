@@ -30,6 +30,25 @@ function logTool(name: string, input: unknown, result: unknown) {
   );
 }
 
+/** Thresholds for large file handling. */
+export const LARGE_FILE_LINE_THRESHOLD = 200;
+export const LARGE_FILE_BYTE_THRESHOLD = 50000;
+export const READ_HEAD_LINES = 50;
+
+/** Extract markdown headings with line numbers for display. */
+export function getMarkdownHeadingsSummary(content: string): string {
+  const lines = content.split("\n");
+  const headings: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (line.length === 0) continue;
+    if (!line.startsWith("#")) continue;
+    headings.push(`  L${i + 1}: ${line}`);
+  }
+  if (headings.length === 0) return "[No Markdown headings found.]";
+  return `\n[Headings:]\n${headings.join("\n")}\n[End of headings.]`;
+}
+
 /** Execute a bash script in the bashkit sandbox backed by agent_data/. */
 export const bashTool = tool({
   description:
@@ -54,30 +73,89 @@ export const bashTool = tool({
 /** Read a file from the agent's writable area (<app_data>/agent_data). */
 export const readFileTool = tool({
   description:
-    "Read a file" +
+    "Read a file. " +
     "Path is relative to that directory " +
-    "(POSIX-style, no leading slash).",
+    "(POSIX-style, no leading slash). " +
+    "For large files the first portion and a summary are returned; " +
+    "use start_line and end_line (1-based, inclusive) to read specific portions.",
   inputSchema: z.object({
     path: z.string().describe("File path."),
+    start_line: z
+      .number()
+      .int()
+      .min(1)
+      .optional()
+      .describe("Start line (1-based)."),
+    end_line: z
+      .number()
+      .int()
+      .min(1)
+      .optional()
+      .describe("End line (1-based, inclusive)."),
   }),
-  execute: async ({ path }) => {
+  execute: async ({ path, start_line, end_line }) => {
     const result = await invoke<string>("read_data_file", { path });
-    logTool("read_file", { path }, result);
-    return result;
+    const lines = result.split("\n");
+    const totalLines = lines.length;
+
+    // If a specific range is requested, return just those lines.
+    if (start_line !== undefined || end_line !== undefined) {
+      const start = start_line ? Math.max(0, start_line - 1) : 0;
+      const end = end_line
+        ? Math.min(totalLines, end_line)
+        : totalLines;
+      const selected = lines.slice(start, end).join("\n");
+      logTool("read_file", { path, start_line, end_line }, selected);
+      return selected;
+    }
+
+    // If the file is small enough, return it in full.
+    if (totalLines <= LARGE_FILE_LINE_THRESHOLD) {
+      logTool("read_file", { path }, result);
+      return result;
+    }
+
+    // Large file: return head + summary.
+    const head = lines.slice(0, READ_HEAD_LINES).join("\n");
+    let summary = `\n\n[File is large: ${totalLines} lines. Showing first ${READ_HEAD_LINES} lines.]`;
+    summary += `\n[Use start_line and end_line to read specific portions.]`;
+
+    // For .md files, add headings summary.
+    console.log("Checking for markdown headings summary for", path);
+    if (path.endsWith(".md")) {
+      console.log("Adding markdown headings summary for", path);
+      summary += getMarkdownHeadingsSummary(result);
+    }
+
+    logTool("read_file", { path, truncated: true, totalLines }, { head, summary });
+    return head + summary;
   },
 });
 
 /** Write a file to the agent's writable area (<app_data>/agent_data). */
 export const writeFileTool = tool({
   description:
-    "Write a text file Parent directories are created automatically.",
+    "Write a text file. Parent directories are created automatically.",
   inputSchema: z.object({
     path: z.string().describe("File path."),
     content: z.string().describe("The text content to write."),
   }),
   execute: async ({ path, content }) => {
     await invoke<void>("write_data_file", { path, content });
-    const result = { ok: true, path, bytes: content.length };
+    const lines = content.split("\n");
+    const result: {
+      ok: true;
+      path: string;
+      bytes: number;
+      warning?: string;
+    } = {
+      ok: true,
+      path,
+      bytes: content.length,
+    };
+    if (lines.length > LARGE_FILE_LINE_THRESHOLD) {
+      result.warning = `Warning: File has ${lines.length} lines (>${LARGE_FILE_LINE_THRESHOLD}). Large files consume context and may not be read back in full.`;
+    }
     logTool("write_file", { path, bytes: content.length }, result);
     return result;
   },
@@ -131,8 +209,13 @@ export const editFileTool = tool({
       newString: new_string,
       replaceAll: replace_all,
     });
-    logTool("edit_file", { path, replace_all }, result);
-    return result;
+    const enhanced: EditResult & { warning?: string } = { ...result };
+    if (result.bytes > LARGE_FILE_BYTE_THRESHOLD) {
+      const estimatedLines = Math.round(result.bytes / 80);
+      enhanced.warning = `Warning: File is ~${result.bytes} bytes (~${estimatedLines} lines). Large files consume context and may not be read back in full.`;
+    }
+    logTool("edit_file", { path, replace_all }, enhanced);
+    return enhanced;
   },
 });
 

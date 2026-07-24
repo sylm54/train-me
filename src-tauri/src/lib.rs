@@ -16,6 +16,7 @@ mod inventory;
 mod manifest;
 mod model_downloader;
 mod package_import;
+mod render_notify;
 mod sounds;
 mod tag_parser;
 
@@ -522,6 +523,18 @@ fn write_script(
         }
     };
 
+    // Second-pass semantic validation: catch unknown sound types, tone
+    // presets, effect types, speaker names, etc. These pass the parser
+    // but would fail the renderer with an opaque "parse …" error.
+    if let Err(e) = tag_parser::validate(&nodes) {
+        return Ok(WriteScriptResult {
+            valid: false,
+            path: None,
+            error: Some(format!("Invalid TTS markup: {}", e)),
+            node_count: nodes.len(),
+        });
+    }
+
     // Resolve the destination under the agent's writable area.
     // We reuse the same traversal-safe resolver used for read_data_file /etc.
     let resolved = match bash::resolve_under(&state.agent_dir, &path) {
@@ -549,26 +562,78 @@ fn write_script(
 
 /// Render (or reuse) a recursive segment manifest for `script_path` (relative
 /// to `agent_dir`). Runs on a blocking thread; idempotent via freshness hash.
+///
+/// Emits `render-manifest-progress` events (carrying `script`, `step`,
+/// `total`, `label`) as each speakable node renders, and drives an ongoing
+/// native "Rendering…" notification. Both are cleared when the render
+/// finishes (success or failure). The frontend filters progress events by
+/// `script` so concurrent renders don't cross-feed.
 #[tauri::command]
 async fn render_manifest(
     script_path: String,
     state: State<'_, AppState>,
-    _app: tauri::AppHandle,
+    app: tauri::AppHandle,
 ) -> Result<RenderedManifest, String> {
     let agent_dir = state.agent_dir.clone();
     let tracks_dir = state.tracks_dir.clone();
     let renderer_arc = state.renderer.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+
+    // Friendly title for the notification body: prefer the file stem.
+    let display_title = script_path
+        .split(|c| c == '/' || c == '\\')
+        .last()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&script_path)
+        .to_string();
+
+    // Set up the native notification up front so it's visible during the
+    // whole render. Best-effort: failures here must not break the render.
+    render_notify::ensure_channel(&app);
+    render_notify::request_permission_best_effort(&app);
+    render_notify::show_render_progress(&app, &display_title, 0, 0);
+
+    // Progress tracker: each tick emits a Tauri event (for the in-app bar)
+    // and throttles a notification body update. The total is seeded lazily
+    // inside the walker as it parses each file (see render_manifest_file).
+    let progress_app = app.clone();
+    let progress_script = script_path.clone();
+    let notify_throttle = Arc::new(render_notify::RenderNotifyThrottle::new());
+    let notify_app = app.clone();
+    let notify_title = display_title.clone();
+    let progress_callback = Box::new(move |step: usize, total: usize, label: &str| {
+        let _ = progress_app.emit(
+            "render-manifest-progress",
+            serde_json::json!({
+                "script": progress_script,
+                "step": step,
+                "total": total,
+                "label": label,
+            }),
+        );
+        notify_throttle.maybe_update(&notify_app, &notify_title, step, total);
+    });
+
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let tracker = Arc::new(std::sync::Mutex::new(audio_renderer::ProgressTracker {
+            step: 0,
+            total: 0,
+            callback: progress_callback,
+        }));
         let mut guard = renderer_arc.lock();
         let renderer = guard
             .as_mut()
             .ok_or_else(|| "Model not loaded. Please load the model first.".to_string())?;
         renderer
-            .render_manifest(&script_path, &agent_dir, &tracks_dir)
-            .map_err(|e| format!("Render error: {}", e))
+            .render_manifest(&script_path, &agent_dir, &tracks_dir, Some(&tracker))
+            .map_err(|e| format!("Render error: {:#}", e))
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+
+    // Whether the render succeeded or failed, tear down the notification so
+    // it doesn't linger forever.
+    render_notify::clear_render_progress(&app);
+    result
 }
 
 /// Report whether a manifest exists for `script_path` and whether it is stale.
@@ -593,8 +658,21 @@ fn manifest_status(
     }
 
     let existing_str = fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?;
-    let existing: manifest::Manifest =
-        serde_json::from_str(&existing_str).map_err(|e| e.to_string())?;
+    // A parse failure here means an old/incompatible manifest format. Rather
+    // than erroring out, treat it as "not rendered" so the UI offers to
+    // re-render (which regenerates it in the current format).
+    let existing: manifest::Manifest = match serde_json::from_str(&existing_str) {
+        Ok(m) => m,
+        Err(_) => {
+            return Ok(ManifestStatus {
+                rendered: false,
+                stale: false,
+                duration: None,
+                created: None,
+                manifest_path: None,
+            })
+        }
+    };
 
     let source_abs = state.agent_dir.join(&script_path);
     let stale = match fs::read(&source_abs) {
@@ -625,7 +703,7 @@ fn read_manifest(manifest_path: String) -> Result<serde_json::Value, String> {
         .to_path_buf();
     let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let mut value: serde_json::Value = serde_json::from_str(&content).map_err(|e| e.to_string())?;
-    manifest::resolve_paths_recursive(&mut value, &base_dir);
+    manifest::resolve_paths_recursive(&mut value["root"], &base_dir);
     Ok(value)
 }
 
@@ -739,6 +817,10 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        // Local plugin: Android foreground media service that keeps
+        // conditioning audio playing when the app is backgrounded. No-op on
+        // desktop.
+        .plugin(tauri_plugin_fgmedia::init())
         // Android-aware FS: lets package imports read `content://` URIs
         // returned by the Android file picker. On non-Android targets the
         // plugin initialises as a no-op stub.
@@ -818,6 +900,10 @@ pub fn run() {
             manifest_status,
             read_manifest,
             list_manifests,
+            // NOTE: the fgmedia commands (start/stop/update_media_state) are
+            // registered by the plugin's own init() via its invoke_handler,
+            // so they must NOT be re-listed here (double registration causes
+            // a macro-name-conflict compile error).
             // Agent / bash / file commands
             bash::exec_bash,
             bash::read_data_file,

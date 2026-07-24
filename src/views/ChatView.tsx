@@ -159,6 +159,16 @@ function ChatViewInner({
     onError: (e) => console.error("[chat] error:", e),
   });
 
+  useEffect(() => {
+    const saved = localStorage.getItem('chat-history');
+    if (saved) setMessages(JSON.parse(saved));
+  }, []);
+
+  useEffect(() => {
+    if (messages.length > 0)
+    localStorage.setItem('chat-history', JSON.stringify(messages));
+  }, [messages]);
+
   const [input, setInput] = useState("");
   const isGenerating = status === "submitted" || status === "streaming";
 
@@ -178,6 +188,7 @@ function ChatViewInner({
 
   const clearChat = () => {
     setMessages([]);
+    localStorage.removeItem('chat-history');
   };
 
   // ── Derive usage totals + active subagent from the event stream ───────
@@ -599,37 +610,27 @@ function ActivityParts({ message }: { message: UIMessage }) {
     }
   });
 
-  const latest = activity.length > 0 ? activity[activity.length - 1] : null;
-  const earlier = latest ? activity.slice(0, -1) : [];
-
   return (
     <>
       {/* The answer text comes first; all tool/thinking activity is
           collapsed to the bottom of the message (earlier steps behind a
           toggle, the latest step shown directly beneath it). */}
       {textChildren}
-      {earlier.length > 0 && (
+      {activity.length > 0 && (
         <Collapsible>
           <CollapsibleTrigger className="flex items-center gap-1 text-[11px] text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)] transition-colors group/collapsible">
             <ChevronDown
               size={11}
               className="transition-transform group-data-[state=open]/collapsible:rotate-90"
             />
-            {earlier.length} earlier {earlier.length === 1 ? "step" : "steps"}
+            {activity.length} {activity.length === 1 ? "step" : "steps"}
           </CollapsibleTrigger>
           <CollapsibleContent className="mt-1 flex flex-col gap-1 border-l border-[var(--color-border)] pl-2">
-            {earlier.map(({ index, part }) => (
-              <ActivityRow key={`earlier-${message.id}-${index}`} part={part} />
+            {activity.map(({ index, part }) => (
+              <ActivityRow key={`activity-${message.id}-${index}`} part={part} />
             ))}
           </CollapsibleContent>
         </Collapsible>
-      )}
-      {latest && (
-        <ActivityRow
-          key={`latest-${message.id}-${latest.index}`}
-          part={latest.part}
-          prominent
-        />
       )}
     </>
   );

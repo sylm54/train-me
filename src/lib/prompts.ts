@@ -27,6 +27,11 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import type { FileEntry } from "./types";
+import {
+  LARGE_FILE_LINE_THRESHOLD,
+  READ_HEAD_LINES,
+  getMarkdownHeadingsSummary,
+} from "./tools";
 
 const featureEmbed = `
 ## Features Overview
@@ -232,7 +237,7 @@ Constant folding: literals, binops of constants, and \`@max\`/\`@min\`/\`@step\`
 - \`<overlay>\` mixes all parts concurrently (all start together). \`<loop>\` repeats sequentially.
 - \`<include>\` renders to a deduped sub-manifest (context resets at the boundary); each file is hashed separately for incremental re-rendering.
 - Interactive tags \`<until>\`/\`<random>\`/\`<scramble>\`/\`<choice>\` produce segment boundaries; decisions for \`<random>\`/\`<scramble>\`/\`<choice>\` happen per-playback, so each listen can differ. \`<until>\` and \`<choice>\` are rejected inside \`<background>\`/\`<overlay>\` (they would block a concurrent stream); \`<random>\`/\`<scramble>\`/\`<loop>\`/\`<include>\` are allowed there. A \`<background>\` whose layer contains no interactive tag is baked into its surrounding segment; one with an interactive layer plays on a parallel track scoped to its enclosing sequence.
-
+- Note that <interactive> is not a valid tag; use <until>, <random>, <scramble>, or <choice> instead.
 ### Example
 
 \`\`\`xml
@@ -362,6 +367,22 @@ function capIncludeWords(content: string): string {
 }
 
 /**
+ * For files included via `{{include}}` that are large (by line count), return
+ * a heads-up message with the beginning of the file, total line count, and
+ * (for .md files) a markdown headings summary.
+ */
+function largeFileHead(content: string, path: string, totalLines: number): string {
+  const lines = content.split("\n");
+  const head = lines.slice(0, READ_HEAD_LINES).join("\n");
+  let msg = `\n\n[File is large: ${totalLines} lines. Showing first ${READ_HEAD_LINES} lines.]`;
+  msg += `\n[Use the read_file tool with start_line and end_line to read specific portions of this file.]`;
+  if (path.endsWith(".md")) {
+    msg += getMarkdownHeadingsSummary(content);
+  }
+  return head + msg;
+}
+
+/**
  * Resolve an `{{include}}` against the agent's writable directory, taking a
  * session-scoped snapshot. Reads go through the `read_data_file` Tauri command
  * (scoped under `agent_data/` by the backend), so traversal outside that dir
@@ -375,7 +396,12 @@ async function renderInclude(rawPath: string): Promise<string> {
   let value: string;
   try {
     const content = await invoke<string>("read_data_file", { path: key });
-    value = capIncludeWords(content);
+    const totalLines = content.split("\n").length;
+    if (totalLines > LARGE_FILE_LINE_THRESHOLD) {
+      value = largeFileHead(content, key, totalLines);
+    } else {
+      value = capIncludeWords(content);
+    }
   } catch (e) {
     // Missing or unreadable: snapshot as the missing marker so a later
     // mid-session write doesn't retroactively populate the prompt.

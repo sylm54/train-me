@@ -1261,11 +1261,14 @@ impl AudioRenderer {
     /// Render `script_rel` (relative to `agent_dir`) to a manifest directory
     /// under `tracks_dir/<id>/`. Idempotent: re-rendering an unchanged script
     /// reuses the existing manifest (see [`Self::render_manifest_file`]).
+    ///
+    /// `progress`, when `Some`, is notified as each speakable node is rendered.
     pub fn render_manifest(
         &mut self,
         script_rel: &str,
         agent_dir: &Path,
         tracks_dir: &Path,
+        progress: Option<&Arc<Mutex<ProgressTracker>>>,
     ) -> Result<RenderedManifest> {
         let source_abs = normalize_path(&agent_dir.join(script_rel));
         if !source_abs.exists() {
@@ -1290,6 +1293,7 @@ impl AudioRenderer {
             tracks_dir,
             &script_dir,
             &mut visited,
+            progress,
         )
     }
 
@@ -1308,6 +1312,7 @@ impl AudioRenderer {
         tracks_dir: &Path,
         script_dir: &Path,
         visited: &mut HashSet<PathBuf>,
+        progress: Option<&Arc<Mutex<ProgressTracker>>>,
     ) -> Result<RenderedManifest> {
         fs::create_dir_all(out_dir)?;
         let bytes = fs::read(source_abs)
@@ -1339,6 +1344,14 @@ impl AudioRenderer {
             .with_context(|| format!("script {} is not UTF-8", source_abs.display()))?;
         let nodes =
             tag_parser::parse(source).with_context(|| format!("parse {}", source_abs.display()))?;
+        // Seed the progress total with this file's speakable-leaf count. The
+        // freshness shortcut above already returned for reused includes, so we
+        // only count files we actually render — no double counting.
+        if let Some(tracker) = progress {
+            if let Ok(mut t) = tracker.lock() {
+                t.total = t.total.saturating_add(count_speakable_nodes(&nodes));
+            }
+        }
         let mut counter = 0usize;
         let root = self.walk(
             &nodes,
@@ -1349,6 +1362,7 @@ impl AudioRenderer {
             tracks_dir,
             &mut counter,
             visited,
+            progress,
         )?;
         let manifest = Manifest {
             version: 2,
@@ -1383,22 +1397,26 @@ impl AudioRenderer {
         tracks_dir: &Path,
         counter: &mut usize,
         visited: &mut HashSet<PathBuf>,
+        progress: Option<&Arc<Mutex<ProgressTracker>>>,
     ) -> Result<Segment> {
         let mut static_buf: Vec<Node> = Vec::new();
         let mut children: Vec<Segment> = Vec::new();
 
         for node in nodes {
             if manifest::contains_split(node) {
-                self.flush_static(&mut static_buf, ctx, out_dir, counter, &mut children)?;
+                self.flush_static(
+                    &mut static_buf, ctx, out_dir, counter, &mut children, progress,
+                )?;
                 let seg = self.emit_split(
                     node, ctx, out_dir, script_dir, agent_dir, tracks_dir, counter, visited,
+                    progress,
                 )?;
                 children.push(seg);
             } else {
                 static_buf.push(node.clone());
             }
         }
-        self.flush_static(&mut static_buf, ctx, out_dir, counter, &mut children)?;
+        self.flush_static(&mut static_buf, ctx, out_dir, counter, &mut children, progress)?;
         Ok(Segment::Sequence { children })
     }
 
@@ -1411,12 +1429,25 @@ impl AudioRenderer {
         out_dir: &Path,
         counter: &mut usize,
         children: &mut Vec<Segment>,
+        progress: Option<&Arc<Mutex<ProgressTracker>>>,
     ) -> Result<()> {
         if buf.is_empty() {
             return Ok(());
         }
-        let (samples, _dur) =
-            self.render_nodes(buf, &ctx.speaker, ctx.volume_scale, ctx.speed_scale)?;
+        // Use the tracked renderer so progress ticks fire DURING synthesis of
+        // each leaf node (not as one lump at the end). When no tracker is
+        // attached we fall back to the cheaper untracked path.
+        let (samples, _dur) = if let Some(tracker) = progress {
+            self.render_nodes_tracked(
+                buf,
+                &ctx.speaker,
+                ctx.volume_scale,
+                ctx.speed_scale,
+                tracker,
+            )?
+        } else {
+            self.render_nodes(buf, &ctx.speaker, ctx.volume_scale, ctx.speed_scale)?
+        };
         let file = self.write_seg(out_dir, counter, &samples)?;
         let duration = samples.len() as f32 / self.sample_rate as f32;
         children.push(Segment::Static { file, duration });
@@ -1443,6 +1474,7 @@ impl AudioRenderer {
         tracks_dir: &Path,
         counter: &mut usize,
         visited: &mut HashSet<PathBuf>,
+        progress: Option<&Arc<Mutex<ProgressTracker>>>,
     ) -> Result<Segment> {
         match node {
             Node::Until {
@@ -1458,8 +1490,19 @@ impl AudioRenderer {
                 }
                 // pre/post_pause are folded into the content render (render_nodes
                 // already handles them); the manifest model doesn't surface them.
-                let (samples, _dur) =
-                    self.render_nodes(children, &ctx.speaker, ctx.volume_scale, ctx.speed_scale)?;
+                // Use the tracked variant when a tracker is attached so progress
+                // ticks fire during the until-block's synthesis.
+                let (samples, _dur) = if let Some(tracker) = progress {
+                    self.render_nodes_tracked(
+                        children,
+                        &ctx.speaker,
+                        ctx.volume_scale,
+                        ctx.speed_scale,
+                        tracker,
+                    )?
+                } else {
+                    self.render_nodes(children, &ctx.speaker, ctx.volume_scale, ctx.speed_scale)?
+                };
                 let file = self.write_seg(out_dir, counter, &samples)?;
                 let duration = samples.len() as f32 / self.sample_rate as f32;
                 let text = tag_parser::extract_text(children);
@@ -1487,6 +1530,7 @@ impl AudioRenderer {
                     .map(|p| {
                         self.walk_part(
                             p, ctx, out_dir, script_dir, agent_dir, tracks_dir, counter, visited,
+                            progress,
                         )
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -1499,6 +1543,7 @@ impl AudioRenderer {
                     .map(|p| {
                         self.walk_part(
                             p, ctx, out_dir, script_dir, agent_dir, tracks_dir, counter, visited,
+                            progress,
                         )
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -1514,6 +1559,7 @@ impl AudioRenderer {
                     .map(|p| {
                         let seg = self.walk_part(
                             p, ctx, out_dir, script_dir, agent_dir, tracks_dir, counter, visited,
+                            progress,
                         )?;
                         Ok(ChoiceOption {
                             label: p.label.clone(),
@@ -1527,13 +1573,14 @@ impl AudioRenderer {
                 })
             }
 
-            Node::Include { src } => {
-                self.emit_include(src, out_dir, script_dir, agent_dir, tracks_dir, visited)
-            }
+            Node::Include { src } => self.emit_include(
+                src, out_dir, script_dir, agent_dir, tracks_dir, visited, progress,
+            ),
 
             Node::Loop { loops, children } => {
                 let child = self.walk(
                     children, ctx, out_dir, script_dir, agent_dir, tracks_dir, counter, visited,
+                    progress,
                 )?;
                 Ok(Segment::Loop {
                     loops: *loops,
@@ -1553,7 +1600,7 @@ impl AudioRenderer {
                     .with_forbid_pause(true);
                 let layer = self.walk(
                     children, &layer_ctx, out_dir, script_dir, agent_dir, tracks_dir, counter,
-                    visited,
+                    visited, progress,
                 )?;
                 Ok(Segment::Background {
                     volume: volume.clone(),
@@ -1569,7 +1616,7 @@ impl AudioRenderer {
                     .map(|p| {
                         let seg = self.walk_part(
                             p, &part_ctx, out_dir, script_dir, agent_dir, tracks_dir, counter,
-                            visited,
+                            visited, progress,
                         )?;
                         Ok(OverlayPartSegment {
                             looped: p.looped,
@@ -1603,6 +1650,7 @@ impl AudioRenderer {
                     .with_speed(speed.as_deref());
                 self.walk(
                     children, &sub, out_dir, script_dir, agent_dir, tracks_dir, counter, visited,
+                    progress,
                 )
             }
 
@@ -1610,6 +1658,7 @@ impl AudioRenderer {
                 let sub = ctx.clone().with_speed(Some(value.as_str()));
                 self.walk(
                     children, &sub, out_dir, script_dir, agent_dir, tracks_dir, counter, visited,
+                    progress,
                 )
             }
 
@@ -1617,6 +1666,7 @@ impl AudioRenderer {
                 let sub = ctx.clone().with_vol(Some(value.as_str()));
                 self.walk(
                     children, &sub, out_dir, script_dir, agent_dir, tracks_dir, counter, visited,
+                    progress,
                 )
             }
 
@@ -1638,6 +1688,7 @@ impl AudioRenderer {
         tracks_dir: &Path,
         counter: &mut usize,
         visited: &mut HashSet<PathBuf>,
+        progress: Option<&Arc<Mutex<ProgressTracker>>>,
     ) -> Result<Segment> {
         let pc = ctx
             .clone()
@@ -1652,10 +1703,16 @@ impl AudioRenderer {
             tracks_dir,
             counter,
             visited,
+            progress,
         )
     }
 
     /// Resolve a `<include src>` to a deduplicated `Import` segment.
+    ///
+    /// Resolution order:
+    /// 1. Try resolving `src` relative to the current script's directory.
+    /// 2. If that file does not exist, try resolving `src` relative to the
+    ///    agent directory root.
     ///
     /// The target is rendered (or reused) under
     /// `tracks/imports/<sha8(abs_path)>/`. Cycle protection: if the target is
@@ -1670,9 +1727,14 @@ impl AudioRenderer {
         agent_dir: &Path,
         tracks_dir: &Path,
         visited: &mut HashSet<PathBuf>,
+        progress: Option<&Arc<Mutex<ProgressTracker>>>,
     ) -> Result<Segment> {
-        let joined = script_dir.join(src);
-        let included_abs = normalize_path(&joined);
+        let relative = normalize_path(&script_dir.join(src));
+        let included_abs = if relative.exists() {
+            relative
+        } else {
+            normalize_path(&agent_dir.join(src))
+        };
         if !included_abs.exists() {
             bail!("Include not found: {}", included_abs.display());
         }
@@ -1698,6 +1760,7 @@ impl AudioRenderer {
                 tracks_dir,
                 &included_dir,
                 visited,
+                progress,
             )?;
             visited.remove(&included_abs);
         }
@@ -1798,6 +1861,8 @@ fn script_relative_to(abs: &Path, base: &Path) -> String {
 /// (typically `state.agent_dir`).
 ///
 /// Behavior:
+/// - If `src` is an absolute path, it is used directly.
+/// - If `src` is a relative path, it is resolved against `base_dir`.
 /// - Circular includes are silently skipped (tracked via the active recursion
 ///   path; siblings may re-include the same file).
 /// - Missing files are silently skipped.
@@ -1957,9 +2022,18 @@ fn resolve_overlay_parts(
 }
 
 /// Resolve a single `<include src="...">` reference.
+///
+/// Resolution order:
+/// 1. Try resolving `src` as a relative path against `base_dir`.
+/// 2. If that file does not exist, try resolving `src` as an absolute path.
 fn resolve_one_include(src: &str, base_dir: &Path, visited: &mut HashSet<PathBuf>) -> Vec<Node> {
-    let joined = base_dir.join(src);
-    let normalized = normalize_path(&joined);
+    // First try resolving relative to base_dir; fall back to absolute.
+    let relative = normalize_path(&base_dir.join(src));
+    let normalized = if relative.exists() {
+        relative
+    } else {
+        normalize_path(Path::new(src))
+    };
 
     if visited.contains(&normalized) {
         log::warn!("Skipping circular include: {}", normalized.display());
