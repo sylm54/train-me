@@ -98,6 +98,7 @@ export function TtsView() {
       setTrackName("");
       await refreshTracks();
     } catch (e) {
+      console.error("Synthesize failed:", e);
       setError(String(e));
     } finally {
       setBusy(false);

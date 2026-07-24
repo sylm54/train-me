@@ -455,18 +455,41 @@ async function runWriter(opts: {
   log("writer", "instructions", preview(opts.instructions));
 
   try {
+    // If the file already exists, read its current content so the
+    // writer can see what it's updating.
+    let existingContent: string | undefined;
+    try {
+      existingContent = await invoke<string>("read_data_file", {
+        path: opts.path,
+      });
+    } catch {
+      // File doesn't exist yet — that's fine.
+    }
+
+    const parts: UIMessage["parts"] = [];
+
+    if (existingContent != null) {
+      parts.push({
+        type: "text",
+        text: `The file \`${opts.path}\` already exists. Here is its current content:\n\n${existingContent}`,
+      });
+    }
+
+    parts.push({
+      type: "text",
+      text:
+        `Write the script to \`${opts.path}\`.
+
+` +
+        `Instructions from the planner:
+${opts.instructions}`,
+    });
+
     const messages: UIMessage[] = [
       {
         id: `writer-user-${Math.random().toString(36).slice(2)}`,
         role: "user",
-        parts: [
-          {
-            type: "text",
-            text:
-              `Write the script to \`${opts.path}\`.\n\n` +
-              `Instructions from the planner:\n${opts.instructions}`,
-          },
-        ],
+        parts,
       },
     ];
 

@@ -6,6 +6,7 @@
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 /// AST node for the TTS tag language.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -755,6 +756,229 @@ fn extract_text_recursive(node: &Node, texts: &mut Vec<String>) {
             }
         }
         Node::Pause { .. } | Node::Sound { .. } | Node::Tone { .. } | Node::Include { .. } => {}
+    }
+}
+
+// ============================================================================
+// Semantic validation
+// ============================================================================
+
+/// Known sound type values that the renderer will accept.
+const VALID_SOUND_TYPES: &[&str] = &[
+    "beep", "pop", "bubble_pop", "camera_shutter", "censor_beep",
+    "heart_beat", "padlock", "snap", "ding", "swoosh", "click",
+    "error", "success", "bell", "water_drop",
+];
+
+/// Known tone presets accepted by `generate_tone`.
+const VALID_TONE_PRESETS: &[&str] = &[
+    "sine", "square", "sawtooth", "triangle", "whitenoise",
+    "pinknoise", "brownnoise",
+    "binaural_theta", "binaural_alpha", "binaural_beta", "binaural_delta",
+];
+
+/// Known effect types accepted by `apply_effect`.
+const VALID_EFFECT_TYPES: &[&str] = &[
+    "echo", "reverb", "filter",
+];
+
+/// Known reverb presets for the "reverb" effect.
+const VALID_REVERB_PRESETS: &[&str] = &[
+    "medium", "small_room", "large_hall", "cathedral", "plate",
+];
+
+/// Known echo presets for the "echo" effect.
+const VALID_ECHO_PRESETS: &[&str] = &[
+    "light", "medium", "heavy",
+];
+
+/// Known speaker names accepted by the TTS engine.
+const VALID_SPEAKERS: &[&str] = &[
+    "male", "male2", "male3", "male4", "male5",
+    "female", "female2", "female3", "female4", "female5",
+];
+
+/// Validate a parsed AST for semantic correctness.
+///
+/// This catches issues the parser doesn't: unknown sound types, tone presets,
+/// effect types, effect presets, and speaker names. The renderer would trip
+/// on these with an opaque error; this gives the writer agent a clear message
+/// at validation time instead.
+///
+/// Returns `Err` with a multi-line summary of all semantic problems found.
+pub fn validate(nodes: &[Node]) -> Result<()> {
+    let mut errors: Vec<String> = Vec::new();
+    let mut seen_includes = HashSet::new();
+    validate_nodes(nodes, &mut errors, &mut seen_includes, &mut Vec::new());
+    if errors.is_empty() {
+        Ok(())
+    } else if errors.len() == 1 {
+        bail!("{}", errors[0])
+    } else {
+        let summary = errors
+            .iter()
+            .enumerate()
+            .map(|(i, e)| format!("  {}. {}", i + 1, e))
+            .collect::<Vec<_>>()
+            .join("\n");
+        bail!("Semantic validation found {} errors:\n{}", errors.len(), summary)
+    }
+}
+
+fn validate_nodes(
+    nodes: &[Node],
+    errors: &mut Vec<String>,
+    seen_includes: &mut HashSet<String>,
+    breadcrumb: &mut Vec<String>,
+) {
+    for node in nodes {
+        match node {
+            Node::Text(_) => {}
+
+            Node::Voice {
+                speaker,
+                children,
+                ..
+            } => {
+                if !VALID_SPEAKERS.contains(&speaker.as_str()) {
+                    errors.push(format!(
+                        "Unknown speaker '{}'. Valid speakers: {}",
+                        speaker,
+                        VALID_SPEAKERS.join(", ")
+                    ));
+                }
+                breadcrumb.push(format!("<voice speaker=\"{}\">", speaker));
+                validate_nodes(children, errors, seen_includes, breadcrumb);
+                breadcrumb.pop();
+            }
+
+            Node::Speed { children, .. } | Node::Volume { children, .. } => {
+                breadcrumb.push("<speed>|<volume>".to_string());
+                validate_nodes(children, errors, seen_includes, breadcrumb);
+                breadcrumb.pop();
+            }
+
+            Node::Sound { sound_type, .. } => {
+                if !VALID_SOUND_TYPES.contains(&sound_type.as_str()) {
+                    let near = breadcrumb.last().map(|s| s.as_str()).unwrap_or("top-level");
+                    errors.push(format!(
+                        "Unknown sound type '{}' in <sound type=\"{}\"> (inside {}). Valid types: {}",
+                        sound_type,
+                        sound_type,
+                        near,
+                        VALID_SOUND_TYPES.join(", ")
+                    ));
+                }
+            }
+
+            Node::Tone {
+                preset,
+                ..
+            } => {
+                if !VALID_TONE_PRESETS.contains(&preset.as_str()) {
+                    let near = breadcrumb.last().map(|s| s.as_str()).unwrap_or("top-level");
+                    errors.push(format!(
+                        "Unknown tone preset '{}' in <tone preset=\"{}\"> (inside {}). Valid presets: {}",
+                        preset,
+                        preset,
+                        near,
+                        VALID_TONE_PRESETS.join(", ")
+                    ));
+                }
+            }
+
+            Node::Effect {
+                effect_type,
+                preset,
+                children,
+                ..
+            } => {
+                if !VALID_EFFECT_TYPES.contains(&effect_type.as_str()) {
+                    errors.push(format!(
+                        "Unknown effect type '{}'. Valid types: {}",
+                        effect_type,
+                        VALID_EFFECT_TYPES.join(", ")
+                    ));
+                } else if effect_type == "echo" {
+                    if let Some(p) = preset {
+                        if !VALID_ECHO_PRESETS.contains(&p.as_str()) {
+                            errors.push(format!(
+                                "Unknown echo preset '{}'. Valid presets: {}",
+                                p,
+                                VALID_ECHO_PRESETS.join(", ")
+                            ));
+                        }
+                    }
+                } else if effect_type == "reverb" {
+                    if let Some(p) = preset {
+                        if !VALID_REVERB_PRESETS.contains(&p.as_str()) {
+                            errors.push(format!(
+                                "Unknown reverb preset '{}'. Valid presets: {}",
+                                p,
+                                VALID_REVERB_PRESETS.join(", ")
+                            ));
+                        }
+                    }
+                }
+                breadcrumb.push(format!("<effect type=\"{}\">", effect_type));
+                validate_nodes(children, errors, seen_includes, breadcrumb);
+                breadcrumb.pop();
+            }
+
+            Node::Include { src } => {
+                if src.is_empty() {
+                    errors.push("<include> has an empty 'src' attribute".to_string());
+                } else if seen_includes.contains(src) {
+                    errors.push(format!(
+                        "Circular or repeated <include src=\"{}\"> — each file may only be included once in a render tree",
+                        src
+                    ));
+                }
+                seen_includes.insert(src.clone());
+            }
+
+            Node::Loop { children, .. } => {
+                breadcrumb.push("<loop>".to_string());
+                validate_nodes(children, errors, seen_includes, breadcrumb);
+                breadcrumb.pop();
+            }
+
+            Node::Background { children, .. } => {
+                breadcrumb.push("<background>".to_string());
+                validate_nodes(children, errors, seen_includes, breadcrumb);
+                breadcrumb.pop();
+            }
+
+            Node::Until {
+                waiting_sound,
+                children,
+                ..
+            } => {
+                if let Some(ws) = waiting_sound {
+                    if !VALID_SOUND_TYPES.contains(&ws.as_str()) {
+                        errors.push(format!(
+                            "Unknown waiting-sound type '{}' in <until>. Valid sound types: {}",
+                            ws,
+                            VALID_SOUND_TYPES.join(", ")
+                        ));
+                    }
+                }
+                breadcrumb.push("<until>".to_string());
+                validate_nodes(children, errors, seen_includes, breadcrumb);
+                breadcrumb.pop();
+            }
+
+            Node::Overlay { parts, .. }
+            | Node::Random { parts }
+            | Node::Scramble { parts }
+            | Node::Choice { options: parts, .. } => {
+                for part in parts {
+                    validate_nodes(&part.children, errors, seen_includes, breadcrumb);
+                }
+            }
+
+            Node::Pause { .. } => {}
+        }
     }
 }
 
