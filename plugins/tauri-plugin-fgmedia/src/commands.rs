@@ -57,11 +57,13 @@ pub fn start_media_service<R: Runtime>(app: AppHandle<R>, args: StartArgs) -> Re
 pub fn update_media_state<R: Runtime>(app: AppHandle<R>, args: StateArgs) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
-        use std::collections::HashMap;
         let fg = app.state::<crate::FgMedia<R>>();
-        let mut payload = HashMap::new();
-        payload.insert("title", args.title.unwrap_or_default());
-        payload.insert("playing", args.playing.unwrap_or(true));
+        // `title` is a String and `playing` is a bool, so the payload value
+        // type must be `serde_json::Value` (not `String`) to carry both.
+        let payload = serde_json::json!({
+            "title": args.title.unwrap_or_default(),
+            "playing": args.playing.unwrap_or(true),
+        });
         fg.handle
             .run_mobile_plugin::<()>("setState", payload)
             .map_err(|e| e.to_string())?;
