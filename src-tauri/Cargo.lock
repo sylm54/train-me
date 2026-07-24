@@ -5216,6 +5216,7 @@ version = "0.1.0"
 dependencies = [
  "log",
  "serde",
+ "serde_json",
  "tauri",
  "tauri-plugin",
 ]
@@ -5804,7 +5805,7 @@ dependencies = [
 
 [[package]]
 name = "train-me"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "aegis",
  "android_logger",
