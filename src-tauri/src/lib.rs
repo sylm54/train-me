@@ -817,10 +817,6 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
-        // Local plugin: Android foreground media service that keeps
-        // conditioning audio playing when the app is backgrounded. No-op on
-        // desktop.
-        .plugin(tauri_plugin_fgmedia::init())
         // Android-aware FS: lets package imports read `content://` URIs
         // returned by the Android file picker. On non-Android targets the
         // plugin initialises as a no-op stub.
@@ -900,10 +896,6 @@ pub fn run() {
             manifest_status,
             read_manifest,
             list_manifests,
-            // NOTE: the fgmedia commands (start/stop/update_media_state) are
-            // registered by the plugin's own init() via its invoke_handler,
-            // so they must NOT be re-listed here (double registration causes
-            // a macro-name-conflict compile error).
             // Agent / bash / file commands
             bash::exec_bash,
             bash::read_data_file,

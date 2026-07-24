@@ -5211,17 +5211,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tauri-plugin-fgmedia"
-version = "0.1.0"
-dependencies = [
- "log",
- "serde",
- "serde_json",
- "tauri",
- "tauri-plugin",
-]
-
-[[package]]
 name = "tauri-plugin-fs"
 version = "2.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5805,7 +5794,7 @@ dependencies = [
 
 [[package]]
 name = "train-me"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "aegis",
  "android_logger",
@@ -5837,7 +5826,6 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-android-fs",
  "tauri-plugin-dialog",
- "tauri-plugin-fgmedia",
  "tauri-plugin-fs",
  "tauri-plugin-notification",
  "tauri-plugin-opener",

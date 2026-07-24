@@ -270,8 +270,6 @@ export function ConditioningView() {
       isMountedRef.current = false;
       playerRef.current?.destroy();
       playerRef.current = null;
-      // Best-effort; no-op on desktop.
-      void invoke("stop_media_service").catch(() => {});
     };
   }, []);
 
@@ -464,27 +462,10 @@ export function ConditioningView() {
         setIsPlaying(true);
         setPlayingScript(current);
 
-        // Title surfaced in the "Now playing" foreground notification.
-        const mediaTitle = current.meta?.title ?? current.id;
-
-        // The player fires `onPlayingChange(true)` on EVERY segment start,
-        // which would flood the IPC channel with redundant
-        // `update_media_state` calls (one per segment — hundreds for a long
-        // script). Track the last reported value and only push to the backend
-        // on a real transition.
-        let lastReportedPlaying = true;
-
         const player = new ManifestPlayer({
           onPrompt: (p) => setActivePrompt(p),
           onPlayingChange: (playing) => {
             setIsPlaying(playing);
-            // Only mirror to the foreground service when the state actually
-            // changes (play↔pause), never on redundant per-segment `true`.
-            if (playing === lastReportedPlaying) return;
-            lastReportedPlaying = playing;
-            void invoke("update_media_state", {
-              args: { title: mediaTitle, playing },
-            }).catch(() => {});
           },
           onEnded: () => {
             void logActivity(
@@ -494,9 +475,6 @@ export function ConditioningView() {
             );
             setPlayingScript(null);
             teardownPlayer();
-            // Playback finished — tear down the foreground service so the
-            // process can be backgrounded/killed normally again.
-            void invoke("stop_media_service").catch(() => {});
           },
           onError: (e) => {
             setPlayerError(e.message || String(e));
@@ -509,12 +487,6 @@ export function ConditioningView() {
           },
         });
         playerRef.current = player;
-        // Start the foreground media service so conditioning audio keeps
-        // playing (and the process stays alive) when the app is backgrounded.
-        // Best effort; no-op on desktop.
-        void invoke("start_media_service", {
-          args: { title: mediaTitle },
-        }).catch(() => {});
         void player.start(tree.root);
       } catch (e) {
         // read_manifest failed before the player could open. Surface the
@@ -532,8 +504,6 @@ export function ConditioningView() {
   const handleClosePlayer = useCallback(() => {
     setPlayingScript(null);
     teardownPlayer();
-    // User exited the player mid-play — stop the foreground media service.
-    void invoke("stop_media_service").catch(() => {});
   }, [teardownPlayer]);
 
   const togglePlayPause = useCallback(() => {
