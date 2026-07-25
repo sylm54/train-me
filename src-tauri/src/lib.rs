@@ -595,12 +595,6 @@ async fn render_manifest(
         .unwrap_or(&script_path)
         .to_string();
 
-    // Set up the native notification up front so it's visible during the
-    // whole render. Best-effort: failures here must not break the render.
-    render_notify::ensure_channel(&app);
-    render_notify::request_permission_best_effort(&app);
-    render_notify::show_render_progress(&app, &display_title, 0, 0);
-
     // Progress tracker: each tick emits a Tauri event (for the in-app bar)
     // and throttles a notification body update. The total is seeded lazily
     // inside the walker as it parses each file (see render_manifest_file).
@@ -622,12 +616,46 @@ async fn render_manifest(
         notify_throttle.maybe_update(&notify_app, &notify_title, step, total);
     });
 
+    // The notification setup (channel creation + the first `show`) used to run
+    // synchronously in this `async` command's body — i.e. on Tauri's main
+    // thread, BEFORE `spawn_blocking`. On Android `NotificationManager.notify()`
+    // is a blocking JNI/service call that can stall the main thread for a long
+    // time (notably on first use and on some OEM ROMs). While blocked, the main
+    // thread can neither dispatch this command into the worker NOR deliver the
+    // worker's emitted progress events — so the in-app bar froze at
+    // "Starting render…" even though the engine was loaded. Channel creation
+    // and the show are moved into the worker below; the notification plugin is
+    // explicitly safe to call from `spawn_blocking` (see render_notify.rs).
+    //
+    // `request_permission_best_effort` stays on the main thread: a runtime
+    // permission request is semantically a UI/Activity operation on Android
+    // and must originate from the main thread. It is also a fast no-op once
+    // permission is granted (and it is, since the app posts routine-reminder
+    // notifications), so it doesn't contribute to the hang.
+    render_notify::request_permission_best_effort(&app);
+
+    let notify_app_for_setup = app.clone();
+    let notify_title_for_setup = display_title.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
+        // First signal to the UI: the command reached the worker. If this
+        // never appears, the hang is in dispatch (event-loop starvation), not
+        // in the render itself.
         let tracker = Arc::new(std::sync::Mutex::new(audio_renderer::ProgressTracker {
             step: 0,
             total: 0,
             callback: progress_callback,
         }));
+        if let Ok(mut t) = tracker.lock() {
+            t.emit_phase("Entering worker…");
+        }
+
+        // Best-effort notification setup, off the main thread. Failures are
+        // logged and swallowed inside render_notify so they can't fail the
+        // render. Done after the "Entering worker…" phase so a hang in channel
+        // creation / show is diagnosable too.
+        render_notify::ensure_channel(&notify_app_for_setup);
+        render_notify::show_render_progress(&notify_app_for_setup, &notify_title_for_setup, 0, 0);
+
         // Surface the (possibly slow / contended) engine acquisition as its own
         // phase so a hang here doesn't read as an opaque "Preparing…".
         if let Ok(mut t) = tracker.lock() {
