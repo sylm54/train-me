@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::expression::{self, Expr};
-use crate::helper::{load_text_to_speech, load_voice_style, write_wav_file, TextToSpeech};
+use crate::helper::{load_text_to_speech, load_voice_style, write_wav_file, Style, TextToSpeech};
 use crate::manifest::{
     self, nominal_duration, relative_path, sha8_of_path, ChoiceOption, Manifest,
     OverlayPartSegment, Segment, WalkCtx,
@@ -23,6 +23,8 @@ use crate::RenderedManifest;
 
 use rand::seq::SliceRandom;
 use rand::Rng;
+
+use std::collections::HashMap;
 
 // ============================================================================
 // Value resolution helpers
@@ -194,6 +196,12 @@ pub struct AudioRenderer {
     model_dir: std::path::PathBuf,
     /// Current sample rate (from TTS model).
     pub sample_rate: u32,
+    /// Parsed voice styles, keyed by speaker name. `synthesize_text` used to
+    /// re-open and re-parse the JSON (`load_voice_style`) on every Text leaf;
+    /// a script with N lines re-parsed the same file N times. This cache loads
+    /// each style lazily on first use, then serves it from memory. `Arc` so a
+    /// future `&self` call path can return a cheap clone.
+    styles: HashMap<String, Arc<Style>>,
 }
 
 impl AudioRenderer {
@@ -207,6 +215,7 @@ impl AudioRenderer {
             tts,
             model_dir: model_dir.to_path_buf(),
             sample_rate,
+            styles: HashMap::new(),
         })
     }
 
@@ -635,15 +644,24 @@ impl AudioRenderer {
         speaker: &str,
         speed: f32,
     ) -> Result<(Vec<f32>, f32)> {
-        let style_path = model_downloader::voice_style_path(&self.model_dir, speaker)
-            .ok_or_else(|| anyhow::anyhow!("Unknown speaker: {}", speaker))?;
-
-        if !style_path.exists() {
-            bail!("Voice style file not found: {:?}", style_path);
-        }
-
-        let style = load_voice_style(&[style_path.to_string_lossy().to_string()], false)
-            .context("Failed to load voice style")?;
+        // Serve the parsed style from the cache, falling back to a one-time
+        // load + parse on first use of this speaker. Previously this re-read
+        // and re-parsed the JSON on every call.
+        let style = match self.styles.get(speaker) {
+            Some(s) => s.clone(),
+            None => {
+                let style_path = model_downloader::voice_style_path(&self.model_dir, speaker)
+                    .ok_or_else(|| anyhow::anyhow!("Unknown speaker: {}", speaker))?;
+                if !style_path.exists() {
+                    bail!("Voice style file not found: {:?}", style_path);
+                }
+                let parsed = load_voice_style(&[style_path.to_string_lossy().to_string()], false)
+                    .context("Failed to load voice style")?;
+                let arc = Arc::new(parsed);
+                self.styles.insert(speaker.to_string(), arc.clone());
+                arc
+            }
+        };
 
         let speed_clamped = speed.clamp(0.5, 1.5);
         let (samples, _duration) = self

@@ -124,13 +124,34 @@ impl UnicodeProcessor {
     }
 }
 
+// ============================================================================
+// Static regexes — compiled once per process, reused across calls.
+// `preprocess_text` runs once per chunk per Text leaf (see TextToSpeech::call),
+// so recompiling these on every call was a measurable cost in profiles.
+// ============================================================================
+use std::sync::LazyLock;
+
+static EMOJI_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[\x{1F600}-\x{1F64F}\x{1F300}-\x{1F5FF}\x{1F680}-\x{1F6FF}\x{1F700}-\x{1F77F}\x{1F780}-\x{1F7FF}\x{1F800}-\x{1F8FF}\x{1F900}-\x{1F9FF}\x{1FA00}-\x{1FA6F}\x{1FA70}-\x{1FAFF}\x{2600}-\x{26FF}\x{2700}-\x{27BF}\x{1F1E6}-\x{1F1FF}]+").unwrap()
+});
+static SP_BEFORE_COMMA_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r" ,").unwrap());
+static SP_BEFORE_PERIOD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r" \.").unwrap());
+static SP_BEFORE_BANG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r" !").unwrap());
+static SP_BEFORE_QMARK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r" \?").unwrap());
+static SP_BEFORE_SEMI_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r" ;").unwrap());
+static SP_BEFORE_COLON_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r" :").unwrap());
+static SP_BEFORE_QUOTE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r" '").unwrap());
+static MULTIPLE_SP_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
+static ENDS_WITH_PUNCT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"[.!?;:,'"\u{201C}\u{201D}\u{2018}\u{2019})\]}…。」』】〉》›»]$"#).unwrap()
+});
+
 pub fn preprocess_text(text: &str, lang: &str) -> Result<String> {
     // TODO: Need advanced normalizer for better performance
     let mut text: String = text.nfkd().collect();
 
     // Remove emojis (wide Unicode range)
-    let emoji_pattern = Regex::new(r"[\x{1F600}-\x{1F64F}\x{1F300}-\x{1F5FF}\x{1F680}-\x{1F6FF}\x{1F700}-\x{1F77F}\x{1F780}-\x{1F7FF}\x{1F800}-\x{1F8FF}\x{1F900}-\x{1F9FF}\x{1FA00}-\x{1FA6F}\x{1FA70}-\x{1FAFF}\x{2600}-\x{26FF}\x{2700}-\x{27BF}\x{1F1E6}-\x{1F1FF}]+").unwrap();
-    text = emoji_pattern.replace_all(&text, "").to_string();
+    text = EMOJI_RE.replace_all(&text, "").to_string();
 
     // Replace various dashes and symbols
     let replacements = [
@@ -175,34 +196,13 @@ pub fn preprocess_text(text: &str, lang: &str) -> Result<String> {
     }
 
     // Fix spacing around punctuation
-    text = Regex::new(r" ,")
-        .unwrap()
-        .replace_all(&text, ",")
-        .to_string();
-    text = Regex::new(r" \.")
-        .unwrap()
-        .replace_all(&text, ".")
-        .to_string();
-    text = Regex::new(r" !")
-        .unwrap()
-        .replace_all(&text, "!")
-        .to_string();
-    text = Regex::new(r" \?")
-        .unwrap()
-        .replace_all(&text, "?")
-        .to_string();
-    text = Regex::new(r" ;")
-        .unwrap()
-        .replace_all(&text, ";")
-        .to_string();
-    text = Regex::new(r" :")
-        .unwrap()
-        .replace_all(&text, ":")
-        .to_string();
-    text = Regex::new(r" '")
-        .unwrap()
-        .replace_all(&text, "'")
-        .to_string();
+    text = SP_BEFORE_COMMA_RE.replace_all(&text, ",").to_string();
+    text = SP_BEFORE_PERIOD_RE.replace_all(&text, ".").to_string();
+    text = SP_BEFORE_BANG_RE.replace_all(&text, "!").to_string();
+    text = SP_BEFORE_QMARK_RE.replace_all(&text, "?").to_string();
+    text = SP_BEFORE_SEMI_RE.replace_all(&text, ";").to_string();
+    text = SP_BEFORE_COLON_RE.replace_all(&text, ":").to_string();
+    text = SP_BEFORE_QUOTE_RE.replace_all(&text, "'").to_string();
 
     // Remove duplicate quotes
     while text.contains("\"\"") {
@@ -216,20 +216,12 @@ pub fn preprocess_text(text: &str, lang: &str) -> Result<String> {
     }
 
     // Remove extra spaces
-    text = Regex::new(r"\s+")
-        .unwrap()
-        .replace_all(&text, " ")
-        .to_string();
+    text = MULTIPLE_SP_RE.replace_all(&text, " ").to_string();
     text = text.trim().to_string();
 
     // If text doesn't end with punctuation, quotes, or closing brackets, add a period
-    if !text.is_empty() {
-        let ends_with_punct =
-            Regex::new(r#"[.!?;:,'"\u{201C}\u{201D}\u{2018}\u{2019})\]}…。」』】〉》›»]$"#)
-                .unwrap();
-        if !ends_with_punct.is_match(&text) {
-            text.push('.');
-        }
+    if !text.is_empty() && !ENDS_WITH_PUNCT_RE.is_match(&text) {
+        text.push('.');
     }
 
     // Validate language
@@ -644,16 +636,21 @@ impl TextToSpeech {
         // Prepare constant arrays
         let total_step_array = Array::from_elem(bsz, total_step as f32);
 
+        // Loop-invariant ONNX inputs: these tensors don't change across the
+        // denoising steps, so build their `Value`s once before the loop instead
+        // of re-cloning the underlying arrays on every step. (xt and the step
+        // counter are the only per-step inputs.)
+        let text_emb_value = Value::from_array(text_emb.clone())?;
+        let latent_mask_value = Value::from_array(latent_mask.clone())?;
+        let text_mask_value2 = Value::from_array(text_mask.clone())?;
+        let total_step_value = Value::from_array(total_step_array)?;
+
         // Denoising loop
         for step in 0..total_step {
             let current_step_array = Array::from_elem(bsz, step as f32);
 
             let xt_value = Value::from_array(xt.clone())?;
-            let text_emb_value = Value::from_array(text_emb.clone())?;
-            let latent_mask_value = Value::from_array(latent_mask.clone())?;
-            let text_mask_value2 = Value::from_array(text_mask.clone())?;
             let current_step_value = Value::from_array(current_step_array)?;
-            let total_step_value = Value::from_array(total_step_array.clone())?;
 
             let vector_est_outputs = self.vector_est_ort.run(ort::inputs! {
                 "noisy_latent" => &xt_value,
