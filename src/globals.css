@@ -121,6 +121,18 @@ body {
     }
 }
 
+/* Indeterminate shimmer for the conditioning render progress bar, shown
+   before the backend has counted the total work (e.g. during the slow model
+   load on mobile). The bar slides across the track and loops. */
+@keyframes render-indeterminate {
+    0% {
+        transform: translateX(-100%);
+    }
+    100% {
+        transform: translateX(400%);
+    }
+}
+
 /* Hide scrollbar utility (used by mobile bottom nav) */
 .scrollbar-none::-webkit-scrollbar {
     display: none;

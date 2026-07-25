@@ -35,10 +35,10 @@ import {
 
 const featureEmbed = `
 ## Features Overview
-### 1. Conditioning (\`conditioning/*.md\`)
+### 1. Conditioning (\`conditioning/*.json\`)
 - Each .json file corresponds to one audio file.
 - File contents describe the associated audio.
-- Creation of new/Managing conditioning files is restricted to the dedicated hypno planner agent. The main agent should never modify these files directly; instead, it should instruct the HypnoPlanner subagent to create or update conditioning entries as needed as it has the necessary context.
+- Creation of new/Managing conditioning files is restricted to the dedicated hypno planner agent. The main agent should never modify these files directly; instead, it should instruct the HypnoPlanner subagent to create or update conditioning entries as needed.
 
 ### 2. Rules (\`rule/*.md\`)
 - Each file represents one rule that the user is expected to follow.
@@ -48,11 +48,11 @@ const featureEmbed = `
 ### 3. Routines (\`routines/*.md\`)
 - Each file defines one routine for the user.
 - Refer to \`examples/routine.md\` for the proper formatting standard.
-- Create one routine file for each distinct routine you want to establish. For routines that vary by day, time, or other conditions, create separate files with clear naming to indicate their context (e.g., \`morning_routine.md\`, \`evening_routine.md\`, \`weekend_routine.md\`).
+- Create one routine file for each distinct routine you want to establish. For routines that vary by day, time, or other conditions, create separate files with clear naming to indicate their context.
 
 ### 4. Inventory
-- **Items**: records items owned by the user.
-  - Read-only for you: use \`inventory items\` to list all, \`inventory items <id>\` to show one.
+- **Items**: records items owned by the user, use the inventory cli to manage/browse inventory.
+  - Read-only for you: use the bash command \`inventory items\` to list all, \`inventory items <id>\` to show one.
   - Managed by the user via the UI.
 - **Wishlist**: things the user should acquire.
   - \`inventory wishlist\` — list all entries.
@@ -61,14 +61,14 @@ const featureEmbed = `
   - \`inventory wishlist remove <id>\` — remove an entry.
   - You have full read/write access to the wishlist.
 ### 5. Chastity
-- Command: \`chastity\`
+- CLI Command: \`chastity\`
 - Capabilities:
   - \`chastity info\` — Displays current lock status.
   - \`chastity unlock\` — Unlocks the user.
-- The user is responsible for locking themselves. Once locked, you can only unlock them by using the \`chastity unlock\` command.
+- The user is responsible for locking themselves. Once locked, only you can unlock them by using the \`chastity unlock\` command in bash.
 
 ### 6. Journal (\`journal/*.md\`, \`journal/format.json\`)
-- The user may maintain personal journal entries in the \`.md\` files (read-only for you).
+- The user may maintain personal journal entries in the \`.md\` files.
 - You may customize prompts and related settings by editing \`format.json\`.
 - Refer to \`example/format.json\` for the expected structure.
 
@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS activity (
     action   TEXT    NOT NULL,
     details  TEXT    NOT NULL DEFAULT ''
 );
+- Note the ts column is a RFC 3339 and ISO 8601 date and time string.
 `.trim();
 
 const ttsTagsEmbed = `

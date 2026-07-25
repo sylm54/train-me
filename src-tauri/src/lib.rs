@@ -113,10 +113,18 @@ pub struct ManifestStatus {
 // ============================================================================
 
 /// Check whether the model has been downloaded and is loaded.
+///
+/// This is a synchronous command (runs on the main thread) and is called on
+/// every ConditioningView mount. A render in flight holds `renderer`'s mutex
+/// for its entire duration (see `render_manifest`), so a blocking `.lock()`
+/// here would freeze the UI until the render finishes — exactly the
+/// "stuck on refreshing" hang when navigating away and back mid-render. We
+/// use `try_lock` instead: if the renderer is busy we still report `loaded:
+/// true` (it IS loaded, just busy), which is the correct answer for the UI.
 #[tauri::command]
 fn get_model_status(state: State<'_, AppState>) -> Result<ModelStatus, String> {
     let downloaded = model_downloader::is_model_downloaded(&state.model_dir);
-    let loaded = state.renderer.lock().is_some();
+    let loaded = state.renderer.try_lock().map(|g| g.is_some()).unwrap_or(true);
     let missing_files = model_downloader::missing_files(&state.model_dir);
     let speakers = model_downloader::available_speakers()
         .iter()

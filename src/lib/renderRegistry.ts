@@ -1,0 +1,189 @@
+/**
+ * Global render state for conditioning manifests.
+ *
+ * The backend's `render_manifest` command is fire-and-forget from the UI's
+ * perspective: it runs on a blocking thread, holds the renderer mutex for the
+ * whole render, emits a single global `render-manifest-progress` event per
+ * step, and has no cancellation. ConditioningView, however, *fully unmounts*
+ * when the user navigates to another screen (App.tsx does
+ * `{view !== "chat" && body}`), so any render-in-flight state kept in that
+ * component is destroyed on navigation — leaving the backend grinding away
+ * with nobody listening, and a freshly mounted view that has no idea a render
+ * is (or was) running.
+ *
+ * This module is the single source of truth for render state. It lives at
+ * module scope (survives unmount/remount) and owns one always-on listener for
+ * the global progress event, attached lazily on first subscription and kept
+ * alive for the app lifetime. Because the listener is up before any render is
+ * ever invoked, no early progress events are missed (which on a slow/mobile
+ * device is exactly the window where the bar used to look "stuck"). Components
+ * subscribe through `useRenderStore` (built on `useSyncExternalStore`).
+ *
+ * State is keyed by the backend's `script` field (the script path), so
+ * concurrent renders of different scripts don't cross-feed each other.
+ */
+
+import { useSyncExternalStore } from "react";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+
+/** Lifecycle of a single script's render. */
+export type RenderStatus = "rendering" | "done" | "error";
+
+export interface RenderEntry {
+  status: RenderStatus;
+  step: number;
+  total: number;
+  label: string;
+  /** Present only when `status === "error"`. */
+  error: string | null;
+}
+
+/** Shape of the backend's `render-manifest-progress` event payload. */
+interface RenderProgressEvent {
+  script: string;
+  step: number;
+  total: number;
+  label: string;
+}
+
+// ── Store ──────────────────────────────────────────────────────────────────
+
+const listeners = new Set<() => void>();
+// A fresh Map ref is published on every mutation so useSyncExternalStore sees
+// a changed snapshot (it compares by reference between renders).
+let store: ReadonlyMap<string, RenderEntry> = new Map();
+
+function emit(): void {
+  for (const l of listeners) l();
+}
+
+function setEntry(scriptPath: string, entry: RenderEntry): void {
+  const next = new Map(store);
+  next.set(scriptPath, entry);
+  store = next;
+  emit();
+}
+
+function subscribe(cb: () => void): () => void {
+  listeners.add(cb);
+  // The global listener is lazily attached the first time anyone subscribes,
+  // and never torn down — it must outlive any single component instance.
+  void ensureGlobalListener();
+  return () => {
+    listeners.delete(cb);
+  };
+}
+
+function getSnapshot(): ReadonlyMap<string, RenderEntry> {
+  return store;
+}
+
+// ── Global progress listener (attached once, kept forever) ─────────────────
+
+let globalListenerPromise: Promise<void> | null = null;
+
+/**
+ * Ensure the global `render-manifest-progress` listener is attached. Safe to
+ * call repeatedly; resolves immediately once the listener is up. Callers that
+ * are about to invoke `render_manifest` should `await` this so the listener's
+ * IPC round-trip has completed before the backend starts emitting — closing
+ * the last race where early events would be missed on a first-ever render.
+ */
+export function ensureGlobalListener(): Promise<void> {
+  if (globalListenerPromise) return globalListenerPromise;
+  globalListenerPromise = (async () => {
+    const unlisten: UnlistenFn = await listen<RenderProgressEvent>(
+      "render-manifest-progress",
+      (e) => {
+        const { script, step, total, label } = e.payload;
+        // Only advance a render that's actually in flight — ignore stray
+        // events for renders whose view instance already marked done/error.
+        const cur = store.get(script);
+        if (!cur || cur.status !== "rendering") return;
+        setEntry(script, {
+          status: "rendering",
+          step,
+          total,
+          label,
+          error: null,
+        });
+      },
+    );
+    // Keep the unlisten handle so the listener could be torn down in tests /
+    // a future hot-reload path; for the app lifetime it intentionally stays
+    // attached (the registry must survive navigation).
+    void unlisten;
+  })();
+  return globalListenerPromise;
+}
+
+// ── Mutators ───────────────────────────────────────────────────────────────
+
+/** Mark a render as starting; clears any prior progress/error for the path. */
+export function markStart(scriptPath: string): void {
+  setEntry(scriptPath, {
+    status: "rendering",
+    step: 0,
+    total: 0,
+    label: "",
+    error: null,
+  });
+}
+
+/** Record a progress tick for an in-flight render. */
+export function updateProgress(
+  scriptPath: string,
+  tick: { step: number; total: number; label: string },
+): void {
+  const cur = store.get(scriptPath);
+  // Don't resurrect a render that already terminated.
+  if (cur && cur.status !== "rendering") return;
+  setEntry(scriptPath, {
+    status: "rendering",
+    step: tick.step,
+    total: tick.total,
+    label: tick.label,
+    error: null,
+  });
+}
+
+/** Mark a render as successfully finished. */
+export function markDone(scriptPath: string): void {
+  setEntry(scriptPath, {
+    status: "done",
+    step: 0,
+    total: 0,
+    label: "",
+    error: null,
+  });
+}
+
+/** Mark a render as failed, recording the error message. */
+export function markError(scriptPath: string, message: string): void {
+  setEntry(scriptPath, {
+    status: "error",
+    step: 0,
+    total: 0,
+    label: "",
+    error: message,
+  });
+}
+
+/** Remove a script's entry entirely (e.g. after the UI has consumed it). */
+export function clear(scriptPath: string): void {
+  if (!store.has(scriptPath)) return;
+  const next = new Map(store);
+  next.delete(scriptPath);
+  store = next;
+  emit();
+}
+
+// ── React binding ──────────────────────────────────────────────────────────
+
+/**
+ * Subscribe to the global render store. Returns the immutable snapshot Map
+ * (keyed by script path). Re-renders the component whenever any entry changes.
+ */
+export function useRenderStore(): ReadonlyMap<string, RenderEntry> {
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+}

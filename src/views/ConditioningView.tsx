@@ -21,7 +21,6 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   AlertCircle,
   ArrowLeft,
@@ -41,21 +40,19 @@ import { Button } from "@/components/ui/button";
 import { type FileEntry, tauriErrorToString } from "@/lib/types";
 import { logActivity } from "@/lib/activity";
 import { ActivePrompt, ManifestPlayer, Segment } from "@/lib/manifestPlayer";
+import {
+  clear as clearRenderEntry,
+  ensureGlobalListener,
+  markDone,
+  markError,
+  markStart,
+  useRenderStore,
+  type RenderEntry,
+} from "@/lib/renderRegistry";
 
 // ──────────────────────────────────────────────────────────────────────────
 // Types
 // ──────────────────────────────────────────────────────────────────────────
-
-interface RenderProgress {
-  /** Script path (relative to agent_dir) this tick is for. Used to scope
-   * progress to the script currently being rendered — the backend emits one
-   * global event, so without this filter two concurrent renders would
-   * cross-feed each other's bars. */
-  script: string;
-  step: number;
-  total: number;
-  label: string;
-}
 
 interface ConditioningMeta {
   title: string;
@@ -133,12 +130,11 @@ export function ConditioningView() {
   const [loading, setLoading] = useState(true);
   const [globalError, setGlobalError] = useState<string | null>(null);
 
-  // Per-script render-in-flight tracking. Keyed by script id.
-  const [renderingIds, setRenderingIds] = useState<Set<string>>(new Set());
-  const [renderErrors, setRenderErrors] = useState<Record<string, string>>({});
-  const [renderProgress, setRenderProgress] = useState<
-    Record<string, RenderProgress>
-  >({});
+  // Per-script render state lives in a module-level store (see
+  // renderRegistry): ConditioningView fully unmounts on navigation, but the
+  // backend render keeps running and keeps emitting progress, so render
+  // tracking must outlive the component instance.
+  const renderStore = useRenderStore();
 
   // Engine / model status, so the detail view can offer to download / load.
   const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
@@ -156,10 +152,10 @@ export function ConditioningView() {
   const [isPlaying, setIsPlaying] = useState(true);
   const [playerError, setPlayerError] = useState<string | null>(null);
   const playerRef = useRef<ManifestPlayer | null>(null);
-  // True while this view instance is mounted. Long-running async flows
-  // (renders) consult this before touching React state, so navigating away
-  // mid-render doesn't push updates at an unmounted tree (which can freeze
-  // the window once the render's spawn_blocking releases the renderer mutex).
+  // True while this view instance is mounted. Used to guard player setup and
+  // the play-after-render transition (so navigating away mid-render doesn't
+  // start a player against an unmounted tree). Render *state* no longer needs
+  // this guard — it lives in the registry, which is always safe to write.
   const isMountedRef = useRef(true);
 
   // ── Loaders ────────────────────────────────────────────────────────────
@@ -273,6 +269,34 @@ export function ConditioningView() {
     };
   }, []);
 
+  // Reconcile completed renders. The registry may record a render as done
+  // while this view isn't looking (navigated away, or a concurrent render of
+  // another script finished). When a script path transitions OUT of
+  // "rendering", re-fetch manifest status so its card flips to "Play" (or
+  // surfaces the new error). This complements the direct `setScripts` in
+  // `renderScript` (which only fires when this instance is still mounted).
+  const prevRenderingRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const currentlyRendering = new Set<string>();
+    for (const [path, entry] of renderStore) {
+      if (entry.status === "rendering") currentlyRendering.add(path);
+    }
+    // Did any path that was rendering last tick finish this tick?
+    let anyFinished = false;
+    for (const path of prevRenderingRef.current) {
+      if (!currentlyRendering.has(path)) {
+        anyFinished = true;
+        break;
+      }
+    }
+    prevRenderingRef.current = currentlyRendering;
+    // Avoid re-fetching on the very first run (nothing was rendering). The
+    // mount effect already does an initial `refresh()`.
+    if (anyFinished) {
+      void refresh();
+    }
+  }, [renderStore, refresh]);
+
   // ── Engine helpers ─────────────────────────────────────────────────────
 
   /** Ensure the TTS engine is loaded, loading it first if necessary. */
@@ -307,33 +331,26 @@ export function ConditioningView() {
   /**
    * Render (or re-render) a script's manifest. Idempotent on the backend:
    * skips work if the hash is fresh. Returns the updated script object on
-   * success, or null on failure (error recorded in `renderErrors`). Also
-   * used as a precondition by `handlePlay` (auto re-render on play).
+   * success, or null on failure (error recorded in the render registry).
+   * Also used as a precondition by `handlePlay` (auto re-render on play).
+   *
+   * Render *state* (in-flight / progress / error) is tracked in the
+   * module-level registry, NOT local component state — so it survives this
+   * view unmounting mid-render (navigation) and is reflected on remount. The
+   * registry owns the single global progress listener; we just `await
+   * ensureGlobalListener()` before invoking so its IPC round-trip is done
+   * before the backend starts emitting (closing the race that lost early
+   * events on slow/mobile devices).
    */
   const renderScript = useCallback(
     async (script: ConditioningScript): Promise<ConditioningScript | null> => {
       if (!script.meta) return null;
+      const scriptPath = script.meta.script_path;
 
-      setRenderingIds((prev) => {
-        const next = new Set(prev);
-        next.add(script.id);
-        return next;
-      });
-      setRenderErrors((prev) => {
-        if (!(script.id in prev)) return prev;
-        const { [script.id]: _drop, ...rest } = prev;
-        return rest;
-      });
-      setRenderProgress((prev) => {
-        if (!(script.id in prev)) return prev;
-        const { [script.id]: _drop, ...rest } = prev;
-        return rest;
-      });
+      // Mark in-flight immediately so the button flips to "Rendering…" before
+      // the (possibly slow) model load. Clears any prior error/progress.
+      markStart(scriptPath);
 
-      // The backend emits a single global `render-manifest-progress` event
-      // carrying the script path; filter by it so concurrent renders don't
-      // cross-feed each other's progress bars.
-      let unlisten: UnlistenFn | undefined;
       try {
         const ready = await ensureModelLoaded();
         if (!ready) {
@@ -342,27 +359,24 @@ export function ConditioningView() {
           );
         }
 
-        unlisten = await listen<RenderProgress>(
-          "render-manifest-progress",
-          (e) => {
-            if (e.payload.script !== script.meta?.script_path) return;
-            // Ignore progress for a render whose view instance has unmounted.
-            if (!isMountedRef.current) return;
-            setRenderProgress((prev) => ({
-              ...prev,
-              [script.id]: e.payload,
-            }));
-          },
-        );
+        // Ensure the global progress listener is attached before we kick off
+        // the backend render, so no early progress events are missed.
+        await ensureGlobalListener();
 
         const m = await invoke<RenderedManifest>("render_manifest", {
-          scriptPath: script.meta.script_path,
+          scriptPath,
         });
 
-        // If the view unmounted while the render was in flight, drop the
-        // result without touching React state.
-        if (!isMountedRef.current) return null;
+        // If the view unmounted while the render was in flight, the registry
+        // still records completion (safe to write anytime); the remount's
+        // `refresh()` will pick up the fresh manifest. We just don't start a
+        // player or log from a dead instance.
+        if (!isMountedRef.current) {
+          markDone(scriptPath);
+          return null;
+        }
 
+        markDone(scriptPath);
         const updated: ConditioningScript = {
           ...script,
           manifest: {
@@ -372,6 +386,9 @@ export function ConditioningView() {
           },
           stale: false,
         };
+        // Update local script state directly so `handlePlay` (the caller) gets
+        // the fresh manifest path from the return value without waiting on the
+        // reconciliation effect. The effect handles the navigate-away case.
         setScripts((prev) =>
           prev.map((s) => (s.id === script.id ? updated : s)),
         );
@@ -383,26 +400,8 @@ export function ConditioningView() {
         return updated;
       } catch (e) {
         console.error("render_manifest failed:", e);
-        if (!isMountedRef.current) return null;
-        setRenderErrors((prev) => ({
-          ...prev,
-          [script.id]: tauriErrorToString(e),
-        }));
+        markError(scriptPath, tauriErrorToString(e));
         return null;
-      } finally {
-        unlisten?.();
-        if (isMountedRef.current) {
-          setRenderingIds((prev) => {
-            const next = new Set(prev);
-            next.delete(script.id);
-            return next;
-          });
-          setRenderProgress((prev) => {
-            if (!(script.id in prev)) return prev;
-            const { [script.id]: _drop, ...rest } = prev;
-            return rest;
-          });
-        }
       }
     },
     [ensureModelLoaded],
@@ -443,13 +442,9 @@ export function ConditioningView() {
       // before touching React state or starting a player.
       if (!isMountedRef.current) return;
 
-      // Clear any stale play/render error so the detail card is clean while
-      // we attempt playback.
-      setRenderErrors((prev) => {
-        if (!(script.id in prev)) return prev;
-        const { [script.id]: _drop, ...rest } = prev;
-        return rest;
-      });
+      // Clear any stale render/play error so the detail card is clean while
+      // we attempt playback. (Routed through the registry so the card sees it.)
+      if (current.meta) clearRenderEntry(current.meta.script_path);
 
       try {
         const tree = await invoke<ReadManifestResult>("read_manifest", {
@@ -492,9 +487,8 @@ export function ConditioningView() {
         // read_manifest failed before the player could open. Surface the
         // error on the detail card (the Player overlay — where `playerError`
         // renders — isn't mounted yet, so it would otherwise be invisible).
-        if (isMountedRef.current) {
-          const msg = tauriErrorToString(e);
-          setRenderErrors((prev) => ({ ...prev, [script.id]: msg }));
+        if (isMountedRef.current && current.meta) {
+          markError(current.meta.script_path, tauriErrorToString(e));
         }
       }
     },
@@ -578,21 +572,28 @@ export function ConditioningView() {
         )}
 
         {/* ── Detail (expanded) view ────────────────────────────────── */}
-        {selected ? (
-          <ScriptDetail
-            script={selected}
-            modelStatus={modelStatus}
-            rendering={renderingIds.has(selected.id)}
-            renderError={renderErrors[selected.id] ?? null}
-            progress={renderProgress[selected.id] ?? null}
-            downloading={downloading}
-            downloadError={downloadError}
-            onBack={() => setSelectedId(null)}
-            onRender={() => handleRender(selected)}
-            onDownload={() => void handleDownload()}
-            onPlay={() => void handlePlay(selected)}
-          />
-        ) : (
+        {selected ? (() => {
+          // Derive render UI state from the (navigation-surviving) registry,
+          // keyed by the backend's script path.
+          const entry = selected.meta
+            ? renderStore.get(selected.meta.script_path) ?? null
+            : null;
+          return (
+            <ScriptDetail
+              script={selected}
+              modelStatus={modelStatus}
+              rendering={entry?.status === "rendering"}
+              renderError={entry?.status === "error" ? entry.error : null}
+              progress={entry}
+              downloading={downloading}
+              downloadError={downloadError}
+              onBack={() => setSelectedId(null)}
+              onRender={() => handleRender(selected)}
+              onDownload={() => void handleDownload()}
+              onPlay={() => void handlePlay(selected)}
+            />
+          );
+        })() : (
           /* ── List view: name + tags only ─────────────────────────── */
           <div className="grid gap-3 grid-cols-1 md:grid-cols-2 lg:grid-cols-3">
             {scripts.map((script) => (
@@ -679,7 +680,7 @@ interface ScriptDetailProps {
   modelStatus: ModelStatus | null;
   rendering: boolean;
   renderError: string | null;
-  progress: RenderProgress | null;
+  progress: RenderEntry | null;
   downloading: boolean;
   downloadError: string | null;
   onBack: () => void;
@@ -829,28 +830,45 @@ function ScriptDetail({
           </p>
         )}
 
-        {/* Render progress (only shown when the backend reports a step) */}
-        {rendering && progress && progress.total > 0 && (
+        {/* Render progress. Shown the whole time a render is in flight so the
+            user always sees something moving (previously the bar was gated on
+            `progress.total > 0`, which the backend seeds lazily as it parses —
+            on a slow/mobile device that gap looked like the render was stuck).
+            Before the total is known we show an indeterminate shimmer. */}
+        {rendering && (
           <div className="space-y-1.5">
             <div className="flex items-center justify-between text-[11px] text-[var(--color-muted-foreground)]">
-              <span className="truncate min-w-0">{progress.label}</span>
-              <span className="shrink-0 ml-2 tabular-nums">
-                {progress.step}/{progress.total}
+              <span className="truncate min-w-0">
+                {progress && progress.total > 0
+                  ? progress.label
+                  : "Preparing…"}
               </span>
+              {progress && progress.total > 0 && (
+                <span className="shrink-0 ml-2 tabular-nums">
+                  {progress.step}/{progress.total}
+                </span>
+              )}
             </div>
-            <div className="h-1.5 rounded-full bg-[var(--color-border)] overflow-hidden">
-              <div
-                className="h-full rounded-full bg-[var(--color-pink-500)] transition-all duration-200 ease-out"
-                style={{
-                  // Clamp to 100%: step can overshoot total slightly when
-                  // includes/loops add work discovered after counting.
-                  width: `${Math.min(
-                    100,
-                    Math.round((progress.step / progress.total) * 100),
-                  )}%`,
-                }}
-              />
-            </div>
+            {progress && progress.total > 0 ? (
+              <div className="h-1.5 rounded-full bg-[var(--color-border)] overflow-hidden">
+                <div
+                  className="h-full rounded-full bg-[var(--color-pink-500)] transition-all duration-200 ease-out"
+                  style={{
+                    // Clamp to 100%: step can overshoot total slightly when
+                    // includes/loops add work discovered after counting.
+                    width: `${Math.min(
+                      100,
+                      Math.round((progress.step / progress.total) * 100),
+                    )}%`,
+                  }}
+                />
+              </div>
+            ) : (
+              // Indeterminate shimmer until the walker has counted the work.
+              <div className="h-1.5 rounded-full bg-[var(--color-border)] overflow-hidden">
+                <div className="h-full w-1/3 rounded-full bg-[var(--color-pink-500)] animate-[render-indeterminate_1.1s_ease-in-out_infinite]" />
+              </div>
+            )}
           </div>
         )}
 
