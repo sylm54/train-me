@@ -84,35 +84,51 @@ let globalListenerPromise: Promise<void> | null = null;
 
 /**
  * Ensure the global `render-manifest-progress` listener is attached. Safe to
- * call repeatedly; resolves immediately once the listener is up. Callers that
- * are about to invoke `render_manifest` should `await` this so the listener's
- * IPC round-trip has completed before the backend starts emitting — closing
- * the last race where early events would be missed on a first-ever render.
+ * call repeatedly; resolves immediately once the listener is up.
+ *
+ * IMPORTANT: callers must NOT `await` this before invoking `render_manifest`.
+ * On some mobile devices the underlying `listen()` IPC never resolves (or
+ * rejects), which previously deadlocked the whole render at "Starting
+ * render…". The render result is delivered through the `invoke` return value,
+ * NOT through these events — the live progress bar is purely cosmetic — so the
+ * listener is best-effort. Fire-and-forget it; the render proceeds regardless.
+ *
+ * Best-effort throughout: a failure is logged and the cached promise is
+ * cleared so a later call can retry. A rejection is never surfaced to callers
+ * (and never becomes an unhandled rejection).
  */
 export function ensureGlobalListener(): Promise<void> {
   if (globalListenerPromise) return globalListenerPromise;
   globalListenerPromise = (async () => {
-    const unlisten: UnlistenFn = await listen<RenderProgressEvent>(
-      "render-manifest-progress",
-      (e) => {
-        const { script, step, total, label } = e.payload;
-        // Only advance a render that's actually in flight — ignore stray
-        // events for renders whose view instance already marked done/error.
-        const cur = store.get(script);
-        if (!cur || cur.status !== "rendering") return;
-        setEntry(script, {
-          status: "rendering",
-          step,
-          total,
-          label,
-          error: null,
-        });
-      },
-    );
-    // Keep the unlisten handle so the listener could be torn down in tests /
-    // a future hot-reload path; for the app lifetime it intentionally stays
-    // attached (the registry must survive navigation).
-    void unlisten;
+    try {
+      const unlisten: UnlistenFn = await listen<RenderProgressEvent>(
+        "render-manifest-progress",
+        (e) => {
+          const { script, step, total, label } = e.payload;
+          // Only advance a render that's actually in flight — ignore stray
+          // events for renders whose view instance already marked done/error.
+          const cur = store.get(script);
+          if (!cur || cur.status !== "rendering") return;
+          setEntry(script, {
+            status: "rendering",
+            step,
+            total,
+            label,
+            error: null,
+          });
+        },
+      );
+      // Keep the unlisten handle so the listener could be torn down in tests /
+      // a future hot-reload path; for the app lifetime it intentionally stays
+      // attached (the registry must survive navigation).
+      void unlisten;
+    } catch (e) {
+      // Don't poison the cache: clear it so the next render can retry, and
+      // swallow — the listener is cosmetic (the render result comes through
+      // the invoke return value, not events).
+      globalListenerPromise = null;
+      console.warn("render-manifest-progress listener failed to attach:", e);
+    }
   })();
   return globalListenerPromise;
 }

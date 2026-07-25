@@ -363,10 +363,25 @@ export function ConditioningView() {
           );
         }
 
-        // Ensure the global progress listener is attached before we kick off
-        // the backend render, so no early progress events are missed.
-        setPhase(scriptPath, "Starting render…");
-        await ensureGlobalListener();
+        // Kick off the global progress listener if it isn't up yet, but DON'T
+        // block on it. A previous version `await`ed `ensureGlobalListener()`
+        // to avoid missing the first few phase events — but on some mobile
+        // devices the `listen()` IPC never resolves, which deadlocked the
+        // whole render at "Starting render…" forever (the render never
+        // started, and no listener existed to catch events even if it had).
+        // Fire-and-forget is strictly safer: the render runs regardless, and
+        // once the listener attaches (usually within ms) subsequent phase
+        // events flow normally. Worst case (listener never attaches) the live
+        // bar stays blank but the render still completes and the card flips
+        // to "Play" — a strict improvement over a permanent hang. The promise
+        // is cached in the registry, so this is a no-op after the first call.
+        ensureGlobalListener();
+
+        // Distinct phase from the listener attach so a future hang is
+        // diagnosable: "Invoking render…" means we reached the `invoke` call;
+        // if it never advances, the stall is in command dispatch, not in
+        // listener registration.
+        setPhase(scriptPath, "Invoking render…");
 
         const m = await invoke<RenderedManifest>("render_manifest", {
           scriptPath,
