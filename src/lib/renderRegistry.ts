@@ -176,6 +176,24 @@ export function updateProgress(
   });
 }
 
+/**
+ * Apply a polled progress snapshot (from the `get_render_progress` command) to
+ * an in-flight render. Unlike `updateProgress`, this IGNORES empty snapshots
+ * (no label AND step 0 AND total 0): the backend's `render_progress` cell is
+ * `Default` both before the first tick lands AND after the render is cleared
+ * on completion, so an empty snapshot means "no data", not "progress is zero".
+ * Feeding it through would wipe a useful phase label ("Invoking render…") and
+ * reset the counters. Non-empty snapshots update exactly like `updateProgress`.
+ */
+export function applyPolledProgress(
+  scriptPath: string,
+  snap: { step: number; total: number; label: string },
+): void {
+  // Empty snapshot = "no data yet" / "already cleared" — leave the entry alone.
+  if (!snap.label && snap.step === 0 && snap.total === 0) return;
+  updateProgress(scriptPath, snap);
+}
+
 /** Mark a render as successfully finished. */
 export function markDone(scriptPath: string): void {
   setEntry(scriptPath, {

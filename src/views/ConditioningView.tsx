@@ -41,6 +41,7 @@ import { type FileEntry, tauriErrorToString } from "@/lib/types";
 import { logActivity } from "@/lib/activity";
 import { ActivePrompt, ManifestPlayer, Segment } from "@/lib/manifestPlayer";
 import {
+  applyPolledProgress,
   clear as clearRenderEntry,
   ensureGlobalListener,
   markDone,
@@ -68,6 +69,13 @@ interface RenderedManifest {
   script: string;
   duration: number;
   created: string;
+}
+
+/** Shape of `get_render_progress`'s return — the polled progress snapshot. */
+interface RenderProgressSnap {
+  step: number;
+  total: number;
+  label: string;
 }
 
 interface ManifestStatus {
@@ -383,9 +391,33 @@ export function ConditioningView() {
         // listener registration.
         setPhase(scriptPath, "Invoking render…");
 
-        const m = await invoke<RenderedManifest>("render_manifest", {
-          scriptPath,
-        });
+        // Poll the backend's progress snapshot over `invoke` (~4 Hz) and feed
+        // it into the registry. This is the mobile-reliable path: on some
+        // devices the `render-manifest-progress` PUSH event never reaches the
+        // JS listener (even though the render runs fine — the device heats
+        // up), so the bar froze at "Invoking render…" forever. `invoke` is the
+        // channel every other command uses, so polling it observes progress as
+        // reliably as the render itself. The listener above is kept as a
+        // secondary path for desktop. Cleared in `finally` so it can't leak
+        // across success, error, or unmount-mid-await.
+        const pollHandle = window.setInterval(async () => {
+          try {
+            const snap = await invoke<RenderProgressSnap>(
+              "get_render_progress",
+              { scriptPath },
+            );
+            applyPolledProgress(scriptPath, snap);
+          } catch {
+            // Best-effort: a single failed poll must not abort the render.
+          }
+        }, 250);
+
+        let m: RenderedManifest;
+        try {
+          m = await invoke<RenderedManifest>("render_manifest", { scriptPath });
+        } finally {
+          window.clearInterval(pollHandle);
+        }
 
         // If the view unmounted while the render was in flight, the registry
         // still records completion (safe to write anytime); the remount's
