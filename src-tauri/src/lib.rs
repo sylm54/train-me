@@ -19,6 +19,7 @@ mod package_import;
 mod render_notify;
 mod sounds;
 mod tag_parser;
+mod validators;
 
 // ============================================================================
 // Application State
@@ -627,6 +628,11 @@ async fn render_manifest(
             total: 0,
             callback: progress_callback,
         }));
+        // Surface the (possibly slow / contended) engine acquisition as its own
+        // phase so a hang here doesn't read as an opaque "Preparing…".
+        if let Ok(mut t) = tracker.lock() {
+            t.emit_phase("Acquiring engine…");
+        }
         let mut guard = renderer_arc.lock();
         let renderer = guard
             .as_mut()
@@ -795,7 +801,14 @@ fn sanitize_track_name(name: &str) -> String {
 // Cron helpers
 // ============================================================================
 
-/// Compute the next `count` fire times for a 5-field cron expression.
+/// Compute the next `count` fire times for a cron expression.
+///
+/// Accepts the documented 5-field form (`min hour dom month dow`) as well
+/// as 6/7-field (`sec min hour dom month dow [year]`) and `@`-shorthands:
+/// a 5-field expression is normalized to 6-field by prepending a `0`
+/// seconds field before handing it to the `cron` crate (which otherwise
+/// silently rejects 5-field input and schedules nothing). See
+/// `validators::normalize_cron`.
 ///
 /// Returns RFC 3339 strings. If the expression is invalid or produces
 /// fewer matches, returns a shorter (or empty) vec.
@@ -805,7 +818,8 @@ fn next_cron_times(expr: &str, count: usize) -> Vec<String> {
     use cron::Schedule as CronSchedule;
     use std::str::FromStr;
 
-    let Ok(schedule) = CronSchedule::from_str(expr) else {
+    let normalized = validators::normalize_cron(expr);
+    let Ok(schedule) = CronSchedule::from_str(&normalized) else {
         return Vec::new();
     };
     schedule
@@ -924,6 +938,8 @@ pub fn run() {
             reset_app_data,
             // Cron computation for routine scheduling
             next_cron_times,
+            // Feature-file validation (routines, rules, conditioning, journal, voice)
+            validators::validate_data_files,
             // Inventory (SQLite-backed)
             inventory::inventory_list_items,
             inventory::inventory_add_item,

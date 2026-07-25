@@ -219,6 +219,65 @@ export const editFileTool = tool({
   },
 });
 
+// ──────────────────────────────────────────────────────────────────────────
+// validate_files: parse-check all feature config files
+// ──────────────────────────────────────────────────────────────────────────
+
+/** One logical problem found by `validate_files`. */
+export interface ValidationProblem {
+  /** "warning" or "error". */
+  severity: "warning" | "error";
+  /** What's wrong. */
+  message: string;
+  /** Concrete suggested fix, if one could be derived. */
+  fix?: string;
+}
+
+/** Result of validating a single file. */
+export interface ValidationFileReport {
+  /** Path relative to agent_data/, forward-slashed. */
+  path: string;
+  /** "ok" | "warning" | "error" — roll-up of `problems`. */
+  status: "ok" | "warning" | "error";
+  problems: ValidationProblem[];
+}
+
+/** Top-level report from `validate_files`. Mirrors the Rust ValidateReport. */
+export interface ValidationReport {
+  files: ValidationFileReport[];
+  checked: number;
+  errors: number;
+  warnings: number;
+}
+
+/**
+ * Validate every known feature file (routines, rules, conditioning,
+ * journal format, voice config) for parse/schema errors and dangling
+ * in-app links. Call this after creating or editing feature files, or
+ * whenever a feature isn't behaving as expected. Read-only.
+ */
+export const validateFilesTool = tool({
+  description:
+    "Validate all feature config files for parse errors. " +
+    "Checks routines/*.md (frontmatter + cron schedule), rule/*.md, " +
+    "conditioning/*.json metadata, journal/format.json fields, and " +
+    "voice/config.json trackers, plus any in-app markdown links they " +
+    "contain. Returns a per-file report; each problem says what is wrong " +
+    "and, when possible, how to fix it. Call after creating/editing " +
+    "feature files, or when a feature isn't working as expected, and fix " +
+    "any reported errors before considering the task done.",
+  inputSchema: z.object({}),
+  execute: async () => {
+    const report = await invoke<ValidationReport>("validate_data_files");
+    logTool("validate_files", {}, {
+      checked: report.checked,
+      errors: report.errors,
+      warnings: report.warnings,
+    });
+    return report;
+  },
+});
+
 /** Map of all tools available to the main agent. */
 export const MAIN_AGENT_TOOLS = {
   bash: bashTool,
@@ -226,4 +285,5 @@ export const MAIN_AGENT_TOOLS = {
   write_file: writeFileTool,
   edit_file: editFileTool,
   list_files: listFilesTool,
+  validate_files: validateFilesTool,
 } as const;

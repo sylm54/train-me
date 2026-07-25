@@ -130,6 +130,19 @@ export function markStart(scriptPath: string): void {
   });
 }
 
+/**
+ * Update ONLY the label of an in-flight render — used to surface fine-grained
+ * phases ("Loading engine…", "Reading script…", …) while `total` is still 0.
+ * The step/total are preserved so a phase set just before the first leaf tick
+ * doesn't wipe the walker's running totals. No-op for renders that aren't
+ * rendering (don't resurrect terminated renders, and don't create an entry).
+ */
+export function setPhase(scriptPath: string, phase: string): void {
+  const cur = store.get(scriptPath);
+  if (!cur || cur.status !== "rendering") return;
+  setEntry(scriptPath, { ...cur, label: phase });
+}
+
 /** Record a progress tick for an in-flight render. */
 export function updateProgress(
   scriptPath: string,

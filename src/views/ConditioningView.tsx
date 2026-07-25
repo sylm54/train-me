@@ -46,6 +46,7 @@ import {
   markDone,
   markError,
   markStart,
+  setPhase,
   useRenderStore,
   type RenderEntry,
 } from "@/lib/renderRegistry";
@@ -350,6 +351,9 @@ export function ConditioningView() {
       // Mark in-flight immediately so the button flips to "Rendering…" before
       // the (possibly slow) model load. Clears any prior error/progress.
       markStart(scriptPath);
+      // Surface fine-grained phases so a hang on a slow/mobile device points
+      // at the offending step instead of an opaque "Preparing…".
+      setPhase(scriptPath, "Loading engine…");
 
       try {
         const ready = await ensureModelLoaded();
@@ -361,6 +365,7 @@ export function ConditioningView() {
 
         // Ensure the global progress listener is attached before we kick off
         // the backend render, so no early progress events are missed.
+        setPhase(scriptPath, "Starting render…");
         await ensureGlobalListener();
 
         const m = await invoke<RenderedManifest>("render_manifest", {
@@ -831,17 +836,18 @@ function ScriptDetail({
         )}
 
         {/* Render progress. Shown the whole time a render is in flight so the
-            user always sees something moving (previously the bar was gated on
-            `progress.total > 0`, which the backend seeds lazily as it parses —
-            on a slow/mobile device that gap looked like the render was stuck).
-            Before the total is known we show an indeterminate shimmer. */}
+            user always sees something moving. The label surfaces fine-grained
+            phases ("Loading engine…", "Parsing script…", …) emitted by the
+            registry and the backend — including BEFORE the walker has counted
+            the work (`total === 0`), which is exactly the window where slow /
+            mobile renders used to look frozen at an opaque "Preparing…". We
+            fall back to that only if no phase has arrived yet. Before the total
+            is known we show an indeterminate shimmer instead of a bar. */}
         {rendering && (
           <div className="space-y-1.5">
             <div className="flex items-center justify-between text-[11px] text-[var(--color-muted-foreground)]">
               <span className="truncate min-w-0">
-                {progress && progress.total > 0
-                  ? progress.label
-                  : "Preparing…"}
+                {(progress && progress.label) || "Preparing…"}
               </span>
               {progress && progress.total > 0 && (
                 <span className="shrink-0 ml-2 tabular-nums">

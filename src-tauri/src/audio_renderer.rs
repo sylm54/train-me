@@ -120,8 +120,19 @@ pub struct ProgressTracker {
 }
 
 impl ProgressTracker {
-    fn emit(&mut self, label: &str) {
+    pub(crate) fn emit(&mut self, label: &str) {
         (self.callback)(self.step, self.total, label);
+    }
+
+    /// Emit a "phase" event: relabel the progress bar WITHOUT advancing the
+    /// leaf counter. Used for pre-walk steps (acquiring the engine, reading &
+    /// hashing the script, freshness check, parsing) that happen before the
+    /// first speakable node finishes synthesizing — i.e. the window where, on
+    /// a slow/mobile device, the bar used to look frozen at an opaque
+    /// "Preparing…". `step` and `total` are reported as-is so a phase set just
+    /// before the first leaf tick doesn't wipe the walker's running totals.
+    pub(crate) fn emit_phase(&mut self, phase: &str) {
+        (self.callback)(self.step, self.total, phase);
     }
 }
 
@@ -1314,6 +1325,15 @@ impl AudioRenderer {
         visited: &mut HashSet<PathBuf>,
         progress: Option<&Arc<Mutex<ProgressTracker>>>,
     ) -> Result<RenderedManifest> {
+        // Surface each pre-walk step as a phase so a hang on a slow/mobile
+        // device points at the offending step instead of an opaque
+        // "Preparing…". Phases relabel the bar WITHOUT advancing the leaf
+        // counter; once `walk` starts the per-leaf labels take over.
+        if let Some(tracker) = progress {
+            if let Ok(mut t) = tracker.lock() {
+                t.emit_phase("Reading script…");
+            }
+        }
         fs::create_dir_all(out_dir)?;
         let bytes = fs::read(source_abs)
             .with_context(|| format!("read script {}", source_abs.display()))?;
@@ -1321,6 +1341,11 @@ impl AudioRenderer {
         let manifest_path = out_dir.join("manifest.json");
 
         // Freshness shortcut.
+        if let Some(tracker) = progress {
+            if let Ok(mut t) = tracker.lock() {
+                t.emit_phase("Checking freshness…");
+            }
+        }
         if manifest_path.exists() {
             if let Ok(existing_str) = fs::read_to_string(&manifest_path) {
                 if let Ok(existing) = serde_json::from_str::<Manifest>(&existing_str) {
@@ -1340,6 +1365,11 @@ impl AudioRenderer {
 
         // Stale or missing — rebuild.
         clean_manifest_dir(out_dir)?;
+        if let Some(tracker) = progress {
+            if let Ok(mut t) = tracker.lock() {
+                t.emit_phase("Parsing script…");
+            }
+        }
         let source = std::str::from_utf8(&bytes)
             .with_context(|| format!("script {} is not UTF-8", source_abs.display()))?;
         let nodes =
@@ -1353,6 +1383,11 @@ impl AudioRenderer {
             }
         }
         let mut counter = 0usize;
+        if let Some(tracker) = progress {
+            if let Ok(mut t) = tracker.lock() {
+                t.emit_phase("Synthesizing audio…");
+            }
+        }
         let root = self.walk(
             &nodes,
             &WalkCtx::root(),

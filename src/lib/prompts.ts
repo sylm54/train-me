@@ -49,6 +49,7 @@ const featureEmbed = `
 - Each file defines one routine for the user.
 - Refer to \`examples/routine.md\` for the proper formatting standard.
 - Create one routine file for each distinct routine you want to establish. For routines that vary by day, time, or other conditions, create separate files with clear naming to indicate their context.
+- The \`schedule:\` frontmatter field is a cron expression. Both 5-field (\`30 2 * * *\` = daily at 02:30) and 6-field (\`0 30 2 * * *\`, with a leading seconds field) forms are accepted; \`@daily\`/\`@hourly\`/etc. shorthands also work.
 
 ### 4. Inventory
 - **Items**: records items owned by the user, use the inventory cli to manage/browse inventory.
@@ -99,6 +100,11 @@ CREATE TABLE IF NOT EXISTS activity (
     details  TEXT    NOT NULL DEFAULT ''
 );
 - Note the ts column is a RFC 3339 and ISO 8601 date and time string.
+
+### 9. Validating feature files
+- The \`validate_files\` tool scans every feature config file (routines, rules, conditioning, journal format, voice config) for parse/schema errors and dangling in-app links, and reports what is wrong and how to fix it.
+- Call it after creating or editing any feature file, and fix every reported \`error\` before considering the task done. \`warning\`s are not fatal but usually indicate something unintended.
+- The \`{{features}}\` block in the system prompt lists which files each feature reads, so the agent knows what \`validate_files\` will check.
 `.trim();
 
 const ttsTagsEmbed = `
