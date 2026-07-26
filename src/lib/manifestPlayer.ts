@@ -12,7 +12,7 @@
  * drives interactive nodes via `continueUntil()` / `choose()`.
  */
 
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { audioUrlForPath } from "@/lib/audioUrl";
 
 // ──────────────────────────────────────────────────────────────────────────
 // Segment tree — mirrors the backend's resolved manifest tree EXACTLY.
@@ -284,8 +284,7 @@ export class ManifestPlayer {
       waitingTrack = this.allocateTrack();
       const el = this.pool[waitingTrack];
       el.loop = true;
-      console.log("Convert",seg.waiting_sound,"to",convertFileSrc(seg.waiting_sound));
-      el.src = convertFileSrc(seg.waiting_sound);
+      el.src = await audioUrlForPath(seg.waiting_sound);
       el.volume = clampVolume(seg.waiting_sound_volume);
       this.active.add(el);
       this.opts.onPlayingChange(true);
@@ -403,13 +402,12 @@ export class ManifestPlayer {
    * Load and play a single file on the given track. Resolves on natural
    * end; rejects on element error. Honors `aborted` at entry and on end.
    */
-  private playFile(absPath: string, trackIndex: number): Promise<void> {
-    if (this.aborted) return Promise.resolve();
+  private async playFile(absPath: string, trackIndex: number): Promise<void> {
+    if (this.aborted) return;
     const el = this.elementFor(trackIndex);
     el.loop = false;
     el.volume = 1;
-    console.log("Convert",absPath,"to",convertFileSrc(absPath));
-    el.src = convertFileSrc(absPath);
+    el.src = await audioUrlForPath(absPath);
     try {
       el.currentTime = 0;
     } catch {

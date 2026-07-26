@@ -104,6 +104,16 @@ tempfile = "3"
 tauri-plugin-notification = "2.3.3"
 cron = "0.16.0"
 
+# In-process localhost HTTP server for serving rendered audio to the WebView.
+# On Android, Tauri's built-in `asset://` protocol routes through the WebView's
+# `shouldInterceptRequest`, which Android's media player mishandles for
+# streamed media — playback cuts off after ~10s with MEDIA_ERR_NETWORK (code 2).
+# A real loopback TCP socket is fetched as a normal connection by the media
+# player, so streaming works. `tower-http`'s `ServeDir` implements full
+# Range / 206 / HEAD / MIME natively, so no manual Range handling is needed.
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
+tower-http = { version = "0.6", features = ["fs"] }
+
 # Desktop-only `env_logger` backend for the `log` facade (see `init_logger` in
 # lib.rs). On Android we use `android_logger` instead, so this is gated to
 # non-Android targets to keep it out of the mobile build.

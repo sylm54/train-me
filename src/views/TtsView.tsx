@@ -6,7 +6,8 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
+import { audioUrlForPath } from "@/lib/audioUrl";
 import { Loader2, Play, Square, Trash2, Volume2 } from "lucide-react";
 
 interface TrackInfo {
@@ -111,7 +112,7 @@ export function TtsView() {
       setAudioUrl(null);
       return;
     }
-    setAudioUrl(convertFileSrc(track.path));
+    setAudioUrl(await audioUrlForPath(track.path));
     setPlayingTrack(track.path);
   };
 

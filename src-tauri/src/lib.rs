@@ -9,6 +9,7 @@ use tauri::{Emitter, Manager, State};
 
 mod activity_db;
 mod audio_renderer;
+mod audio_server;
 mod bash;
 mod chastity;
 mod expression;
@@ -38,12 +39,16 @@ mod validators;
 /// `model_dir`     = `<app_data>/model`
 /// `tracks_dir`    = `<app_data>/tracks`
 /// `bash`          = bashkit sandbox mounted over `agent_dir`
+/// `audio_base_url` = base URL of the in-process audio server
+///                    (`http://127.0.0.1:<port>?t=<token>`), used by the
+///                    frontend to stream rendered WAVs reliably on Android.
 pub struct AppState {
     pub data_dir: PathBuf,
     pub agent_dir: PathBuf,
     pub state_dir: PathBuf,
     pub model_dir: PathBuf,
     pub tracks_dir: PathBuf,
+    pub audio_base_url: String,
     pub renderer: Arc<Mutex<Option<audio_renderer::AudioRenderer>>>,
     pub bash: Arc<bash::BashSandbox>,
 }
@@ -338,6 +343,16 @@ fn get_sound_names() -> Vec<String> {
 #[tauri::command]
 fn get_data_dir(state: State<'_, AppState>) -> String {
     state.data_dir.to_string_lossy().to_string()
+}
+
+/// Return the base URL of the in-process audio server, e.g.
+/// `http://127.0.0.1:43219?t=<token>`. The frontend appends
+/// `/tracks/<relative-path>` to stream rendered WAVs. This real loopback
+/// socket avoids the Android WebView `shouldInterceptRequest` media-streaming
+/// bug that truncates `asset://` audio at ~10s. See `audio_server` module docs.
+#[tauri::command]
+fn get_audio_base_url(state: State<'_, AppState>) -> String {
+    state.audio_base_url.clone()
 }
 
 /// Return the absolute path of the agent's writable data directory.
@@ -860,6 +875,21 @@ fn mtime_rfc3339_pub(path: &std::path::Path) -> String {
 // Helpers
 // ============================================================================
 
+/// Generate a random per-launch token for the audio server. 32 hex chars
+/// (128 bits of entropy) is more than enough to make loopback port-scanning
+/// useless: even a local attacker who finds the port can't guess the token.
+fn generate_audio_token() -> String {
+    use rand::RngCore;
+    use std::fmt::Write;
+    let mut buf = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut buf);
+    let mut s = String::with_capacity(32);
+    for b in buf {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 fn sanitize_track_name(name: &str) -> String {
     let sanitized: String = name
         .chars()
@@ -1002,12 +1032,45 @@ pub fn run() {
             let bash_sandbox = bash::create_bash_sandbox(&agent_dir, &state_dir)
                 .expect("Failed to initialize bashkit sandbox");
 
+            // Start the in-process audio server. Bound synchronously
+            // (`block_on`) so the base URL is available before the first
+            // `get_audio_base_url` call can fire — binding a loopback socket
+            // is sub-millisecond. The serve loop itself is detached inside
+            // `bind_audio_server` and runs for the app's lifetime. See
+            // `audio_server` module docs for why we serve audio over HTTP
+            // rather than Tauri's `asset://` protocol.
+            let audio_token = generate_audio_token();
+            let audio_base_url =
+                match tauri::async_runtime::block_on(audio_server::bind_audio_server(
+                    tracks_dir.clone(),
+                    audio_token.clone(),
+                )) {
+                    Ok((addr, _join)) => {
+                        let url = format!(
+                            "http://{}?{}={}",
+                            addr,
+                            audio_server::TOKEN_PARAM,
+                            audio_token
+                        );
+                        log::info!("Audio server listening on {}", addr);
+                        url
+                    }
+                    Err(e) => {
+                        // Non-fatal: audio playback will be broken, but the
+                        // rest of the app should still start. The frontend
+                        // falls back to a clearly-invalid URL it can surface.
+                        log::error!("Failed to start audio server: {e}");
+                        String::from("about:blank")
+                    }
+                };
+
             app.manage(AppState {
                 data_dir,
                 agent_dir,
                 state_dir,
                 model_dir,
                 tracks_dir,
+                audio_base_url,
                 renderer: Arc::new(Mutex::new(None)),
                 bash: Arc::new(bash_sandbox),
             });
@@ -1041,6 +1104,7 @@ pub fn run() {
             // Subagent commands
             write_script,
             get_data_dir,
+            get_audio_base_url,
             get_agent_dir,
             // Onboarding: has a framework been imported?
             framework_installed,
