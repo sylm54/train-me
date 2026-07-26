@@ -37,6 +37,7 @@ use axum::{
 };
 use tauri::async_runtime::JoinHandle;
 use tokio::net::TcpListener;
+use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
 /// Query-string key carrying the per-launch access token. Exposed so the
@@ -68,6 +69,13 @@ fn audio_router(tracks_dir: PathBuf, token: String) -> Router {
             AudioServerState { token },
             require_token,
         ))
+        .layer(
+            CorsLayer::permissive()
+                // Only allow the WebView's origin (tauri://localhost on Android,
+                // https://tauri.localhost on desktop) so other local apps can't
+                // use the audio server as a proxy. The token check still applies.
+                .allow_origin(tower_http::cors::Any),
+        )
 }
 
 /// Middleware: reject any request whose `?t=<token>` doesn't match. Returns
