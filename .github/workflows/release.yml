@@ -78,6 +78,11 @@ jobs:
         env:
           NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
 
+      - name: Patch usesCleartextTraffic
+        run: |
+          FILE="src-tauri/gen/android/app/build.gradle.kts"
+          sed -i 's/manifestPlaceholders\["usesCleartextTraffic"\] = "false"/manifestPlaceholders["usesCleartextTraffic"] = "true"/' "$FILE"
+
       - name: Add NDK toolchain to PATH
         run: echo "${ANDROID_HOME}/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
