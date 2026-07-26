@@ -104,6 +104,21 @@ tempfile = "3"
 tauri-plugin-notification = "2.3.3"
 cron = "0.16.0"
 
+# Desktop-only `env_logger` backend for the `log` facade (see `init_logger` in
+# lib.rs). On Android we use `android_logger` instead, so this is gated to
+# non-Android targets to keep it out of the mobile build.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+env_logger = "0.11"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Local override: `turso_ext` (pulled in transitively via
+# bashkit[sqlite] → turso_core → turso_ext) ships a build script that uses
+# `cfg!(target_os = "windows")`, which inside a build script is evaluated
+# against the *host* platform, not the *target*. Cross-compiling from Windows
+# to Android therefore emits `cargo:rustc-link-lib=advapi32` and the Android
+# linker fails with "unable to find library -ladvapi32". The vendored copy in
+# `vendor/turso_ext` is the same source with that one build-script bug fixed.
+[patch.crates-io]
+turso_ext = { path = "vendor/turso_ext" }

@@ -3,8 +3,9 @@
  * Also surfaces the existing TTS model status.
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   AlertCircle,
   AlertTriangle,
@@ -22,6 +23,8 @@ import {
   PackageOpen,
   RotateCcw,
   Save,
+  Send,
+  Sparkles,
 } from "lucide-react";
 import { useSettings, DEFAULT_MODELS } from "@/lib/settings";
 import type {
@@ -30,12 +33,21 @@ import type {
   ProviderName,
   ReasoningEffort,
 } from "@/lib/types";
+import { tauriErrorToString } from "@/lib/types";
 import {
   pickAndImportPackage,
   type ImportResult,
   type PackageKind,
 } from "@/lib/packages";
 import { loadPrompt } from "@/lib/prompts";
+import {
+  ensureGlobalListener,
+  markDone,
+  markError,
+  markStart,
+  useRenderStore,
+  type RenderEntry,
+} from "@/lib/renderRegistry";
 
 interface ModelStatus {
   downloaded: boolean;
@@ -442,6 +454,15 @@ export function SettingsView() {
               )}
             </div>
           </div>
+        </section>
+
+        {/* ── Diagnostics: event + render round-trip tests ─────── */}
+        <section className="space-y-4">
+          <h2 className="text-sm uppercase tracking-wider text-[var(--color-muted-foreground)]">
+            Diagnostics
+          </h2>
+          <EventTestCard />
+          <RenderTestCard modelLoaded={!!modelStatus?.loaded} />
         </section>
 
         {/* ── Debug: system-prompt inspector ───────────────────── */}
@@ -963,6 +984,301 @@ function FileTreeNode({
           )}
         </>
       )}
+    </div>
+  );
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Diagnostics: event round-trip + local render test
+// ──────────────────────────────────────────────────────────────────────────
+
+/** Payload of the backend `test-event` push event. */
+interface TestEventPayload {
+  index: number;
+  total: number;
+  message: string;
+  ts: string;
+}
+
+/**
+ * Send a `test_event` command and show the `test-event` push events that come
+ * back. Verifies the full backend → frontend event path (the same channel the
+ * render progress bar depends on). Keeps a running count so dropped or
+ * duplicated events are visible, and clears cleanly on unmount.
+ */
+function EventTestCard() {
+  const [events, setEvents] = useState<TestEventPayload[]>([]);
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    // Subscribe for the component's lifetime. `listen` is async; we capture
+    // the unlisten fn and call it on cleanup so a re-mount never stacks
+    // listeners.
+    let unlisten: UnlistenFn | null = null;
+    let cancelled = false;
+    listen<TestEventPayload>("test-event", (e) => {
+      // Newest first — easy to see new events arrive at the top.
+      setEvents((prev) => [e.payload, ...prev].slice(0, 50));
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch((e) => {
+        console.warn("test-event listener failed to attach:", e);
+      });
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, []);
+
+  const send = async () => {
+    setError(null);
+    setSending(true);
+    try {
+      await invoke("test_event");
+    } catch (e) {
+      setError(tauriErrorToString(e));
+    } finally {
+      setSending(false);
+    }
+  };
+
+  // Expected count is the highest `total` we've seen (the backend always
+  // sends 5). The diff surfaces dropped events.
+  const expected = events.reduce((m, e) => Math.max(m, e.total), 0);
+
+  return (
+    <div className="border border-[var(--color-border)] rounded-lg p-4 bg-[var(--color-surface)] space-y-3">
+      <div className="flex items-baseline justify-between gap-3">
+        <div className="text-sm font-medium">Event round-trip</div>
+        <span className="text-xs text-[var(--color-muted-foreground)]">
+          received{" "}
+          <span className="font-mono tabular-nums text-[var(--color-foreground)]">
+            {events.length}
+          </span>
+          {expected > 0 && (
+            <>
+              {" "}
+              / expected{" "}
+              <span className="font-mono tabular-nums">{expected}</span>
+            </>
+          )}
+        </span>
+      </div>
+      <p className="text-xs text-[var(--color-muted-foreground)]">
+        Emits 5 <code className="font-mono">test-event</code> push events from
+        the backend (~300 ms apart) and lists them as they arrive. Verifies the
+        same backend → frontend event channel the render progress bar uses.
+      </p>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          onClick={send}
+          disabled={sending}
+          className="px-3 py-2 text-sm rounded-md bg-[var(--color-pink-400)] text-[var(--color-primary-foreground)] hover:bg-[var(--color-pink-500)] disabled:opacity-50 inline-flex items-center gap-2"
+        >
+          {sending ? (
+            <Loader2 size={14} className="animate-spin" />
+          ) : (
+            <Send size={14} />
+          )}
+          Send test events
+        </button>
+        {events.length > 0 && (
+          <button
+            onClick={() => setEvents([])}
+            className="px-3 py-2 text-sm rounded-md border border-[var(--color-border)] hover:bg-[var(--color-pink-50)]"
+          >
+            Clear
+          </button>
+        )}
+      </div>
+
+      {error && (
+        <p className="text-xs text-[var(--color-danger)] flex items-start gap-1.5">
+          <AlertCircle size={14} className="mt-0.5 shrink-0" />
+          <span className="break-words">{error}</span>
+        </p>
+      )}
+
+      {events.length > 0 && (
+        <ul className="space-y-1 max-h-48 overflow-auto text-xs font-mono">
+          {events.map((e, i) => (
+            <li
+              key={`${e.ts}-${i}`}
+              className="flex items-center gap-2 text-[var(--color-foreground)]"
+            >
+              <span className="shrink-0 inline-block size-1.5 rounded-full bg-[var(--color-pink-400)]" />
+              <span className="tabular-nums shrink-0 w-8">
+                #{e.index}/{e.total}
+              </span>
+              <span className="shrink-0 text-[var(--color-muted-foreground)]">
+                {e.ts.replace("T", " ").replace(/\.\d+.*$/, "")}
+              </span>
+              <span className="truncate">{e.message}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+/** Path (relative to agent_data) of the throwaway script the render test uses. */
+const RENDER_TEST_SCRIPT = "hypnos/_settings_render_test.xml";
+
+/** A few seconds of audio — short enough to render quickly for a smoke test. */
+const RENDER_TEST_MARKUP = `<!-- Settings diagnostic render test -->
+<voice speaker="female" speed="1.0">
+  <pause duration="0.3"/>
+  This is a render test from settings.
+  <pause duration="0.5"/>
+  Audio events are working.
+  <pause duration="0.5"/>
+</voice>
+`;
+
+interface RenderedManifest {
+  id: string;
+  manifest_path: string;
+  script: string;
+  duration: number;
+  created: string;
+}
+
+/**
+ * Render a short throwaway script end-to-end (write → render_manifest) and show
+ * live progress through the SAME registry/events the ConditioningView uses — a
+ * true exercise of the (throttled) `render-manifest-progress` path. Requires
+ * the TTS engine to be loaded (gated on `modelLoaded`).
+ */
+function RenderTestCard({ modelLoaded }: { modelLoaded: boolean }) {
+  const renderStore = useRenderStore();
+  const entry: RenderEntry | null = renderStore.get(RENDER_TEST_SCRIPT) ?? null;
+  const rendering = entry?.status === "rendering";
+  const renderError = entry?.status === "error" ? entry.error : null;
+  const [result, setResult] = useState<RenderedManifest | null>(null);
+  const [localError, setLocalError] = useState<string | null>(null);
+  // Guards the result/error state against an unmount-mid-await so a stale
+  // setState never fires on a dead instance.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  const run = async () => {
+    if (!modelLoaded) return;
+    setResult(null);
+    setLocalError(null);
+    markStart(RENDER_TEST_SCRIPT);
+    try {
+      await invoke("write_data_file", {
+        path: RENDER_TEST_SCRIPT,
+        content: RENDER_TEST_MARKUP,
+      });
+      ensureGlobalListener();
+      const m = await invoke<RenderedManifest>("render_manifest", {
+        scriptPath: RENDER_TEST_SCRIPT,
+      });
+      if (!mountedRef.current) {
+        markDone(RENDER_TEST_SCRIPT);
+        return;
+      }
+      markDone(RENDER_TEST_SCRIPT);
+      setResult(m);
+    } catch (e) {
+      const msg = tauriErrorToString(e);
+      if (mountedRef.current) setLocalError(msg);
+      markError(RENDER_TEST_SCRIPT, msg);
+    }
+  };
+
+  return (
+    <div className="border border-[var(--color-border)] rounded-lg p-4 bg-[var(--color-surface)] space-y-3">
+      <div className="text-sm font-medium">Local render test</div>
+      <p className="text-xs text-[var(--color-muted-foreground)]">
+        Writes a ~3-second throwaway script and renders it through the same path
+        as Conditioning, surfacing live progress events. Requires the TTS engine
+        to be loaded above.
+      </p>
+
+      {/* Live progress (events-only, same shape as the conditioning detail card). */}
+      {rendering && (
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between text-[11px] text-[var(--color-muted-foreground)]">
+            <span className="truncate min-w-0">
+              {(entry && entry.label) || "Preparing…"}
+            </span>
+            {entry && entry.total > 0 && (
+              <span className="shrink-0 ml-2 tabular-nums">
+                {entry.step}/{entry.total}
+              </span>
+            )}
+          </div>
+          {entry && entry.total > 0 ? (
+            <div className="h-1.5 rounded-full bg-[var(--color-border)] overflow-hidden">
+              <div
+                className="h-full rounded-full bg-[var(--color-pink-500)] transition-all duration-200 ease-out"
+                style={{
+                  width: `${Math.min(
+                    100,
+                    Math.round((entry.step / entry.total) * 100),
+                  )}%`,
+                }}
+              />
+            </div>
+          ) : (
+            <div className="h-1.5 rounded-full bg-[var(--color-border)] overflow-hidden">
+              <div className="h-full w-1/3 rounded-full bg-[var(--color-pink-500)] animate-[render-indeterminate_1.1s_ease-in-out_infinite]" />
+            </div>
+          )}
+        </div>
+      )}
+
+      {result && !rendering && (
+        <p className="text-xs text-[var(--color-success)] flex items-start gap-1.5">
+          <CheckCircle2 size={14} className="mt-0.5 shrink-0" />
+          <span>
+            Rendered OK — {result.duration.toFixed(1)}s.
+            <code className="font-mono text-[10px] block text-[var(--color-muted-foreground)] break-all">
+              {result.manifest_path}
+            </code>
+          </span>
+        </p>
+      )}
+
+      {(localError || renderError) && !rendering && (
+        <p className="text-xs text-[var(--color-danger)] flex items-start gap-1.5">
+          <AlertCircle size={14} className="mt-0.5 shrink-0" />
+          <span className="break-words">{localError ?? renderError}</span>
+        </p>
+      )}
+
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          onClick={run}
+          disabled={!modelLoaded || rendering}
+          className="px-3 py-2 text-sm rounded-md bg-[var(--color-pink-400)] text-[var(--color-primary-foreground)] hover:bg-[var(--color-pink-500)] disabled:opacity-50 inline-flex items-center gap-2"
+        >
+          {rendering ? (
+            <Loader2 size={14} className="animate-spin" />
+          ) : (
+            <Sparkles size={14} />
+          )}
+          Run test render
+        </button>
+        {!modelLoaded && (
+          <span className="text-xs text-[var(--color-muted-foreground)]">
+            Load the TTS engine above first.
+          </span>
+        )}
+      </div>
     </div>
   );
 }

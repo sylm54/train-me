@@ -63,10 +63,30 @@ pub fn ensure_channel<R: tauri::Runtime>(app: &AppHandle<R>) {
 }
 
 /// Request notification permission if not already granted. Best-effort.
+///
+/// NOTE: callers on an async critical path should prefer
+/// [`request_permission_detached`]: on some Android OEM stacks the plugin's
+/// `request_permission()` bridge can synchronously block on the UI looper,
+/// which would stall the calling task.
 pub fn request_permission_best_effort<R: tauri::Runtime>(app: &AppHandle<R>) {
     if let Err(e) = app.notification().request_permission() {
         log::debug!("request_permission failed: {e}");
     }
+}
+
+/// Spawn the notification-permission request on a detached blocking thread so
+/// it can never stall the caller. Used by `render_manifest`, which runs on an
+/// async command thread that must not block before it reaches `spawn_blocking`
+/// (a blocked permission call here previously hung the whole render at
+/// "Preparing…"). The handle is dropped intentionally (fire-and-forget); the
+/// permission state is read lazily when a notification is actually shown.
+pub fn request_permission_detached<R: tauri::Runtime>(app: &AppHandle<R>) {
+    let app = app.clone();
+    // `spawn_blocking` returns a JoinHandle we deliberately drop: the
+    // permission result is best-effort and not needed to proceed.
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        request_permission_best_effort(&app);
+    });
 }
 
 /// Show (or update) the render-progress notification. Marked `ongoing` so it
