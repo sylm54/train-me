@@ -112,7 +112,7 @@ cron = "0.16.0"
 # player, so streaming works. `tower-http`'s `ServeDir` implements full
 # Range / 206 / HEAD / MIME natively, so no manual Range handling is needed.
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
-tower-http = { version = "0.6", features = ["fs"] }
+tower-http = { version = "0.6", features = ["fs", "cors"] }
 
 # Desktop-only `env_logger` backend for the `log` facade (see `init_logger` in
 # lib.rs). On Android we use `android_logger` instead, so this is gated to
