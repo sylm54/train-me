@@ -407,7 +407,8 @@ export class ManifestPlayer {
     const el = this.elementFor(trackIndex);
     el.loop = false;
     el.volume = 1;
-    el.src = await audioUrlForPath(absPath);
+    const url = await audioUrlForPath(absPath);
+    el.src = url;
     try {
       el.currentTime = 0;
     } catch {
@@ -436,7 +437,8 @@ export class ManifestPlayer {
         reject(
           new Error(
             `Playback failed for ${absPath}` +
-              (el.error ? ` (code ${el.error.code})` : ""),
+              (el.error ? ` (code ${el.error.code})` : "") +
+              ` [url=${url}]`,
           ),
         );
       };
