@@ -31,9 +31,18 @@ export async function audioBaseUrl(): Promise<string> {
     const url = await invoke<string>("get_audio_base_url");
     cachedBase = url;
     pendingBase = null;
+    console.log(`[audioUrl] base URL: ${url}`);
     return url;
   })();
   return pendingBase;
+}
+
+/**
+ * Synchronously return the cached base URL, or null if it hasn't been
+ * fetched yet. Useful for debug displays that don't want to await.
+ */
+export function getCachedBaseUrl(): string | null {
+  return cachedBase;
 }
 
 /**
@@ -70,5 +79,7 @@ export async function audioUrlForPath(absPath: string): Promise<string> {
     .split("/")
     .map(encodeURIComponent)
     .join("/")}`;
-  return query ? `${beforeQuery}${pathPart}?${query}` : `${beforeQuery}${pathPart}`;
+  const url = query ? `${beforeQuery}${pathPart}?${query}` : `${beforeQuery}${pathPart}`;
+  console.log(`[audioUrl] ${absPath} → ${url}`);
+  return url;
 }

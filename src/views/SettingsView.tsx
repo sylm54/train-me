@@ -24,9 +24,11 @@ import {
   RotateCcw,
   Save,
   Send,
+  Server,
   Sparkles,
 } from "lucide-react";
 import { useSettings, DEFAULT_MODELS } from "@/lib/settings";
+import { getCachedBaseUrl } from "@/lib/audioUrl";
 import type {
   AgentName,
   FileEntry,
@@ -513,6 +515,30 @@ export function SettingsView() {
                   busy={promptBusy}
                 />
               ))}
+
+              {/* ── Audio server info ── */}
+              <div className="pt-2 border-t border-[var(--color-border)]">
+                <h3 className="text-xs font-semibold uppercase tracking-wider text-[var(--color-muted-foreground)] mb-2 flex items-center gap-1.5">
+                  <Server size={12} />
+                  Audio server
+                </h3>
+                <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] p-3">
+                  {getCachedBaseUrl() ? (
+                    <div className="space-y-1">
+                      <p className="text-xs text-[var(--color-muted-foreground)]">
+                        Base URL
+                      </p>
+                      <code className="block text-xs font-mono break-all bg-[var(--color-bg)] rounded px-2 py-1 select-all">
+                        {getCachedBaseUrl()}
+                      </code>
+                    </div>
+                  ) : (
+                    <p className="text-xs text-[var(--color-muted-foreground)] italic">
+                      Not yet fetched — play a track first.
+                    </p>
+                  )}
+                </div>
+              </div>
 
               {/* ── Agent files ── */}
               <div className="pt-2 border-t border-[var(--color-border)]">
