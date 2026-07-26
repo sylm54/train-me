@@ -159,41 +159,6 @@ export function setPhase(scriptPath: string, phase: string): void {
   setEntry(scriptPath, { ...cur, label: phase });
 }
 
-/** Record a progress tick for an in-flight render. */
-export function updateProgress(
-  scriptPath: string,
-  tick: { step: number; total: number; label: string },
-): void {
-  const cur = store.get(scriptPath);
-  // Don't resurrect a render that already terminated.
-  if (cur && cur.status !== "rendering") return;
-  setEntry(scriptPath, {
-    status: "rendering",
-    step: tick.step,
-    total: tick.total,
-    label: tick.label,
-    error: null,
-  });
-}
-
-/**
- * Apply a polled progress snapshot (from the `get_render_progress` command) to
- * an in-flight render. Unlike `updateProgress`, this IGNORES empty snapshots
- * (no label AND step 0 AND total 0): the backend's `render_progress` cell is
- * `Default` both before the first tick lands AND after the render is cleared
- * on completion, so an empty snapshot means "no data", not "progress is zero".
- * Feeding it through would wipe a useful phase label ("Invoking render…") and
- * reset the counters. Non-empty snapshots update exactly like `updateProgress`.
- */
-export function applyPolledProgress(
-  scriptPath: string,
-  snap: { step: number; total: number; label: string },
-): void {
-  // Empty snapshot = "no data yet" / "already cleared" — leave the entry alone.
-  if (!snap.label && snap.step === 0 && snap.total === 0) return;
-  updateProgress(scriptPath, snap);
-}
-
 /** Mark a render as successfully finished. */
 export function markDone(scriptPath: string): void {
   setEntry(scriptPath, {

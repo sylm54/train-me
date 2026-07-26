@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -45,30 +46,6 @@ pub struct AppState {
     pub tracks_dir: PathBuf,
     pub renderer: Arc<Mutex<Option<audio_renderer::AudioRenderer>>>,
     pub bash: Arc<bash::BashSandbox>,
-    /// Single-slot snapshot of the in-flight render's progress, written by the
-    /// `render_manifest` worker and read by the `get_render_progress` command.
-    ///
-    /// Exists because Tauri's push events (`app.emit` → JS `listen`) proved
-    /// unreliable for delivering progress on some mobile devices: the render
-    /// ran (the device heated up) but no events ever reached the UI, freezing
-    /// the bar at the last frontend-set label. Polling this snapshot over
-    /// `invoke` (the channel every other command in the app already uses)
-    /// makes progress observation as reliable as the render itself. Only one
-    /// render can hold `renderer`'s mutex at a time, so a single slot can't be
-    /// corrupted by concurrency.
-    pub render_progress: Arc<Mutex<RenderProgressSnap>>,
-}
-
-/// Progress snapshot for the currently-rendering manifest.
-///
-/// Written on every progress tick (each phase + each synthesized leaf) and
-/// read by `get_render_progress`. `Default` gives the "nothing yet" state
-/// (empty label, zeroed counters) which the frontend treats as "no data".
-#[derive(Serialize, Deserialize, Clone, Default)]
-pub struct RenderProgressSnap {
-    pub step: usize,
-    pub total: usize,
-    pub label: String,
 }
 
 // ============================================================================
@@ -597,13 +574,11 @@ fn write_script(
 /// to `agent_dir`). Runs on a blocking thread; idempotent via freshness hash.
 ///
 /// Emits `render-manifest-progress` events (carrying `script`, `step`,
-/// `total`, `label`) as each speakable node renders, AND writes the same tick
-/// into `AppState::render_progress` (polled via `get_render_progress` — the
-/// mobile-reliable path, since push events don't reach the UI on some
-/// devices), and drives an ongoing native "Rendering…" notification. All
-/// three are cleared when the render finishes (success or failure). The
-/// frontend filters progress events by `script` so concurrent renders don't
-/// cross-feed.
+/// `total`, `label`) as each speakable node renders, throttled to ~2 Hz
+/// (see `emit_throttle_ms` in the callback below — fast synthesis ticks get
+/// coalesced; it's fine to drop updates). Also drives an ongoing native
+/// "Rendering…" notification (throttled independently). The frontend filters
+/// progress events by `script` so concurrent renders don't cross-feed.
 #[tauri::command]
 async fn render_manifest(
     script_path: String,
@@ -613,7 +588,6 @@ async fn render_manifest(
     let agent_dir = state.agent_dir.clone();
     let tracks_dir = state.tracks_dir.clone();
     let renderer_arc = state.renderer.clone();
-    let render_progress_arc = state.render_progress.clone();
 
     // Friendly title for the notification body: prefer the file stem.
     let display_title = script_path
@@ -623,56 +597,70 @@ async fn render_manifest(
         .unwrap_or(&script_path)
         .to_string();
 
-    // Clear any stale progress from a previous render so the polling loop
-    // (get_render_progress) can't read it before this render's first tick
-    // lands. Held as empty until the worker's first emit overwrites it.
-    {
-        let mut snap = render_progress_arc.lock();
-        *snap = RenderProgressSnap::default();
-    }
-
-    // Progress tracker: each tick (a) emits a Tauri push event for the in-app
-    // bar (the desktop path) and (b) writes the shared snapshot polled via
-    // get_render_progress (the mobile-reliable path — push events proved
-    // unreliable for delivering progress on some devices). It also throttles a
-    // native notification body update. The total is seeded lazily inside the
-    // walker as it parses each file (see render_manifest_file).
+    // Progress tracker: each tick emits a Tauri push event for the in-app
+    // progress bar, throttled to 2 Hz (a render can emit hundreds of ticks —
+    // we don't need them all, and dropping is fine for a purely cosmetic bar).
+    // The native "Rendering…" notification is throttled independently. The
+    // total is seeded lazily inside the walker as it parses each file (see
+    // render_manifest_file).
     let progress_app = app.clone();
     let progress_script = script_path.clone();
     let notify_throttle = Arc::new(render_notify::RenderNotifyThrottle::new());
     let notify_app = app.clone();
     let notify_title = display_title.clone();
-    let snap_for_cb = render_progress_arc.clone();
+    // Shared throttle state for the push-event emit. The first tick always
+    // emits; subsequent ticks emit only if ≥2 Hz has elapsed. Held behind a
+    // Mutex because the callback is `Fn` (called from the worker thread).
+    let emit_last: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+    /// Minimum gap between `render-manifest-progress` push events (~2 Hz).
+    /// Phase labels (each does real work) are naturally further apart than
+    /// this, so they always come through; only fast synthesis ticks coalesce.
+    const EMIT_THROTTLE: Duration = Duration::from_millis(500);
     let progress_callback = Box::new(move |step: usize, total: usize, label: &str| {
-        // Primary (desktop): push event.
-        let _ = progress_app.emit(
-            "render-manifest-progress",
-            serde_json::json!({
-                "script": progress_script,
-                "step": step,
-                "total": total,
-                "label": label,
-            }),
-        );
-        // Secondary (mobile-reliable): shared snapshot, polled via
-        // get_render_progress. This is the path that actually reaches the UI
-        // on devices where `emit` → `listen` delivery is unreliable.
-        {
-            let mut s = snap_for_cb.lock();
-            s.step = step;
-            s.total = total;
-            s.label = label.to_string();
+        // Throttle the push event to ~2 Hz. Always emit the first tick of a
+        // render so the bar moves immediately; otherwise require the gap.
+        let should_emit = {
+            let mut guard = emit_last.lock();
+            let now = Instant::now();
+            match *guard {
+                None => {
+                    *guard = Some(now);
+                    true
+                }
+                Some(last) if now.duration_since(last) >= EMIT_THROTTLE => {
+                    *guard = Some(now);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if should_emit {
+            let _ = progress_app.emit(
+                "render-manifest-progress",
+                serde_json::json!({
+                    "script": progress_script,
+                    "step": step,
+                    "total": total,
+                    "label": label,
+                }),
+            );
         }
+        // The notification has its own (independent) throttle.
         notify_throttle.maybe_update(&notify_app, &notify_title, step, total);
     });
 
-    // `request_permission_best_effort` runs here (async worker thread): a
-    // runtime notification-permission check. Best-effort; failures are logged
-    // and swallowed inside render_notify so they can't fail the render.
-    render_notify::request_permission_best_effort(&app);
+    // Fire the notification-permission request detached, NOT on this async
+    // command thread. On some Android OEM stacks (e.g. ColorOS/OxygenOS) the
+    // plugin's `request_permission()` JNI bridge can synchronously block
+    // waiting on the UI looper; calling it inline here wedged the whole
+    // `render_manifest` command before `spawn_blocking` even ran — no phase
+    // event ever emitted and the invoke never resolved ("stuck on Preparing").
+    // Detaching means a blocked permission call can never stall the render.
+    render_notify::request_permission_detached(&app);
 
     let notify_app_for_setup = app.clone();
     let notify_title_for_setup = display_title.clone();
+    log::info!("render_manifest: dispatching to spawn_blocking (script={})", script_path);
     let result = tauri::async_runtime::spawn_blocking(move || {
         // First signal to the UI: the command reached the worker. If this
         // never appears, the hang is in dispatch (event-loop starvation), not
@@ -682,6 +670,7 @@ async fn render_manifest(
             total: 0,
             callback: progress_callback,
         }));
+        log::info!("render_manifest: worker started");
         if let Ok(mut t) = tracker.lock() {
             t.emit_phase("Entering worker…");
         }
@@ -698,48 +687,25 @@ async fn render_manifest(
         if let Ok(mut t) = tracker.lock() {
             t.emit_phase("Acquiring engine…");
         }
+        log::info!("render_manifest: acquiring engine lock");
         let mut guard = renderer_arc.lock();
+        log::info!("render_manifest: engine lock acquired");
         let renderer = guard
             .as_mut()
             .ok_or_else(|| "Model not loaded. Please load the model first.".to_string())?;
-        renderer
+        log::info!("render_manifest: starting render_manifest on engine");
+        let r = renderer
             .render_manifest(&script_path, &agent_dir, &tracks_dir, Some(&tracker))
-            .map_err(|e| format!("Render error: {:#}", e))
+            .map_err(|e| format!("Render error: {:#}", e));
+        log::info!("render_manifest: engine returned");
+        r
     })
     .await;
 
-    // Clear the snapshot regardless of outcome (success, error, or panic) so
-    // the polling loop stops seeing in-flight progress once the render ends.
-    // Without this a poll after completion would read the last tick forever.
-    {
-        let mut snap = render_progress_arc.lock();
-        *snap = RenderProgressSnap::default();
-    }
     // Whether the render succeeded or failed, tear down the notification so
     // it doesn't linger forever.
     render_notify::clear_render_progress(&app);
     result.map_err(|e| e.to_string())?
-}
-
-/// Read the current progress snapshot for the in-flight render.
-///
-/// The mobile-reliable counterpart to the `render-manifest-progress` push
-/// event: the worker writes `AppState::render_progress` on every tick, and the
-/// frontend polls this command (~4 Hz) to observe it. `invoke` is the channel
-/// every other command in the app uses, so it reaches the UI where push events
-/// don't. Synchronous and main-thread-safe: locking a `parking_lot::Mutex` to
-/// clone a handful of fields is microseconds.
-///
-/// `script_path` is accepted for API symmetry but the snapshot is single-slot
-/// (only one render can hold `renderer`'s mutex at a time, so there's no
-/// concurrency to disambiguate). The frontend correlates by `scriptPath`
-/// through its registry, as before.
-#[tauri::command]
-fn get_render_progress(
-    _script_path: String,
-    state: State<'_, AppState>,
-) -> Result<RenderProgressSnap, String> {
-    Ok(state.render_progress.lock().clone())
 }
 
 /// Report whether a manifest exists for `script_path` and whether it is stale.
@@ -857,6 +823,27 @@ fn list_manifests(state: State<'_, AppState>) -> Result<Vec<RenderedManifest>, S
     Ok(out)
 }
 
+/// Diagnostic helper: emit a short stream of `test-event` push events so the
+/// Settings UI can verify end-to-end that backend → frontend event delivery is
+/// working (and surface dropped / duplicated events). Sends 5 events ~300 ms
+/// apart; the payload carries an index, message, and RFC 3339 timestamp.
+#[tauri::command]
+async fn test_event(app: tauri::AppHandle) -> Result<(), String> {
+    for i in 1..=5 {
+        let _ = app.emit(
+            "test-event",
+            serde_json::json!({
+                "index": i,
+                "total": 5,
+                "message": format!("Test event #{i}"),
+                "ts": chrono::Local::now().to_rfc3339(),
+            }),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    Ok(())
+}
+
 /// RFC 3339 mtime of a path ("now" fallback). Thin pub(crate) wrapper so
 /// command functions in lib.rs can reuse the helper living in audio_renderer.
 fn mtime_rfc3339_pub(path: &std::path::Path) -> String {
@@ -925,8 +912,39 @@ fn next_cron_times(expr: &str, count: usize) -> Vec<String> {
 // App entrypoint
 // ============================================================================
 
+/// Initialise the `log` facade so `log::info!` / `warn!` / `debug!` calls
+/// actually go somewhere observable.
+///
+/// On Android the default `log` sink is a no-op — without an initialised
+/// logger every `log::*!` call in the backend is silently discarded, which
+/// made a stuck render (see `render_manifest`) invisible: logcat showed nothing
+/// from the Rust side even though the worker had hung. We route through
+/// `android_logger` (tag `RustStdout`, matching Tauri's convention) so the
+/// existing `log::*!` callsites show up in `adb logcat`.
+///
+/// On non-Android (desktop) targets we fall back to `env_logger`, which prints
+/// to stderr — useful when running `cargo tauri dev` on the host. Filter is
+/// `info` by default; override with `RUST_LOG` (desktop) or by editing here.
+#[cfg(target_os = "android")]
+fn init_logger() {
+    use android_logger::Config;
+    android_logger::init_once(
+        Config::default()
+            .with_max_level(log::LevelFilter::Info)
+            .with_tag("RustStdout"),
+    );
+}
+
+#[cfg(not(target_os = "android"))]
+fn init_logger() {
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .try_init();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    init_logger();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -992,7 +1010,6 @@ pub fn run() {
                 tracks_dir,
                 renderer: Arc::new(Mutex::new(None)),
                 bash: Arc::new(bash_sandbox),
-                render_progress: Arc::new(Mutex::new(RenderProgressSnap::default())),
             });
 
             Ok(())
@@ -1011,9 +1028,8 @@ pub fn run() {
             manifest_status,
             read_manifest,
             list_manifests,
-            // Polled progress snapshot for an in-flight render (mobile-reliable
-            // alternative to the render-manifest-progress push event).
-            get_render_progress,
+            // Diagnostics: emit a test-event stream (Settings → Diagnostics).
+            test_event,
             // Agent / bash / file commands
             bash::exec_bash,
             bash::read_data_file,
