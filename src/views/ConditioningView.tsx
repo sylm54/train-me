@@ -31,6 +31,7 @@ import {
   RefreshCw,
   Sparkles,
   Tag,
+  Trash2,
   Volume2,
   Zap,
 } from "lucide-react";
@@ -438,6 +439,43 @@ export function ConditioningView() {
     [renderScript],
   );
 
+  /**
+   * Delete a script's rendered manifest. The script source is untouched, so
+   * it can be re-rendered anytime. Confirms first (the delete is irreversible
+   * for the rendered audio), then clears any stale render-registry entry and
+   * refreshes so the card flips back to "Render".
+   */
+  const handleDelete = useCallback(
+    async (script: ConditioningScript) => {
+      if (!script.meta) return;
+      if (
+        !window.confirm(
+          "Delete this render? The script itself is kept — you can re-render it anytime.",
+        )
+      ) {
+        return;
+      }
+      try {
+        await invoke("delete_manifest", {
+          scriptPath: script.meta.script_path,
+        });
+        // Drop any in-flight/stale progress + error for this script so the
+        // detail card doesn't show a lingering error after the wipe.
+        clearRenderEntry(script.meta.script_path);
+        void logActivity(
+          "conditioning",
+          "delete-render",
+          `${script.id} (${script.meta.script_path})`,
+        );
+        await refresh();
+      } catch (e) {
+        // Surface on the detail card via the registry.
+        markError(script.meta.script_path, tauriErrorToString(e));
+      }
+    },
+    [refresh],
+  );
+
   // ── Player lifecycle ───────────────────────────────────────────────────
 
   /** Tear down the current player instance (if any) and clear UI state. */
@@ -617,6 +655,7 @@ export function ConditioningView() {
               onRender={() => handleRender(selected)}
               onDownload={() => void handleDownload()}
               onPlay={() => void handlePlay(selected)}
+              onDelete={() => void handleDelete(selected)}
             />
           );
         })() : (
@@ -713,6 +752,7 @@ interface ScriptDetailProps {
   onRender: () => void;
   onDownload: () => void;
   onPlay: () => void;
+  onDelete: () => void;
 }
 
 function ScriptDetail({
@@ -727,6 +767,7 @@ function ScriptDetail({
   onRender,
   onDownload,
   onPlay,
+  onDelete,
 }: ScriptDetailProps) {
   const { meta, metaError, manifest, stale } = script;
 
@@ -921,6 +962,22 @@ function ScriptDetail({
             >
               {rendering ? <Loader2 className="animate-spin" /> : <Sparkles />}
               Re-render
+            </Button>
+          )}
+
+          {/* Delete the rendered manifest (keeps the script source). Pushed to
+              the end and danger-tinted so it reads as a deliberate, destructive
+              action distinct from the primary render/play flow. */}
+          {hasManifest && (
+            <Button
+              variant="ghost"
+              size="lg"
+              onClick={onDelete}
+              disabled={rendering || !meta}
+              className="ml-auto text-[var(--color-danger)] hover:bg-[var(--color-pink-50)]"
+            >
+              <Trash2 />
+              Delete render
             </Button>
           )}
         </div>

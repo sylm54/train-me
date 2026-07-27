@@ -5,6 +5,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { save } from "@tauri-apps/plugin-dialog";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   AlertCircle,
@@ -15,6 +16,7 @@ import {
   Copy,
   Eye,
   EyeOff,
+  FileArchive,
   FileCode2,
   FileText,
   Folder,
@@ -542,6 +544,11 @@ export function SettingsView() {
                   Agent files
                 </h3>
                 <AgentFileTree />
+              </div>
+
+              {/* ── Export scripts as zip (debug) ── */}
+              <div className="pt-2 border-t border-[var(--color-border)]">
+                <ExportScriptsCard />
               </div>
             </div>
           )}
@@ -1300,6 +1307,125 @@ function RenderTestCard({ modelLoaded }: { modelLoaded: boolean }) {
             Load the TTS engine above first.
           </span>
         )}
+      </div>
+    </div>
+  );
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Debug: export all conditioning scripts (+ includes) as a ZIP
+// ──────────────────────────────────────────────────────────────────────────
+
+/** Result of the backend `export_scripts_zip` command. */
+interface ExportResult {
+  /** Number of files written into the archive. */
+  files: number;
+  /** Total uncompressed bytes across all archived files. */
+  bytes: number;
+  /** Non-fatal warnings (missing/malformed inputs), one per line. */
+  note: string | null;
+}
+
+/**
+ * Bundle every conditioning script and everything needed to re-render it
+ * (each `conditioning/*.json`, its referenced script, and every `<include>`
+ * target) into a ZIP for debugging. Unrelated/sensitive data (journal,
+ * routines, voice, …) is excluded. Uses the OS save dialog for the output
+ * path, then hands off to the backend to walk + zip.
+ */
+function ExportScriptsCard() {
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<ExportResult | null>(null);
+  const [outPath, setOutPath] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const run = async () => {
+    setError(null);
+    setResult(null);
+    setOutPath(null);
+    // Pick the destination first. `save()` returns null if the user cancels.
+    let target: string | null;
+    try {
+      target = await save({
+        defaultPath: "scripts.zip",
+        filters: [{ name: "ZIP archive", extensions: ["zip"] }],
+      });
+    } catch (e) {
+      setError(String(e));
+      return;
+    }
+    if (!target) return;
+
+    setBusy(true);
+    try {
+      const res = await invoke<ExportResult>("export_scripts_zip", {
+        outPath: target,
+      });
+      setResult(res);
+      setOutPath(target);
+    } catch (e) {
+      setError(tauriErrorToString(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="border border-[var(--color-border)] rounded-lg p-4 bg-[var(--color-surface)] space-y-3">
+      <div className="flex items-baseline justify-between gap-3">
+        <div className="text-sm font-medium">Export scripts as zip</div>
+        <FileArchive size={14} className="text-[var(--color-muted-foreground)]" />
+      </div>
+      <p className="text-xs text-[var(--color-muted-foreground)]">
+        Bundles every conditioning script, its referenced script file, and all{" "}
+        <code className="font-mono">&lt;include&gt;</code> targets into a ZIP —
+        the minimal set needed to reproduce a render. Excludes unrelated data
+        (journal, routines, voice).
+      </p>
+
+      {error && (
+        <p className="text-xs text-[var(--color-danger)] flex items-start gap-1.5">
+          <AlertCircle size={14} className="mt-0.5 shrink-0" />
+          <span className="break-words">{error}</span>
+        </p>
+      )}
+
+      {result && !busy && (
+        <div className="space-y-1">
+          <p className="text-xs text-[var(--color-success)] flex items-start gap-1.5">
+            <CheckCircle2 size={14} className="mt-0.5 shrink-0" />
+            <span>
+              Exported {result.files} file{result.files === 1 ? "" : "s"} (
+              {formatSize(result.bytes)}).
+            </span>
+          </p>
+          {outPath && (
+            <code className="block text-[10px] font-mono break-all text-[var(--color-muted-foreground)] bg-[var(--color-bg)] rounded px-2 py-1">
+              {outPath}
+            </code>
+          )}
+          {result.note && (
+            <p className="text-xs text-[var(--color-warning)] flex items-start gap-1.5 whitespace-pre-wrap">
+              <AlertCircle size={14} className="mt-0.5 shrink-0" />
+              <span className="break-words">{result.note}</span>
+            </p>
+          )}
+        </div>
+      )}
+
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          onClick={run}
+          disabled={busy}
+          className="px-3 py-2 text-sm rounded-md bg-[var(--color-pink-400)] text-[var(--color-primary-foreground)] hover:bg-[var(--color-pink-500)] disabled:opacity-50 inline-flex items-center gap-2"
+        >
+          {busy ? (
+            <Loader2 size={14} className="animate-spin" />
+          ) : (
+            <FileArchive size={14} />
+          )}
+          Export scripts
+        </button>
       </div>
     </div>
   );

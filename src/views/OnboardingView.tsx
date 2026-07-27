@@ -43,9 +43,9 @@ const PROVIDER_LABELS: Record<ProviderName, string> = {
 
 const MODEL_PRESETS: Record<ProviderName, string[]> = {
   openrouter: [
-    "anthropic/claude-3.5-sonnet",
-    "anthropic/claude-3.7-sonnet",
-    "anthropic/claude-sonnet-4",
+    "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4-pro",
+    "google/gemini-2.5-flash",
     "openai/gpt-4o",
     "openai/gpt-4o-mini",
     "google/gemini-2.5-flash",

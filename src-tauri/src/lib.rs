@@ -1,5 +1,6 @@
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -113,6 +114,19 @@ pub struct ManifestStatus {
     pub duration: Option<f32>,
     pub created: Option<String>,
     pub manifest_path: Option<String>,
+}
+
+/// Result of `export_scripts_zip`: how many files were archived and the total
+/// uncompressed byte count. `note` carries non-fatal warnings (e.g. a
+/// conditioning JSON that failed to parse, or a referenced script missing).
+#[derive(Serialize, Clone, Debug)]
+pub struct ExportResult {
+    /// Number of files written into the archive.
+    pub files: usize,
+    /// Total uncompressed bytes across all archived files.
+    pub bytes: u64,
+    /// Non-fatal warnings, one per line (e.g. missing/malformed inputs).
+    pub note: Option<String>,
 }
 
 // ============================================================================
@@ -328,6 +342,22 @@ fn list_tracks(state: State<'_, AppState>) -> Result<Vec<TrackInfo>, String> {
 fn delete_track(path: String) -> Result<String, String> {
     fs::remove_file(&path).map_err(|e| format!("Failed to delete track: {}", e))?;
     Ok("Deleted".to_string())
+}
+
+/// Delete a conditioning script's rendered manifest (the `tracks/<id>/`
+/// directory holding manifest.json + seg-*.wav). The script source itself is
+/// untouched, so it can be re-rendered anytime. The shared `tracks/imports/`
+/// dedup dirs are deliberately left alone — another script may reference them.
+#[tauri::command]
+fn delete_manifest(script_path: String, state: State<'_, AppState>) -> Result<(), String> {
+    let dir = state
+        .tracks_dir
+        .join(manifest::manifest_id(&script_path));
+    if dir.exists() {
+        fs::remove_dir_all(&dir)
+            .map_err(|e| format!("Failed to delete render: {}", e))?;
+    }
+    Ok(())
 }
 
 /// Return available sound effect names.
@@ -838,6 +868,295 @@ fn list_manifests(state: State<'_, AppState>) -> Result<Vec<RenderedManifest>, S
     Ok(out)
 }
 
+// ============================================================================
+// Debug: export all conditioning scripts (+ referenced files + includes) as ZIP
+// ============================================================================
+
+/// Conditioning metadata JSON shape (only `script_path` is needed here).
+#[derive(Deserialize)]
+struct ConditioningMeta {
+    script_path: String,
+}
+
+/// Lexically collapse `.` / `..` without requiring the path to exist, then
+/// verify the result stays under `root`. Mirrors `bash::resolve_under` but
+/// accepts an already-joined absolute path (used for include resolution, where
+/// the base is the *script's* directory rather than `agent_dir` directly).
+fn normalize_under(root: &Path, joined: &Path) -> Result<PathBuf, String> {
+    let mut normalized = PathBuf::new();
+    for c in joined.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    if !normalized.starts_with(root) {
+        return Err("path escapes the agent directory".to_string());
+    }
+    Ok(normalized)
+}
+
+/// Resolve a `<include src>` to an absolute path, using the SAME rule as the
+/// renderer (`audio_renderer::AudioRenderer::emit_include`): relative to the
+/// including script's directory first, then relative to `agent_dir`. Returns
+/// `None` (with a warning pushed to `warnings`) if neither exists.
+fn resolve_include(
+    src: &str,
+    script_dir: &Path,
+    agent_dir: &Path,
+    warnings: &mut Vec<String>,
+) -> Option<PathBuf> {
+    let rel = script_dir.join(src);
+    if rel.exists() {
+        if let Ok(n) = normalize_under(agent_dir, &rel) {
+            return Some(n);
+        }
+    }
+    let abs = agent_dir.join(src);
+    if abs.exists() {
+        if let Ok(n) = normalize_under(agent_dir, &abs) {
+            return Some(n);
+        }
+    }
+    warnings.push(format!("include not found: {}", src));
+    None
+}
+
+/// Recursively collect every `<include src>` target reachable from `nodes`,
+/// appending each resolved (absolute) path to `out` and recursing into the
+/// included file's own AST. `visited` prevents cycles / duplicate work
+/// (mirrors the renderer's `visited` set).
+fn collect_includes(
+    nodes: &[tag_parser::Node],
+    script_dir: &Path,
+    agent_dir: &Path,
+    out: &mut Vec<PathBuf>,
+    visited: &mut std::collections::HashSet<PathBuf>,
+    warnings: &mut Vec<String>,
+) {
+    for node in nodes {
+        match node {
+            tag_parser::Node::Include { src } => {
+                if let Some(abs) = resolve_include(src, script_dir, agent_dir, warnings) {
+                    if visited.insert(abs.clone()) {
+                        out.push(abs.clone());
+                        // Recurse into the included file's AST, resolving its
+                        // own includes relative to ITS directory.
+                        let inc_dir = abs
+                            .parent()
+                            .unwrap_or_else(|| std::path::Path::new("."))
+                            .to_path_buf();
+                        if let Ok(bytes) = fs::read(&abs) {
+                            if let Ok(src_str) = std::str::from_utf8(&bytes) {
+                                if let Ok(inc_nodes) = tag_parser::parse(src_str) {
+                                    collect_includes(
+                                        &inc_nodes, &inc_dir, agent_dir, out, visited, warnings,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Container nodes — recurse to find nested includes.
+            tag_parser::Node::Voice { children, .. }
+            | tag_parser::Node::Speed { children, .. }
+            | tag_parser::Node::Volume { children, .. }
+            | tag_parser::Node::Effect { children, .. }
+            | tag_parser::Node::Background { children, .. }
+            | tag_parser::Node::Until { children, .. }
+            | tag_parser::Node::Loop { children, .. } => {
+                collect_includes(children, script_dir, agent_dir, out, visited, warnings);
+            }
+            tag_parser::Node::Overlay { parts, .. }
+            | tag_parser::Node::Random { parts }
+            | tag_parser::Node::Scramble { parts }
+            | tag_parser::Node::Choice { options: parts, .. } => {
+                for part in parts {
+                    collect_includes(
+                        &part.children, script_dir, agent_dir, out, visited, warnings,
+                    );
+                }
+            }
+            // Leaves with no children / no includes.
+            tag_parser::Node::Text(_)
+            | tag_parser::Node::Pause { .. }
+            | tag_parser::Node::Sound { .. }
+            | tag_parser::Node::Tone { .. } => {}
+        }
+    }
+}
+
+/// Debug export: write every conditioning script and everything needed to
+/// re-render it to a ZIP at `out_path`.
+///
+/// Scope is the minimal set needed to reproduce a render: each
+/// `conditioning/*.json`, its referenced `script_path`, and every
+/// `<include>` target resolved recursively (same rule the renderer uses).
+/// Entries are stored under their `agent_dir`-relative paths so the archive
+/// preserves the on-disk layout. Unrelated/sensitive data (journal, routines,
+/// voice, …) is intentionally excluded.
+///
+/// All file I/O runs on a blocking thread (the walk + ZIP build are
+/// synchronous). Returns counts and any non-fatal warnings.
+#[tauri::command]
+async fn export_scripts_zip(
+    out_path: String,
+    state: State<'_, AppState>,
+) -> Result<ExportResult, String> {
+    let agent_dir = state.agent_dir.clone();
+    let out_path = PathBuf::from(out_path);
+
+    let result = tauri::async_runtime::spawn_blocking(move || -> Result<ExportResult, String> {
+        let cond_dir = agent_dir.join("conditioning");
+
+        // Gather the set of absolute files to archive, deduplicated. Order:
+        // conditioning JSONs first, then each one's script + includes.
+        let mut files: Vec<PathBuf> = Vec::new();
+        let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        let mut warnings: Vec<String> = Vec::new();
+        let mut add = |abs: PathBuf, seen: &mut std::collections::HashSet<PathBuf>| {
+            if seen.insert(abs.clone()) {
+                files.push(abs);
+            }
+        };
+
+        if cond_dir.is_dir() {
+            let entries = fs::read_dir(&cond_dir).map_err(|e| e.to_string())?;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                // Always archive the conditioning JSON itself.
+                add(path.clone(), &mut seen);
+
+                let raw = match fs::read_to_string(&path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warnings.push(format!(
+                            "couldn't read {}: {}",
+                            path.file_name().unwrap_or_default().to_string_lossy(),
+                            e
+                        ));
+                        continue;
+                    }
+                };
+                let meta: ConditioningMeta = match serde_json::from_str(&raw) {
+                    Ok(m) => m,
+                    Err(_) => {
+                        warnings.push(format!(
+                            "couldn't parse {} (not a conditioning JSON?)",
+                            path.file_name().unwrap_or_default().to_string_lossy()
+                        ));
+                        continue;
+                    }
+                };
+
+                // Resolve the referenced script under agent_dir.
+                let script_abs = match bash::resolve_under(&agent_dir, &meta.script_path) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warnings.push(format!(
+                            "bad script_path {:?} in {}: {}",
+                            meta.script_path,
+                            path.file_name().unwrap_or_default().to_string_lossy(),
+                            e
+                        ));
+                        continue;
+                    }
+                };
+                if !script_abs.exists() {
+                    warnings.push(format!("script not found: {}", meta.script_path));
+                } else {
+                    add(script_abs.clone(), &mut seen);
+                    let script_dir = script_abs
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .to_path_buf();
+                    if let Ok(bytes) = fs::read(&script_abs) {
+                        if let Ok(src_str) = std::str::from_utf8(&bytes) {
+                            if let Ok(nodes) = tag_parser::parse(src_str) {
+                                let mut incs: Vec<PathBuf> = Vec::new();
+                                collect_includes(
+                                    &nodes,
+                                    &script_dir,
+                                    &agent_dir,
+                                    &mut incs,
+                                    &mut std::collections::HashSet::new(),
+                                    &mut warnings,
+                                );
+                                for inc in incs {
+                                    add(inc, &mut seen);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            warnings.push("no conditioning/ directory found".to_string());
+        }
+
+        // Build the ZIP. Entries are stored under agent_dir-relative paths so
+        // unzipping reproduces the layout.
+        let file = fs::File::create(&out_path)
+            .map_err(|e| format!("Failed to create zip: {}", e))?;
+        let mut zip = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default();
+
+        let mut count = 0usize;
+        let mut total_bytes = 0u64;
+        for abs in &files {
+            let bytes = match fs::read(abs) {
+                Ok(b) => b,
+                Err(e) => {
+                    warnings.push(format!(
+                        "couldn't read {}: {}",
+                        abs.display(),
+                        e
+                    ));
+                    continue;
+                }
+            };
+            // agent_dir-relative archive name, forward-slash normalised.
+            let rel = abs
+                .strip_prefix(&agent_dir)
+                .map(|p| {
+                    p.to_string_lossy()
+                        .replace('\\', "/")
+                })
+                .unwrap_or_else(|_| abs.to_string_lossy().replace('\\', "/"));
+            zip.start_file(&rel, opts)
+                .map_err(|e| format!("zip write failed: {}", e))?;
+            zip.write_all(&bytes)
+                .map_err(|e| format!("zip write failed: {}", e))?;
+            total_bytes += bytes.len() as u64;
+            count += 1;
+        }
+        zip.finish()
+            .map_err(|e| format!("Failed to finalize zip: {}", e))?;
+
+        let note = if warnings.is_empty() {
+            None
+        } else {
+            Some(warnings.join("\n"))
+        };
+        Ok(ExportResult {
+            files: count,
+            bytes: total_bytes,
+            note,
+        })
+    })
+    .await
+    .map_err(|e| format!("Export task failed: {}", e))?;
+
+    result
+}
+
 /// Diagnostic helper: emit a short stream of `test-event` push events so the
 /// Settings UI can verify end-to-end that backend → frontend event delivery is
 /// working (and surface dropped / duplicated events). Sends 5 events ~300 ms
@@ -1091,6 +1410,9 @@ pub fn run() {
             manifest_status,
             read_manifest,
             list_manifests,
+            delete_manifest,
+            // Debug: export all conditioning scripts (+ includes) as a zip
+            export_scripts_zip,
             // Diagnostics: emit a test-event stream (Settings → Diagnostics).
             test_event,
             // Agent / bash / file commands
