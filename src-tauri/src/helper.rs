@@ -146,6 +146,8 @@ static ENDS_WITH_PUNCT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"[.!?;:,'"\u{201C}\u{201D}\u{2018}\u{2019})\]}…。」』】〉》›»]$"#).unwrap()
 });
 
+const MIN_TEXT_LENGTH: usize = 10;
+
 pub fn preprocess_text(text: &str, lang: &str) -> Result<String> {
     // TODO: Need advanced normalizer for better performance
     let mut text: String = text.nfkd().collect();
@@ -222,6 +224,14 @@ pub fn preprocess_text(text: &str, lang: &str) -> Result<String> {
     // If text doesn't end with punctuation, quotes, or closing brackets, add a period
     if !text.is_empty() && !ENDS_WITH_PUNCT_RE.is_match(&text) {
         text.push('.');
+    }
+
+    // Pad with periods if text is too short (avoids model issues with tiny inputs)
+    if text.chars().count() < MIN_TEXT_LENGTH {
+        let padding = MIN_TEXT_LENGTH - text.chars().count();
+        for _ in 0..padding {
+            text.push('.');
+        }
     }
 
     // Validate language
