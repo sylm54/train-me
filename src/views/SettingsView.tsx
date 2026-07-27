@@ -1338,23 +1338,38 @@ function ExportScriptsCard() {
   const [result, setResult] = useState<ExportResult | null>(null);
   const [outPath, setOutPath] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Whether the backend is the Android build. The OS save dialog returns an
+  // unusable `content://` URI on Android, so there we skip it and let the
+  // backend write to Downloads + fire the share sheet instead.
+  const [android, setAndroid] = useState(false);
+
+  useEffect(() => {
+    invoke<boolean>("is_android")
+      .then(setAndroid)
+      .catch(() => setAndroid(false));
+  }, []);
 
   const run = async () => {
     setError(null);
     setResult(null);
     setOutPath(null);
-    // Pick the destination first. `save()` returns null if the user cancels.
-    let target: string | null;
-    try {
-      target = await save({
-        defaultPath: "scripts.zip",
-        filters: [{ name: "ZIP archive", extensions: ["zip"] }],
-      });
-    } catch (e) {
-      setError(String(e));
-      return;
+
+    // Desktop: pick the destination first. `save()` returns null if the user
+    // cancels. Android: skip the dialog entirely and pass null — the backend
+    // writes to public Downloads/train-me/ and opens the share sheet.
+    let target: string | null = null;
+    if (!android) {
+      try {
+        target = await save({
+          defaultPath: "scripts.zip",
+          filters: [{ name: "ZIP archive", extensions: ["zip"] }],
+        });
+      } catch (e) {
+        setError(String(e));
+        return;
+      }
+      if (!target) return;
     }
-    if (!target) return;
 
     setBusy(true);
     try {
@@ -1397,6 +1412,9 @@ function ExportScriptsCard() {
             <span>
               Exported {result.files} file{result.files === 1 ? "" : "s"} (
               {formatSize(result.bytes)}).
+              {android
+                ? " Saved to Downloads/train-me/ — use the share sheet to send it."
+                : ""}
             </span>
           </p>
           {outPath && (
