@@ -991,7 +991,7 @@ fn collect_includes(
 }
 
 /// Debug export: write every conditioning script and everything needed to
-/// re-render it to a ZIP at `out_path`.
+/// re-render it to a ZIP.
 ///
 /// Scope is the minimal set needed to reproduce a render: each
 /// `conditioning/*.json`, its referenced `script_path`, and every
@@ -1000,161 +1000,248 @@ fn collect_includes(
 /// preserves the on-disk layout. Unrelated/sensitive data (journal, routines,
 /// voice, …) is intentionally excluded.
 ///
-/// All file I/O runs on a blocking thread (the walk + ZIP build are
-/// synchronous). Returns counts and any non-fatal warnings.
+/// The destination depends on the platform:
+/// - **Desktop**: `out_path` (from the OS save dialog) is the ZIP file to
+///   write directly.
+/// - **Android**: the save dialog returns an unusable `content://` URI, so
+///   `out_path` is `None`. Instead we write the archive into public
+///   `Downloads/train-me/` via `tauri-plugin-android-fs` (which yields a
+///   shareable `content://` URI) and immediately fire the system share sheet,
+///   letting the user send/save the file with another app. This sidesteps the
+///   `fs::File::create` failure entirely.
+///
+/// Returns counts and any non-fatal warnings.
 #[tauri::command]
 async fn export_scripts_zip(
-    out_path: String,
+    out_path: Option<String>,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ExportResult, String> {
     let agent_dir = state.agent_dir.clone();
-    let out_path = PathBuf::from(out_path);
 
-    let result = tauri::async_runtime::spawn_blocking(move || -> Result<ExportResult, String> {
-        let cond_dir = agent_dir.join("conditioning");
+    // ── 1. Build the ZIP bytes (in memory). The script set is small text
+    //    files, so buffering in memory is fine and works identically on both
+    //    platforms — no filesystem handle to keep open across the IPC below.
+    let zip_bytes = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        gather_scripts_zip(&agent_dir)
+    })
+    .await
+    .map_err(|e| format!("Export task failed: {}", e))??;
 
-        // Gather the set of absolute files to archive, deduplicated. Order:
-        // conditioning JSONs first, then each one's script + includes.
-        let mut files: Vec<PathBuf> = Vec::new();
-        let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-        let mut warnings: Vec<String> = Vec::new();
-        let mut add = |abs: PathBuf, seen: &mut std::collections::HashSet<PathBuf>| {
-            if seen.insert(abs.clone()) {
-                files.push(abs);
-            }
-        };
+    let total_bytes = zip_bytes.len() as u64;
+    // Count entries by reopening the archive we just built (cheap, in-memory).
+    let count = count_zip_entries(&zip_bytes);
 
-        if cond_dir.is_dir() {
-            let entries = fs::read_dir(&cond_dir).map_err(|e| e.to_string())?;
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                    continue;
-                }
-                // Always archive the conditioning JSON itself.
-                add(path.clone(), &mut seen);
+    // ── 2. Persist + hand off to the user. Branch on platform at compile
+    //    time so desktop never touches the android-fs plugin and vice-versa.
+    let warnings: Vec<String>;
+    #[cfg(target_os = "android")]
+    {
+        use tauri_plugin_android_fs::{AndroidFsExt, PublicGeneralPurposeDir};
+        let api = app.android_fs_async();
 
-                let raw = match fs::read_to_string(&path) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        warnings.push(format!(
-                            "couldn't read {}: {}",
-                            path.file_name().unwrap_or_default().to_string_lossy(),
-                            e
-                        ));
-                        continue;
-                    }
-                };
-                let meta: ConditioningMeta = match serde_json::from_str(&raw) {
-                    Ok(m) => m,
-                    Err(_) => {
-                        warnings.push(format!(
-                            "couldn't parse {} (not a conditioning JSON?)",
-                            path.file_name().unwrap_or_default().to_string_lossy()
-                        ));
-                        continue;
-                    }
-                };
+        // Write into public Downloads/train-me/scripts.zip → a persistent,
+        // shareable content:// URI (no permissions needed on Android 11+).
+        let uri = api
+            .public_storage()
+            .write_new(
+                None,
+                PublicGeneralPurposeDir::Download,
+                "train-me/scripts.zip",
+                Some("application/zip"),
+                zip_bytes.as_slice(),
+            )
+            .await
+            .map_err(|e| format!("Failed to write zip to Downloads: {}", e))?;
 
-                // Resolve the referenced script under agent_dir.
-                let script_abs = match bash::resolve_under(&agent_dir, &meta.script_path) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        warnings.push(format!(
-                            "bad script_path {:?} in {}: {}",
-                            meta.script_path,
-                            path.file_name().unwrap_or_default().to_string_lossy(),
-                            e
-                        ));
-                        continue;
-                    }
-                };
-                if !script_abs.exists() {
-                    warnings.push(format!("script not found: {}", meta.script_path));
-                } else {
-                    add(script_abs.clone(), &mut seen);
-                    let script_dir = script_abs
-                        .parent()
-                        .unwrap_or_else(|| std::path::Path::new("."))
-                        .to_path_buf();
-                    if let Ok(bytes) = fs::read(&script_abs) {
-                        if let Ok(src_str) = std::str::from_utf8(&bytes) {
-                            if let Ok(nodes) = tag_parser::parse(src_str) {
-                                let mut incs: Vec<PathBuf> = Vec::new();
-                                collect_includes(
-                                    &nodes,
-                                    &script_dir,
-                                    &agent_dir,
-                                    &mut incs,
-                                    &mut std::collections::HashSet::new(),
-                                    &mut warnings,
-                                );
-                                for inc in incs {
-                                    add(inc, &mut seen);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            warnings.push("no conditioning/ directory found".to_string());
+        // Fire the system share sheet so the user can send/save the file with
+        // another app. Returns immediately (the chooser is non-blocking).
+        let mut w = Vec::new();
+        if let Err(e) = api.file_opener().share_file(&uri).await {
+            w.push(format!("share sheet failed: {}", e));
         }
-
-        // Build the ZIP. Entries are stored under agent_dir-relative paths so
-        // unzipping reproduces the layout.
-        let file = fs::File::create(&out_path)
+        warnings = w;
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        // `app` is only used by the Android share path above.
+        let _ = app;
+        let out_path = out_path.ok_or_else(|| {
+            "No output path provided (the save dialog was cancelled).".to_string()
+        })?;
+        let out_path = PathBuf::from(out_path);
+        fs::write(&out_path, &zip_bytes)
             .map_err(|e| format!("Failed to create zip: {}", e))?;
-        let mut zip = zip::ZipWriter::new(file);
-        let opts = zip::write::SimpleFileOptions::default();
+        warnings = Vec::new();
+    }
 
-        let mut count = 0usize;
-        let mut total_bytes = 0u64;
-        for abs in &files {
-            let bytes = match fs::read(abs) {
-                Ok(b) => b,
+    Ok(ExportResult {
+        files: count,
+        bytes: total_bytes,
+        note: if warnings.is_empty() {
+            None
+        } else {
+            Some(warnings.join("\n"))
+        },
+    })
+}
+
+/// Walk `agent_dir/conditioning/*.json`, collect each script + its recursive
+/// `<include>` targets, and write them all to a fresh in-memory ZIP. Entries
+/// use `agent_dir`-relative, forward-slash names so unzipping reproduces the
+/// layout. Returns the raw archive bytes.
+fn gather_scripts_zip(agent_dir: &Path) -> Result<Vec<u8>, String> {
+    let cond_dir = agent_dir.join("conditioning");
+
+    // Gather the set of absolute files to archive, deduplicated. Order:
+    // conditioning JSONs first, then each one's script + includes.
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut warnings: Vec<String> = Vec::new();
+    let mut add = |abs: PathBuf, seen: &mut std::collections::HashSet<PathBuf>| {
+        if seen.insert(abs.clone()) {
+            files.push(abs);
+        }
+    };
+
+    if cond_dir.is_dir() {
+        let entries = fs::read_dir(&cond_dir).map_err(|e| e.to_string())?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            // Always archive the conditioning JSON itself.
+            add(path.clone(), &mut seen);
+
+            let raw = match fs::read_to_string(&path) {
+                Ok(s) => s,
                 Err(e) => {
                     warnings.push(format!(
                         "couldn't read {}: {}",
-                        abs.display(),
+                        path.file_name().unwrap_or_default().to_string_lossy(),
                         e
                     ));
                     continue;
                 }
             };
-            // agent_dir-relative archive name, forward-slash normalised.
-            let rel = abs
-                .strip_prefix(&agent_dir)
-                .map(|p| {
-                    p.to_string_lossy()
-                        .replace('\\', "/")
-                })
-                .unwrap_or_else(|_| abs.to_string_lossy().replace('\\', "/"));
-            zip.start_file(&rel, opts)
-                .map_err(|e| format!("zip write failed: {}", e))?;
-            zip.write_all(&bytes)
-                .map_err(|e| format!("zip write failed: {}", e))?;
-            total_bytes += bytes.len() as u64;
-            count += 1;
+            let meta: ConditioningMeta = match serde_json::from_str(&raw) {
+                Ok(m) => m,
+                Err(_) => {
+                    warnings.push(format!(
+                        "couldn't parse {} (not a conditioning JSON?)",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                    continue;
+                }
+            };
+
+            // Resolve the referenced script under agent_dir.
+            let script_abs = match bash::resolve_under(agent_dir, &meta.script_path) {
+                Ok(p) => p,
+                Err(e) => {
+                    warnings.push(format!(
+                        "bad script_path {:?} in {}: {}",
+                        meta.script_path,
+                        path.file_name().unwrap_or_default().to_string_lossy(),
+                        e
+                    ));
+                    continue;
+                }
+            };
+            if !script_abs.exists() {
+                warnings.push(format!("script not found: {}", meta.script_path));
+            } else {
+                add(script_abs.clone(), &mut seen);
+                let script_dir = script_dir_of(&script_abs);
+                if let Ok(bytes) = fs::read(&script_abs) {
+                    if let Ok(src_str) = std::str::from_utf8(&bytes) {
+                        if let Ok(nodes) = tag_parser::parse(src_str) {
+                            let mut incs: Vec<PathBuf> = Vec::new();
+                            collect_includes(
+                                &nodes,
+                                &script_dir,
+                                agent_dir,
+                                &mut incs,
+                                &mut std::collections::HashSet::new(),
+                                &mut warnings,
+                            );
+                            for inc in incs {
+                                add(inc, &mut seen);
+                            }
+                        }
+                    }
+                }
+            }
         }
-        zip.finish()
-            .map_err(|e| format!("Failed to finalize zip: {}", e))?;
+    } else {
+        warnings.push("no conditioning/ directory found".to_string());
+    }
 
-        let note = if warnings.is_empty() {
-            None
-        } else {
-            Some(warnings.join("\n"))
+    // Build the ZIP into a memory buffer.
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let opts = zip::write::SimpleFileOptions::default();
+    for abs in &files {
+        let bytes = match fs::read(abs) {
+            Ok(b) => b,
+            Err(e) => {
+                warnings.push(format!("couldn't read {}: {}", abs.display(), e));
+                continue;
+            }
         };
-        Ok(ExportResult {
-            files: count,
-            bytes: total_bytes,
-            note,
-        })
-    })
-    .await
-    .map_err(|e| format!("Export task failed: {}", e))?;
+        // agent_dir-relative archive name, forward-slash normalised.
+        let rel = abs
+            .strip_prefix(agent_dir)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| abs.to_string_lossy().replace('\\', "/"));
+        zip.start_file(&rel, opts)
+            .map_err(|e| format!("zip write failed: {}", e))?;
+        zip.write_all(&bytes)
+            .map_err(|e| format!("zip write failed: {}", e))?;
+    }
+    let cursor = zip
+        .finish()
+        .map_err(|e| format!("Failed to finalize zip: {}", e))?;
 
-    result
+    // Fold the (non-fatal) collection warnings into the archive as a README so
+    // the user sees them when debugging — they explain missing files.
+    let mut bytes = cursor.into_inner();
+    if !warnings.is_empty() {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(std::mem::take(&mut bytes)));
+        zip.start_file("_export-warnings.txt", opts)
+            .map_err(|e| format!("zip write failed: {}", e))?;
+        zip.write_all(warnings.join("\n").as_bytes())
+            .map_err(|e| format!("zip write failed: {}", e))?;
+        bytes = zip
+            .finish()
+            .map_err(|e| format!("Failed to finalize zip: {}", e))?
+            .into_inner();
+    }
+    Ok(bytes)
+}
+
+/// Parent directory of `abs`, or "." if none (mirrors the renderer's
+/// `emit_include` default).
+fn script_dir_of(abs: &Path) -> PathBuf {
+    abs.parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf()
+}
+
+/// Count entries in an in-memory ZIP (for the result's `files` count).
+fn count_zip_entries(zip_bytes: &[u8]) -> usize {
+    zip::ZipArchive::new(std::io::Cursor::new(zip_bytes))
+        .map(|a| a.len())
+        .unwrap_or(0)
+}
+
+/// Whether the backend was compiled for Android. The frontend uses this to
+/// decide whether to show the OS save dialog (desktop) or let the backend
+/// share via the system share sheet (Android, where the save dialog returns
+/// an unusable `content://` URI).
+#[tauri::command]
+fn is_android() -> bool {
+    cfg!(target_os = "android")
 }
 
 /// Diagnostic helper: emit a short stream of `test-event` push events so the
@@ -1413,6 +1500,7 @@ pub fn run() {
             delete_manifest,
             // Debug: export all conditioning scripts (+ includes) as a zip
             export_scripts_zip,
+            is_android,
             // Diagnostics: emit a test-event stream (Settings → Diagnostics).
             test_event,
             // Agent / bash / file commands
