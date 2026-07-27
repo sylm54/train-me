@@ -72,15 +72,11 @@ const PROVIDER_LABELS: Record<ProviderName, string> = {
 /** Common model presets to ease configuration. */
 const MODEL_PRESETS: Record<ProviderName, string[]> = {
   openrouter: [
-    "anthropic/claude-3.5-sonnet",
-    "anthropic/claude-3.7-sonnet",
-    "anthropic/claude-sonnet-4",
+    "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4-pro",
     "openai/gpt-4o",
-    "openai/gpt-4o-mini",
-    "google/gemini-2.5-flash",
-    "meta-llama/llama-3.3-70b-instruct",
   ],
-  openai: ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "o4-mini"],
+  openai: ["gpt-4o", "gpt-4.1"],
 };
 
 const REASONING_OPTIONS: {

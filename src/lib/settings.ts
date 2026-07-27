@@ -20,8 +20,8 @@ const STORAGE_KEY = "train-me.settings.v1";
 
 /** Sensible default model choices. */
 export const DEFAULT_MODELS: Record<ProviderName, string> = {
-  openrouter: "anthropic/claude-3.5-sonnet",
-  openai: "gpt-4o-mini",
+  openrouter: "deepseek/deepseek-v4-flash",
+  openai: "",
 };
 
 const DEFAULT_SETTINGS: AgentSettings = {
