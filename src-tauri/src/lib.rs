@@ -1032,58 +1032,76 @@ async fn export_scripts_zip(
     // Count entries by reopening the archive we just built (cheap, in-memory).
     let count = count_zip_entries(&zip_bytes);
 
-    // ── 2. Persist + hand off to the user. Branch on platform at compile
-    //    time so desktop never touches the android-fs plugin and vice-versa.
-    let warnings: Vec<String>;
-    #[cfg(target_os = "android")]
-    {
-        use tauri_plugin_android_fs::{AndroidFsExt, PublicGeneralPurposeDir};
-        let api = app.android_fs_async();
-
-        // Write into public Downloads/train-me/scripts.zip → a persistent,
-        // shareable content:// URI (no permissions needed on Android 11+).
-        let uri = api
-            .public_storage()
-            .write_new(
-                None,
-                PublicGeneralPurposeDir::Download,
-                "train-me/scripts.zip",
-                Some("application/zip"),
-                zip_bytes.as_slice(),
-            )
-            .await
-            .map_err(|e| format!("Failed to write zip to Downloads: {}", e))?;
-
-        // Fire the system share sheet so the user can send/save the file with
-        // another app. Returns immediately (the chooser is non-blocking).
-        let mut w = Vec::new();
-        if let Err(e) = api.file_opener().share_file(&uri).await {
-            w.push(format!("share sheet failed: {}", e));
-        }
-        warnings = w;
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        // `app` is only used by the Android share path above.
-        let _ = app;
-        let out_path = out_path.ok_or_else(|| {
-            "No output path provided (the save dialog was cancelled).".to_string()
-        })?;
-        let out_path = PathBuf::from(out_path);
-        fs::write(&out_path, &zip_bytes)
-            .map_err(|e| format!("Failed to create zip: {}", e))?;
-        warnings = Vec::new();
-    }
+    // ── 2. Persist + hand off to the user via the shared helper (handles
+    //    the desktop save-path vs. Android Downloads + share-sheet split).
+    let note = persist_export_artifact(&app, out_path, &zip_bytes, "scripts.zip", "application/zip").await?;
 
     Ok(ExportResult {
         files: count,
         bytes: total_bytes,
-        note: if warnings.is_empty() {
+        note,
+    })
+}
+
+/// Persist an export artifact (zip/csv/…) to the user-chosen destination and
+/// hand it off.
+///
+/// Branches on platform at compile time:
+/// - **Desktop**: writes the bytes to `out_path` (from the OS save dialog).
+///   Returns an error if `out_path` is `None` (dialog was cancelled).
+/// - **Android**: the save dialog returns an unusable `content://` URI, so
+///   `out_path` is ignored (`None` is expected). Instead the bytes are written
+///   into public `Downloads/train-me/<default_name>` via `tauri-plugin-android-fs`
+///   (which yields a shareable `content://` URI) and the system share sheet is
+///   fired so the user can send/save the file with another app.
+///
+/// Returns `Some(warnings)` if anything non-fatal happened (e.g. the share
+/// sheet failed to open), otherwise `None`.
+pub async fn persist_export_artifact(
+    app: &tauri::AppHandle,
+    out_path: Option<String>,
+    bytes: &[u8],
+    default_name: &str,
+    mime: &str,
+) -> Result<Option<String>, String> {
+    #[cfg(target_os = "android")]
+    {
+        use tauri_plugin_android_fs::{AndroidFsExt, PublicGeneralPurposeDir};
+        let api = app.android_fs_async();
+        let rel = format!("train-me/{}", default_name);
+
+        // Write into public Downloads/train-me/<default_name> → a persistent,
+        // shareable content:// URI (no permissions needed on Android 11+).
+        let uri = api
+            .public_storage()
+            .write_new(None, PublicGeneralPurposeDir::Download, &rel, Some(mime), bytes)
+            .await
+            .map_err(|e| format!("Failed to write {} to Downloads: {}", default_name, e))?;
+
+        // Fire the system share sheet. Returns immediately (non-blocking).
+        let mut warnings = Vec::new();
+        if let Err(e) = api.file_opener().share_file(&uri).await {
+            warnings.push(format!("share sheet failed: {}", e));
+        }
+        return Ok(if warnings.is_empty() {
             None
         } else {
             Some(warnings.join("\n"))
-        },
-    })
+        });
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        let _ = (default_name, mime);
+        let out_path = out_path.ok_or_else(|| {
+            "No output path provided (the save dialog was cancelled).".to_string()
+        })?;
+        let out_path = PathBuf::from(out_path);
+        fs::write(&out_path, bytes)
+            .map_err(|e| format!("Failed to write {}: {}", out_path.display(), e))?;
+        Ok(None)
+    }
 }
 
 /// Walk `agent_dir/conditioning/*.json`, collect each script + its recursive
@@ -1233,6 +1251,174 @@ fn count_zip_entries(zip_bytes: &[u8]) -> usize {
     zip::ZipArchive::new(std::io::Cursor::new(zip_bytes))
         .map(|a| a.len())
         .unwrap_or(0)
+}
+
+// ============================================================================
+// Full-data ZIP export
+// ============================================================================
+
+/// A `(source_dir, archive_prefix)` pair: everything under `source_dir` is
+/// added to the zip under the `archive_prefix/` folder. Empty `source_dir`s
+/// (e.g. nothing rendered yet) are skipped silently. Owns its path so it can
+/// move into a `spawn_blocking` closure (`'static`).
+struct ArchiveRoot {
+    source: PathBuf,
+    prefix: &'static str,
+}
+
+/// Full backup: bundle everything the user could want to restore **except**
+/// the (large, redownloadable) TTS model.
+///
+/// Archive layout:
+/// - `prompts/`            — system prompts (`data_dir/prompts/`)
+/// - `agent_data/`         — agent scratch: journal, scripts, conditioning,
+///                           routines, rules, voice, `activity.db`, …
+/// - `state/`              — `inventory.db`, `chastity.json`
+/// - `tracks/`             — rendered TTS audio
+/// - `settings.json`       — frontend settings (incl. API keys) from localStorage
+/// - `chat-history.json`   — the saved chat transcript from localStorage
+///
+/// `settings_json` / `chat_history_json` are the raw localStorage strings the
+/// frontend passes in (they may be `None` if nothing is stored yet). The TTS
+/// model in `model/` is intentionally excluded.
+#[tauri::command]
+async fn export_all_zip(
+    out_path: Option<String>,
+    settings_json: Option<String>,
+    chat_history_json: Option<String>,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ExportResult, String> {
+    // Clone everything the blocking task needs up front (paths are cheap).
+    let prompts_dir = state.data_dir.join("prompts");
+    let agent_dir = state.agent_dir.clone();
+    let state_dir = state.state_dir.clone();
+    let tracks_dir = state.tracks_dir.clone();
+
+    let roots = vec![
+        ArchiveRoot { source: prompts_dir, prefix: "prompts" },
+        ArchiveRoot { source: agent_dir, prefix: "agent_data" },
+        ArchiveRoot { source: state_dir, prefix: "state" },
+        ArchiveRoot { source: tracks_dir, prefix: "tracks" },
+    ];
+
+    let zip_bytes = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        gather_full_zip(roots, settings_json, chat_history_json)
+    })
+    .await
+    .map_err(|e| format!("Export task failed: {}", e))??;
+
+    let total_bytes = zip_bytes.len() as u64;
+    let count = count_zip_entries(&zip_bytes);
+
+    let note = persist_export_artifact(&app, out_path, &zip_bytes, "train-me-backup.zip", "application/zip").await?;
+
+    Ok(ExportResult {
+        files: count,
+        bytes: total_bytes,
+        note,
+    })
+}
+
+/// Walk every `ArchiveRoot` recursively and write the whole tree into a fresh
+/// in-memory ZIP. `settings_json` and `chat_history_json` (if present) are
+/// added as top-level `settings.json` / `chat-history.json` entries.
+///
+/// Files are stored under their `prefix/` + source-relative, forward-slash
+/// names so unzipping reproduces the on-disk layout. Unreadable files are
+/// skipped with a non-fatal warning rather than aborting the whole backup.
+fn gather_full_zip(
+    roots: Vec<ArchiveRoot>,
+    settings_json: Option<String>,
+    chat_history_json: Option<String>,
+) -> Result<Vec<u8>, String> {
+    let mut warnings: Vec<String> = Vec::new();
+
+    // Collect (archive_name, bytes) entries. We buffer file bytes eagerly so
+    // the ZipWriter borrows are short-lived and we can't deadlock on a deep
+    // recursion holding the cursor borrow open.
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+
+    for root in roots {
+        if !root.source.is_dir() {
+            continue;
+        }
+        let base = root.source.clone();
+        let prefix = root.prefix;
+        let mut stack: Vec<PathBuf> = vec![base.clone()];
+        while let Some(dir) = stack.pop() {
+            let read = match fs::read_dir(&dir) {
+                Ok(r) => r,
+                Err(e) => {
+                    warnings.push(format!("couldn't read {}: {}", dir.display(), e));
+                    continue;
+                }
+            };
+            for entry in read.flatten() {
+                let path = entry.path();
+                let meta = match entry.metadata() {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warnings.push(format!("couldn't stat {}: {}", path.display(), e));
+                        continue;
+                    }
+                };
+                if meta.is_dir() {
+                    stack.push(path);
+                } else if meta.is_file() {
+                    let bytes = match fs::read(&path) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warnings.push(format!("couldn't read {}: {}", path.display(), e));
+                            continue;
+                        }
+                    };
+                    // <prefix>/<source-relative path>, forward-slash normalised.
+                    let rel = match path.strip_prefix(&base) {
+                        Ok(p) => p.to_string_lossy().replace('\\', "/"),
+                        Err(_) => path.to_string_lossy().replace('\\', "/"),
+                    };
+                    let name = if rel.is_empty() {
+                        prefix.to_string()
+                    } else {
+                        format!("{}/{}", prefix, rel)
+                    };
+                    entries.push((name, bytes));
+                }
+                // Symlinks are skipped — never followed across a backup.
+            }
+        }
+    }
+
+    if let Some(s) = settings_json {
+        entries.push(("settings.json".to_string(), s.into_bytes()));
+    }
+    if let Some(c) = chat_history_json {
+        entries.push(("chat-history.json".to_string(), c.into_bytes()));
+    }
+
+    // Build the ZIP.
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let opts = zip::write::SimpleFileOptions::default();
+    for (name, bytes) in &entries {
+        zip.start_file(name, opts)
+            .map_err(|e| format!("zip write failed: {}", e))?;
+        zip.write_all(bytes)
+            .map_err(|e| format!("zip write failed: {}", e))?;
+    }
+
+    // Fold non-fatal warnings into the archive so the user sees them.
+    if !warnings.is_empty() {
+        zip.start_file("_export-warnings.txt", opts)
+            .map_err(|e| format!("zip write failed: {}", e))?;
+        zip.write_all(warnings.join("\n").as_bytes())
+            .map_err(|e| format!("zip write failed: {}", e))?;
+    }
+
+    let cursor = zip
+        .finish()
+        .map_err(|e| format!("Failed to finalize zip: {}", e))?;
+    Ok(cursor.into_inner())
 }
 
 /// Whether the backend was compiled for Android. The frontend uses this to
@@ -1500,6 +1686,8 @@ pub fn run() {
             delete_manifest,
             // Debug: export all conditioning scripts (+ includes) as a zip
             export_scripts_zip,
+            // Full backup: export all data (except the TTS model) as a zip
+            export_all_zip,
             is_android,
             // Diagnostics: emit a test-event stream (Settings → Diagnostics).
             test_event,
@@ -1535,6 +1723,8 @@ pub fn run() {
             inventory::inventory_add_wishlist_item,
             inventory::inventory_update_wishlist_item,
             inventory::inventory_remove_wishlist_item,
+            inventory::inventory_export_csv,
+            inventory::inventory_import_csv,
             // Activity (SQLite-backed)
             activity_db::activity_list_entries,
             activity_db::activity_get_entry,

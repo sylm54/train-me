@@ -16,7 +16,9 @@ import type {
 
 import { ensureNotificationPermission } from "./notifications";
 
-const STORAGE_KEY = "train-me.settings.v1";
+/** localStorage key under which settings (incl. API keys) are persisted.
+ * Exported so the full-data backup can read the raw stored value. */
+export const STORAGE_KEY = "train-me.settings.v1";
 
 /** Sensible default model choices. */
 export const DEFAULT_MODELS: Record<ProviderName, string> = {

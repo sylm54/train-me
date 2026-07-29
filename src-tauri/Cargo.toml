@@ -77,6 +77,10 @@ parking_lot = "0.12"
 # SQLite for inventory/activity logs
 rusqlite = { version = "0.31", features = ["bundled"] }
 
+# RFC-4180 CSV (de)serialization for the inventory im/export. Pure Rust, so
+# it builds unchanged for the Android target.
+csv = "1"
+
 # Force aegis (a transitive dep of bashkit's `sqlite` → turso_core) to use
 # its pure-Rust backend. aegis's build script otherwise compiles C with
 # `cc::Build::prefer_clang_cl_over_msvc(true)`, which picks up the Android
