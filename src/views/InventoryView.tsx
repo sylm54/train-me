@@ -11,9 +11,11 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import {
   AlertCircle,
   Check,
+  Download,
   Loader2,
   PackageOpen,
   Pencil,
@@ -21,12 +23,14 @@ import {
   RefreshCw,
   ShoppingBag,
   Trash2,
+  Upload,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { tauriErrorToString } from "@/lib/types";
 import { logActivity } from "@/lib/activity";
+import { isAndroid } from "@/lib/export";
 
 // ──────────────────────────────────────────────────────────────────────────
 // Types (mirror Rust `InventoryItem` / `WishlistItem` in inventory.rs)
@@ -50,6 +54,25 @@ interface WishlistItem {
   notes: string | null;
   created_at: string;
   updated_at: string;
+}
+
+/** Result of the backend `inventory_export_csv` command. */
+interface InventoryCsvExportResult {
+  /** Number of data rows written. */
+  files: number;
+  /** Total bytes written. */
+  bytes: number;
+  /** Non-fatal warnings, one per line. */
+  note: string | null;
+}
+
+/** Result of the backend `inventory_import_csv` command. */
+interface InventoryCsvImportResult {
+  items_added: number;
+  items_updated: number;
+  wishlist_added: number;
+  wishlist_updated: number;
+  note: string | null;
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -97,6 +120,14 @@ export function InventoryView() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+
+  // CSV im/export state
+  const [csvBusy, setCsvBusy] = useState(false);
+  const [csvStatus, setCsvStatus] = useState<
+    | { kind: "ok"; text: string }
+    | { kind: "error"; text: string }
+    | null
+  >(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -209,7 +240,72 @@ export function InventoryView() {
     [refresh],
   );
 
-  const busy = loading || refreshing;
+  /** Export both tables to a single CSV (type column distinguishes rows). */
+  const exportCsv = useCallback(async () => {
+    setCsvBusy(true);
+    setCsvStatus(null);
+    try {
+      // Android: skip the save dialog (returns an unusable content:// URI) —
+      // the backend writes to Downloads/train-me/ and shares instead.
+      let target: string | null = null;
+      if (!(await isAndroid())) {
+        target = await saveDialog({
+          defaultPath: "inventory.csv",
+          filters: [{ name: "CSV", extensions: ["csv"] }],
+        });
+        if (!target) return; // user cancelled
+      }
+      const res = await invoke<InventoryCsvExportResult>(
+        "inventory_export_csv",
+        { outPath: target },
+      );
+      await logActivity("inventory", "export_csv", `${res.files} rows`);
+      setCsvStatus({
+        kind: "ok",
+        text: `Exported ${res.files} row${res.files === 1 ? "" : "s"}.`,
+      });
+    } catch (e) {
+      setCsvStatus({ kind: "error", text: tauriErrorToString(e) });
+    } finally {
+      setCsvBusy(false);
+    }
+  }, []);
+
+  /** Import (upsert) rows from a CSV previously produced by exportCsv. */
+  const importCsv = useCallback(async () => {
+    setCsvBusy(true);
+    setCsvStatus(null);
+    try {
+      const selected = await openDialog({
+        multiple: false,
+        filters: [{ name: "CSV", extensions: ["csv"] }],
+      });
+      if (!selected) return; // user cancelled
+      const path = typeof selected === "string" ? selected : selected[0];
+      const res = await invoke<InventoryCsvImportResult>(
+        "inventory_import_csv",
+        { path },
+      );
+      await logActivity(
+        "inventory",
+        "import_csv",
+        `+${res.items_added}~${res.items_updated} items, +${res.wishlist_added}~${res.wishlist_updated} wishlist`,
+      );
+      await refresh();
+      setCsvStatus({
+        kind: "ok",
+        text:
+          `Imported ${res.items_added + res.wishlist_added} new + ` +
+          `${res.items_updated + res.wishlist_updated} updated.`,
+      });
+    } catch (e) {
+      setCsvStatus({ kind: "error", text: tauriErrorToString(e) });
+    } finally {
+      setCsvBusy(false);
+    }
+  }, [refresh]);
+
+  const busy = loading || refreshing || csvBusy;
 
   return (
     <div className="flex-1 overflow-y-auto">
@@ -223,18 +319,66 @@ export function InventoryView() {
               <h1 className="text-2xl font-semibold tracking-tight">
                 Inventory
               </h1>
+              <p className="text-xs text-[var(--color-muted-foreground)] mt-1">
+                Import/export items & wishlist as CSV.
+              </p>
             </div>
           </div>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={handleRefresh}
-            disabled={busy}
-          >
-            {refreshing ? <Loader2 className="animate-spin" /> : <RefreshCw />}
-            Refresh
-          </Button>
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={exportCsv}
+              disabled={busy || csvBusy}
+            >
+              {csvBusy ? (
+                <Loader2 className="animate-spin" />
+              ) : (
+                <Download />
+              )}
+              <span className="hidden sm:inline">Export CSV</span>
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={importCsv}
+              disabled={busy || csvBusy}
+            >
+              {csvBusy ? (
+                <Loader2 className="animate-spin" />
+              ) : (
+                <Upload />
+              )}
+              <span className="hidden sm:inline">Import CSV</span>
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleRefresh}
+              disabled={busy}
+            >
+              {refreshing ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+              Refresh
+            </Button>
+          </div>
         </header>
+
+        {csvStatus && !csvBusy && (
+          <div
+            className={`flex items-start gap-2 rounded-lg border p-3 text-sm ${
+              csvStatus.kind === "ok"
+                ? "border-[var(--color-success)] text-[var(--color-success)]"
+                : "border-[var(--color-danger)] bg-[var(--color-pink-50)] text-[var(--color-danger)]"
+            }`}
+          >
+            {csvStatus.kind === "ok" ? (
+              <Check size={16} className="mt-0.5 shrink-0" />
+            ) : (
+              <AlertCircle size={16} className="mt-0.5 shrink-0" />
+            )}
+            <span className="break-words">{csvStatus.text}</span>
+          </div>
+        )}
 
         {error && (
           <div className="flex items-start gap-2 rounded-lg border border-[var(--color-danger)] bg-[var(--color-pink-50)] p-3 text-sm text-[var(--color-danger)]">

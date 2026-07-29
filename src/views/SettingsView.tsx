@@ -14,6 +14,7 @@ import {
   ChevronDown,
   ChevronRight,
   Copy,
+  Database,
   Eye,
   EyeOff,
   FileArchive,
@@ -29,7 +30,7 @@ import {
   Server,
   Sparkles,
 } from "lucide-react";
-import { useSettings, DEFAULT_MODELS } from "@/lib/settings";
+import { useSettings, DEFAULT_MODELS, STORAGE_KEY } from "@/lib/settings";
 import { getCachedBaseUrl } from "@/lib/audioUrl";
 import type {
   AgentName,
@@ -52,6 +53,7 @@ import {
   useRenderStore,
   type RenderEntry,
 } from "@/lib/renderRegistry";
+import { pickExportPath, isAndroid } from "@/lib/export";
 
 interface ModelStatus {
   downloaded: boolean;
@@ -407,6 +409,14 @@ export function SettingsView() {
             error={importError.specialisation}
             onImport={() => handleImportPackage("specialisation")}
           />
+        </section>
+
+        {/* ── Backup ─────────────────────────────────────────────── */}
+        <section className="space-y-4">
+          <h2 className="text-sm uppercase tracking-wider text-[var(--color-muted-foreground)]">
+            Backup
+          </h2>
+          <ExportAllDataCard />
         </section>
 
         {/* ── TTS model status ─────────────────────────────────────── */}
@@ -1313,10 +1323,10 @@ function RenderTestCard({ modelLoaded }: { modelLoaded: boolean }) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Debug: export all conditioning scripts (+ includes) as a ZIP
+// Backup: export ALL data (except the TTS model) as a ZIP
 // ──────────────────────────────────────────────────────────────────────────
 
-/** Result of the backend `export_scripts_zip` command. */
+/** Result of the backend `export_all_zip` / `export_scripts_zip` commands. */
 interface ExportResult {
   /** Number of files written into the archive. */
   files: number;
@@ -1325,6 +1335,132 @@ interface ExportResult {
   /** Non-fatal warnings (missing/malformed inputs), one per line. */
   note: string | null;
 }
+
+/**
+ * Full backup: bundles prompts, agent_data (context, scripts, journal,
+ * conditioning, routines, rules, activity.db, …), state (inventory.db +
+ * chastity.json), rendered tracks, and the frontend settings + chat history
+ * (pulled from localStorage) into a single ZIP. The TTS model in `model/`
+ * is excluded (large and redownloadable). API keys ARE included so this is
+ * a complete restorable backup — keep the file safe.
+ */
+function ExportAllDataCard() {
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<ExportResult | null>(null);
+  const [outPath, setOutPath] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [android, setAndroid] = useState(false);
+
+  useEffect(() => {
+    isAndroid()
+      .then(setAndroid)
+      .catch(() => setAndroid(false));
+  }, []);
+
+  const run = async () => {
+    setError(null);
+    setResult(null);
+    setOutPath(null);
+
+    // Desktop: pick destination first. Android: pass null → backend writes
+    // to Downloads/train-me/ + opens the share sheet.
+    let target: string | null = null;
+    if (!android) {
+      target = await pickExportPath("train-me-backup.zip", "zip");
+      if (target === null) return; // user cancelled
+    }
+
+    // Read the raw localStorage payloads so the backup captures settings
+    // (incl. API keys) and the saved chat transcript verbatim.
+    const settingsJson = localStorage.getItem(STORAGE_KEY);
+    const chatHistoryJson = localStorage.getItem("chat-history");
+
+    setBusy(true);
+    try {
+      const res = await invoke<ExportResult>("export_all_zip", {
+        outPath: target,
+        settingsJson,
+        chatHistoryJson,
+      });
+      setResult(res);
+      setOutPath(target);
+    } catch (e) {
+      setError(tauriErrorToString(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="border border-[var(--color-border)] rounded-lg p-4 bg-[var(--color-surface)] space-y-3">
+      <div className="flex items-baseline justify-between gap-3">
+        <div className="text-sm font-medium">Export all data (zip)</div>
+        <Database size={14} className="text-[var(--color-muted-foreground)]" />
+      </div>
+      <p className="text-xs text-[var(--color-muted-foreground)]">
+        Bundles prompts, agent data (context, chats, journal, conditioning,
+        routines, inventory, chastity, activity log), rendered audio, and your
+        settings (including API keys) into a single ZIP. The downloaded TTS
+        model is excluded (re-download it from the TTS engine section).
+      </p>
+
+      {error && (
+        <p className="text-xs text-[var(--color-danger)] flex items-start gap-1.5">
+          <AlertCircle size={14} className="mt-0.5 shrink-0" />
+          <span className="break-words">{error}</span>
+        </p>
+      )}
+
+      {result && !busy && (
+        <div className="space-y-1">
+          <p className="text-xs text-[var(--color-success)] flex items-start gap-1.5">
+            <CheckCircle2 size={14} className="mt-0.5 shrink-0" />
+            <span>
+              Exported {result.files} file{result.files === 1 ? "" : "s"} (
+              {formatSize(result.bytes)}).
+              {android
+                ? " Saved to Downloads/train-me/ — use the share sheet to send it."
+                : ""}
+            </span>
+          </p>
+          {outPath && (
+            <code className="block text-[10px] font-mono break-all text-[var(--color-muted-foreground)] bg-[var(--color-bg)] rounded px-2 py-1">
+              {outPath}
+            </code>
+          )}
+          {result.note && (
+            <p className="text-xs text-[var(--color-warning)] flex items-start gap-1.5 whitespace-pre-wrap">
+              <AlertCircle size={14} className="mt-0.5 shrink-0" />
+              <span className="break-words">{result.note}</span>
+            </p>
+          )}
+        </div>
+      )}
+
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          onClick={run}
+          disabled={busy}
+          className="px-3 py-2 text-sm rounded-md bg-[var(--color-pink-400)] text-[var(--color-primary-foreground)] hover:bg-[var(--color-pink-500)] disabled:opacity-50 inline-flex items-center gap-2"
+        >
+          {busy ? (
+            <Loader2 size={14} className="animate-spin" />
+          ) : (
+            <FileArchive size={14} />
+          )}
+          Export all data
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Debug: export all conditioning scripts (+ includes) as a ZIP
+// ──────────────────────────────────────────────────────────────────────────
+
+/** (The `ExportResult` shape is declared above, next to `ExportAllDataCard`,
+ * since both the full-data and scripts-only exports return it.) */
 
 /**
  * Bundle every conditioning script and everything needed to re-render it
