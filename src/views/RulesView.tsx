@@ -10,11 +10,19 @@ import {
   FileText,
   Loader2,
   RefreshCw,
+  ShieldOff,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { MarkdownBody } from "@/components/MarkdownBody";
 import type { FileEntry } from "@/lib/types";
 import { tauriErrorToString } from "@/lib/types";
+import {
+  daysSince,
+  fetchTrackStats,
+  logActivity,
+  relativeTime,
+  type TrackStat,
+} from "@/lib/activity";
 
 interface Rule {
   /** Path relative to agent_data, e.g., "rule/dress_code.md" */
@@ -42,6 +50,14 @@ export function RulesView() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+
+  // Per-rule "broke" stats (last broken / count), derived from the activity
+  // log. Days-clean is computed client-side from `lastTs`. Fetched alongside
+  // the rule list and refreshed after each "Broke Rule" press.
+  const [stats, setStats] = useState<Map<string, TrackStat>>(new Map());
+  const refreshStats = useCallback(async () => {
+    setStats(await fetchTrackStats("rule", "broke"));
+  }, []);
 
   const loadAll = useCallback(async () => {
     setLoading(true);
@@ -76,6 +92,9 @@ export function RulesView() {
     setRules(initial);
     setLoading(false);
 
+    // Load broke-stats alongside the rule content (both independent fetches).
+    void refreshStats();
+
     // Eagerly load content for every rule, capturing per-file errors.
     await Promise.all(
       initial.map(async (rule) => {
@@ -97,7 +116,16 @@ export function RulesView() {
         }
       }),
     );
-  }, []);
+  }, [refreshStats]);
+
+  /** Record that a rule was broken, then refresh stats so the card updates. */
+  const handleBroke = useCallback(
+    async (rule: Rule) => {
+      await logActivity("rule", "broke", rule.id);
+      await refreshStats();
+    },
+    [refreshStats],
+  );
 
   useEffect(() => {
     loadAll();
@@ -190,7 +218,12 @@ export function RulesView() {
             </h2>
             <div className="space-y-4">
               {rules.map((rule) => (
-                <RuleCard key={rule.path} rule={rule} />
+                <RuleCard
+                  key={rule.path}
+                  rule={rule}
+                  stats={stats.get(rule.id) ?? null}
+                  onBroke={() => void handleBroke(rule)}
+                />
               ))}
             </div>
           </section>
@@ -202,11 +235,19 @@ export function RulesView() {
 
 interface RuleCardProps {
   rule: Rule;
+  /** Derived "broke" stats for this rule, or null if never broken. */
+  stats: TrackStat | null;
+  onBroke: () => void;
 }
 
-function RuleCard({ rule }: RuleCardProps) {
+function RuleCard({ rule, stats, onBroke }: RuleCardProps) {
   const bodyReady = rule.content !== null;
   const bodyError = rule.loadError !== null;
+
+  // Days clean: full local days since the rule was last broken. `0` means it
+  // was broken today; null (never broken) shows as a "clean" placeholder.
+  const lastBroken = stats && stats.count > 0 ? stats.lastTs : null;
+  const daysClean = lastBroken !== null ? daysSince(lastBroken) : null;
 
   return (
     <article className="border border-[var(--color-pink-200)] rounded-lg bg-[var(--color-surface)] overflow-hidden">
@@ -243,6 +284,50 @@ function RuleCard({ rule }: RuleCardProps) {
         )}
 
         {bodyReady && <MarkdownBody>{rule.content ?? ""}</MarkdownBody>}
+
+        {/* Compliance stats + Broke Rule action. */}
+        <div className="flex flex-wrap items-center justify-between gap-3 mt-4 pt-4 border-t border-[var(--color-border)]">
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <span className="inline-flex items-baseline gap-1 rounded-md border border-[var(--color-border)] bg-[var(--color-pink-50)]/50 px-2 py-1">
+              <span className="text-[10px] uppercase tracking-wider text-[var(--color-muted-foreground)]">
+                Days clean
+              </span>
+              <span className="font-medium tabular-nums text-[var(--color-foreground)]">
+                {daysClean !== null ? daysClean : "∞"}
+              </span>
+            </span>
+            {lastBroken !== null && (
+              <>
+                <span className="inline-flex items-baseline gap-1 rounded-md border border-[var(--color-border)] bg-[var(--color-pink-50)]/50 px-2 py-1">
+                  <span className="text-[10px] uppercase tracking-wider text-[var(--color-muted-foreground)]">
+                    Last broken
+                  </span>
+                  <span className="font-medium tabular-nums text-[var(--color-foreground)]">
+                    {relativeTime(lastBroken)}
+                  </span>
+                </span>
+                <span className="inline-flex items-baseline gap-1 rounded-md border border-[var(--color-border)] bg-[var(--color-pink-50)]/50 px-2 py-1">
+                  <span className="text-[10px] uppercase tracking-wider text-[var(--color-muted-foreground)]">
+                    Times
+                  </span>
+                  <span className="font-medium tabular-nums text-[var(--color-foreground)]">
+                    {stats!.count}
+                  </span>
+                </span>
+              </>
+            )}
+          </div>
+
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={onBroke}
+            className="text-[var(--color-danger)] border-[var(--color-danger)]/40 hover:bg-[var(--color-pink-50)]"
+          >
+            <ShieldOff size={14} />
+            Broke Rule
+          </Button>
+        </div>
       </div>
     </article>
   );

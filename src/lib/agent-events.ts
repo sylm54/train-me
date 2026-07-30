@@ -43,7 +43,25 @@ export type AgentEvent =
       type: "subagent-step";
       agent: Exclude<AgentRole, "main">;
       label: string;
+      /** Optional detail (e.g. a friendly path) shown after the label. */
       detail?: string;
+      /** For the writer: which writeScript attempt this is (1-based). */
+      attempt?: number;
+      ts: number;
+    }
+  | {
+      /** One completed tool call by a subagent; accumulated into the history. */
+      type: "subagent-tool";
+      agent: Exclude<AgentRole, "main">;
+      toolName: string;
+      /** Friendly label (e.g. "Reading file"). */
+      label: string;
+      /** Optional friendly detail (e.g. a path). */
+      detail?: string;
+      /** Which writeScript attempt this was, for the writer. */
+      attempt?: number;
+      /** Whether the tool returned successfully. */
+      ok: boolean;
       ts: number;
     }
   | { type: "subagent-end"; agent: Exclude<AgentRole, "main">; ts: number };

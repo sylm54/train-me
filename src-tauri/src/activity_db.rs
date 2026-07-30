@@ -37,6 +37,26 @@ pub struct ActivityEntry {
     pub details: String,
 }
 
+/// Aggregated tracking stats for one item (keyed by the activity row's
+/// `details`, which carries the stable item id — a conditioning JSON stem, a
+/// rule/routine filename stem, …).
+///
+/// `last_ts` is the RFC 3339 timestamp of the most recent matching event.
+/// `count` is the total number of matching events.
+/// `streak` is the current consecutive-calendar-day streak of matching events
+/// — counting back from the most recent event's date, only if that date is
+/// today or yesterday (local time); otherwise `0`. This is meaningful for
+/// "engagement" events (conditioning plays, routine done). For "broke rule"
+/// events the frontend instead derives "days clean" from `last_ts`, since a
+/// broke-event streak is not a desirable metric.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TrackStatRow {
+    pub id: String,
+    pub last_ts: String,
+    pub count: i64,
+    pub streak: i64,
+}
+
 // ============================================================================
 // Schema bootstrap (one-shot, transient libsqlite3 connection)
 // ============================================================================
@@ -175,6 +195,107 @@ pub async fn activity_log_entry(
             action,
             details,
         })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Parse an RFC 3339 timestamp's local date, returning `None` on failure.
+/// Used to bucket events into calendar days for streak counting.
+fn local_date_from_rfc3339(ts: &str) -> Option<chrono::NaiveDate> {
+    use chrono::DateTime;
+    DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Local).date_naive())
+}
+
+/// Aggregate tracking stats (last_ts / count / streak) for every item id under
+/// a given `(feature, action)` pair. `details` carries the item id; rows are
+/// grouped by it, ordered by timestamp so the streak can be walked from newest
+/// to oldest. The streak counts consecutive local calendar days with ≥1 event,
+/// ending only if the most recent event's date is today or yesterday (local).
+#[tauri::command]
+pub async fn activity_track_stats(
+    feature: String,
+    action: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<TrackStatRow>, String> {
+    let agent_dir = state.agent_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<Vec<TrackStatRow>, String> {
+        let conn = open_db(&agent_dir)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT details, ts FROM activity \
+                 WHERE feature = ?1 AND action = ?2 \
+                 ORDER BY details, ts",
+            )
+            .map_err(|e| e.to_string())?;
+        // Collect raw (id, ts) rows.
+        let raw: rusqlite::Result<Vec<(String, String)>> = stmt
+            .query_map(params![feature, action], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?
+            .collect();
+        let raw = raw.map_err(|e| e.to_string())?;
+
+        // Group by id, preserving insertion order of first-seen ids.
+        use std::collections::BTreeMap;
+        let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (id, ts) in raw {
+            grouped.entry(id).or_default().push(ts);
+        }
+
+        let today = chrono::Local::now().date_naive();
+        let mut out: Vec<TrackStatRow> = Vec::with_capacity(grouped.len());
+        for (id, mut ts_list) in grouped {
+            if ts_list.is_empty() {
+                continue;
+            }
+            // ts_list is ascending (ordered by ts); the streak walk goes from
+            // the newest backward, so reverse it once.
+            ts_list.reverse();
+            let last_ts = ts_list[0].clone();
+
+            // Bucket into distinct local dates, newest first.
+            let mut dates: Vec<chrono::NaiveDate> = Vec::new();
+            for ts in &ts_list {
+                if let Some(d) = local_date_from_rfc3339(ts) {
+                    match dates.last() {
+                        Some(&prev) if prev == d => {} // same day, skip
+                        _ => dates.push(d),
+                    }
+                }
+            }
+
+            // Streak: only counts if the most recent event date is today or
+            // yesterday (local). Walk distinct dates newest→oldest while they
+            // are consecutive.
+            let mut streak: i64 = 0;
+            if let Some(&first) = dates.first() {
+                if first == today || first == today.pred_opt().unwrap_or(today) {
+                    streak = 1;
+                    for window in dates.windows(2) {
+                        // newest-first: window[0] should be window[1].succ().
+                        if window[0].pred_opt().as_ref() == Some(&window[1]) {
+                            streak += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            out.push(TrackStatRow {
+                id,
+                last_ts,
+                count: ts_list.len() as i64,
+                streak,
+            });
+        }
+        // Stable order by id so the UI list is deterministic.
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
     })
     .await
     .map_err(|e| e.to_string())?

@@ -8,6 +8,7 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   AlertCircle,
+  CheckCircle2,
   Clock,
   ListChecks,
   Loader2,
@@ -24,6 +25,12 @@ import {
 import { MarkdownBody } from "@/components/MarkdownBody";
 import type { FileEntry } from "@/lib/types";
 import { tauriErrorToString } from "@/lib/types";
+import {
+  fetchTrackStats,
+  logActivity,
+  relativeTime,
+  type TrackStat,
+} from "@/lib/activity";
 
 // ─── Types ──────────────────────────────────────────────────────────────
 
@@ -138,6 +145,14 @@ export function RoutinesView() {
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
 
+  // Per-routine "done" stats (last / streak / count), derived from the activity
+  // log. Fetched alongside the routine list and refreshed after each
+  // "Done Routine" press.
+  const [stats, setStats] = useState<Map<string, TrackStat>>(new Map());
+  const refreshStats = useCallback(async () => {
+    setStats(await fetchTrackStats("routine", "done"));
+  }, []);
+
   const loadAll = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -175,6 +190,9 @@ export function RoutinesView() {
     setRoutines(initial);
     setLoading(false);
 
+    // Load done-stats alongside the routine content (both independent fetches).
+    void refreshStats();
+
     // Eagerly load content for every routine, capturing per-file errors.
     await Promise.all(
       initial.map(async (routine) => {
@@ -208,7 +226,16 @@ export function RoutinesView() {
         }
       }),
     );
-  }, []);
+  }, [refreshStats]);
+
+  /** Record that a routine was done, then refresh stats so the card updates. */
+  const handleDone = useCallback(
+    async (routine: Routine) => {
+      await logActivity("routine", "done", routine.id);
+      await refreshStats();
+    },
+    [refreshStats],
+  );
 
   useEffect(() => {
     loadAll();
@@ -305,7 +332,12 @@ export function RoutinesView() {
             </h2>
             <div className="space-y-4">
               {routines.map((routine) => (
-                <RoutineCard key={routine.path} routine={routine} />
+                <RoutineCard
+                  key={routine.path}
+                  routine={routine}
+                  stats={stats.get(routine.id) ?? null}
+                  onDone={() => void handleDone(routine)}
+                />
               ))}
             </div>
           </section>
@@ -319,9 +351,12 @@ export function RoutinesView() {
 
 interface RoutineCardProps {
   routine: Routine;
+  /** Derived "done" stats for this routine, or null if never done. */
+  stats: TrackStat | null;
+  onDone: () => void;
 }
 
-function RoutineCard({ routine }: RoutineCardProps) {
+function RoutineCard({ routine, stats, onDone }: RoutineCardProps) {
   const bodyReady = routine.body !== null;
   const bodyError = routine.loadError !== null;
 
@@ -379,6 +414,45 @@ function RoutineCard({ routine }: RoutineCardProps) {
         )}
 
         {bodyReady && <MarkdownBody>{routine.body ?? ""}</MarkdownBody>}
+
+        {/* Completion stats + Done Routine action. */}
+        <div className="flex flex-wrap items-center justify-between gap-3 mt-4 pt-4 border-t border-[var(--color-border)]">
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <span className="inline-flex items-baseline gap-1 rounded-md border border-[var(--color-border)] bg-[var(--color-pink-50)]/50 px-2 py-1">
+              <span className="text-[10px] uppercase tracking-wider text-[var(--color-muted-foreground)]">
+                Streak
+              </span>
+              <span className="font-medium tabular-nums text-[var(--color-foreground)]">
+                {stats ? stats.streak : 0}d
+              </span>
+            </span>
+            {stats && stats.count > 0 && (
+              <>
+                <span className="inline-flex items-baseline gap-1 rounded-md border border-[var(--color-border)] bg-[var(--color-pink-50)]/50 px-2 py-1">
+                  <span className="text-[10px] uppercase tracking-wider text-[var(--color-muted-foreground)]">
+                    Last done
+                  </span>
+                  <span className="font-medium tabular-nums text-[var(--color-foreground)]">
+                    {relativeTime(stats.lastTs)}
+                  </span>
+                </span>
+                <span className="inline-flex items-baseline gap-1 rounded-md border border-[var(--color-border)] bg-[var(--color-pink-50)]/50 px-2 py-1">
+                  <span className="text-[10px] uppercase tracking-wider text-[var(--color-muted-foreground)]">
+                    Times
+                  </span>
+                  <span className="font-medium tabular-nums text-[var(--color-foreground)]">
+                    {stats.count}
+                  </span>
+                </span>
+              </>
+            )}
+          </div>
+
+          <Button variant="default" size="sm" onClick={onDone}>
+            <CheckCircle2 size={14} />
+            Done Routine
+          </Button>
+        </div>
       </div>
     </article>
   );

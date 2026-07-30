@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use std::path::{Component, Path, PathBuf};
 
 use crate::audio_renderer::resolve_scalar;
-use crate::tag_parser::Node;
+use crate::tag_parser::{Node, SectionRole};
 
 // ============================================================================
 // Segment tree
@@ -100,6 +100,16 @@ pub enum Segment {
         #[serde(skip_serializing_if = "Option::is_none")]
         duration: Option<f32>,
         parts: Vec<OverlayPartSegment>,
+    },
+
+    /// Structural section (`<intro>`/`<main>`/`<outro>`). The player plays
+    /// `<intro>`/`<outro>` once and loops `<main>` a chosen number of times.
+    /// Mirrors `tag_parser::Node::Section` so the structure survives into the
+    /// manifest (otherwise the whole section would bake into one `Static`
+    /// clip and couldn't be looped independently).
+    Section {
+        role: SectionRole,
+        child: Box<Segment>,
     },
 }
 
@@ -290,7 +300,8 @@ pub(crate) fn contains_split(node: &Node) -> bool {
         | Node::Speed { children, .. }
         | Node::Volume { children, .. }
         | Node::Loop { children, .. }
-        | Node::Background { children, .. } => children.iter().any(contains_split),
+        | Node::Background { children, .. }
+        | Node::Section { children, .. } => children.iter().any(contains_split),
 
         Node::Overlay { parts, .. } => parts.iter().any(|p| p.children.iter().any(contains_split)),
 
@@ -331,6 +342,7 @@ pub(crate) fn nominal_duration(seg: &Segment) -> f32 {
                     .fold(0.0, f32::max)
             }
         }
+        Segment::Section { child, .. } => nominal_duration(child),
     }
 }
 
@@ -446,6 +458,11 @@ pub(crate) fn resolve_paths_recursive(value: &mut serde_json::Value, base_dir: &
                 }
             }
         }
+        Some("section") => {
+            if let Some(seg) = value.get_mut("child") {
+                resolve_paths_recursive(seg, base_dir);
+            }
+        }
         _ => {}
     }
 }
@@ -453,7 +470,7 @@ pub(crate) fn resolve_paths_recursive(value: &mut serde_json::Value, base_dir: &
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tag_parser::OverlayPart;
+    use crate::tag_parser::{OverlayPart, SectionRole};
     use std::fs;
     use tempfile::tempdir;
 
@@ -650,8 +667,62 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_paths_recursive_static_and_import() {
+    fn test_contains_split_section_recurse() {
+        // A section wrapping a Random splits (interactive inside).
+        assert!(contains_split(&Node::Section {
+            role: SectionRole::Main,
+            children: vec![Node::Random { parts: vec![] }],
+        }));
+        // A clean section does NOT split on its own.
+        assert!(!contains_split(&Node::Section {
+            role: SectionRole::Intro,
+            children: vec![Node::Text("hello".into())],
+        }));
+    }
+
+    #[test]
+    fn test_nominal_duration_section() {
+        // Section contributes its child's duration once (the UI's "~15:00"
+        // badge is a one-pass estimate; main-repeats is a play-time concern).
+        let seg = Segment::Section {
+            role: SectionRole::Main,
+            child: Box::new(Segment::Static {
+                file: "a.wav".into(),
+                duration: 10.0,
+            }),
+        };
+        assert!((nominal_duration(&seg) - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_resolve_paths_recursive_section() {
         use serde_json::json;
+        let mut val = json!({
+            "type": "sequence",
+            "children": [
+                {"type": "section", "role": "intro", "child": {"type": "static", "file": "seg-000.wav", "duration": 1.0}},
+                {"type": "section", "role": "main", "child": {"type": "static", "file": "seg-001.wav", "duration": 2.0}},
+                {"type": "section", "role": "outro", "child": {"type": "static", "file": "seg-002.wav", "duration": 3.0}}
+            ]
+        });
+        let base = Path::new("/app/tracks/top1");
+        resolve_paths_recursive(&mut val, base);
+        let children = val.get("children").unwrap().as_array().unwrap();
+        for (i, expected) in ["seg-000.wav", "seg-001.wav", "seg-002.wav"].iter().enumerate() {
+            let got = children[i]
+                .get("child")
+                .unwrap()
+                .get("file")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .replace('\\', "/");
+            assert_eq!(got, format!("/app/tracks/top1/{}", expected));
+        }
+    }
+
+    #[test]
+    fn test_resolve_paths_recursive_static_and_import() {        use serde_json::json;
         let mut val = json!({
             "type": "sequence",
             "children": [

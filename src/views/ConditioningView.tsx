@@ -39,8 +39,19 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { type FileEntry, tauriErrorToString } from "@/lib/types";
-import { logActivity } from "@/lib/activity";
+import {
+  fetchTrackStats,
+  logActivity,
+  relativeTime,
+  type TrackStat,
+} from "@/lib/activity";
 import { ActivePrompt, ManifestPlayer, Segment } from "@/lib/manifestPlayer";
+import {
+  analyzeSections,
+  formatDuration,
+  totalDurationFor,
+  type SectionAnalysis,
+} from "@/lib/segments";
 import {
   clear as clearRenderEntry,
   ensureGlobalListener,
@@ -117,12 +128,6 @@ function deriveId(jsonPath: string): string {
   return name.replace(/\.json$/i, "");
 }
 
-function formatDuration(s: number): string {
-  const m = Math.floor(s / 60);
-  const ss = Math.floor(s % 60);
-  return `${m}:${ss.toString().padStart(2, "0")}`;
-}
-
 // ──────────────────────────────────────────────────────────────────────────
 // Component
 // ──────────────────────────────────────────────────────────────────────────
@@ -138,6 +143,14 @@ export function ConditioningView() {
   // tracking must outlive the component instance.
   const renderStore = useRenderStore();
 
+  // Per-script listen stats (last / streak / count), derived from the activity
+  // log by the backend. Refreshed alongside the script list and after a play
+  // ends so the detail card reflects the new listen immediately.
+  const [stats, setStats] = useState<Map<string, TrackStat>>(new Map());
+  const refreshStats = useCallback(async () => {
+    setStats(await fetchTrackStats("conditioning", "play"));
+  }, []);
+
   // Engine / model status, so the detail view can offer to download / load.
   const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
   const [downloading, setDownloading] = useState(false);
@@ -145,6 +158,11 @@ export function ConditioningView() {
 
   // Navigation phase: null = list, otherwise the expanded script.
   const [selectedId, setSelectedId] = useState<string | null>(null);
+
+  // Repeat count chosen on the detail-card slider (how many times `<main>`
+  // plays). Defaults to 1 (a single pass) and resets whenever the selected
+  // script changes.
+  const [mainRepeats, setMainRepeats] = useState(1);
 
   // Full-screen player. Set only while a manifest is playing.
   const [playingScript, setPlayingScript] = useState<ConditioningScript | null>(
@@ -255,7 +273,8 @@ export function ConditioningView() {
   useEffect(() => {
     void refresh();
     void refreshModelStatus();
-  }, [refresh, refreshModelStatus]);
+    void refreshStats();
+  }, [refresh, refreshModelStatus, refreshStats]);
 
   // Tear down the player when this view unmounts (the user navigates to
   // another screen). Without this, the ManifestPlayer's async playback loop
@@ -419,11 +438,8 @@ export function ConditioningView() {
         setScripts((prev) =>
           prev.map((s) => (s.id === script.id ? updated : s)),
         );
-        void logActivity(
-          "conditioning",
-          "render",
-          `${script.id} → ${m.manifest_path}`,
-        );
+        // Note: rendering is no longer logged to the activity feed. Only
+        // listens (plays that reach completion) count toward listen stats.
         return updated;
       } catch (e) {
         console.error("render_manifest failed:", e);
@@ -462,11 +478,6 @@ export function ConditioningView() {
         // Drop any in-flight/stale progress + error for this script so the
         // detail card doesn't show a lingering error after the wipe.
         clearRenderEntry(script.meta.script_path);
-        void logActivity(
-          "conditioning",
-          "delete-render",
-          `${script.id} (${script.meta.script_path})`,
-        );
         await refresh();
       } catch (e) {
         // Surface on the detail card via the registry.
@@ -527,11 +538,11 @@ export function ConditioningView() {
             setIsPlaying(playing);
           },
           onEnded: () => {
-            void logActivity(
-              "conditioning",
-              "play",
-              `${current.id} → ${current.manifest?.path ?? ""}`,
-            );
+            // A completed listen: log it (details = the stable script id, which
+            // the tracking aggregator groups on) then refresh stats so the
+            // detail card updates its listen count / streak immediately.
+            void logActivity("conditioning", "play", current.id);
+            void refreshStats();
             setPlayingScript(null);
             teardownPlayer();
           },
@@ -544,6 +555,9 @@ export function ConditioningView() {
             });
             return res.root;
           },
+          // Pass the chosen repeat count so `<main>` loops accordingly. For
+          // scripts without sections this is simply ignored.
+          mainRepeats,
         });
         playerRef.current = player;
         void player.start(tree.root);
@@ -556,7 +570,7 @@ export function ConditioningView() {
         }
       }
     },
-    [renderScript, teardownPlayer],
+    [renderScript, teardownPlayer, mainRepeats, refreshStats],
   );
 
   const handleClosePlayer = useCallback(() => {
@@ -577,6 +591,49 @@ export function ConditioningView() {
     () => scripts.find((s) => s.id === selectedId) ?? null,
     [scripts, selectedId],
   );
+
+  /**
+   * Section analysis for the selected script's manifest tree. Computed by
+   * reading the manifest and running `analyzeSections` client-side. `null`
+   * until the tree loads or when the script has no `<main>` section — in
+   * which case no repeat slider is shown.
+   */
+  const [repeatInfo, setRepeatInfo] = useState<SectionAnalysis | null>(null);
+
+  useEffect(() => {
+    // Reset the repeat count whenever the user selects a different script so a
+    // stale slider value never carries over.
+    setMainRepeats(1);
+    setRepeatInfo(null);
+
+    const manifestPath = selected?.manifest?.path;
+    if (!manifestPath) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const tree = await invoke<ReadManifestResult>("read_manifest", {
+          manifestPath,
+        });
+        if (cancelled) return;
+        setRepeatInfo(analyzeSections(tree.root));
+      } catch (e) {
+        // Non-fatal: the tree may be mid-render or unreadable; just skip the
+        // slider. Playback will surface its own error if the manifest is bad.
+        console.warn("read_manifest for section analysis failed:", e);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [selected]);
+
+  // Clamp the chosen repeat count if the budget shrinks (e.g. the script was
+  // re-rendered with a longer main). Keeps the slider value in range.
+  useEffect(() => {
+    if (repeatInfo && mainRepeats > repeatInfo.maxRepeats) {
+      setMainRepeats(repeatInfo.maxRepeats);
+    }
+  }, [repeatInfo, mainRepeats]);
 
   const empty = useMemo(
     () => !loading && scripts.length === 0 && !globalError,
@@ -651,6 +708,10 @@ export function ConditioningView() {
               progress={entry}
               downloading={downloading}
               downloadError={downloadError}
+              repeatInfo={repeatInfo}
+              mainRepeats={mainRepeats}
+              onMainRepeatsChange={setMainRepeats}
+              stats={stats.get(selected.id) ?? null}
               onBack={() => setSelectedId(null)}
               onRender={() => handleRender(selected)}
               onDownload={() => void handleDownload()}
@@ -748,6 +809,13 @@ interface ScriptDetailProps {
   progress: RenderEntry | null;
   downloading: boolean;
   downloadError: string | null;
+  /** Section analysis for the rendered manifest, or null if not repeatable. */
+  repeatInfo: SectionAnalysis | null;
+  /** Chosen `<main>` repeat count (1 = single pass). */
+  mainRepeats: number;
+  onMainRepeatsChange: (n: number) => void;
+  /** Derived listen stats for this script, or null if never listened. */
+  stats: TrackStat | null;
   onBack: () => void;
   onRender: () => void;
   onDownload: () => void;
@@ -763,6 +831,10 @@ function ScriptDetail({
   progress,
   downloading,
   downloadError,
+  repeatInfo,
+  mainRepeats,
+  onMainRepeatsChange,
+  stats,
   onBack,
   onRender,
   onDownload,
@@ -873,6 +945,9 @@ function ScriptDetail({
           <p className="text-sm text-[var(--color-muted-foreground)]">—</p>
         )}
 
+        {/* Listen stats (derived from the activity log). */}
+        <ListenStats stats={stats} />
+
         {/* Errors */}
         {metaError && (
           <p className="text-xs text-[var(--color-danger)] flex items-start gap-1.5">
@@ -940,6 +1015,20 @@ function ScriptDetail({
           </div>
         )}
 
+        {/* Repeat slider — only for non-interactive `<main>` scripts with more
+            than one possible pass. Lets the user extend total listening time in
+            `<main>`-duration steps up to 10h; intro/outro always play once. */}
+        {hasManifest &&
+          repeatInfo?.repeatable &&
+          repeatInfo.maxRepeats > 1 &&
+          repeatInfo.main > 0 && (
+            <RepeatSlider
+              analysis={repeatInfo}
+              repeats={mainRepeats}
+              onChange={onMainRepeatsChange}
+            />
+          )}
+
         {/* Actions */}
         <div className="flex flex-wrap items-center gap-2 pt-1">
           <Button
@@ -981,6 +1070,103 @@ function ScriptDetail({
             </Button>
           )}
         </div>
+      </div>
+    </div>
+  );
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Listen stats — last listen / streak / count, derived from the activity log
+// ──────────────────────────────────────────────────────────────────────────
+
+interface ListenStatsProps {
+  stats: TrackStat | null;
+}
+
+/**
+ * A compact row of three chips summarizing listening history: when it was last
+ * listened to, the current consecutive-day listen streak, and total listens.
+ * Renders nothing if the script has never been played.
+ */
+function ListenStats({ stats }: ListenStatsProps) {
+  if (!stats || stats.count === 0) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-2 text-xs">
+      <StatChip label="Last listen" value={relativeTime(stats.lastTs)} />
+      <StatChip label="Streak" value={`${stats.streak}d`} />
+      <StatChip
+        label="Listens"
+        value={String(stats.count)}
+      />
+    </div>
+  );
+}
+
+/** A small labeled stat chip. */
+function StatChip({ label, value }: { label: string; value: string }) {
+  return (
+    <span className="inline-flex items-baseline gap-1 rounded-md border border-[var(--color-border)] bg-[var(--color-pink-50)]/50 px-2 py-1">
+      <span className="text-[10px] uppercase tracking-wider text-[var(--color-muted-foreground)]">
+        {label}
+      </span>
+      <span className="font-medium tabular-nums text-[var(--color-foreground)]">
+        {value}
+      </span>
+    </span>
+  );
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Repeat slider — extends total listening time for non-interactive scripts
+// ──────────────────────────────────────────────────────────────────────────
+
+interface RepeatSliderProps {
+  analysis: SectionAnalysis;
+  /** Current `<main>` repeat count (1 = single pass). */
+  repeats: number;
+  onChange: (n: number) => void;
+}
+
+/**
+ * A discrete slider that sets how many times `<main>` plays. Range is
+ * `[1, maxRepeats]` in steps of 1; each step adds one `<main>` duration.
+ * The min endpoint is a single full pass (intro + main + outro), the max is
+ * capped so total time ≤ 10h. Displays the resulting total listening time.
+ */
+function RepeatSlider({ analysis, repeats, onChange }: RepeatSliderProps) {
+  const min = 1;
+  const max = analysis.maxRepeats;
+  const clamped = Math.min(Math.max(repeats, min), max);
+  // Native range input is 0-indexed over [0, max-1] so each integer step maps
+  // to a repeat count; keeps the knob's left edge at "one pass".
+  const sliderValue = clamped - min;
+
+  const total = totalDurationFor(analysis, clamped);
+
+  return (
+    <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-pink-50)]/40 p-4 space-y-2.5">
+      <div className="flex items-baseline justify-between gap-2">
+        <span className="text-sm font-medium text-[var(--color-foreground)]">
+          Repeat length
+        </span>
+        <span className="text-sm tabular-nums font-semibold text-[var(--color-pink-700)]">
+          {formatDuration(total)}
+        </span>
+      </div>
+      <input
+        type="range"
+        min={0}
+        max={Math.max(0, max - min)}
+        step={1}
+        value={sliderValue}
+        onChange={(e) => onChange(Number(e.target.value) + min)}
+        className="w-full accent-[var(--color-pink-500)] cursor-pointer"
+        aria-label="Repeat count"
+      />
+      <div className="flex items-center justify-between text-[11px] text-[var(--color-muted-foreground)] tabular-nums">
+        <span>{formatDuration(totalDurationFor(analysis, min))}</span>
+        <span>+{formatDuration(analysis.main)} / step</span>
+        <span>{formatDuration(totalDurationFor(analysis, max))}</span>
       </div>
     </div>
   );

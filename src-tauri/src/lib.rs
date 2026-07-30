@@ -968,7 +968,8 @@ fn collect_includes(
             | tag_parser::Node::Effect { children, .. }
             | tag_parser::Node::Background { children, .. }
             | tag_parser::Node::Until { children, .. }
-            | tag_parser::Node::Loop { children, .. } => {
+            | tag_parser::Node::Loop { children, .. }
+            | tag_parser::Node::Section { children, .. } => {
                 collect_includes(children, script_dir, agent_dir, out, visited, warnings);
             }
             tag_parser::Node::Overlay { parts, .. }
@@ -1729,6 +1730,7 @@ pub fn run() {
             activity_db::activity_list_entries,
             activity_db::activity_get_entry,
             activity_db::activity_log_entry,
+            activity_db::activity_track_stats,
             // Chastity (state-dir-backed)
             chastity::get_chastity_state,
             chastity::chastity_lock,
