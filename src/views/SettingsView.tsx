@@ -31,6 +31,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import { useSettings, DEFAULT_MODELS, STORAGE_KEY } from "@/lib/settings";
+import { loadMeta, loadMessages } from "@/lib/chatStore";
 import { getCachedBaseUrl } from "@/lib/audioUrl";
 import type {
   AgentName,
@@ -106,7 +107,8 @@ const AGENT_PROMPTS: { agent: AgentName; file: string; label: string }[] = [
 type PromptMode = "rendered" | "raw";
 
 export function SettingsView() {
-  const { settings, setApiKey, setAgent, resetOnboarding } = useSettings();
+  const { settings, setApiKey, setAgent, setChat, resetOnboarding } =
+    useSettings();
   const [reveal, setReveal] = useState<Record<ProviderName, boolean>>({
     openrouter: false,
     openai: false,
@@ -386,6 +388,61 @@ export function SettingsView() {
           })}
         </section>
 
+        {/* ── Chat behaviour ──────────────────────────────────────── */}
+        <section className="space-y-4">
+          <h2 className="text-sm uppercase tracking-wider text-[var(--color-muted-foreground)]">
+            Chat
+          </h2>
+          <div className="border border-[var(--color-border)] rounded-lg p-4 bg-[var(--color-surface)] space-y-4">
+            <p className="text-xs text-[var(--color-muted-foreground)]">
+              Control when the live context is compacted and when idle chats are
+              auto-archived. The full transcript is always saved to{" "}
+              <code className="font-mono">chats/&lt;id&gt;.xml</code> on the
+              agent's disk first, so nothing is ever lost.
+            </p>
+
+            <ChatNumberField
+              label="Auto-compact at (tokens)"
+              value={settings.chat.contextLimit}
+              min={1000}
+              step={1000}
+              hint="Running token estimate at which the oldest turns are dropped. Match this to your model's context window."
+              onChange={(v) => {
+                setChat({ contextLimit: v });
+                flashSave();
+              }}
+            />
+            <ChatNumberField
+              label="Keep recent turns"
+              value={settings.chat.compactKeepTurns}
+              min={1}
+              step={1}
+              hint="Number of most-recent user/assistant messages kept when compacting. Older turns remain on disk."
+              onChange={(v) => {
+                setChat({ compactKeepTurns: v });
+                flashSave();
+              }}
+            />
+            <ChatNumberField
+              label="Auto-clear idle chats (minutes)"
+              value={settings.chat.idleClearMinutes}
+              min={0}
+              step={15}
+              hint="Chats with no activity for this long are moved to the archive. 0 disables."
+              onChange={(v) => {
+                setChat({ idleClearMinutes: v });
+                flashSave();
+              }}
+            />
+            {settings.chat.idleClearMinutes > 0 && (
+              <p className="text-[11px] text-[var(--color-muted-foreground)]">
+                Idle chats archive after{" "}
+                {formatMinutes(settings.chat.idleClearMinutes)} of inactivity.
+              </p>
+            )}
+          </div>
+        </section>
+
         {/* ── Package import ──────────────────────────────────────── */}
         <section className="space-y-4">
           <h2 className="text-sm uppercase tracking-wider text-[var(--color-muted-foreground)]">
@@ -655,6 +712,70 @@ function StatusDot({ on }: { on: boolean }) {
     <span
       className={`size-2.5 rounded-full ${on ? "bg-[var(--color-success)]" : "bg-[var(--color-border)]"}`}
     />
+  );
+}
+
+/** Format a minute count as a human duration: 240 → "4h", 90 → "1h 30m". */
+function formatMinutes(minutes: number): string {
+  if (minutes <= 0) return "never";
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  if (h === 0) return `${m}m`;
+  if (m === 0) return `${h}h`;
+  return `${h}h ${m}m`;
+}
+
+/**
+ * Gather every chat (metadata + messages, active and archived) into a single
+ * JSON blob for the backup ZIP. Replaces the old single-key `chat-history`
+ * read now that chats are multi-entry. Returns null if there are no chats.
+ */
+function collectAllChatHistoryJson(): string | null {
+  const chats = loadMeta();
+  if (chats.length === 0) return null;
+  const payload = chats.map((meta) => ({
+    meta,
+    messages: loadMessages(meta.id),
+  }));
+  return JSON.stringify(payload);
+}
+
+/** A labelled number input used in the Chat settings section. */
+function ChatNumberField({
+  label,
+  value,
+  min,
+  step,
+  hint,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  step: number;
+  hint?: string;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <div>
+      <label className="block text-sm font-medium mb-1.5">{label}</label>
+      <input
+        type="number"
+        value={value}
+        min={min}
+        step={step}
+        onChange={(e) => {
+          const v = Number(e.target.value);
+          if (Number.isFinite(v)) onChange(Math.max(min, Math.round(v)));
+        }}
+        className="w-full sm:w-48 font-mono text-sm border border-[var(--color-border)] rounded-md px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-[var(--color-pink-300)]"
+      />
+      {hint && (
+        <p className="text-[11px] text-[var(--color-muted-foreground)] mt-1">
+          {hint}
+        </p>
+      )}
+    </div>
   );
 }
 
@@ -1371,9 +1492,9 @@ function ExportAllDataCard() {
     }
 
     // Read the raw localStorage payloads so the backup captures settings
-    // (incl. API keys) and the saved chat transcript verbatim.
+    // (incl. API keys) and every chat transcript (active + archived).
     const settingsJson = localStorage.getItem(STORAGE_KEY);
-    const chatHistoryJson = localStorage.getItem("chat-history");
+    const chatHistoryJson = collectAllChatHistoryJson();
 
     setBusy(true);
     try {

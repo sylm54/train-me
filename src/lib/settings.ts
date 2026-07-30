@@ -12,6 +12,7 @@ import type {
   AgentName,
   ProviderName,
   ReasoningEffort,
+  ChatSettings,
 } from "./types";
 
 import { ensureNotificationPermission } from "./notifications";
@@ -26,6 +27,18 @@ export const DEFAULT_MODELS: Record<ProviderName, string> = {
   openai: "",
 };
 
+/** Default chat behaviour settings. */
+export const DEFAULT_CHAT_SETTINGS: ChatSettings = {
+  // 120k tokens: a safe ceiling for most mid-tier models. Auto-compact
+  // kicks in before the provider rejects an over-long request.
+  contextLimit: 120_000,
+  // Keep the last 6 user/assistant turns when compacting — enough recent
+  // context to stay conversational without re-reading the whole history.
+  compactKeepTurns: 6,
+  // 4 hours of inactivity before an idle chat auto-archives. 0 disables.
+  idleClearMinutes: 240,
+};
+
 const DEFAULT_SETTINGS: AgentSettings = {
   apiKeys: {},
   agents: {
@@ -33,6 +46,7 @@ const DEFAULT_SETTINGS: AgentSettings = {
     planner: { provider: "openrouter", model: DEFAULT_MODELS.openrouter },
     writer: { provider: "openrouter", model: DEFAULT_MODELS.openrouter },
   },
+  chat: { ...DEFAULT_CHAT_SETTINGS },
   onboarded: false,
 };
 
@@ -47,6 +61,10 @@ function load(): AgentSettings {
         ...DEFAULT_SETTINGS.agents,
         ...(parsed.agents ?? {}),
       } as AgentSettings["agents"],
+      chat: {
+        ...DEFAULT_SETTINGS.chat,
+        ...(parsed.chat ?? {}),
+      },
       onboarded: parsed.onboarded ?? false,
     };
   } catch {
@@ -135,5 +153,24 @@ export function useSettings() {
     });
   }, []);
 
-  return { settings, setApiKey, setAgent, completeOnboarding, resetOnboarding };
+  /** Update the chat behaviour settings (context limit, compaction, idle). */
+  const setChat = useCallback((patch: Partial<ChatSettings>) => {
+    setSettings((prev) => {
+      const next: AgentSettings = {
+        ...prev,
+        chat: { ...prev.chat, ...patch },
+      };
+      save(next);
+      return next;
+    });
+  }, []);
+
+  return {
+    settings,
+    setApiKey,
+    setAgent,
+    setChat,
+    completeOnboarding,
+    resetOnboarding,
+  };
 }

@@ -21,11 +21,20 @@ import { useSettings } from "@/lib/settings";
 import { useFeatureVisibility } from "@/lib/features";
 import { useGlobalAppLinkNavigation } from "@/lib/links";
 import { useRoutineNotifier } from "@/lib/use-routine-notifier";
+import { createChat, ensureActiveChat } from "@/lib/chatStore";
+import { useIdleChatSweeper } from "@/hooks/useIdleChatSweeper";
 import type { View } from "@/lib/views";
 
 export default function App() {
   const { settings, completeOnboarding } = useSettings();
   const [view, setView] = useState<View>("chat");
+
+  // The active chat id is owned here so it survives view switches (the
+  // ChatView is kept mounted; only its `key` changes when the chat does).
+  // Lazily pick the newest active chat, creating one if none exists.
+  const [activeChatId, setActiveChatId] = useState<string>(
+    () => ensureActiveChat().id,
+  );
 
   // Stable navigate callback used to switch views (sidebar + the
   // global in-app link interceptor below).
@@ -35,6 +44,17 @@ export default function App() {
 
   // Keep routine notifications alive for the lifetime of the app.
   useRoutineNotifier();
+
+  // Auto-archive chats that have been idle past the configured threshold.
+  // If the swept chat happens to be the active one, switch to a fresh chat.
+  // (Declared before the onboarding early-return so hooks stay stable.)
+  useIdleChatSweeper(
+    settings.chat.idleClearMinutes,
+    activeChatId,
+    useCallback(() => {
+      setActiveChatId(createChat().id);
+    }, []),
+  );
 
   // Intercept clicks on in-app links (e.g. `conditioning/foo.json`)
   // anywhere in the app — chat messages, rules, routines, journal, voice —
@@ -110,7 +130,11 @@ export default function App() {
           when active preserves the original layout (ChatView behaves as a
           direct child of <main>). */}
       <div className={view === "chat" ? "contents" : "hidden"}>
-        <ChatView onOpenSettings={() => setView("settings")} />
+        <ChatView
+          activeChatId={activeChatId}
+          onActiveChatChange={setActiveChatId}
+          onOpenSettings={() => setView("settings")}
+        />
       </div>
       {view !== "chat" && body}
     </AppShell>

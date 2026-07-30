@@ -71,6 +71,24 @@ const LOG_STYLES: Record<SubagentName, string> = {
 /** Cap previews so a single tool result doesn't drown the console. */
 const PREVIEW_MAX = 240;
 
+/** Max length for a friendly tool detail (path / command) surfaced to the UI. */
+const DETAIL_MAX = 60;
+
+/**
+ * Derive a short, friendly detail string from a tool's parsed input — e.g. a
+ * file path, or (for bash) the command. Returns undefined when there's nothing
+ * worth showing. Keeps the UI feed compact and free of raw JSON.
+ */
+function toolDetail(toolName: string, input: unknown): string | undefined {
+  const obj = (input ?? {}) as Record<string, unknown>;
+  if (typeof obj.path === "string" && obj.path.length > 0) return obj.path;
+  if (toolName === "bash" && typeof obj.command === "string") {
+    const c = obj.command.replace(/\s+/g, " ").trim();
+    return c.length > DETAIL_MAX ? c.slice(0, DETAIL_MAX) + "…" : c;
+  }
+  return undefined;
+}
+
 /**
  * Truncate a value (usually a string or serialisable object) for compact
  * console output. Returns the original value if it's already short.
@@ -136,12 +154,38 @@ function emitStart(agent: SubagentName) {
 }
 
 /** Update the current step label for a running subagent. */
-function emitStep(agent: SubagentName, toolName: string, detail?: string) {
+function emitStep(
+  agent: SubagentName,
+  toolName: string,
+  detail?: string,
+  attempt?: number,
+) {
   emitAgentEvent({
     type: "subagent-step",
     agent,
     label: STEP_LABEL[toolName] ?? toolName,
     detail,
+    attempt,
+    ts: Date.now(),
+  });
+}
+
+/** Record one completed subagent tool call in the UI history feed. */
+function emitTool(
+  agent: SubagentName,
+  toolName: string,
+  detail: string | undefined,
+  attempt: number | undefined,
+  ok: boolean,
+) {
+  emitAgentEvent({
+    type: "subagent-tool",
+    agent,
+    toolName,
+    label: STEP_LABEL[toolName] ?? toolName,
+    detail,
+    attempt,
+    ok,
     ts: Date.now(),
   });
 }
@@ -247,6 +291,28 @@ async function runSubagent(opts: {
     let finalText = "";
     let pendingText = "";
 
+    // Per-tool-call bookkeeping for the UI feed. The writer's writeScript is
+    // retried on validation failure, so we count consecutive writeScript calls
+    // within a single run and surface the attempt number. We also buffer each
+    // call's input JSON deltas (keyed by id) so we can derive a friendly
+    // detail (path/command) once the call resolves.
+    let writeScriptAttempts = 0;
+    const toolInputBuffers = new Map<string, string>();
+    const toolNamesById = new Map<string, string>();
+
+    const finishToolCall = (
+      id: string,
+      toolName: string,
+      ok: boolean,
+      input?: unknown,
+    ) => {
+      const attempt =
+        toolName === "writeScript" ? writeScriptAttempts : undefined;
+      emitTool(opts.agent, toolName, toolDetail(toolName, input), attempt, ok);
+      toolInputBuffers.delete(id);
+      toolNamesById.delete(id);
+    };
+
     for await (const part of result.fullStream) {
       switch (part.type) {
         case "text-delta":
@@ -263,9 +329,9 @@ async function runSubagent(opts: {
 
         case "reasoning-start":
           // Reasoning is intentionally NOT accumulated into finalText —
-          // subagent thinking must not leak into tool results returned to
-          // the parent agent. We just open a console group for it so it
-          // can be inspected during debugging.
+          // subagent thinking must not leak into tool results returned to the
+          // parent agent. We just open a console group for it so it can be
+          // inspected during debugging.
           if (pendingText.trim()) {
             log(opts.agent, "💬 text", preview(pendingText.trim()));
             pendingText = "";
@@ -298,20 +364,41 @@ async function runSubagent(opts: {
           finalText = "";
           const dynamic = "dynamic" in part && part.dynamic ? " (dynamic)" : "";
           log(opts.agent, `🔧 tool call: ${part.toolName}${dynamic}`);
-          // Surface a friendly step label (no args) to the UI progress feed.
-          emitStep(opts.agent, part.toolName);
+          // The writer retries writeScript on validation failure; count each
+          // call so the UI can show "attempt 2", etc.
+          if (part.toolName === "writeScript") writeScriptAttempts += 1;
+          toolInputBuffers.set(part.id, "");
+          toolNamesById.set(part.id, part.toolName);
+          // Surface a friendly step label to the UI progress feed. The writer
+          // includes the attempt number when > 1.
+          emitStep(
+            opts.agent,
+            part.toolName,
+            undefined,
+            part.toolName === "writeScript" ? writeScriptAttempts : undefined,
+          );
+          break;
+        }
+
+        case "tool-input-delta": {
+          // Buffer the input JSON deltas so we can parse a detail later.
+          const buf = toolInputBuffers.get(part.id);
+          if (buf !== undefined) toolInputBuffers.set(part.id, buf + part.delta);
           break;
         }
 
         case "tool-input-end":
-          // Tool input parsing complete; we don't log the args here because
-          // the SDK emits them as separate deltas and we'd just see JSON.
+          // Tool input parsing complete; the buffered JSON is consumed on
+          // tool-result/tool-error.
           break;
 
         case "tool-result": {
           // The `output` field is the JSON the tool's execute() returned.
           const outputPreview = preview("output" in part ? part.output : part);
           log(opts.agent, `↳ ${part.toolName} result`, outputPreview);
+          const input =
+            "input" in part ? (part as { input?: unknown }).input : undefined;
+          finishToolCall(part.toolCallId, part.toolName, true, input);
           break;
         }
 
@@ -321,6 +408,9 @@ async function runSubagent(opts: {
               ? part.errorText
               : "unknown tool error";
           log(opts.agent, `✗ ${part.toolName} error`, msg);
+          const input =
+            "input" in part ? (part as { input?: unknown }).input : undefined;
+          finishToolCall(part.toolCallId, part.toolName, false, input);
           break;
         }
 

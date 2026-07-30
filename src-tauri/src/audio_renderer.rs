@@ -157,7 +157,8 @@ pub fn count_speakable_nodes(nodes: &[Node]) -> usize {
             | Node::Volume { children, .. }
             | Node::Effect { children, .. }
             | Node::Background { children, .. }
-            | Node::Until { children, .. } => {
+            | Node::Until { children, .. }
+            | Node::Section { children, .. } => {
                 count += count_speakable_nodes(children);
             }
             Node::Loop { loops, children } => {
@@ -571,6 +572,15 @@ impl AudioRenderer {
                 Node::Include { .. } => {
                     // Includes should have been resolved by `resolve_includes`
                     // before reaching the renderer. Silently ignore if not.
+                }
+
+                Node::Section { children, .. } => {
+                    // Sections are structural: render their children inline with
+                    // the inherited context (transparent to flat synthesis).
+                    let (samples, dur) =
+                        self.render_nodes(children, default_speaker, volume_scale, speed_scale)?;
+                    foreground.extend_from_slice(&samples);
+                    _total_duration += dur;
                 }
             }
         }
@@ -1137,6 +1147,19 @@ impl AudioRenderer {
                 }
 
                 Node::Include { .. } => {}
+
+                Node::Section { children, .. } => {
+                    // Structural — render children inline with inherited context.
+                    let (samples, dur) = self.render_nodes_tracked(
+                        children,
+                        default_speaker,
+                        volume_scale,
+                        speed_scale,
+                        tracker,
+                    )?;
+                    foreground.extend_from_slice(&samples);
+                    _total_duration += dur;
+                }
             }
         }
 
@@ -1456,6 +1479,26 @@ impl AudioRenderer {
         let mut children: Vec<Segment> = Vec::new();
 
         for node in nodes {
+            // Sections are structural: handle them BEFORE the split check so a
+            // clean section becomes `Section{child: Static{…}}` (loopable by the
+            // player) rather than being flattened into the surrounding buffer.
+            // A section containing an interactive tag still recurses through
+            // `walk`, producing a `Section` over a Sequence — the player loops
+            // that sequence's main content.
+            if let Node::Section { role, children: sec_children } = node {
+                self.flush_static(
+                    &mut static_buf, ctx, out_dir, counter, &mut children, progress,
+                )?;
+                let child = self.walk(
+                    sec_children, ctx, out_dir, script_dir, agent_dir, tracks_dir, counter,
+                    visited, progress,
+                )?;
+                children.push(Segment::Section {
+                    role: *role,
+                    child: Box::new(child),
+                });
+                continue;
+            }
             if manifest::contains_split(node) {
                 self.flush_static(
                     &mut static_buf, ctx, out_dir, counter, &mut children, progress,
@@ -1720,6 +1763,19 @@ impl AudioRenderer {
                 self.walk(
                     children, &sub, out_dir, script_dir, agent_dir, tracks_dir, counter, visited,
                     progress,
+                )
+            }
+
+            // Sections are handled directly in `walk` (before the split check),
+            // so reaching one here means the walker changed shape — fail loudly.
+            Node::Section { role, .. } => {
+                bail!(
+                    "<{}> section reached emit_split (must be handled in walk)",
+                    match role {
+                        tag_parser::SectionRole::Intro => "intro",
+                        tag_parser::SectionRole::Main => "main",
+                        tag_parser::SectionRole::Outro => "outro",
+                    }
                 )
             }
 
@@ -2047,6 +2103,11 @@ fn resolve_includes_in_node(
         Node::Choice { prompt, options } => {
             let options = resolve_overlay_parts(options, base_dir, visited);
             vec![Node::Choice { prompt, options }]
+        }
+
+        Node::Section { role, children } => {
+            let children = resolve_includes_inner(children, base_dir, visited);
+            vec![Node::Section { role, children }]
         }
 
         // Leaves with no nested children — pass through unchanged.
@@ -3274,7 +3335,8 @@ mod tests {
             | Node::Effect { children, .. }
             | Node::Loop { children, .. }
             | Node::Background { children, .. }
-            | Node::Until { children, .. } => {
+            | Node::Until { children, .. }
+            | Node::Section { children, .. } => {
                 for child in children {
                     collect_text_recursive(child, texts);
                 }
@@ -3318,7 +3380,10 @@ mod tests {
             | Node::Effect { children, .. }
             | Node::Loop { children, .. }
             | Node::Background { children, .. }
-            | Node::Until { children, .. } => children.iter().any(contains_include_recursive),
+            | Node::Until { children, .. }
+            | Node::Section { children, .. } => {
+                children.iter().any(contains_include_recursive)
+            }
             Node::Overlay { parts, .. } => parts
                 .iter()
                 .any(|p| p.children.iter().any(contains_include_recursive)),

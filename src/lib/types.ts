@@ -28,10 +28,36 @@ export interface AgentModelConfig {
 /** API keys indexed by provider. */
 export type ApiKeys = Partial<Record<ProviderName, string>>;
 
+/**
+ * Chat behaviour settings. All are user-tunable from the Settings → Chat
+ * section.
+ */
+export interface ChatSettings {
+  /**
+   * Token estimate at which auto-compact fires. Once the running token total
+   * for a chat reaches this, the oldest turns are dropped (down to
+   * `compactKeepTurns`). The full transcript is always saved to
+   * `chats/<id>.xml` on the agent's disk first, so nothing is lost.
+   */
+  contextLimit: number;
+  /**
+   * Number of recent user/assistant messages to keep when auto-compacting.
+   * Everything older is dropped from the live chat (but remains on disk).
+   */
+  compactKeepTurns: number;
+  /**
+   * Minutes of inactivity after which an idle chat is auto-archived.
+   * `0` disables the idle timer entirely.
+   */
+  idleClearMinutes: number;
+}
+
 /** Complete settings persisted to localStorage. */
 export interface AgentSettings {
   apiKeys: ApiKeys;
   agents: Record<AgentName, AgentModelConfig>;
+  /** Chat behaviour (context limit, compaction, idle clear). */
+  chat: ChatSettings;
   /** Whether the user has completed the onboarding wizard. */
   onboarded: boolean;
 }

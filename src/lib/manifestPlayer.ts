@@ -51,6 +51,11 @@ export type Segment =
         speed?: string;
         segment: Segment;
       }[];
+    }
+  | {
+      type: "section";
+      role: "intro" | "main" | "outro";
+      child: Segment;
     };
 
 /** A prompt surfaced to the UI for interactive (`until` / `choice`) nodes. */
@@ -77,6 +82,13 @@ export interface ManifestPlayerOptions {
    * into them, so the player pulls them on demand.
    */
   readImport: (manifestPath: string) => Promise<Segment>;
+  /**
+   * How many times to play the `<main>` section. `1` = once (the default).
+   * `<intro>`/`<outro>` always play once each regardless of this value.
+   * Only meaningful for scripts authored with `<intro>`/`<main>`/`<outro>`
+   * structural tags.
+   */
+  mainRepeats?: number;
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -94,9 +106,12 @@ export class ManifestPlayer {
   private aborted = false;
   /** Resolver for the currently pending `until`/`choice` prompt, if any. */
   private promptResolver: ((value: number) => void) | null = null;
+  /** How many times the `<main>` section plays (clamped to ≥1). */
+  private readonly mainRepeats: number;
 
   constructor(opts: ManifestPlayerOptions) {
     this.opts = opts;
+    this.mainRepeats = Math.max(1, Math.floor(opts.mainRepeats ?? 1));
   }
 
   /** Begin playing the root segment. Resolves when the whole tree finishes. */
@@ -203,6 +218,15 @@ export class ManifestPlayer {
       case "overlay":
         await this.playOverlay(seg);
         return;
+      case "section": {
+        // `<intro>`/`<outro>` play once; `<main>` repeats `mainRepeats` times.
+        const repeats = seg.role === "main" ? this.mainRepeats : 1;
+        for (let i = 0; i < repeats; i++) {
+          if (this.aborted) return;
+          await this.play(seg.child, trackIndex);
+        }
+        return;
+      }
       default: {
         // Exhaustiveness guard — should be unreachable if the union matches
         // the backend.

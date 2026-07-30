@@ -8,6 +8,31 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+/// Which structural section a `<intro>`/`<main>`/`<outro>` block belongs to.
+///
+/// Sections are transparent to flat audio synthesis but are preserved through
+/// the manifest so the player can loop `<main>` a chosen number of times while
+/// playing `<intro>`/`<outro>` once each.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SectionRole {
+    Intro,
+    Main,
+    Outro,
+}
+
+impl SectionRole {
+    /// Parse a tag name (`"intro"`/`"main"`/`"outro"`) into a role.
+    pub fn from_tag(name: &str) -> Option<Self> {
+        match name {
+            "intro" => Some(SectionRole::Intro),
+            "main" => Some(SectionRole::Main),
+            "outro" => Some(SectionRole::Outro),
+            _ => None,
+        }
+    }
+}
+
 /// AST node for the TTS tag language.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Node {
@@ -119,6 +144,15 @@ pub enum Node {
     /// Include another XML file at this point. Resolved by the audio renderer
     /// before rendering (see `audio_renderer::resolve_includes`).
     Include { src: String },
+
+    /// Structural section marker (`<intro>`/`<main>`/`<outro>`). Transparent to
+    /// flat synthesis (its children render inline) but preserved as a distinct
+    /// manifest segment so the player can loop `<main>` and play
+    /// `<intro>`/`<outro>` once each.
+    Section {
+        role: SectionRole,
+        children: Vec<Node>,
+    },
 }
 
 /// A part within an overlay.
@@ -221,6 +255,7 @@ impl TagParser {
             "random" => self.parse_random_tag(),
             "scramble" => self.parse_scramble_tag(),
             "choice" => self.parse_choice_tag(),
+            "intro" | "main" | "outro" => self.parse_section_tag(&tag_name),
             other => bail!("Unknown tag: <{}>", other),
         }
     }
@@ -538,6 +573,27 @@ impl TagParser {
         })
     }
 
+    /// Parse `<intro>`/`<main>`/`<outro>` — container tags (children required)
+    /// with no meaningful attributes. The name maps to a `SectionRole`.
+    fn parse_section_tag(&mut self, name: &str) -> Result<Node> {
+        let role = SectionRole::from_tag(name)
+            .ok_or_else(|| anyhow::anyhow!("not a section tag: <{}>", name))?;
+        // Sections take no attributes today; read & discard any present so a
+        // stray attribute doesn't break parsing.
+        let _attrs = self.read_attributes();
+        if self.peek_str("/>") {
+            self.expect_str("/>")?;
+            bail!("<{}> tag must have children", name);
+        }
+        self.expect_str(">")?;
+        let children = self.parse_nodes()?;
+        self.expect_closing(name)?;
+        Ok(Node::Section {
+            role,
+            children: filter_empty_text(children),
+        })
+    }
+
     // --- Helper methods ---
 
     fn peek_str(&self, s: &str) -> bool {
@@ -736,7 +792,8 @@ fn extract_text_recursive(node: &Node, texts: &mut Vec<String>) {
         | Node::Effect { children, .. }
         | Node::Loop { children, .. }
         | Node::Background { children, .. }
-        | Node::Until { children, .. } => {
+        | Node::Until { children, .. }
+        | Node::Section { children, .. } => {
             for child in children {
                 extract_text_recursive(child, texts);
             }
@@ -945,6 +1002,17 @@ fn validate_nodes(
 
             Node::Background { children, .. } => {
                 breadcrumb.push("<background>".to_string());
+                validate_nodes(children, errors, seen_includes, breadcrumb);
+                breadcrumb.pop();
+            }
+
+            Node::Section { role, children } => {
+                let name = match role {
+                    SectionRole::Intro => "intro",
+                    SectionRole::Main => "main",
+                    SectionRole::Outro => "outro",
+                };
+                breadcrumb.push(format!("<{}>", name));
                 validate_nodes(children, errors, seen_includes, breadcrumb);
                 breadcrumb.pop();
             }
@@ -1383,5 +1451,62 @@ mod tests {
             }
             _ => panic!("Expected Random node"),
         }
+    }
+
+    #[test]
+    fn test_parse_sections() {
+        let input = r#"<intro>Welcome</intro><main><loop loops="3">Breathe</loop></main><outro>Goodbye</outro>"#;
+        let nodes = parse(input).unwrap();
+        assert_eq!(nodes.len(), 3);
+        assert!(matches!(
+            &nodes[0],
+            Node::Section { role: SectionRole::Intro, .. }
+        ));
+        assert!(matches!(
+            &nodes[1],
+            Node::Section { role: SectionRole::Main, .. }
+        ));
+        assert!(matches!(
+            &nodes[2],
+            Node::Section { role: SectionRole::Outro, .. }
+        ));
+        if let Node::Section { children, .. } = &nodes[1] {
+            assert_eq!(children.len(), 1);
+            assert!(matches!(children[0], Node::Loop { loops: 3, .. }));
+        }
+    }
+
+    #[test]
+    fn test_parse_section_requires_children() {
+        let result = parse("<main/>");
+        assert!(result.is_err(), "self-closing <main/> should error");
+        let result = parse("<intro></intro>");
+        // Empty (whitespace-only) children parse to zero nodes, which is valid
+        // structurally — the section just has no content.
+        assert!(result.is_ok(), "empty section should parse: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_parse_section_nested() {
+        let input = r#"<main><voice speaker="female"><until button="Go">Press</until></voice></main>"#;
+        let nodes = parse(input).unwrap();
+        match &nodes[0] {
+            Node::Section {
+                role: SectionRole::Main,
+                children,
+            } => {
+                assert_eq!(children.len(), 1);
+                assert!(matches!(children[0], Node::Voice { .. }));
+            }
+            _ => panic!("Expected Section node"),
+        }
+    }
+
+    #[test]
+    fn test_section_role_from_tag() {
+        assert_eq!(SectionRole::from_tag("intro"), Some(SectionRole::Intro));
+        assert_eq!(SectionRole::from_tag("main"), Some(SectionRole::Main));
+        assert_eq!(SectionRole::from_tag("outro"), Some(SectionRole::Outro));
+        assert_eq!(SectionRole::from_tag("verse"), None);
     }
 }

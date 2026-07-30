@@ -39,17 +39,20 @@ const featureEmbed = `
 - Each .json file corresponds to one audio file.
 - File contents describe the associated audio.
 - Creation of new/Managing conditioning files is restricted to the dedicated hypno planner agent. The main agent should never modify these files directly; instead, it should instruct the HypnoPlanner subagent to create or update conditioning entries as needed.
+- Listening stats (last listen, listen streak, listen count) are auto-derived by the app from the activity log when a user finishes playing a script — do NOT store any stat/counter/last-listened fields inside the conditioning JSON; the app owns them and they would be clobbered on your next edit.
 
 ### 2. Rules (\`rule/*.md\`)
 - Each file represents one rule that the user is expected to follow.
 - Refer to \`examples/rule.md\` for the correct formatting standard.
 - Create one rule file for each distinct rule you want to enforce.
+- Compliance stats (days clean, last broken, times broken) are auto-derived by the app from the activity log when the user logs "Broke Rule" — do NOT store any stat/counter/last-broken fields inside the rule markdown; the app owns them.
 
 ### 3. Routines (\`routines/*.md\`)
 - Each file defines one routine for the user.
 - Refer to \`examples/routine.md\` for the proper formatting standard.
 - Create one routine file for each distinct routine you want to establish. For routines that vary by day, time, or other conditions, create separate files with clear naming to indicate their context.
 - The \`schedule:\` frontmatter field is a cron expression. Both 5-field (\`30 2 * * *\` = daily at 02:30) and 6-field (\`0 30 2 * * *\`, with a leading seconds field) forms are accepted; \`@daily\`/\`@hourly\`/etc. shorthands also work.
+- Completion stats (done streak, last done, times done) are auto-derived by the app from the activity log when the user logs "Done Routine" — do NOT store any stat/counter/last-done fields inside the routine markdown; the app owns them.
 
 ### 4. Inventory
 - **Items**: records items owned by the user, use the inventory cli to manage/browse inventory.
@@ -193,6 +196,12 @@ Interactive branch. At playback the player pauses and shows one button per part 
 #### \`<include>\` — self-closing (requires \`src\`)
 - \`src\` — required. Pulls in another XML file by path. Nested includes are supported with circular-include detection. In manifest mode, an include is rendered as its OWN manifest (deduped on disk by source path, so the same file included twice is stored and rendered once) and referenced by the parent; context (voice/speed/volume) is RESET at the include boundary, so an included file should declare its own \`<voice>\`. Each included file has its own content hash, so editing a sub-file re-renders only that sub-manifest.
 
+#### \`<intro>\` / \`<main>\` / \`<outro>\` — containers (children required); optional structural markers
+Mark the structural sections of a script. They are **transparent to audio synthesis** (their children render exactly as if the wrapper were absent) but are preserved in the manifest so the player can treat them specially: \`<intro>\` and \`<outro>\` play **once each**, while \`<main>\` can be **repeated**.
+- At playback, when \`<main>\` contains NO interactive tag (\`<until>\`/\`<random>\`/\`<scramble>\`/\`<choice>\`), the listener is offered a "Repeat length" slider that extends total listening time in \`<main>\`-duration steps — from one full pass (intro + main + outro) up to 10 hours — by looping \`<main>\` the chosen number of times. \`<intro>\`/\`<outro>\` may themselves contain interactive tags without disabling the slider.
+- Use at most one \`<main>\` per script. Sections may be omitted entirely (a script with no sections plays once, exactly as before).
+- No attributes. Nest any tags inside them.
+
 ### Sound types
 
 Valid \`<sound type>\` values: \`beep\`, \`pop\`, \`bubble_pop\`, \`camera_shutter\`, \`censor_beep\`, \`heart_beat\`, \`padlock\`, \`snap\`, \`ding\`, \`swoosh\`, \`click\`, \`error\`, \`success\`, \`bell\`, \`water_drop\`.
@@ -245,6 +254,7 @@ Constant folding: literals, binops of constants, and \`@max\`/\`@min\`/\`@step\`
 - \`<include>\` renders to a deduped sub-manifest (context resets at the boundary); each file is hashed separately for incremental re-rendering.
 - Interactive tags \`<until>\`/\`<random>\`/\`<scramble>\`/\`<choice>\` produce segment boundaries; decisions for \`<random>\`/\`<scramble>\`/\`<choice>\` happen per-playback, so each listen can differ. \`<until>\` and \`<choice>\` are rejected inside \`<background>\`/\`<overlay>\` (they would block a concurrent stream); \`<random>\`/\`<scramble>\`/\`<loop>\`/\`<include>\` are allowed there. A \`<background>\` whose layer contains no interactive tag is baked into its surrounding segment; one with an interactive layer plays on a parallel track scoped to its enclosing sequence.
 - Note that <interactive> is not a valid tag; use <until>, <random>, <scramble>, or <choice> instead.
+- \`<intro>\`/\`<main>\`/\`<outro>\` are optional structural markers (transparent to audio). When a non-interactive \`<main>\` is present, the listener gets a pre-play "Repeat length" slider that loops \`<main>\` to extend the session up to 10h; intro/outro always play once.
 ### Example
 
 \`\`\`xml
@@ -310,6 +320,22 @@ Constant folding: literals, binops of constants, and \`@max\`/\`@min\`/\`@step\`
   <part label="Down">Down, sinking further with every breath.</part>
   <part label="Further">Further away, letting go completely.</part>
 </choice>
+
+<!-- Structural sections: intro/outro play once, main repeats via the slider.
+     Because this <main> has no interactive tag, the listener can extend the
+     session in main-length steps up to 10h. -->
+<intro>
+  <voice speaker='male'>Welcome. Settle in and get comfortable.</voice>
+</intro>
+<main>
+  <loop loops='4'>
+    <voice speaker='female'>Breathe in, and let it all go.</voice>
+    <pause duration='2'/>
+  </loop>
+</main>
+<outro>
+  <voice speaker='male'>Well done. Return gently when you are ready.</voice>
+</outro>
 \`\`\`
 `.trim();
 

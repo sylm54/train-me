@@ -14,7 +14,6 @@ import {
   AlertCircle,
   ChevronDown,
   ChevronRight,
-  Filter,
   Loader2,
   RefreshCw,
   Search,
@@ -50,21 +49,44 @@ function formatTimestamp(s: string): string {
   }
 }
 
-function uniqueFeatures(entries: ActivityEntry[]): string[] {
-  const set = new Set<string>();
-  for (const e of entries) set.add(e.feature);
-  return Array.from(set).sort();
+/**
+ * The explicit activity-feature tabs. "all" shows everything; every other
+ * entry filters the feed to a single feature. `value` is the feature string
+ * used in the activity log; `label` is what the tab shows.
+ */
+interface FeatureTab {
+  value: string;
+  label: string;
+}
+
+const FEATURE_TABS: FeatureTab[] = [
+  { value: "all", label: "All" },
+  { value: "conditioning", label: "Conditioning" },
+  { value: "rule", label: "Rules" },
+  { value: "routine", label: "Routines" },
+  { value: "chastity", label: "Chastity" },
+  { value: "inventory", label: "Inventory" },
+  { value: "journal", label: "Journal" },
+  { value: "voice", label: "Voice" },
+];
+
+/** Count entries per feature, used to badge each tab. */
+function featureCounts(entries: ActivityEntry[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const e of entries) {
+    counts.set(e.feature, (counts.get(e.feature) ?? 0) + 1);
+  }
+  return counts;
 }
 
 function applyFilter(
   entries: ActivityEntry[],
-  filter: string,
+  feature: string,
   search: string,
 ): ActivityEntry[] {
-  const f = filter.trim().toLowerCase();
   const s = search.trim().toLowerCase();
   return entries.filter((e) => {
-    if (f && !e.feature.toLowerCase().includes(f)) return false;
+    if (feature !== "all" && e.feature !== feature) return false;
     if (s) {
       const hay =
         `${e.feature} ${e.action} ${e.details} #${e.id}`.toLowerCase();
@@ -84,7 +106,7 @@ export function ActivityView() {
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
 
-  const [filter, setFilter] = useState("");
+  const [feature, setFeature] = useState<string>("all");
   const [search, setSearch] = useState("");
 
   // Expanded rows (inspect view) — keyed by id.
@@ -122,10 +144,10 @@ export function ActivityView() {
 
   // ── Derived state ───────────────────────────────────────────────────
 
-  const features = useMemo(() => uniqueFeatures(entries), [entries]);
+  const counts = useMemo(() => featureCounts(entries), [entries]);
   const filtered = useMemo(
-    () => applyFilter(entries, filter, search),
-    [entries, filter, search],
+    () => applyFilter(entries, feature, search),
+    [entries, feature, search],
   );
 
   const listBusy = loading || refreshing;
@@ -140,7 +162,7 @@ export function ActivityView() {
   };
 
   const clearFilters = () => {
-    setFilter("");
+    setFeature("all");
     setSearch("");
   };
 
@@ -181,7 +203,42 @@ export function ActivityView() {
           </div>
         )}
 
-        {/* ── Filter bar ─────────────────────────────────────────── */}
+        {/* ── Feature tabs ──────────────────────────────────────── */}
+        <div className="flex flex-wrap items-center gap-1.5">
+          {FEATURE_TABS.map((tab) => {
+            const active = feature === tab.value;
+            const count = tab.value === "all" ? entries.length : counts.get(tab.value) ?? 0;
+            return (
+              <button
+                key={tab.value}
+                type="button"
+                onClick={() => setFeature(tab.value)}
+                className={[
+                  "inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium transition-colors",
+                  active
+                    ? "bg-[var(--color-pink-500)] text-white"
+                    : "bg-[var(--color-surface)] text-[var(--color-muted-foreground)] border border-[var(--color-border)] hover:bg-[var(--color-pink-50)] hover:text-[var(--color-foreground)]",
+                ].join(" ")}
+              >
+                {tab.label}
+                {count > 0 && (
+                  <span
+                    className={[
+                      "inline-flex items-center justify-center rounded-full px-1.5 min-w-[1.25rem] h-5 text-[10px] tabular-nums",
+                      active
+                        ? "bg-white/25 text-white"
+                        : "bg-[var(--color-pink-100)] text-[var(--color-pink-700)]",
+                    ].join(" ")}
+                  >
+                    {count}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+
+        {/* ── Search ────────────────────────────────────────────── */}
         <section className="border border-[var(--color-border)] rounded-lg bg-[var(--color-surface)] p-3 flex flex-wrap items-end gap-2">
           <div className="flex-1 min-w-[180px] space-y-1.5">
             <label className="text-xs text-[var(--color-muted-foreground)] flex items-center gap-1">
@@ -194,24 +251,7 @@ export function ActivityView() {
               placeholder="Search action, details, id…"
             />
           </div>
-          <div className="flex-1 min-w-[180px] space-y-1.5">
-            <label className="text-xs text-[var(--color-muted-foreground)] flex items-center gap-1">
-              <Filter size={12} />
-              Feature filter
-            </label>
-            <Input
-              value={filter}
-              onChange={(e) => setFilter(e.target.value)}
-              placeholder="e.g. rule, journal, chastity"
-              list="activity-feature-list"
-            />
-            <datalist id="activity-feature-list">
-              {features.map((f) => (
-                <option key={f} value={f} />
-              ))}
-            </datalist>
-          </div>
-          {(filter || search) && (
+          {(feature !== "all" || search) && (
             <Button variant="outline" size="sm" onClick={clearFilters}>
               Clear
             </Button>
