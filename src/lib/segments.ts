@@ -96,6 +96,11 @@ export interface SectionAnalysis {
    * The slider's range is `[1, maxRepeats]`.
    */
   maxRepeats: number;
+  /**
+   * Whether the `<main>` section contains no interactive cues, so it can be
+   * safely looped. The slider is only shown when this is `true`.
+   */
+  repeatable: boolean;
 }
 
 /**
@@ -131,7 +136,6 @@ export function analyzeSections(root: Segment): SectionAnalysis | null {
     intro,
     main,
     outro,
-    mainChild: mainSection.child,
     repeatable,
     maxRepeats,
   };
