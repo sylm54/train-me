@@ -74,8 +74,9 @@ export const bashTool = tool({
 export const readFileTool = tool({
   description:
     "Read a file. " +
-    "Path is relative to that directory " +
-    "(POSIX-style, no leading slash). " +
+    "Path is relative to the agent's data directory, or sandbox-absolute " +
+    "(leading slash, as `ls`/bash print it). Both resolve to the same " +
+    "on-disk root the other tools and bash use. " +
     "For large files the first portion and a summary are returned; " +
     "use start_line and end_line (1-based, inclusive) to read specific portions.",
   inputSchema: z.object({
@@ -168,7 +169,10 @@ export const listFilesTool = tool({
     path: z
       .string()
       .default(".")
-      .describe("Relative directory path. Use '.' for the root."),
+      .describe(
+        "Directory path, relative to the data directory or sandbox-absolute " +
+          "(leading slash). Use '.' for the root.",
+      ),
   }),
   execute: async ({ path }) => {
     const entries = await invoke<FileEntry[]>("list_data_files", { path });
@@ -189,7 +193,12 @@ export const editFileTool = tool({
     "it with. By default `old_string` must match exactly once; set " +
     "`replace_all` to true to substitute every occurrence.",
   inputSchema: z.object({
-    path: z.string().describe("File path relative to the data directory."),
+    path: z
+      .string()
+      .describe(
+        "File path, relative to the data directory or sandbox-absolute " +
+          "(leading slash, as bash prints it).",
+      ),
     old_string: z
       .string()
       .describe(
@@ -251,25 +260,44 @@ export interface ValidationReport {
 }
 
 /**
- * Validate every known feature file (routines, rules, conditioning,
- * journal format, voice config) for parse/schema errors and dangling
- * in-app links. Call this after creating or editing feature files, or
- * whenever a feature isn't behaving as expected. Read-only.
+ * Validate feature config files (and, for conditioning, their referenced
+ * XML scripts) for parse/schema/import errors and dangling in-app links.
+ * Call this after creating or editing feature files, or whenever a feature
+ * isn't behaving as expected. Read-only.
  */
 export const validateFilesTool = tool({
   description:
-    "Validate all feature config files for parse errors. " +
-    "Checks routines/*.md (frontmatter + cron schedule), rule/*.md, " +
-    "conditioning/*.json metadata, journal/format.json fields, and " +
-    "voice/config.json trackers, plus any in-app markdown links they " +
-    "contain. Returns a per-file report; each problem says what is wrong " +
-    "and, when possible, how to fix it. Call after creating/editing " +
-    "feature files, or when a feature isn't working as expected, and fix " +
-    "any reported errors before considering the task done.",
-  inputSchema: z.object({}),
-  execute: async () => {
-    const report = await invoke<ValidationReport>("validate_data_files");
-    logTool("validate_files", {}, {
+    "Validate feature config files for parse errors, schema problems, " +
+    "and dangling references. Checks routines/*.md (frontmatter + cron " +
+    "schedule), rule/*.md, conditioning/*.json (metadata PLUS the " +
+    "referenced XML script: tag syntax, semantic tag checks, and <include> " +
+    "import validity — dangling and circular includes are errors), " +
+    "journal/format.json fields, and voice/config.json trackers, plus any " +
+    "in-app markdown links they contain. Returns a per-file report; each " +
+    "problem says what is wrong and, when possible, how to fix it. " +
+    "XML scripts under hypnos/ that no conditioning entry references are " +
+    "reported as a warning (still linted). " +
+    "Optional `path` narrows the scope to files at or under that path " +
+    "(relative to agent_data/, forward slashes) — e.g. 'conditioning', " +
+    "'conditioning/foo.json', or 'hypnos'. Scoping a conditioning entry " +
+    "still pulls in its full XML include tree. Omit `path` to validate " +
+    "everything. Call after creating/editing files, or when something " +
+    "isn't working, and fix any reported errors before considering the " +
+    "task done.",
+  inputSchema: z.object({
+    path: z
+      .string()
+      .optional()
+      .describe(
+        "Optional scope: only validate files at or under this path " +
+          "(relative to agent_data/, forward slashes). " +
+          "e.g. 'conditioning', 'conditioning/foo.json', 'hypnos'. " +
+          "Omit to validate all feature files.",
+      ),
+  }),
+  execute: async ({ path }) => {
+    const report = await invoke<ValidationReport>("validate_data_files", { path });
+    logTool("validate_files", { path }, {
       checked: report.checked,
       errors: report.errors,
       warnings: report.warnings,

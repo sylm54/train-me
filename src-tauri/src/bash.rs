@@ -7,6 +7,7 @@
 //! command sends a request, awaits a oneshot response, and returns.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -78,8 +79,11 @@ impl BashSandbox {
 
 /// Spawn a dedicated worker thread that owns the [`bashkit::Bash`] instance.
 ///
-/// `agent_dir` is the directory the bash sandbox mounts as its root `/`.
-/// This is `<app_data>/agent_data` — the agent's writable scratch space.
+/// `agent_dir` is the directory the bash sandbox exposes as its root `/`,
+/// mounted directly as a read-write [`bashkit::RealFs`] (not an overlay).
+/// This is `<app_data>/agent_data` — the agent's writable scratch space, and
+/// the *same* on-disk root the file tools (`read_data_file`, etc.) operate on,
+/// so a file created/moved/edited in bash is immediately visible to them.
 /// App-managed dirs (prompts/, model/, tracks/) live outside the sandbox.
 ///
 // `state_dir` is the directory holding app-managed state that the agent
@@ -111,8 +115,28 @@ pub fn create_bash_sandbox(agent_dir: &Path, state_dir: &Path) -> anyhow::Result
                 .build()
                 .expect("failed to build bash worker runtime");
 
+            // Mount the agent's host directory directly as a read-write
+            // RealFs, NOT via `mount_real_readwrite`. The latter wraps the
+            // host dir in an `OverlayFs` whose upper layer is an
+            // `InMemoryFs` — by design, all bash writes land in memory and
+            // never reach the host dir that `read_data_file`/
+            // `write_data_file`/etc. read via `std::fs`. That split caused
+            // `bash mv a b` to succeed in bash while a subsequent
+            // `read_file("b")` ENOENTed (and bash writes were lost on
+            // restart). A direct `RealFs(ReadWrite)` makes bash and the
+            // file tools share one on-disk root.
+            //
+            // `RealFs::new` canonicalizes the root and requires it to exist;
+            // `agent_dir` is created (`ensure_agent_dir`) before this is
+            // called. It still enforces per-path containment (no escapes via
+            // `..` or symlinks), so the agent stays scoped to `agent_dir`.
+            let realfs = bashkit::RealFs::new(&mount_path, bashkit::RealFsMode::ReadWrite)
+                .expect("failed to mount agent dir as RealFs");
+            let agent_fs: Arc<dyn bashkit::FileSystem> =
+                Arc::new(bashkit::PosixFs::new(realfs));
+
             let builder = bashkit::Bash::builder()
-                .mount_real_readwrite(&mount_path)
+                .fs(agent_fs)
                 .username("agent")
                 .hostname("train-me")
                 .cwd("/")
@@ -175,14 +199,34 @@ pub async fn exec_bash(
     state.bash.exec(&command).await
 }
 
-/// Resolve a relative path inside `root`, rejecting traversal escapes.
+/// Resolve a path inside `root`, rejecting traversal escapes.
 ///
 /// `root` is the agent's writable area (`<app_data>/agent_data`), so this
 /// is what backs `read_data_file` / `write_data_file` / `list_data_files`.
 /// Re-used by other modules (e.g. `crate::write_script`) that need to write
 /// under the agent's area with the same safety checks.
+///
+/// Accepts the path forms the agent encounters, all resolved under `root`:
+/// - relative: `foo/bar`
+/// - `.`-prefixed: `./foo/bar`
+/// - sandbox-absolute: `/foo/bar` (the form bash emits, since `pwd` is `/`)
+///
+/// A single leading `/` (and any leading `./`) is stripped so the path is
+/// treated as `root`-relative. This mirrors bashkit's own `RealFs::resolve`.
+/// Host-absolute inputs that would escape `root` (e.g. `C:\foo` on Windows,
+/// or a `/`-prefixed path whose remainder is itself absolute) are rejected.
+/// The existing `..`-collapse + containment check still guards against
+/// traversal escapes.
 pub fn resolve_under(root: &Path, rel: &str) -> Result<PathBuf, String> {
-    let rel_path = Path::new(rel);
+    // Normalize the leading form: strip a single leading '/' (sandbox-root
+    // absolute) and any leading './'. Leave the rest intact so the path
+    // stays a plain relative path for `root.join(...)`.
+    let stripped = rel.trim_start_matches("./");
+    let stripped = stripped.strip_prefix('/').unwrap_or(stripped);
+    // Reject anything that's still absolute after stripping — that means it
+    // carries a host prefix (e.g. `C:\...`) or an escaped root, which we never
+    // want to resolve under the agent dir.
+    let rel_path = Path::new(stripped);
     if rel_path.is_absolute() {
         return Err("Absolute paths are not allowed".to_string());
     }
@@ -418,3 +462,89 @@ pub fn ensure_state_dir(data_dir: &Path) -> std::io::Result<PathBuf> {
 // Suppress unused-import warnings for symbols we once needed but no longer do.
 #[allow(dead_code)]
 fn _unused_imports() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    // --- resolve_under: path-form acceptance ------------------------------
+
+    #[test]
+    fn resolve_under_accepts_relative() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let got = resolve_under(&root, "rule/daily.md").unwrap();
+        assert_eq!(got, root.join("rule/daily.md"));
+    }
+
+    #[test]
+    fn resolve_under_accepts_dot_slash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let got = resolve_under(&root, "./rule/daily.md").unwrap();
+        assert_eq!(got, root.join("rule/daily.md"));
+    }
+
+    #[test]
+    fn resolve_under_accepts_sandbox_absolute() {
+        // The form bash emits (pwd is "/"): leading "/" means sandbox root.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let got = resolve_under(&root, "/rule/daily.md").unwrap();
+        assert_eq!(got, root.join("rule/daily.md"));
+    }
+
+    #[test]
+    fn resolve_under_rejects_parent_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        assert!(resolve_under(&root, "../escape.md").is_err());
+        assert!(resolve_under(&root, "/../escape.md").is_err());
+        assert!(resolve_under(&root, "rule/../../escape.md").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_under_rejects_host_absolute_on_windows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        // `C:\...` must not be resolved under the agent dir.
+        assert!(resolve_under(&root, "C:\\Windows\\system32").is_err());
+    }
+
+    // --- the actual fix: bash writes are visible on the host --------------
+    //
+    // Reproduces the dump scenario at the filesystem layer: a write through
+    // the same RealFs(ReadWrite) the sandbox now uses must be observable via
+    // std::fs (which is what read_data_file uses), and vice-versa. Under the
+    // old mount_real_readwrite (OverlayFs + InMemoryFs upper) this would fail
+    // because the write never reached the host dir.
+    #[tokio::test]
+    async fn bash_fs_write_is_visible_to_std_fs() {
+        use bashkit::{FileSystem, PosixFs, RealFs, RealFsMode};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = RealFs::new(tmp.path(), RealFsMode::ReadWrite).unwrap();
+        let fs: Arc<dyn FileSystem> = Arc::new(PosixFs::new(backend));
+
+        // Write via the sandbox's filesystem (as `echo > /rule/daily.md` would).
+        fs.mkdir(std::path::Path::new("/rule"), true).await.unwrap();
+        fs.write_file(std::path::Path::new("/rule/daily.md"), b"hello")
+            .await
+            .unwrap();
+
+        // Read via std::fs (as read_data_file does). This is the regression:
+        // it must see the bash-side write.
+        let on_host = std::fs::read(tmp.path().join("rule/daily.md")).unwrap();
+        assert_eq!(on_host, b"hello");
+
+        // And the reverse: a std::fs write is visible to the sandbox fs.
+        std::fs::write(tmp.path().join("rule/other.md"), b"world").unwrap();
+        let via_fs = fs
+            .read_file(std::path::Path::new("/rule/other.md"))
+            .await
+            .unwrap();
+        assert_eq!(via_fs, b"world");
+    }
+}

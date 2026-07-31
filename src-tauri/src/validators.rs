@@ -400,21 +400,24 @@ fn validate_rule(rel_path: &str, content: &str, agent_dir: &Path) -> FileReport 
     report
 }
 
-/// `conditioning/*.json`
-fn validate_conditioning(rel_path: &str, content: &str, agent_dir: &Path) -> FileReport {
+/// `conditioning/*.json`. Returns the JSON metadata report first, followed by
+/// one `FileReport` per `.xml` reachable from `script_path` (syntax, semantic,
+/// and `<include>` import validity). When the metadata is broken we return
+/// just the JSON report — there's no reliable `script_path` to chase.
+fn validate_conditioning(rel_path: &str, content: &str, agent_dir: &Path) -> Vec<FileReport> {
     let mut report = FileReport::new(rel_path);
     let parsed: serde_json::Value = match serde_json::from_str(content) {
         Ok(v) => v,
         Err(e) => {
             report.push(err(format!("invalid JSON: {e}")));
-            return report;
+            return vec![report];
         }
     };
     let obj = match parsed.as_object() {
         Some(o) => o,
         None => {
             report.push(err("conditioning metadata must be a JSON object"));
-            return report;
+            return vec![report];
         }
     };
 
@@ -444,24 +447,255 @@ fn validate_conditioning(rel_path: &str, content: &str, agent_dir: &Path) -> Fil
         }
     }
 
-    // Warn if the referenced script file doesn't exist.
-    if let Some(script) = nonempty_string("script_path") {
-        if let Ok(p) = crate::bash::resolve_under(agent_dir, script) {
-            if !p.exists() {
-                report.push(Problem {
-                    severity: "warning".to_string(),
-                    message: format!(
-                        "`script_path` points to `{script}`, which does not exist"
-                    ),
-                    fix: Some(format!(
-                        "create `{script}` (or have the Hypno Planner subagent author it)"
-                    )),
-                });
+    // If the metadata is structurally broken (no usable script_path), stop
+    // here — `validate_script_tree` would just echo the same missing-script
+    // error. Only descend when there's a non-empty script_path.
+    let script_path = match nonempty_string("script_path") {
+        Some(s) => s,
+        None => return vec![report],
+    };
+
+    // Validate the referenced XML tree (root + all transitively-included
+    // files). `validate_script_tree` itself reports a missing/escaping
+    // script_path as an error, so drop the old warning-only existence check.
+    let mut reports = vec![report];
+    reports.extend(validate_script_tree(script_path, agent_dir));
+    reports
+}
+
+// ============================================================================
+// Conditioning script validation (XML syntax + import validity)
+// ============================================================================
+//
+// `validate_conditioning` above only checks the JSON metadata. The real
+// payload is the `.xml` referenced by `script_path`, which composes further
+// files via `<include src="...">`. These helpers parse every `.xml` reachable
+// from a conditioning entry, run `tag_parser`'s syntax + semantic checks on
+// each, and chase `<include>`s transitively to catch:
+//
+//   - dangling includes  (target doesn't exist / escapes agent_dir)
+//   - circular includes  (a file (transitively) includes an ancestor on the
+//     current path — distinct from "already fully visited = share, fine")
+//   - unparseable included files
+//
+// The include-resolution rule mirrors the renderer
+// (`audio_renderer::AudioRenderer::emit_include`): relative to the including
+// script's directory first, then relative to `agent_dir`. Keeping the rule
+// identical means the linter's verdict matches what actually renders.
+
+/// Lexically collapse `.`/`..` without requiring the path to exist, then
+/// verify the result stays under `root`. Mirrors `bash::resolve_under` but
+/// accepts an already-joined absolute path (include srcs are resolved relative
+/// to the *including* script's dir, not `agent_dir` directly).
+fn normalize_under(root: &Path, joined: &Path) -> Result<PathBuf, String> {
+    let mut normalized = PathBuf::new();
+    for c in joined.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    if !normalized.starts_with(root) {
+        return Err("path escapes the agent directory".to_string());
+    }
+    Ok(normalized)
+}
+
+/// Resolve a `<include src>` to an absolute path the same way the renderer
+/// does: relative to the including script's directory first, then relative to
+/// `agent_dir`. Returns `Err` with a message if neither exists or the resolved
+/// path escapes `agent_dir` — the caller turns that into a diagnostic.
+fn resolve_include(
+    src: &str,
+    script_dir: &Path,
+    agent_dir: &Path,
+) -> Result<PathBuf, String> {
+    let rel = script_dir.join(src);
+    if rel.exists() {
+        if let Ok(n) = normalize_under(agent_dir, &rel) {
+            return Ok(n);
+        }
+    }
+    let abs = agent_dir.join(src);
+    if abs.exists() {
+        if let Ok(n) = normalize_under(agent_dir, &abs) {
+            return Ok(n);
+        }
+    }
+    Err(format!("include not found: {}", src))
+}
+
+/// Convert an absolute path under `agent_dir` back to a forward-slashed,
+/// `agent_dir`-relative path for a `FileReport`. Falls back to the absolute
+/// display if it isn't under `agent_dir` (shouldn't happen post-`resolve_include`).
+fn rel_under(agent_dir: &Path, abs: &Path) -> String {
+    abs.strip_prefix(agent_dir)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| abs.to_string_lossy().replace('\\', "/"))
+}
+
+/// Validate the full script tree reachable from `script_path` (the
+/// `script_path` value from a conditioning JSON, relative to `agent_dir`).
+///
+/// Returns one `FileReport` per distinct `.xml` file (the root plus every
+/// transitively-included file). The root's absence or unparseability is
+/// reported on the root's own `FileReport`; dangling/circular/unparseable
+/// includes are reported on the file that *contains* the offending
+/// `<include>` (so the agent knows which file to fix).
+fn validate_script_tree(script_path: &str, agent_dir: &Path) -> Vec<FileReport> {
+    use std::collections::{HashMap, HashSet};
+
+    let mut reports: HashMap<PathBuf, FileReport> = HashMap::new();
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    let mut on_stack: HashSet<PathBuf> = HashSet::new();
+
+    // Resolve the root script under agent_dir (same containment check as the
+    // other data-file commands).
+    let root = match crate::bash::resolve_under(agent_dir, script_path) {
+        Ok(p) => p,
+        Err(msg) => {
+            // Path escapes agent_dir or is otherwise invalid — report on the
+            // script_path display string since there's no real file.
+            let mut r = FileReport::new(script_path);
+            r.push(err(format!("`script_path` {msg}")));
+            return vec![r];
+        }
+    };
+    if !root.exists() {
+        let mut r = FileReport::new(script_path);
+        r.push(err(format!(
+            "`script_path` points to `{script_path}`, which does not exist"
+        )));
+        return vec![r];
+    }
+
+    walk_script(&root, agent_dir, &mut reports, &mut visited, &mut on_stack);
+
+    // Emit reports in a stable order: by agent_dir-relative path.
+    let mut ordered: Vec<FileReport> = reports.into_values().collect();
+    ordered.sort_by(|a, b| a.path.cmp(&b.path));
+    ordered
+}
+
+/// Recursive DFS over the include graph rooted at `abs`.
+///
+/// State:
+/// - `reports` — one entry per visited file (keyed by absolute path).
+/// - `visited` — files ever entered (dedup + share).
+/// - `on_stack` — files on the current DFS path (true cycle detection).
+fn walk_script(
+    abs: &Path,
+    agent_dir: &Path,
+    reports: &mut std::collections::HashMap<PathBuf, FileReport>,
+    visited: &mut std::collections::HashSet<PathBuf>,
+    on_stack: &mut std::collections::HashSet<PathBuf>,
+) {
+    // Already fully visited elsewhere in the tree — share, don't re-walk.
+    if !visited.insert(abs.to_path_buf()) {
+        return;
+    }
+    on_stack.insert(abs.to_path_buf());
+
+    let rel = rel_under(agent_dir, abs);
+
+    let content = match std::fs::read_to_string(abs) {
+        Ok(c) => c,
+        Err(e) => {
+            let mut r = FileReport::new(&rel);
+            r.push(err(format!("could not read file: {e}")));
+            reports.insert(abs.to_path_buf(), r);
+            on_stack.remove(abs);
+            return;
+        }
+    };
+
+    let nodes = match crate::tag_parser::parse(&content) {
+        Ok(n) => n,
+        Err(e) => {
+            // Unparseable file: record the parse error and don't descend
+            // (we can't trust the AST to find nested includes).
+            let mut r = FileReport::new(&rel);
+            r.push(err(format!("invalid TTS markup: {e}")));
+            reports.insert(abs.to_path_buf(), r);
+            on_stack.remove(abs);
+            return;
+        }
+    };
+
+    // Syntax + semantic lint for this file.
+    let mut report = FileReport::new(&rel);
+    if let Err(e) = crate::tag_parser::validate(&nodes) {
+        report.push(err(format!("invalid TTS markup: {e}")));
+    }
+
+    // Resolve every <include> declared in this file, attach diagnostics here,
+    // and recurse into the resolvable, non-cyclic targets.
+    let script_dir = abs
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    let declared = collect_include_srcs(&nodes);
+
+    for src in declared {
+        match resolve_include(&src, &script_dir, agent_dir) {
+            Err(msg) => report.push(err(msg)), // dangling / escapes agent_dir
+            Ok(target) => {
+                if on_stack.contains(&target) {
+                    // Back-edge to an ancestor on the current path → real cycle.
+                    report.push(err(format!(
+                        "circular include: `{src}` (→ `{}`)",
+                        rel_under(agent_dir, &target)
+                    )));
+                } else {
+                    // Recurse; the child's own report (if any) is inserted by
+                    // the recursive call. If the child fails to parse, that's
+                    // reported on the child — no extra error needed here.
+                    walk_script(&target, agent_dir, reports, visited, on_stack);
+                }
             }
         }
     }
 
-    report
+    reports.insert(abs.to_path_buf(), report);
+    on_stack.remove(abs);
+}
+
+/// Gather every `<include src="...">` string declared in `nodes`, recursing
+/// into all container / parts nodes. Returns them in document order. Does not
+/// resolve or validate them — the caller does, attaching diagnostics to its
+/// own report.
+fn collect_include_srcs(nodes: &[crate::tag_parser::Node]) -> Vec<String> {
+    use crate::tag_parser::Node;
+    let mut out = Vec::new();
+    fn rec(nodes: &[Node], out: &mut Vec<String>) {
+        for node in nodes {
+            match node {
+                Node::Include { src } => out.push(src.clone()),
+                Node::Voice { children, .. }
+                | Node::Speed { children, .. }
+                | Node::Volume { children, .. }
+                | Node::Effect { children, .. }
+                | Node::Background { children, .. }
+                | Node::Until { children, .. }
+                | Node::Loop { children, .. }
+                | Node::Section { children, .. } => rec(children, out),
+                Node::Overlay { parts, .. }
+                | Node::Random { parts }
+                | Node::Scramble { parts }
+                | Node::Choice { options: parts, .. } => {
+                    for part in parts {
+                        rec(&part.children, out);
+                    }
+                }
+                Node::Text(_) | Node::Pause { .. } | Node::Sound { .. } | Node::Tone { .. } => {}
+            }
+        }
+    }
+    rec(nodes, &mut out);
+    out
 }
 
 /// `journal/format.json`
@@ -772,71 +1006,238 @@ fn list_dir_files(dir_rel: &str, agent_dir: &Path) -> Vec<(String, PathBuf)> {
 // The Tauri command
 // ============================================================================
 
+/// Normalize a relative path to forward slashes with no leading `.`/`/`, for
+/// prefix-matching against a scope.
+fn norm_rel(p: &str) -> String {
+    let p = p.trim_start_matches(['.', '/']);
+    p.replace('\\', "/")
+}
+
+/// True if `rel_path` (an `agent_data/`-relative path) is at or under `scope`.
+/// `scope` itself is normalized the same way. A bare feature dir like
+/// `"conditioning"` matches `conditioning/foo.json`; an exact file like
+/// `"conditioning/foo.json"` matches only itself; `"hypnos"` matches every
+/// `.xml` under `hypnos/` at any depth. Empty scope matches everything.
+fn in_scope(rel_path: &str, scope: &str) -> bool {
+    let rel = norm_rel(rel_path);
+    let scope = norm_rel(scope);
+    if scope.is_empty() {
+        return true;
+    }
+    if rel == scope {
+        return true;
+    }
+    // Directory-prefix match: rel must start with "scope/".
+    rel.starts_with(&format!("{scope}/"))
+}
+
+/// Recursively list `(rel, full)` pairs for every regular file under `dir_rel`
+/// (relative to `agent_dir`). Returns empty if the dir doesn't exist. Used to
+/// walk `hypnos/` at arbitrary depth for standalone/unreferenced XML.
+fn list_dir_files_recursive(dir_rel: &str, agent_dir: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(dir) = crate::bash::resolve_under(agent_dir, dir_rel) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut stack = vec![(dir_rel.to_string(), dir.clone())];
+    while let Some((rel, d)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        let mut entries: Vec<_> = rd.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let name = entry.file_name().to_string_lossy().to_string();
+            let child_rel = format!("{rel}/{name}");
+            if meta.is_dir() {
+                stack.push((child_rel, entry.path()));
+            } else if meta.is_file() {
+                out.push((child_rel, entry.path()));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 /// Validate every known feature file under `agent_data/` and return a
 /// structured report. Read-only.
+///
+/// When `path` is `Some(scope)`, only files at or under `scope` (relative to
+/// `agent_data/`, forward slashes) are validated. Scoping a conditioning entry
+/// (e.g. `"conditioning/foo.json"`) still pulls in its full XML include tree,
+/// because import validity is checked "up to the .json root"; scoping a bare
+/// `.xml` (e.g. `"hypnos/foo.xml"`) lints that script standalone. When `path`
+/// is `None`, every known feature file is validated as before.
 #[tauri::command]
-pub fn validate_data_files(state: State<'_, AppState>) -> ValidateReport {
+pub fn validate_data_files(
+    path: Option<String>,
+    state: State<'_, AppState>,
+) -> ValidateReport {
     let agent_dir = state.agent_dir.clone();
     let mut files: Vec<FileReport> = Vec::new();
     let mut errors = 0usize;
     let mut warnings = 0usize;
 
-    // One-shot helper to finalize counts as we collect.
-    macro_rules! collect {
-        ($report:expr) => {{
-            let r = $report;
-            if r.status == "error" {
-                errors += 1;
-            } else if r.status == "warning" {
-                warnings += 1;
-            }
-            files.push(r);
-        }};
+    // One-shot helpers to finalize counts as we collect.
+    fn push_one(
+        files: &mut Vec<FileReport>,
+        errors: &mut usize,
+        warnings: &mut usize,
+        r: FileReport,
+    ) {
+        if r.status == "error" {
+            *errors += 1;
+        } else if r.status == "warning" {
+            *warnings += 1;
+        }
+        files.push(r);
     }
+    let collect = |files: &mut Vec<FileReport>, errors: &mut usize, warnings: &mut usize,
+                   r: FileReport| push_one(files, errors, warnings, r);
+
+    // Resolve + validate the scope itself: a malformed/escaping scope yields a
+    // single error report and nothing else. An absent scope dir yields an empty
+    // report (matches `list_dir_files`). Bare-existence of the scope as a path
+    // is *not* required (e.g. `path="routines"` when that dir exists is fine,
+    // but `path="conditioning/missing.json"` just lints nothing under it).
+    let scope: Option<String> = match &path {
+        Some(p) if !p.trim().is_empty() => {
+            match crate::bash::resolve_under(&agent_dir, p) {
+                Ok(_) => Some(norm_rel(p)),
+                Err(msg) => {
+                    let mut r = FileReport::new(norm_rel(p));
+                    r.push(err(msg));
+                    collect(&mut files, &mut errors, &mut warnings, r);
+                    return ValidateReport {
+                        checked: files.len(),
+                        errors,
+                        warnings,
+                        files,
+                    };
+                }
+            }
+        }
+        _ => None,
+    };
+    let in_scope_of = |rel: &str| match &scope {
+        Some(s) => in_scope(rel, s),
+        None => true,
+    };
 
     // routines/*.md
     for (rel, full) in list_dir_files("routines", &agent_dir) {
-        if !rel.to_ascii_lowercase().ends_with(".md") {
+        if !rel.to_ascii_lowercase().ends_with(".md") || !in_scope_of(&rel) {
             continue;
         }
         let content = std::fs::read_to_string(&full).unwrap_or_default();
-        collect!(validate_routine(&rel, &content, &agent_dir));
+        let r = validate_routine(&rel, &content, &agent_dir);
+        collect(&mut files, &mut errors, &mut warnings, r);
     }
 
     // rule/*.md  (on-disk dir is singular)
     for (rel, full) in list_dir_files("rule", &agent_dir) {
-        if !rel.to_ascii_lowercase().ends_with(".md") {
+        if !rel.to_ascii_lowercase().ends_with(".md") || !in_scope_of(&rel) {
             continue;
         }
         let content = std::fs::read_to_string(&full).unwrap_or_default();
-        collect!(validate_rule(&rel, &content, &agent_dir));
+        let r = validate_rule(&rel, &content, &agent_dir);
+        collect(&mut files, &mut errors, &mut warnings, r);
     }
 
-    // conditioning/*.json
+    // conditioning/*.json (+ referenced XML trees). We track every .xml the
+    // in-scope conditioning entries reach, so the unreferenced-XML pass below
+    // can tell standalone scripts apart from reachable ones.
+    let mut reachable_xml: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (rel, full) in list_dir_files("conditioning", &agent_dir) {
-        if !rel.to_ascii_lowercase().ends_with(".json") {
+        if !rel.to_ascii_lowercase().ends_with(".json") || !in_scope_of(&rel) {
             continue;
         }
         let content = std::fs::read_to_string(&full).unwrap_or_default();
-        collect!(validate_conditioning(&rel, &content, &agent_dir));
+        for r in validate_conditioning(&rel, &content, &agent_dir) {
+            // Record any XML file this entry reached (status ok/warning/error
+            // all mean it exists on disk and is part of a tree).
+            if r.path.to_ascii_lowercase().ends_with(".xml") {
+                reachable_xml.insert(r.path.clone());
+            }
+            collect(&mut files, &mut errors, &mut warnings, r);
+        }
     }
 
     // journal/format.json
-    let journal_format = crate::bash::resolve_under(&agent_dir, "journal/format.json")
-        .ok()
-        .filter(|p| p.exists());
-    if let Some(full) = journal_format {
-        let content = std::fs::read_to_string(&full).unwrap_or_default();
-        collect!(validate_journal_format("journal/format.json", &content));
+    if in_scope_of("journal/format.json") {
+        let journal_format = crate::bash::resolve_under(&agent_dir, "journal/format.json")
+            .ok()
+            .filter(|p| p.exists());
+        if let Some(full) = journal_format {
+            let content = std::fs::read_to_string(&full).unwrap_or_default();
+            let r = validate_journal_format("journal/format.json", &content);
+            collect(&mut files, &mut errors, &mut warnings, r);
+        }
     }
 
     // voice/config.json
-    let voice_config = crate::bash::resolve_under(&agent_dir, "voice/config.json")
-        .ok()
-        .filter(|p| p.exists());
-    if let Some(full) = voice_config {
-        let content = std::fs::read_to_string(&full).unwrap_or_default();
-        collect!(validate_voice_config("voice/config.json", &content, &agent_dir));
+    if in_scope_of("voice/config.json") {
+        let voice_config = crate::bash::resolve_under(&agent_dir, "voice/config.json")
+            .ok()
+            .filter(|p| p.exists());
+        if let Some(full) = voice_config {
+            let content = std::fs::read_to_string(&full).unwrap_or_default();
+            let r = validate_voice_config("voice/config.json", &content, &agent_dir);
+            collect(&mut files, &mut errors, &mut warnings, r);
+        }
+    }
+
+    // Standalone / unreferenced scripts: every .xml under hypnos/ that no
+    // in-scope conditioning entry reached. These are linted (parse + semantic
+    // + their own includes) and warned — not errored — for being unreferenced.
+    // Skipped entirely when the scope doesn't cover hypnos/.
+    if in_scope_of("hypnos") || scope.as_deref() == Some("hypnos") {
+        for (rel, full) in list_dir_files_recursive("hypnos", &agent_dir) {
+            if !rel.to_ascii_lowercase().ends_with(".xml") || !in_scope_of(&rel) {
+                continue;
+            }
+            // If this file was reached by a conditioning tree above, it's
+            // already linted; don't double-report. Compare on rel path.
+            if reachable_xml.contains(&rel) {
+                continue;
+            }
+            // Lint the standalone script: its own parse + semantics + the
+            // includes IT declares (import validity within the file).
+            let mut r = FileReport::new(&rel);
+            let content = std::fs::read_to_string(&full).unwrap_or_default();
+            let nodes = match crate::tag_parser::parse(&content) {
+                Ok(n) => n,
+                Err(e) => {
+                    r.push(err(format!("invalid TTS markup: {e}")));
+                    collect(&mut files, &mut errors, &mut warnings, r);
+                    continue;
+                }
+            };
+            if let Err(e) = crate::tag_parser::validate(&nodes) {
+                r.push(err(format!("invalid TTS markup: {e}")));
+            }
+            // Also chase this standalone script's own includes so a dangling
+            // <include> in an unreferenced file still gets caught.
+            let script_dir = full
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_path_buf();
+            for src in collect_include_srcs(&nodes) {
+                if let Err(msg) = resolve_include(&src, &script_dir, &agent_dir) {
+                    r.push(err(msg));
+                }
+            }
+            // Unreferenced is a warning, not an error (per design decision).
+            r.push(warn(
+                "script is not referenced by any conditioning JSON entry".to_string(),
+            ));
+            collect(&mut files, &mut errors, &mut warnings, r);
+        }
     }
 
     ValidateReport {
@@ -921,5 +1322,162 @@ mod tests {
         assert_eq!(in_app_link_target("https://x.com"), None);
         assert_eq!(in_app_link_target("chastity"), None);
         assert_eq!(in_app_link_target("inventory/items#42"), None);
+    }
+
+    // ── Conditioning script tree validation ──────────────────────────────
+
+    /// Helper: build a temp agent_dir, write files under it, return the dir.
+    fn agent_dir_with(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for (rel, content) in files {
+            let p = tmp.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, content).unwrap();
+        }
+        tmp
+    }
+
+    fn problems_for(report: &FileReport) -> Vec<String> {
+        report.problems.iter().map(|p| p.message.clone()).collect()
+    }
+
+    #[test]
+    fn script_tree_valid_simple_xml_has_no_errors() {
+        let dir = agent_dir_with(&[(
+            "hypnos/root.xml",
+            "<voice speaker='female'>Hello there.</voice>",
+        )]);
+        let reports = validate_script_tree("hypnos/root.xml", dir.path());
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].path, "hypnos/root.xml");
+        assert_eq!(reports[0].status, "ok", "{:?}", reports[0].problems);
+    }
+
+    #[test]
+    fn script_tree_reports_xml_parse_error_on_root() {
+        let dir = agent_dir_with(&[("hypnos/root.xml", "<voice>oops no close")]);
+        let reports = validate_script_tree("hypnos/root.xml", dir.path());
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].status, "error");
+        assert!(problems_for(&reports[0])[0].contains("invalid TTS markup"));
+    }
+
+    #[test]
+    fn script_tree_flags_unknown_sound_type_semantically() {
+        let dir = agent_dir_with(&[(
+            "hypnos/root.xml",
+            "<voice><sound type='not_a_real_sound'/></voice>",
+        )]);
+        let reports = validate_script_tree("hypnos/root.xml", dir.path());
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].status, "error");
+        assert!(problems_for(&reports[0])[0].contains("invalid TTS markup"));
+    }
+
+    #[test]
+    fn script_tree_dangling_include_is_an_error_on_owner() {
+        // root includes a file that does not exist.
+        let dir = agent_dir_with(&[(
+            "hypnos/root.xml",
+            "<voice><include src='hypnos/missing.xml'/></voice>",
+        )]);
+        let reports = validate_script_tree("hypnos/root.xml", dir.path());
+        // Only the root is reported (the missing file isn't linted).
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].path, "hypnos/root.xml");
+        assert_eq!(reports[0].status, "error");
+        assert!(
+            problems_for(&reports[0])
+                .iter()
+                .any(|m| m.contains("include not found")),
+            "{:?}",
+            reports[0].problems
+        );
+    }
+
+    #[test]
+    fn script_tree_resolves_include_relative_to_script_dir() {
+        // root.xml lives in hypnos/sub/ and includes sibling "leaf.xml" by
+        // bare filename — resolvable relative to the script's own dir.
+        let dir = agent_dir_with(&[
+            (
+                "hypnos/sub/root.xml",
+                "<voice><include src='leaf.xml'/></voice>",
+            ),
+            ("hypnos/sub/leaf.xml", "<voice>nested</voice>"),
+        ]);
+        let reports = validate_script_tree("hypnos/sub/root.xml", dir.path());
+        assert_eq!(reports.len(), 2, "{:?}", reports);
+        // Both files clean.
+        assert!(reports.iter().all(|r| r.status == "ok"), "{:?}", reports);
+        let paths: Vec<_> = reports.iter().map(|r| r.path.as_str()).collect();
+        assert!(paths.contains(&"hypnos/sub/root.xml"));
+        assert!(paths.contains(&"hypnos/sub/leaf.xml"));
+    }
+
+    #[test]
+    fn script_tree_circular_include_is_an_error() {
+        // a.xml includes b.xml, b.xml includes a.xml → cycle.
+        let dir = agent_dir_with(&[
+            (
+                "hypnos/a.xml",
+                "<voice><include src='hypnos/b.xml'/></voice>",
+            ),
+            (
+                "hypnos/b.xml",
+                "<voice><include src='hypnos/a.xml'/></voice>",
+            ),
+        ]);
+        let reports = validate_script_tree("hypnos/a.xml", dir.path());
+        // At least one file reports a circular-include error.
+        let any_cycle = reports.iter().any(|r| {
+            r.problems
+                .iter()
+                .any(|p| p.message.contains("circular include"))
+        });
+        assert!(any_cycle, "no circular-include error reported: {:?}", reports);
+    }
+
+    #[test]
+    fn script_tree_diamond_includes_lint_each_file_once() {
+        // root → {left, right}; both → shared. `shared` must be linted once.
+        let dir = agent_dir_with(&[
+            (
+                "hypnos/root.xml",
+                "<voice><include src='hypnos/left.xml'/><include src='hypnos/right.xml'/></voice>",
+            ),
+            (
+                "hypnos/left.xml",
+                "<voice><include src='hypnos/shared.xml'/></voice>",
+            ),
+            (
+                "hypnos/right.xml",
+                "<voice><include src='hypnos/shared.xml'/></voice>",
+            ),
+            ("hypnos/shared.xml", "<voice>base</voice>"),
+        ]);
+        let reports = validate_script_tree("hypnos/root.xml", dir.path());
+        // 4 distinct files, no duplicates, all clean.
+        assert_eq!(reports.len(), 4, "{:?}", reports);
+        let mut paths: Vec<_> = reports.iter().map(|r| r.path.clone()).collect();
+        paths.sort();
+        paths.dedup();
+        assert_eq!(paths.len(), 4);
+        assert!(reports.iter().all(|r| r.status == "ok"), "{:?}", reports);
+    }
+
+    // ── Path scoping helper ──────────────────────────────────────────────
+
+    #[test]
+    fn in_scope_prefix_and_exact_matches() {
+        assert!(in_scope("conditioning/a.json", "conditioning"));
+        assert!(in_scope("conditioning/a.json", "conditioning/a.json"));
+        assert!(!in_scope("conditioning/a.json", "conditioning/b.json"));
+        assert!(in_scope("hypnos/sub/x.xml", "hypnos"));
+        assert!(!in_scope("routines/a.md", "conditioning"));
+        // Leading dot/slash on either side is normalized away.
+        assert!(in_scope("./conditioning/a.json", "./conditioning"));
+        // Empty scope matches everything.
+        assert!(in_scope("anything", ""));
     }
 }

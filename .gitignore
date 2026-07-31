@@ -21,7 +21,7 @@ test-model
 *.njsproj
 *.sln
 *.sw?
-
+case_study/
 /*.md
 
 target

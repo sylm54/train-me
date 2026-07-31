@@ -11,9 +11,9 @@
  *  - `usage`     — token usage per agent role, emitted when a `streamText`
  *                  call finishes. The UI accumulates these to show a
  *                  running token / spend total.
- *  - `subagent*` — lifecycle + step events for the planner/writer, so the
+ *  - `subagent*` — lifecycle + step events for the planner, so the
  *                  UI can show high-level progress ("Planning…",
- *                  "Writing script…") without exposing internals. Exact
+ *                  "Validating files…") without exposing internals. Exact
  *                  traces still go to the browser console via the
  *                  subagent logger.
  *
@@ -22,7 +22,7 @@
 
 import { useEffect, useState } from "react";
 
-export type AgentRole = "main" | "planner" | "writer";
+export type AgentRole = "main" | "planner";
 
 /** Normalized token usage for one finished model call. */
 export interface Usage {
@@ -45,7 +45,7 @@ export type AgentEvent =
       label: string;
       /** Optional detail (e.g. a friendly path) shown after the label. */
       detail?: string;
-      /** For the writer: which writeScript attempt this is (1-based). */
+      /** Reserved for retry-aware tool steps (currently unused). */
       attempt?: number;
       ts: number;
     }
@@ -58,7 +58,7 @@ export type AgentEvent =
       label: string;
       /** Optional friendly detail (e.g. a path). */
       detail?: string;
-      /** Which writeScript attempt this was, for the writer. */
+      /** Reserved for retry-aware tool steps (currently unused). */
       attempt?: number;
       /** Whether the tool returned successfully. */
       ok: boolean;

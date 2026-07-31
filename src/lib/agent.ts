@@ -21,7 +21,7 @@ import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import type { AgentSettings, AgentName, ProviderName } from "./types";
 import { MAIN_AGENT_TOOLS } from "./tools";
 import { buildInvokePlannerTool } from "./subagents";
-import { emitAgentEvent } from "./agent-events";
+import { emitAgentEvent, type AgentRole } from "./agent-events";
 
 /**
  * Report token usage for an agent role to the UI event bus.
@@ -31,7 +31,7 @@ import { emitAgentEvent } from "./agent-events";
  * emit a single event per finished call. Failures are ignored — usage is
  * informational, never load-bearing.
  */
-function reportUsage(role: "main" | "planner" | "writer", usage: unknown) {
+function reportUsage(role: AgentRole, usage: unknown) {
   try {
     const u = (usage ?? {}) as Record<string, number | undefined>;
     const promptTokens = u.promptTokens ?? u.inputTokens ?? 0;
@@ -114,9 +114,9 @@ export function buildProviderOptions(
 
 /**
  * Build the main agent's toolset. Includes the base tools (bash, files,
- * prompts) plus the `invoke_planner` subagent tool. The planner tool is
- * rebuilt whenever `settings` change because it captures the settings to
- * spawn the planner/writer LLM calls.
+ * prompts, validate_files) plus the `invoke_planner` subagent tool. The
+ * planner tool is rebuilt whenever `settings` change because it captures
+ * the settings to spawn the planner LLM call.
  */
 export function buildMainAgentTools(settings: AgentSettings): ToolSet {
   return {

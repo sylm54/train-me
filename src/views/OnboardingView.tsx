@@ -33,7 +33,6 @@ import {
 const AGENT_LABELS: Record<AgentName, string> = {
   main: "Main agent",
   planner: "Hypno planner",
-  writer: "Hypno writer",
 };
 
 const PROVIDER_LABELS: Record<ProviderName, string> = {
@@ -249,7 +248,7 @@ function WelcomeStep() {
         <FeatureCard
           icon={<Sparkles size={16} />}
           title="Pick your models"
-          body="Connect an OpenRouter or OpenAI key and choose a model for the main, planner, and writer agents."
+          body="Connect an OpenRouter or OpenAI key and choose a model for the main and planner agents."
         />
         <FeatureCard
           icon={<PackageOpen size={16} />}

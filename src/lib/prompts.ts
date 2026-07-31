@@ -105,7 +105,7 @@ CREATE TABLE IF NOT EXISTS activity (
 - Note the ts column is a RFC 3339 and ISO 8601 date and time string.
 
 ### 9. Validating feature files
-- The \`validate_files\` tool scans every feature config file (routines, rules, conditioning, journal format, voice config) for parse/schema errors and dangling in-app links, and reports what is wrong and how to fix it.
+- The \`validate_files\` tool scans every feature config file (routines, rules, conditioning, journal format, voice config) for parse/schema errors and dangling in-app links, and reports what is wrong and how to fix it. For conditioning entries it also validates the referenced XML script: tag syntax, semantic tag checks, and \`<include>\` import validity (dangling and circular includes are errors). An optional \`path\` argument narrows the scope to files at or under that path.
 - Call it after creating or editing any feature file, and fix every reported \`error\` before considering the task done. \`warning\`s are not fatal but usually indicate something unintended.
 - The \`{{features}}\` block in the system prompt lists which files each feature reads, so the agent knows what \`validate_files\` will check.
 `.trim();
@@ -113,7 +113,7 @@ CREATE TABLE IF NOT EXISTS activity (
 const ttsTagsEmbed = `
 ## TTS Tag System
 
-The TTS tag markup is an XML-like language used inside the train-me app to author spoken-word audio scripts — speech, pauses, sound effects, tones, DSP effects, concurrent layering, loops, and interactive pauses (button-waits, random picks, shuffled order, and listener-driven branches). Scripts render to a segment manifest so interactive tags are resolved per-playback. The \`writeScript\` tool parses, validates, and saves a script, returning \`{ valid, path, error, node_count }\`.
+The TTS tag markup is an XML-like language used inside the train-me app to author spoken-word audio scripts — speech, pauses, sound effects, tones, DSP effects, concurrent layering, loops, and interactive pauses (button-waits, random picks, shuffled order, and listener-driven branches). Scripts render to a segment manifest so interactive tags are resolved per-playback. Author scripts with \`write_file\` / \`edit_file\`, then check them with the \`validate_files\` tool (optionally scoped to a path) — it parses and semantically validates the markup and chases \`<include>\` references, reporting any errors per file.
 
 ### Conventions
 - Tags are case-sensitive and lowercase.
@@ -201,6 +201,7 @@ Mark the structural sections of a script. They are **transparent to audio synthe
 - At playback, when \`<main>\` contains NO interactive tag (\`<until>\`/\`<random>\`/\`<scramble>\`/\`<choice>\`), the listener is offered a "Repeat length" slider that extends total listening time in \`<main>\`-duration steps — from one full pass (intro + main + outro) up to 10 hours — by looping \`<main>\` the chosen number of times. \`<intro>\`/\`<outro>\` may themselves contain interactive tags without disabling the slider.
 - Use at most one \`<main>\` per script. Sections may be omitted entirely (a script with no sections plays once, exactly as before).
 - No attributes. Nest any tags inside them.
+- Only use these in the top-level script; not subscripts, includes or background/overlay layers.
 
 ### Sound types
 

@@ -1,34 +1,28 @@
 /**
- * Subagent orchestration: hypno planner + writer.
+ * Subagent orchestration: hypno planner.
  *
- * Both subagents are spawned from the frontend via separate `streamText`
- * calls. They are *not* exposed to the user — only the main agent sees
- * `invoke_planner`, and only the planner sees `invoke_writer`.
+ * The planner is spawned from the frontend via its own `streamText` call.
+ * It is *not* exposed to the user — only the main agent sees `invoke_planner`.
  *
  * Lifecycle:
  *
  *   Main agent
  *     └─ tool: invoke_planner(task: string)
  *          └─ streamText(planner prompt, planner tools)
- *               ├─ tool: bash / read_file / write_file / list_files
- *               └─ tool: invoke_writer(path: string, instructions: string)
- *                    └─ streamText(writer prompt, writer tools)
- *                         └─ tool: writeScript(content: string)
+ *               ├─ tool: bash / read_file / write_file / edit_file / list_files
+ *               └─ tool: validate_files (path-aware)
  *
- * The writer's text output is routed back to the planner as part of the
- * `invoke_writer` tool result. The planner's final text becomes the
- * `invoke_planner` tool result the main agent sees.
+ * The planner writes XML scripts directly with `write_file`/`edit_file` and
+ * validates them with `validate_files` (optionally scoped to a path). Its
+ * final text becomes the `invoke_planner` tool result the main agent sees.
  *
- * Note on concurrency: writer invocations are strictly serial — the
- * planner awaits each `invoke_writer` call before issuing another — so we
- * can use a single module-level slot (`currentWriterPath`) to thread the
- * destination path from `invoke_writer` into the writer's `writeScript`
- * tool without relying on any closed-over context the AI SDK doesn't
- * expose publicly.
+ * (The writer subagent that used to sit below the planner has been removed —
+ * the planner now authors and lints scripts itself. See `validate_files` for
+ * the XML syntax + import-validity checks.)
  *
  * All subagent activity is mirrored to the browser devtools console
- * (search for `[planner]` / `[writer]`). Each invocation opens a
- * collapsed console.group; expand it to see the full trace.
+ * (search for `[planner]`). Each invocation opens a collapsed
+ * console.group; expand it to see the full trace.
  */
 
 import {
@@ -40,32 +34,29 @@ import {
   isLoopFinished,
 } from "ai";
 import { z } from "zod";
-import { invoke } from "@tauri-apps/api/core";
 
 import { loadPrompt } from "./prompts";
 import { getProvider, buildProviderOptions } from "./agent";
-import { bashTool, readFileTool, writeFileTool, listFilesTool } from "./tools";
+import {
+  bashTool,
+  readFileTool,
+  writeFileTool,
+  editFileTool,
+  listFilesTool,
+  validateFilesTool,
+} from "./tools";
 import type { AgentSettings } from "./types";
 import { emitAgentEvent, type AgentRole } from "./agent-events";
-
-/** Result of the backend `write_script` Tauri command. */
-interface WriteScriptResult {
-  valid: boolean;
-  path: string | null;
-  error: string | null;
-  node_count: number;
-}
 
 // ============================================================================
 // Console logging helpers
 // ============================================================================
 
-type SubagentName = "planner" | "writer";
+type SubagentName = "planner";
 
-/** Distinct console-marker colours per subagent so they're easy to scan. */
+/** Distinct console-marker colour for the planner so it's easy to scan. */
 const LOG_STYLES: Record<SubagentName, string> = {
   planner: "color:#d946ef;font-weight:bold", // pink-500
-  writer: "color:#06b6d4;font-weight:bold", // cyan-500
 };
 
 /** Cap previews so a single tool result doesn't drown the console. */
@@ -129,7 +120,6 @@ function log(agent: SubagentName, message: string, ...args: unknown[]) {
 
 const START_LABEL: Record<SubagentName, string> = {
   planner: "Planning",
-  writer: "Writing script",
 };
 
 const STEP_LABEL: Record<string, string> = {
@@ -138,8 +128,7 @@ const STEP_LABEL: Record<string, string> = {
   write_file: "Writing file",
   edit_file: "Editing file",
   list_files: "Listing files",
-  writeScript: "Writing script",
-  invoke_writer: "Writing script",
+  validate_files: "Validating files",
   invoke_planner: "Planning",
 };
 
@@ -217,13 +206,6 @@ function reportUsage(agent: SubagentName, usage: unknown) {
 }
 
 /**
- * Slot for the destination path of the currently-running writer call.
- * Written by `invoke_writer.execute`, read by the `writeScript` tool's
- * execute(). Safe because writer runs are strictly serial.
- */
-let currentWriterPath: string | null = null;
-
-/**
  * Run a single subagent invocation to completion and return the assistant's
  * last text message — i.e. the text emitted after the final tool call.
  *
@@ -291,12 +273,9 @@ async function runSubagent(opts: {
     let finalText = "";
     let pendingText = "";
 
-    // Per-tool-call bookkeeping for the UI feed. The writer's writeScript is
-    // retried on validation failure, so we count consecutive writeScript calls
-    // within a single run and surface the attempt number. We also buffer each
-    // call's input JSON deltas (keyed by id) so we can derive a friendly
-    // detail (path/command) once the call resolves.
-    let writeScriptAttempts = 0;
+    // Per-tool-call bookkeeping for the UI feed. We buffer each call's input
+    // JSON deltas (keyed by id) so we can derive a friendly detail
+    // (path/command) once the call resolves.
     const toolInputBuffers = new Map<string, string>();
     const toolNamesById = new Map<string, string>();
 
@@ -306,9 +285,7 @@ async function runSubagent(opts: {
       ok: boolean,
       input?: unknown,
     ) => {
-      const attempt =
-        toolName === "writeScript" ? writeScriptAttempts : undefined;
-      emitTool(opts.agent, toolName, toolDetail(toolName, input), attempt, ok);
+      emitTool(opts.agent, toolName, toolDetail(toolName, input), undefined, ok);
       toolInputBuffers.delete(id);
       toolNamesById.delete(id);
     };
@@ -364,19 +341,10 @@ async function runSubagent(opts: {
           finalText = "";
           const dynamic = "dynamic" in part && part.dynamic ? " (dynamic)" : "";
           log(opts.agent, `🔧 tool call: ${part.toolName}${dynamic}`);
-          // The writer retries writeScript on validation failure; count each
-          // call so the UI can show "attempt 2", etc.
-          if (part.toolName === "writeScript") writeScriptAttempts += 1;
           toolInputBuffers.set(part.id, "");
           toolNamesById.set(part.id, part.toolName);
-          // Surface a friendly step label to the UI progress feed. The writer
-          // includes the attempt number when > 1.
-          emitStep(
-            opts.agent,
-            part.toolName,
-            undefined,
-            part.toolName === "writeScript" ? writeScriptAttempts : undefined,
-          );
+          // Surface a friendly step label to the UI progress feed.
+          emitStep(opts.agent, part.toolName, undefined, undefined);
           break;
         }
 
@@ -461,220 +429,38 @@ async function runSubagent(opts: {
 }
 
 // ============================================================================
-// Writer subagent
-// ============================================================================
-
-/** Build the writer subagent's toolset (just `writeScript`). */
-function buildWriterTools() {
-  return {
-    writeScript: tool({
-      description:
-        "Validate and save TTS markup. " +
-        "Returns {valid, path, error, node_count}. If valid=false, fix the " +
-        "markup based on `error` and call again.",
-      inputSchema: z.object({
-        content: z
-          .string()
-          .describe(
-            "The full TTS markup document (XML-like tags + text). " +
-              "Will be parsed by the backend before saving.",
-          ),
-      }),
-      execute: async ({ content }) => {
-        if (currentWriterPath == null) {
-          return {
-            valid: false,
-            error:
-              "No destination path associated with this writer invocation. " +
-              "Internal error: invoke_writer did not set currentWriterPath.",
-            path: null,
-            node_count: 0,
-          } satisfies WriteScriptResult;
-        }
-        log(
-          "writer",
-          `↗ writeScript → ${currentWriterPath}`,
-          `(${content.length} chars)`,
-        );
-        try {
-          const result = await invoke<WriteScriptResult>("write_script", {
-            path: currentWriterPath,
-            content,
-          });
-          log(
-            "writer",
-            result.valid
-              ? `✓ writeScript ok (${result.node_count} nodes)`
-              : `✗ writeScript invalid`,
-            result.error ?? "",
-          );
-          return result;
-        } catch (e) {
-          log("writer", `✗ writeScript exception`, String(e));
-          return {
-            valid: false,
-            error: String(e),
-            path: null,
-            node_count: 0,
-          } satisfies WriteScriptResult;
-        }
-      },
-    }),
-  };
-}
-
-/**
- * Run the writer subagent. Returns the writer's final text (which becomes
- * part of the `invoke_writer` tool result the planner sees).
- */
-async function runWriter(opts: {
-  settings: AgentSettings;
-  systemPrompt: string;
-  path: string;
-  instructions: string;
-}): Promise<string> {
-  const previous = currentWriterPath;
-  currentWriterPath = opts.path;
-
-  console.groupCollapsed(
-    `%c[writer]`,
-    LOG_STYLES.writer,
-    `▶ invoke_writer → ${opts.path}`,
-  );
-  log("writer", `task: ${opts.path}`);
-  log("writer", "instructions", preview(opts.instructions));
-
-  try {
-    // If the file already exists, read its current content so the
-    // writer can see what it's updating.
-    let existingContent: string | undefined;
-    try {
-      existingContent = await invoke<string>("read_data_file", {
-        path: opts.path,
-      });
-    } catch {
-      // File doesn't exist yet — that's fine.
-    }
-
-    const parts: UIMessage["parts"] = [];
-
-    if (existingContent != null) {
-      parts.push({
-        type: "text",
-        text: `The file \`${opts.path}\` already exists. Here is its current content:\n\n${existingContent}`,
-      });
-    }
-
-    parts.push({
-      type: "text",
-      text:
-        `Write the script to \`${opts.path}\`.
-
-` +
-        `Instructions from the planner:
-${opts.instructions}`,
-    });
-
-    const messages: UIMessage[] = [
-      {
-        id: `writer-user-${Math.random().toString(36).slice(2)}`,
-        role: "user",
-        parts,
-      },
-    ];
-
-    const out = await runSubagent({
-      settings: opts.settings,
-      agent: "writer",
-      systemPrompt: opts.systemPrompt,
-      messages,
-      tools: buildWriterTools(),
-    });
-    log("writer", "✔ writer done");
-    return out;
-  } catch (e) {
-    log(
-      "writer",
-      "✗ writer failed",
-      e instanceof Error ? e.message : String(e),
-    );
-    throw e;
-  } finally {
-    console.groupEnd();
-    currentWriterPath = previous;
-  }
-}
-
-// ============================================================================
 // Planner subagent
 // ============================================================================
 
-/** Build the planner subagent's toolset. */
-function buildPlannerTools(settings: AgentSettings, writerPrompt: string) {
+/**
+ * Build the planner subagent's toolset.
+ *
+ * The planner authors scripts directly with `write_file`/`edit_file` and
+ * validates them with `validate_files` (optionally scoped to a path). There
+ * is no longer a separate writer subagent.
+ */
+function buildPlannerTools() {
   return {
     bash: bashTool,
     read_file: readFileTool,
     write_file: writeFileTool,
+    edit_file: editFileTool,
     list_files: listFilesTool,
-    invoke_writer: tool({
-      description:
-        "Spawn the Hypno Writer subagent to produce a single TTS XML " +
-        "script at the given path. Pass detailed instructions: pacing, " +
-        "voice(s), tone, sound effects, loops, intended emotional state. " +
-        "Returns {ok, path, output?, error?} where `output` is the " +
-        "writer's final text (typically a one-line confirmation, or an " +
-        "error message).",
-      inputSchema: z.object({
-        path: z
-          .string()
-          .describe(
-            "Destination path relative to the agent's writable area " +
-              "(POSIX-style, no leading slash). e.g. " +
-              "'conditioning/my_script.xml'.",
-          ),
-        instructions: z
-          .string()
-          .describe(
-            "Detailed brief for the writer. Include pacing, voices, " +
-              "tone, sound effects, loops, and the intended emotional " +
-              "state. The writer has no other context.",
-          ),
-      }),
-      execute: async ({ path, instructions }) => {
-        log("planner", `↘ invoke_writer → ${path}`, preview(instructions));
-        try {
-          const output = await runWriter({
-            settings,
-            systemPrompt: writerPrompt,
-            path,
-            instructions,
-          });
-          log("planner", `↖ invoke_writer done ← ${path}`, preview(output));
-          return { ok: true, path, output };
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          log("planner", `✗ invoke_writer failed`, msg);
-          return { ok: false, path, error: msg };
-        }
-      },
-    }),
+    validate_files: validateFilesTool,
   };
 }
 
 /**
  * Invoke the planner subagent with a high-level task from the main agent.
  *
- * Loads the planner + writer prompts from disk on every invocation so the
- * user can edit them and see changes immediately.
+ * Loads the planner prompt from disk on every invocation so the user can
+ * edit it and see changes immediately.
  */
 export async function invokePlanner(opts: {
   settings: AgentSettings;
   task: string;
 }): Promise<string> {
-  const [plannerPrompt, writerPrompt] = await Promise.all([
-    loadPrompt("hypno_planner.md"),
-    loadPrompt("hypno_writer.md"),
-  ]);
+  const plannerPrompt = await loadPrompt("hypno_planner.md");
 
   if (!plannerPrompt) {
     log("planner", "✗ prompts/hypno_planner.md missing or empty");
@@ -696,7 +482,7 @@ export async function invokePlanner(opts: {
       },
     ];
 
-    const tools = buildPlannerTools(opts.settings, writerPrompt);
+    const tools = buildPlannerTools();
 
     const out = await runSubagent({
       settings: opts.settings,
