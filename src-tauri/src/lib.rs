@@ -536,83 +536,7 @@ fn wipe_agent_data(agent_dir: &std::path::Path) -> Result<(), String> {
 }
 
 // ============================================================================
-// writeScript command (writer subagent)
-// ============================================================================
-
-/// Result returned by the `write_script` Tauri command.
-/// `valid=false` means the XML failed validation; the writer subagent
-/// should look at `error` and try again.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct WriteScriptResult {
-    pub valid: bool,
-    /// Absolute path the file was written to (only present on success).
-    pub path: Option<String>,
-    /// Validation error message (only present on failure).
-    pub error: Option<String>,
-    /// Number of top-level AST nodes parsed (debug info).
-    pub node_count: usize,
-}
-
-/// Tauri command invoked by the writer subagent's `writeScript` tool.
-///
-/// Validates the XML body via `tag_parser::parse()` and writes it to
-/// `<agent_data>/<path>` on success. On validation failure, returns
-/// `valid=false` with the parser error — the writer can read the error
-/// from the tool result and try again.
-#[tauri::command]
-fn write_script(
-    path: String,
-    content: String,
-    state: State<'_, AppState>,
-) -> Result<WriteScriptResult, String> {
-    // Validate XML by parsing the TTS tag AST.
-    let nodes = match tag_parser::parse(&content) {
-        Ok(nodes) => nodes,
-        Err(e) => {
-            return Ok(WriteScriptResult {
-                valid: false,
-                path: None,
-                error: Some(format!("Invalid TTS markup: {}", e)),
-                node_count: 0,
-            });
-        }
-    };
-
-    // Second-pass semantic validation: catch unknown sound types, tone
-    // presets, effect types, speaker names, etc. These pass the parser
-    // but would fail the renderer with an opaque "parse …" error.
-    if let Err(e) = tag_parser::validate(&nodes) {
-        return Ok(WriteScriptResult {
-            valid: false,
-            path: None,
-            error: Some(format!("Invalid TTS markup: {}", e)),
-            node_count: nodes.len(),
-        });
-    }
-
-    // Resolve the destination under the agent's writable area.
-    // We reuse the same traversal-safe resolver used for read_data_file /etc.
-    let resolved = match bash::resolve_under(&state.agent_dir, &path) {
-        Ok(p) => p,
-        Err(e) => return Err(e),
-    };
-
-    if let Some(parent) = resolved.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
-    }
-
-    fs::write(&resolved, &content).map_err(|e| format!("write {}: {}", resolved.display(), e))?;
-
-    Ok(WriteScriptResult {
-        valid: true,
-        path: Some(resolved.to_string_lossy().to_string()),
-        error: None,
-        node_count: nodes.len(),
-    })
-}
-
-// ============================================================================
-// Manifest commands (recursive segment manifest backend)
+// Manifest commands (recursive segment manifests backend)
 // ============================================================================
 
 /// Render (or reuse) a recursive segment manifest for `script_path` (relative
@@ -1700,8 +1624,6 @@ pub fn run() {
             bash::list_data_files,
             bash::read_prompt,
             bash::list_prompt_files,
-            // Subagent commands
-            write_script,
             get_data_dir,
             get_audio_base_url,
             get_agent_dir,

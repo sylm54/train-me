@@ -66,7 +66,6 @@ interface ModelStatus {
 const AGENT_LABELS: Record<AgentName, string> = {
   main: "Main agent",
   planner: "Hypno planner",
-  writer: "Hypno writer",
 };
 
 const PROVIDER_LABELS: Record<ProviderName, string> = {
@@ -101,7 +100,6 @@ const REASONING_OPTIONS: {
 const AGENT_PROMPTS: { agent: AgentName; file: string; label: string }[] = [
   { agent: "main", file: "main_agent.md", label: "Main agent" },
   { agent: "planner", file: "hypno_planner.md", label: "Hypno planner" },
-  { agent: "writer", file: "hypno_writer.md", label: "Hypno writer" },
 ];
 
 type PromptMode = "rendered" | "raw";

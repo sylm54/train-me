@@ -22,7 +22,7 @@
  * in a message is shown, with earlier steps collapsed behind a toggle.
  * Exact inputs/outputs are mirrored to the browser console by the agent
  * runtime. A status bar surfaces running token totals and high-level
- * subagent activity (Planning / Writing script).
+ * subagent activity (Planning / Validating files).
  *
  * Implementation note: we split this into an outer loader (ChatView)
  * and an inner chat (ChatViewInner). `useChat` in `@ai-sdk/react`
@@ -472,9 +472,9 @@ function ChatViewInner({
           ))}
 
           {/* Persistent "agent is running" indicator with subagent
-              hierarchy. Shows the full delegation stack (planner → writer)
-              with elapsed time on the active innermost agent. The ticking
-              seconds prove the system is alive even during long generations. */}
+              hierarchy. Shows the running planner with elapsed time. The
+              ticking seconds prove the system is alive even during long
+              generations. */}
           {isGenerating && (
             <SubagentProgressIndicator
               stack={subagentStack}
@@ -1016,22 +1016,21 @@ function formatRelative(ts: number): string {
 // ── Subagent / token derivation ──────────────────────────────────────
 
 /** Color dot per subagent, mirroring the console marker colours. */
-const SUBAGENT_COLOR: Record<"planner" | "writer", string> = {
+const SUBAGENT_COLOR: Record<"planner", string> = {
   planner: "#d946ef", // pink-500
-  writer: "#06b6d4", // cyan-500
 };
 
 interface ActiveSubagent {
-  agent: "planner" | "writer";
+  agent: "planner";
   label: string;
   startedAt: number;
-  /** Latest writeScript attempt for this subagent (writer only). */
+  /** Reserved for retry-aware tool steps (currently unused). */
   attempt?: number;
 }
 
 /** One recorded subagent tool call (for the expandable history). */
 interface ToolHistoryEntry {
-  agent: "planner" | "writer";
+  agent: "planner";
   toolName: string;
   label: string;
   detail?: string;
@@ -1047,13 +1046,12 @@ interface Totals {
 
 /**
  * Walk the event stream and derive (a) cumulative token + spend totals,
- * (b) the currently-active subagent stack, and (c) the per-subagent tool-call
+ * (b) the currently-active subagent, and (c) the planner's tool-call
  * history (for the expandable list under the progress indicator).
  *
- * The planner/writer are strictly serial and nested, so a simple counter per
- * agent reconstructs the stack correctly: a `start` with no matching `end`
- * means that agent is still running. Tool-call history is accumulated in
- * order and attributed to the agent that made the call.
+ * A `start` with no matching `end` means the planner is still running. Tool
+ * history is accumulated in order. (There is no longer a nested writer
+ * subagent — the planner authors and validates scripts directly.)
  */
 function deriveStats(events: AgentEvent[]): {
   totals: Totals;
@@ -1064,23 +1062,11 @@ function deriveStats(events: AgentEvent[]): {
   let promptTokens = 0;
   let completionTokens = 0;
 
-  // Track open activity per subagent + the most recent step label.
-  const open: Record<"planner" | "writer", boolean> = {
-    planner: false,
-    writer: false,
-  };
-  const label: Record<"planner" | "writer", string> = {
-    planner: "",
-    writer: "",
-  };
-  const attempt: Record<"planner" | "writer", number | undefined> = {
-    planner: undefined,
-    writer: undefined,
-  };
-  const startedAt: Record<"planner" | "writer", number> = {
-    planner: 0,
-    writer: 0,
-  };
+  // Track open activity for the planner + the most recent step label.
+  let open = false;
+  let label = "";
+  let attempt: number | undefined = undefined;
+  let startedAt = 0;
   const toolHistory: ToolHistoryEntry[] = [];
 
   for (const e of events) {
@@ -1091,14 +1077,14 @@ function deriveStats(events: AgentEvent[]): {
         break;
       }
       case "subagent-start":
-        open[e.agent] = true;
-        label[e.agent] = e.label;
-        startedAt[e.agent] = e.ts;
-        attempt[e.agent] = undefined;
+        open = true;
+        label = e.label;
+        startedAt = e.ts;
+        attempt = undefined;
         break;
       case "subagent-step":
-        label[e.agent] = e.label;
-        attempt[e.agent] = e.attempt;
+        label = e.label;
+        attempt = e.attempt;
         break;
       case "subagent-tool":
         toolHistory.push({
@@ -1112,31 +1098,23 @@ function deriveStats(events: AgentEvent[]): {
         });
         break;
       case "subagent-end":
-        open[e.agent] = false;
+        open = false;
         break;
     }
   }
 
-  // Build the stack outer → inner (planner before writer when both open).
-  const subagentStack: ActiveSubagent[] = [];
-  if (open.planner) {
-    subagentStack.push({
-      agent: "planner",
-      label: label.planner || "Planning",
-      startedAt: startedAt.planner,
-      attempt: attempt.planner,
-    });
-  }
-  if (open.writer) {
-    subagentStack.push({
-      agent: "writer",
-      label: label.writer || "Writing",
-      startedAt: startedAt.writer,
-      attempt: attempt.writer,
-    });
-  }
+  // The stack is a single-element list when the planner is running.
+  const subagentStack: ActiveSubagent[] = open
+    ? [
+        {
+          agent: "planner",
+          label: label || "Planning",
+          startedAt,
+          attempt,
+        },
+      ]
+    : [];
 
-  // The active subagent is the innermost running one.
   const activeSubagent =
     subagentStack.length > 0 ? subagentStack[subagentStack.length - 1] : null;
 

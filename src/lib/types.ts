@@ -3,7 +3,7 @@
  */
 
 /** A single agent slot. */
-export type AgentName = "main" | "planner" | "writer";
+export type AgentName = "main" | "planner";
 
 /** Provider identifier (OpenAI-compatible endpoints). */
 export type ProviderName = "openrouter" | "openai";

@@ -3,7 +3,7 @@
  *
  * Persisted values:
  *  - API keys per provider (OpenRouter, OpenAI)
- *  - Model selection per agent slot (main, planner, writer)
+ *  - Model selection per agent slot (main, planner)
  */
 
 import { useEffect, useState, useCallback } from "react";
@@ -44,7 +44,6 @@ const DEFAULT_SETTINGS: AgentSettings = {
   agents: {
     main: { provider: "openrouter", model: DEFAULT_MODELS.openrouter },
     planner: { provider: "openrouter", model: DEFAULT_MODELS.openrouter },
-    writer: { provider: "openrouter", model: DEFAULT_MODELS.openrouter },
   },
   chat: { ...DEFAULT_CHAT_SETTINGS },
   onboarded: false,
