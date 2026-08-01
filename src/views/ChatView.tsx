@@ -11,10 +11,13 @@
  * `chats/<id>.xml` on the agent's disk) rather than destroying it; a true
  * delete is only available from the archive list.
  *
- * Context meter: the footer shows the running token estimate against the
- * configured context limit, with a coloured bar and a "% left before
- * auto-compact" readout. When the limit is reached, the oldest turns are
- * dropped (the full transcript is already on disk, so nothing is lost).
+ * Context meter: the footer shows the CURRENT context size (the last
+ * prompt-token count reported by the model) against the configured limit,
+ * with a coloured bar and a "% context left" readout. When the limit is
+ * reached, the older turns are SUMMARIZED by the model: the summary is
+ * injected into the system prompt and the summarized prefix is dropped from
+ * what's sent — but the full transcript is never removed from the UI or disk,
+ * and a one-time modal explains what happened. (See `lib/compaction.ts`.)
  *
  * Design: the UI shows *progress*, not internals. Tool calls render as
  * compact one-liners (e.g. "Edited file · path/foo.ts"); reasoning just
@@ -24,16 +27,21 @@
  * runtime. A status bar surfaces running token totals and high-level
  * subagent activity (Planning / Validating files).
  *
+ * Failure recovery: if a generation finishes without producing any assistant
+ * content (the "message sent but nothing happened" symptom), an inline
+ * "Retry" affordance re-requests the last user message instead of leaving the
+ * user staring at silence.
+ *
  * Implementation note: we split this into an outer loader (ChatView)
  * and an inner chat (ChatViewInner). `useChat` in `@ai-sdk/react`
  * captures its `transport` only at Chat-instance creation time and only
  * recreates the Chat when the `chat` or `id` option changes — not when
- * `transport` changes. If we passed `transport: undefined` on the
- * first render (while the prompt is still loading), the hook would
- * silently fall back to `DefaultChatTransport` and POST to `/api/chat`,
- * which is what produced the 404s users saw when using OpenRouter.
- * Mounting the inner component only once the transport is ready
- * guarantees `useChat` is initialized with the right transport.
+ * `transport` changes. So the outer component builds ONE stable transport
+ * (via getters that read live settings/prompt from refs) and never
+ * recreates it: every send reads the latest configuration without
+ * remounting the chat, which both avoids the stale-transport bug and
+ * guarantees in-flight generations are never interrupted by a settings
+ * edit. The inner component still mounts only once the prompt is ready.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -52,6 +60,7 @@ import {
   Pencil,
   Plus,
   RotateCcw,
+  ScrollText,
   Trash2,
   Wrench,
   Check,
@@ -79,6 +88,7 @@ import {
   type ChatMeta,
 } from "@/lib/chatStore";
 import { writeChatXml } from "@/lib/chatExport";
+import { runCompaction, type CompactionState } from "@/lib/compaction";
 
 // AI Elements primitives
 import {
@@ -101,6 +111,7 @@ import {
   Dialog,
   DialogContent,
   DialogTitle,
+  DialogDescription,
 } from "@/components/ui/dialog";
 import {
   DropdownMenu,
@@ -158,11 +169,30 @@ export function ChatView({
     refreshPrompt();
   }, []);
 
-  // Build a transport whenever settings or system prompt change.
+  // Keep the latest settings + system prompt in refs so the transport's
+  // getters can read them on every call. This lets us build the transport
+  // exactly ONCE for the app lifetime — so `useChat` (which only captures the
+  // transport at Chat-instance creation) always uses a transport that reads
+  // current values, instead of a stale snapshot. Changing model/provider in
+  // Settings now takes effect on the next send without remounting the chat.
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+  const systemPromptRef = useRef(systemPrompt);
+  systemPromptRef.current = systemPrompt;
+
+  // The transport is stable: it consults the refs above per call. Created
+  // once the prompt has loaded (so the first prompt isn't empty), and never
+  // recreated — identity stays the same for the rest of the session.
   const transport = useMemo(() => {
     if (!systemPrompt) return null;
-    return createMainAgentTransport(settings, systemPrompt);
-  }, [settings, systemPrompt]);
+    return createMainAgentTransport({
+      getSettings: () => settingsRef.current,
+      getSystemPrompt: () => systemPromptRef.current,
+    });
+    // Deliberately empty deps: build once when the prompt is first ready,
+    // then keep it forever. The getters read live values via refs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [systemPrompt]);
 
   // The chat needs an API key for the configured provider.
   const apiKeyMissing =
@@ -208,16 +238,17 @@ function ChatViewInner({
   onOpenSettings,
 }: ChatViewInnerProps) {
   // useChat only captures the transport at Chat-instance creation time.
-  // The outer component mounts us only after `transport` is ready, so the
-  // first call to useChat here is guaranteed to see a real transport (or
-  // for the API-key-missing case, an outer guard prevents sending).
-  // Switching `activeChatId` remounts this component (key=activeChatId),
+  // The outer component builds a STABLE transport (via getters that read
+  // live settings/prompt from refs), so there is no stale-transport problem:
+  // every send reads the latest configuration without remounting the chat.
+  // Switching `activeChatId` still remounts this component (key=activeChatId),
   // so each chat gets its own useChat instance + clean event window.
-  const { messages, sendMessage, status, error, setMessages, stop } = useChat({
-    id: activeChatId,
-    transport: transport ?? undefined,
-    onError: (e) => console.error("[chat] error:", e),
-  });
+  const { messages, sendMessage, regenerate, status, error, setMessages, stop } =
+    useChat({
+      id: activeChatId,
+      transport: transport ?? undefined,
+      onError: (e) => console.error("[chat] error:", e),
+    });
 
   const chats = useChats();
   const activeChat = chats.find((c) => c.id === activeChatId);
@@ -254,9 +285,15 @@ function ChatViewInner({
   }, [messages, activeChatId]);
 
   // Also persist immediately when generation finishes (so the transcript is
-  // on disk even if the user closes the window right after).
+  // on disk even if the user closes the window right after). This is also
+  // where we detect the "agent never responded" failure mode: the stream
+  // finished (status left `submitted`/`streaming`) but produced no assistant
+  // message — the trailing message is still the user's, or the last assistant
+  // message is empty. In that case we surface a Retry affordance instead of
+  // leaving the user staring at silence.
   const isGenerating = status === "submitted" || status === "streaming";
   const wasGenerating = useRef(false);
+  const [emptyResponse, setEmptyResponse] = useState(false);
   useEffect(() => {
     if (wasGenerating.current && !isGenerating && messages.length > 0) {
       saveMessages(activeChatId, messages);
@@ -264,9 +301,26 @@ function ChatViewInner({
       // (and auto-compact) can recover full history via read_file.
       writeChatXml(messages, activeChatId);
       touchChat(activeChatId, messages.find((m) => m.role === "user") ?? null);
+
+      // Empty-response detection (only when there was no hard error — that's
+      // surfaced separately via the error banner).
+      if (!error) {
+        const last = messages[messages.length - 1];
+        const lastIsUser = last.role === "user";
+        const lastAssistantEmpty =
+          last.role === "assistant" &&
+          (last.parts ?? []).every(
+            (p) =>
+              (p.type !== "text" || !((p as { text?: string }).text ?? "").trim()) &&
+              !p.type.startsWith("tool-"),
+          );
+        // An empty assistant message carries only reasoning (stripped from the
+        // stream) or nothing at all.
+        setEmptyResponse(lastIsUser || (lastAssistantEmpty && messages.length >= 1));
+      }
     }
     wasGenerating.current = isGenerating;
-  }, [isGenerating, messages, activeChatId]);
+  }, [isGenerating, messages, activeChatId, error]);
 
   const [input, setInput] = useState("");
 
@@ -276,7 +330,12 @@ function ChatViewInner({
 
   const onSubmit = ({ text }: { text: string }) => {
     const trimmed = text.trim();
-    if (!trimmed || !transport || isGenerating) return;
+    // Guard on apiKeyMissing too: sendMessage commits the user message before
+    // the transport runs, and a missing key throws synchronously inside
+    // sendMessages — which would leave an orphaned user message with no
+    // assistant turn (one cause of "sent but no response").
+    if (!trimmed || !transport || apiKeyMissing || isGenerating) return;
+    setEmptyResponse(false); // clear any prior empty-response notice
     sendMessage({ text: trimmed });
     // Bump activity immediately so the idle sweeper can't race a just-sent
     // message. The title is derived from the real first user message once
@@ -287,6 +346,13 @@ function ChatViewInner({
     // affect React-controlled values.
     setInput("");
   };
+
+  // Retry the last exchange after an empty response. `regenerate` re-requests
+  // the trailing user message without adding a new one.
+  const onRetry = useCallback(() => {
+    setEmptyResponse(false);
+    regenerate();
+  }, [regenerate]);
 
   // ── Chat actions ────────────────────────────────────────────────────
   const newChat = useCallback(() => {
@@ -304,46 +370,73 @@ function ChatViewInner({
     onActiveChatChange(c.id);
   }, [activeChatId, messages, onActiveChatChange]);
 
-  // ── Auto-compact: drop oldest turns when the context limit is hit ──
-  // Token estimate comes from the cumulative usage events for THIS chat
-  // (reset on chat switch because the component remounts). When it crosses
-  // the configured limit, we keep only the most recent N turns and re-save.
-  // The full transcript is already on disk at chats/<id>.xml, so nothing
-  // is lost — this just keeps the live context lean.
+  // ── Auto-compact: summarize oldest turns when the context limit is hit ──
+  // The token estimate tracks the CURRENT context size (the last prompt-token
+  // count reported by the model), not a cumulative lifetime total — so it
+  // matches the `contextLimit` setting (a model context-window ceiling) and
+  // naturally drops again after summarizing. When it crosses the limit we ask
+  // the model to summarize the older prefix; the transport then drops that
+  // prefix from what it sends and injects the summary into the system prompt.
+  // The UI `messages` array is NEVER truncated here — the full history stays
+  // visible (and on disk at chats/<id>.xml).
   const { contextLimit, compactKeepTurns } = settings.chat;
   const compactedRef = useRef(false);
+  const compactingRef = useRef(false);
+  const [summaryNotice, setSummaryNotice] = useState<CompactionState | null>(
+    null,
+  );
   const tokenEstimate = useTokenEstimate(events);
+
+  // Keep latest settings in a ref so the async summarize callback reads
+  // current values rather than a stale snapshot from when the effect ran.
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+
   useEffect(() => {
-    if (compactedRef.current) return;
+    if (compactedRef.current || compactingRef.current) return;
     if (tokenEstimate < contextLimit) return;
     if (messages.length === 0) return;
-    if (isGenerating) return; // don't mutate mid-stream
+    if (isGenerating) return; // don't summarize mid-stream
+    if (apiKeyMissing) return; // need the key to call the summarizer
 
-    const kept = keepRecentTurns(messages, compactKeepTurns);
-    if (kept.length === messages.length) {
-      // Nothing to drop (e.g. already short); mark done to avoid re-looping.
-      compactedRef.current = true;
-      return;
-    }
-    setMessages(kept);
-    saveMessages(activeChatId, kept);
-    compactedRef.current = true;
-    console.info(
-      `[chat] auto-compacted ${activeChatId}: dropped ` +
-        `${messages.length - kept.length} messages (saved to chats/${activeChatId}.xml)`,
-    );
+    let cancelled = false;
+    compactingRef.current = true;
+    (async () => {
+      const before = messages.length;
+      const state = await runCompaction(
+        settingsRef.current,
+        activeChatId,
+        messages,
+        compactKeepTurns,
+      );
+      if (cancelled) return;
+      if (state) {
+        compactedRef.current = true;
+        setSummaryNotice(state);
+        console.info(
+          `[chat] summarized ${activeChatId}: compacted prefix ` +
+            `(${state.lastSummarizedId}) — ${before} messages still fully visible`,
+        );
+      }
+      compactingRef.current = false;
+    })();
+    return () => {
+      cancelled = true;
+      compactingRef.current = false;
+    };
   }, [
     tokenEstimate,
     contextLimit,
     compactKeepTurns,
     messages,
     isGenerating,
-    setMessages,
+    apiKeyMissing,
     activeChatId,
   ]);
 
-  // Reset the compacted latch if the user manually starts a new exchange
-  // after a compaction (so a future limit breach can compact again).
+  // Reset the compacted latch once the context has shrunk well below the limit
+  // (after summarizing, the next sent prompt is small again, so the estimate
+  // drops and this latch frees up a future compaction).
   useEffect(() => {
     if (tokenEstimate < contextLimit * 0.5) compactedRef.current = false;
   }, [tokenEstimate, contextLimit]);
@@ -483,6 +576,13 @@ function ChatViewInner({
               toolHistory={toolHistory}
             />
           )}
+
+          {/* Empty-response recovery: the stream finished but produced no
+              assistant content (the "nothing happens" failure mode). Offer a
+              one-click retry that re-requests the last user message. */}
+          {emptyResponse && !isGenerating && !error && (
+            <EmptyResponseBanner onRetry={onRetry} />
+          )}
         </ConversationContent>
         <ConversationScrollButton />
       </Conversation>
@@ -524,6 +624,9 @@ function ChatViewInner({
         onClear={archiveCurrent}
       />
 
+      {/* ── Summary notice: shown once when auto-compact summarizes ── */}
+      <SummarizedModal state={summaryNotice} onClose={() => setSummaryNotice(null)} />
+
       {/* ── Switcher sheet (active + archived chats) ──────────── */}
       <ChatSwitcherSheet
         open={switcherOpen}
@@ -554,46 +657,31 @@ function ChatViewInner({
 // ── Token estimate ────────────────────────────────────────────────────
 
 /**
- * Sum the cumulative usage events emitted since this component mounted. Each
- * `useChat`-keyed remount (chat switch) starts a fresh event window, so the
- * estimate is naturally per-chat. This mirrors the old footer's total.
+ * Track the CURRENT context size from the usage event stream: the
+ * prompt-token count of the most recent main-agent call (the size of what was
+ * actually sent to the model), plus its completion tokens so the meter keeps
+ * moving while a long answer streams.
+ *
+ * This is deliberately NOT a cumulative lifetime sum. The `contextLimit`
+ * setting is a model context-window ceiling, so the meter must reflect how
+ * full the window is *right now*. Because it tracks current size, the
+ * estimate drops again after auto-compact summarizes the older prefix — which
+ * is exactly what lets compaction stay rare instead of re-firing on every
+ * send. Each `useChat`-keyed remount (chat switch) starts a fresh event
+ * window, so the estimate is per-chat.
  */
 function useTokenEstimate(events: AgentEvent[]): number {
   return useMemo(() => {
-    let promptTokens = 0;
-    let completionTokens = 0;
+    let lastPrompt = 0;
+    let lastCompletion = 0;
     for (const e of events) {
-      if (e.type === "usage") {
-        promptTokens += e.usage.promptTokens;
-        completionTokens += e.usage.completionTokens;
+      if (e.type === "usage" && e.role === "main") {
+        lastPrompt = e.usage.promptTokens;
+        lastCompletion = e.usage.completionTokens;
       }
     }
-    return promptTokens + completionTokens;
+    return lastPrompt + lastCompletion;
   }, [events]);
-}
-
-/**
- * Reduce a message list to the most recent `keepTurns` user/assistant turns
- * (counting each message as one turn). Tool-result-only messages and any
- * leading assistant activity are dropped so the kept context starts cleanly.
- * Returns a new array; the input is not mutated.
- */
-function keepRecentTurns(messages: UIMessage[], keepTurns: number): UIMessage[] {
-  if (keepTurns <= 0 || messages.length === 0) return messages;
-  // Walk from the end, collecting until we have `keepTurns` conversational
-  // (user or assistant) messages. We keep whole messages — tool calls/results
-  // attached to a kept assistant message stay with it.
-  const kept: UIMessage[] = [];
-  let count = 0;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i];
-    if (m.role === "user" || m.role === "assistant") {
-      kept.unshift(m);
-      count++;
-      if (count >= keepTurns) break;
-    }
-  }
-  return kept;
 }
 
 // ── Chat header ───────────────────────────────────────────────────────
@@ -722,10 +810,11 @@ function ContextFooter({
         )}
       </div>
 
-      {/* Context meter — always visible (mobile + desktop). */}
+      {/* Context meter — always visible (mobile + desktop). Shows the current
+          context size vs. the limit; older turns are summarized when full. */}
       <div
         className="flex items-center gap-2 shrink-0 tabular-nums"
-        title={`${remainingPct}% left before auto-compact`}
+        title={`${remainingPct}% context left (older turns are summarized when full)`}
       >
         {/* Compact bar (small enough for mobile) */}
         <div className="flex w-16 h-1.5 rounded-full bg-[var(--color-border)] overflow-hidden">
@@ -763,6 +852,74 @@ function ContextFooter({
 function formatTokens(n: number): string {
   if (n >= 1000) return `${Math.round(n / 1000)}k`;
   return String(n);
+}
+
+// ── Empty-response recovery banner ─────────────────────────────────────
+
+/**
+ * Inline notice shown when a generation finished without producing any
+ * assistant content (no text, no tool calls — the exact "message sent but
+ * nothing happened" symptom). Offers a retry that re-requests the last user
+ * message via the SDK's `regenerate`.
+ */
+function EmptyResponseBanner({ onRetry }: { onRetry: () => void }) {
+  return (
+    <div className="mx-auto my-1 px-3 py-2 rounded-md bg-[var(--color-surface-muted)] border border-[var(--color-border)] text-xs text-[var(--color-muted-foreground)] flex items-center gap-2 max-w-md">
+      <AlertCircle size={13} className="shrink-0" />
+      <span className="flex-1">No response received from the agent.</span>
+      <button
+        onClick={onRetry}
+        className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-[var(--color-pink-400)] text-[var(--color-primary-foreground)] hover:bg-[var(--color-pink-500)] shrink-0"
+      >
+        <RotateCcw size={11} /> Retry
+      </button>
+    </div>
+  );
+}
+
+// ── Summarized modal ───────────────────────────────────────────────────
+
+/**
+ * One-time modal shown right after auto-compact summarizes the older turns.
+ * Explains what happened and reassures the user that the full history is
+ * still visible in the chat (and on disk). Dismissing it doesn't undo
+ * anything — the summary is already in effect.
+ */
+function SummarizedModal({
+  state,
+  onClose,
+}: {
+  state: CompactionState | null;
+  onClose: () => void;
+}) {
+  return (
+    <Dialog open={!!state} onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="sm:max-w-lg flex flex-col gap-3 max-h-[80vh]">
+        <DialogTitle className="flex items-center gap-2 text-sm font-semibold">
+          <ScrollText size={15} className="text-[var(--color-pink-500)]" />
+          Conversation summarized
+        </DialogTitle>
+        <DialogDescription className="text-xs text-[var(--color-muted-foreground)]">
+          The chat's context grew large, so the older turns were summarized to
+          keep things running smoothly. The full history is still visible below
+          and saved on disk — nothing was deleted.
+        </DialogDescription>
+        {state?.summary && (
+          <div className="text-xs leading-relaxed overflow-y-auto rounded-md border border-[var(--color-border)] bg-[var(--color-surface-muted)] p-3 whitespace-pre-wrap">
+            {state.summary}
+          </div>
+        )}
+        <div className="flex justify-end">
+          <button
+            onClick={onClose}
+            className="inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md bg-[var(--color-pink-400)] text-[var(--color-primary-foreground)] hover:bg-[var(--color-pink-500)]"
+          >
+            <Check size={13} /> Got it
+          </button>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
 }
 
 // ── Chat switcher sheet ───────────────────────────────────────────────

@@ -34,15 +34,19 @@ export type ApiKeys = Partial<Record<ProviderName, string>>;
  */
 export interface ChatSettings {
   /**
-   * Token estimate at which auto-compact fires. Once the running token total
-   * for a chat reaches this, the oldest turns are dropped (down to
-   * `compactKeepTurns`). The full transcript is always saved to
-   * `chats/<id>.xml` on the agent's disk first, so nothing is lost.
+   * Current-context-size threshold at which auto-compact fires. The meter
+   * tracks the actual size of what was last sent to the model (the last
+   * prompt-token count). When it reaches this limit, the older turns are
+   * summarized by the model and replaced with a summary injected into the
+   * system prompt. The full transcript is never removed from the UI or disk
+   * (it's always at `chats/<id>.xml`), so nothing is lost. Match this to
+   * your model's context window.
    */
   contextLimit: number;
   /**
-   * Number of recent user/assistant messages to keep when auto-compacting.
-   * Everything older is dropped from the live chat (but remains on disk).
+   * Number of recent user/assistant messages always kept live (never folded
+   * into the summary) when auto-compacting. Older turns beyond this window
+   * are what get summarized.
    */
   compactKeepTurns: number;
   /**

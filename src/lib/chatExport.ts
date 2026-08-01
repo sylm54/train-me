@@ -7,8 +7,9 @@
  * `user` / `assistant` text turns and write a compact XML document to
  * `agent_data/chats/<id>.xml` via the existing `write_data_file` Tauri command.
  *
- * This is what makes auto-compact (dropping oldest turns) safe: the dropped
- * turns are never lost, they're always recoverable from disk via `read_file`.
+ * This is what makes auto-compact safe: even when older turns are summarized
+ * (and dropped from what's sent to the model), the full original transcript
+ * is never lost — it's always recoverable from disk via `read_file`.
  */
 
 import { invoke } from "@tauri-apps/api/core";

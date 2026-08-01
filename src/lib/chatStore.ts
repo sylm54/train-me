@@ -22,6 +22,7 @@
 import { useSyncExternalStore, useCallback } from "react";
 import { nanoid } from "nanoid";
 import type { UIMessage } from "ai";
+import { clearCompaction } from "./compaction";
 
 /** localStorage key holding the chat metadata array. */
 const STORE_KEY = "train-me.chats.v1";
@@ -275,6 +276,8 @@ export function deleteChatPermanently(id: string) {
   const chats = readShape().chats.filter((c) => c.id !== id);
   writeShape({ version: 1, chats });
   deleteMessages(id);
+  // Also drop any compaction state for this chat.
+  clearCompaction(id);
 }
 
 /** Rename a chat (active or archived). */

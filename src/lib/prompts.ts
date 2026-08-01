@@ -538,7 +538,7 @@ async function renderSpecial(): Promise<string> {
       console.warn(`[prompts] Special file "${f}" has no frontmatter, skipping.`);
       continue;
     }
-    rows.push({ file: f.replace(/^special\//, ""), fields: frontmatter });
+    rows.push({ file: f, fields: frontmatter });
   }
   console.log("C: ",rows);
 
