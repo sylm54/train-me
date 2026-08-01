@@ -4,7 +4,7 @@
 //! `agent_data/`:
 //!
 //!   - `routines/*.md`         (frontmatter `schedule` cron + markdown body)
-//!   - `rule/*.md`             (free-form markdown)
+//!   - `rules/*.md`             (free-form markdown)
 //!   - `conditioning/*.json`   (TTS metadata sidecar)
 //!   - `journal/format.json`   (journal field definitions)
 //!   - `voice/config.json`     (voice-training tracker config)
@@ -330,11 +330,11 @@ fn in_app_link_target(href: &str) -> Option<String> {
     }
 
     let head = segs[0].to_ascii_lowercase();
-    // Map a recognized first segment to the on-disk directory. `rule` is the
-    // real dir (singular); `rules/` is accepted as an alias.
+    // Map a recognized first segment to the on-disk directory. `rules` is the
+    // real dir; `rule/` is accepted as a legacy alias.
     let dir = match head.as_str() {
         "conditioning" => "conditioning",
-        "rule" | "rules" => "rule",
+        "rule" | "rules" => "rules",
         "routines" | "routine" => "routines",
         "journal" => "journal",
         "voice" => "voice",
@@ -388,7 +388,7 @@ fn validate_routine(rel_path: &str, content: &str, agent_dir: &Path) -> FileRepo
     report
 }
 
-/// `rule/*.md`
+/// `rules/*.md`
 fn validate_rule(rel_path: &str, content: &str, agent_dir: &Path) -> FileReport {
     let mut report = FileReport::new(rel_path);
     if !rel_path.to_ascii_lowercase().ends_with(".md") {
@@ -1139,8 +1139,8 @@ pub fn validate_data_files(
         collect(&mut files, &mut errors, &mut warnings, r);
     }
 
-    // rule/*.md  (on-disk dir is singular)
-    for (rel, full) in list_dir_files("rule", &agent_dir) {
+    // rules/*.md
+    for (rel, full) in list_dir_files("rules", &agent_dir) {
         if !rel.to_ascii_lowercase().ends_with(".md") || !in_scope_of(&rel) {
             continue;
         }
@@ -1313,7 +1313,12 @@ mod tests {
     fn in_app_link_resolves_rules_alias_and_skips_external() {
         assert_eq!(
             in_app_link_target("rules/dress.md").as_deref(),
-            Some("rule/dress.md")
+            Some("rules/dress.md")
+        );
+        // Legacy singular `rule/` prefix still resolves to the `rules/` dir.
+        assert_eq!(
+            in_app_link_target("rule/dress.md").as_deref(),
+            Some("rules/dress.md")
         );
         assert_eq!(
             in_app_link_target("./conditioning/a.json").as_deref(),

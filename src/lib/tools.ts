@@ -269,7 +269,7 @@ export const validateFilesTool = tool({
   description:
     "Validate feature config files for parse errors, schema problems, " +
     "and dangling references. Checks routines/*.md (frontmatter + cron " +
-    "schedule), rule/*.md, conditioning/*.json (metadata PLUS the " +
+    "schedule), rules/*.md, conditioning/*.json (metadata PLUS the " +
     "referenced XML script: tag syntax, semantic tag checks, and <include> " +
     "import validity — dangling and circular includes are errors), " +
     "journal/format.json fields, and voice/config.json trackers, plus any " +

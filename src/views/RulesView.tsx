@@ -66,7 +66,7 @@ export function RulesView() {
 
     let entries: FileEntry[];
     try {
-      entries = await invoke<FileEntry[]>("list_data_files", { path: "rule" });
+      entries = await invoke<FileEntry[]>("list_data_files", { path: "rules" });
     } catch (e) {
       setError(tauriErrorToString(e));
       setLoading(false);

@@ -41,7 +41,7 @@ const featureEmbed = `
 - Creation of new/Managing conditioning files is restricted to the dedicated hypno planner agent. The main agent should never modify these files directly; instead, it should instruct the HypnoPlanner subagent to create or update conditioning entries as needed.
 - Listening stats (last listen, listen streak, listen count) are auto-derived by the app from the activity log when a user finishes playing a script — do NOT store any stat/counter/last-listened fields inside the conditioning JSON; the app owns them and they would be clobbered on your next edit.
 
-### 2. Rules (\`rule/*.md\`)
+### 2. Rules (\`rules/*.md\`)
 - Each file represents one rule that the user is expected to follow.
 - Refer to \`examples/rule.md\` for the correct formatting standard.
 - Create one rule file for each distinct rule you want to enforce.
