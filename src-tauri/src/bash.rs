@@ -438,7 +438,7 @@ pub fn ensure_agent_dir(data_dir: &Path) -> std::io::Result<()> {
     for sub in [
         "special",
         "conditioning",
-        "rule",
+        "rules",
         "routines",
         "journal",
         "voice",
@@ -474,16 +474,16 @@ mod tests {
     fn resolve_under_accepts_relative() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
-        let got = resolve_under(&root, "rule/daily.md").unwrap();
-        assert_eq!(got, root.join("rule/daily.md"));
+        let got = resolve_under(&root, "rules/daily.md").unwrap();
+        assert_eq!(got, root.join("rules/daily.md"));
     }
 
     #[test]
     fn resolve_under_accepts_dot_slash() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
-        let got = resolve_under(&root, "./rule/daily.md").unwrap();
-        assert_eq!(got, root.join("rule/daily.md"));
+        let got = resolve_under(&root, "./rules/daily.md").unwrap();
+        assert_eq!(got, root.join("rules/daily.md"));
     }
 
     #[test]
@@ -491,8 +491,8 @@ mod tests {
         // The form bash emits (pwd is "/"): leading "/" means sandbox root.
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
-        let got = resolve_under(&root, "/rule/daily.md").unwrap();
-        assert_eq!(got, root.join("rule/daily.md"));
+        let got = resolve_under(&root, "/rules/daily.md").unwrap();
+        assert_eq!(got, root.join("rules/daily.md"));
     }
 
     #[test]
@@ -501,7 +501,7 @@ mod tests {
         let root = tmp.path().canonicalize().unwrap();
         assert!(resolve_under(&root, "../escape.md").is_err());
         assert!(resolve_under(&root, "/../escape.md").is_err());
-        assert!(resolve_under(&root, "rule/../../escape.md").is_err());
+        assert!(resolve_under(&root, "rules/../../escape.md").is_err());
     }
 
     #[cfg(windows)]
@@ -528,21 +528,21 @@ mod tests {
         let backend = RealFs::new(tmp.path(), RealFsMode::ReadWrite).unwrap();
         let fs: Arc<dyn FileSystem> = Arc::new(PosixFs::new(backend));
 
-        // Write via the sandbox's filesystem (as `echo > /rule/daily.md` would).
-        fs.mkdir(std::path::Path::new("/rule"), true).await.unwrap();
-        fs.write_file(std::path::Path::new("/rule/daily.md"), b"hello")
+        // Write via the sandbox's filesystem (as `echo > /rules/daily.md` would).
+        fs.mkdir(std::path::Path::new("/rules"), true).await.unwrap();
+        fs.write_file(std::path::Path::new("/rules/daily.md"), b"hello")
             .await
             .unwrap();
 
         // Read via std::fs (as read_data_file does). This is the regression:
         // it must see the bash-side write.
-        let on_host = std::fs::read(tmp.path().join("rule/daily.md")).unwrap();
+        let on_host = std::fs::read(tmp.path().join("rules/daily.md")).unwrap();
         assert_eq!(on_host, b"hello");
 
         // And the reverse: a std::fs write is visible to the sandbox fs.
-        std::fs::write(tmp.path().join("rule/other.md"), b"world").unwrap();
+        std::fs::write(tmp.path().join("rules/other.md"), b"world").unwrap();
         let via_fs = fs
-            .read_file(std::path::Path::new("/rule/other.md"))
+            .read_file(std::path::Path::new("/rules/other.md"))
             .await
             .unwrap();
         assert_eq!(via_fs, b"world");
