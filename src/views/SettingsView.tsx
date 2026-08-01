@@ -393,18 +393,20 @@ export function SettingsView() {
           </h2>
           <div className="border border-[var(--color-border)] rounded-lg p-4 bg-[var(--color-surface)] space-y-4">
             <p className="text-xs text-[var(--color-muted-foreground)]">
-              Control when the live context is compacted and when idle chats are
-              auto-archived. The full transcript is always saved to{" "}
+              Control when the live context is summarized and when idle chats
+              are auto-archived. When the context fills up, older turns are
+              summarized (never deleted) — the full transcript always stays
+              visible and is saved to{" "}
               <code className="font-mono">chats/&lt;id&gt;.xml</code> on the
-              agent's disk first, so nothing is ever lost.
+              agent's disk.
             </p>
 
             <ChatNumberField
-              label="Auto-compact at (tokens)"
+              label="Auto-summarize at (tokens)"
               value={settings.chat.contextLimit}
               min={1000}
               step={1000}
-              hint="Running token estimate at which the oldest turns are dropped. Match this to your model's context window."
+              hint="Current context size at which older turns are summarized into the system prompt. Match this to your model's context window."
               onChange={(v) => {
                 setChat({ contextLimit: v });
                 flashSave();
@@ -415,7 +417,7 @@ export function SettingsView() {
               value={settings.chat.compactKeepTurns}
               min={1}
               step={1}
-              hint="Number of most-recent user/assistant messages kept when compacting. Older turns remain on disk."
+              hint="Number of most-recent user/assistant turns always kept live (never summarized). Older turns beyond this are summarized."
               onChange={(v) => {
                 setChat({ compactKeepTurns: v });
                 flashSave();

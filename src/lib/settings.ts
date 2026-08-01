@@ -30,10 +30,11 @@ export const DEFAULT_MODELS: Record<ProviderName, string> = {
 /** Default chat behaviour settings. */
 export const DEFAULT_CHAT_SETTINGS: ChatSettings = {
   // 120k tokens: a safe ceiling for most mid-tier models. Auto-compact
-  // kicks in before the provider rejects an over-long request.
+  // summarizes the older turns before the live context grows past this,
+  // so requests stay within the model's window.
   contextLimit: 120_000,
-  // Keep the last 6 user/assistant turns when compacting — enough recent
-  // context to stay conversational without re-reading the whole history.
+  // Keep the last 6 user/assistant turns live when compacting — enough
+  // recent context to stay conversational while older turns are summarized.
   compactKeepTurns: 6,
   // 4 hours of inactivity before an idle chat auto-archives. 0 disables.
   idleClearMinutes: 240,

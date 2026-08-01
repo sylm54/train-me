@@ -22,6 +22,11 @@ import type { AgentSettings, AgentName, ProviderName } from "./types";
 import { MAIN_AGENT_TOOLS } from "./tools";
 import { buildInvokePlannerTool } from "./subagents";
 import { emitAgentEvent, type AgentRole } from "./agent-events";
+import {
+  getCompaction,
+  liveMessagesForModel,
+  systemPromptWithSummary,
+} from "./compaction";
 
 /**
  * Report token usage for an agent role to the UI event bus.
@@ -169,22 +174,39 @@ function stripReasoningFromStream() {
 /**
  * Create a custom `ChatTransport` that streams from the main agent.
  *
- * Reads the main agent prompt from disk on every submission (so users can
- * edit `prompts/main_agent.md` and see changes on the next message).
+ * IMPORTANT — live values via getters: `useChat` in `@ai-sdk/react` captures
+ * its `transport` only at Chat-instance creation time and only recreates the
+ * Chat when the `id` option changes — NOT when `transport` changes. If we
+ * closed over `settings`/`systemPrompt` and built a fresh transport object on
+ * each settings change (the old design), `useChat` would keep using the stale
+ * transport, routing sends through an outdated model/API key/endpoint — one of
+ * the causes of "message sent but agent never responds".
  *
- * Note: we ignore `trigger`/`chatId`/`messageId` because we re-derive
- * everything from `messages`.
+ * So this transport is created ONCE for the app lifetime and reads the current
+ * settings + system prompt + compaction state through the getters each call.
+ * That guarantees every send uses the latest configuration without ever
+ * remounting the chat (which would interrupt in-flight generations).
+ *
+ * Compaction: per-call, the summarized prefix is dropped from what we send and
+ * replaced by the summary injected into the system prompt (see
+ * `liveMessagesForModel` / `systemPromptWithSummary`). The UI `messages` array
+ * is never mutated here — it keeps the full transcript for display.
+ *
+ * Note: we ignore `trigger`/`messageId` because we re-derive everything from
+ * `messages`.
  */
-export function createMainAgentTransport(
-  settings: AgentSettings,
-  systemPrompt: string,
-): ChatTransport<UIMessage> {
-  // Build the toolset once per (settings, systemPrompt) pair. The planner
-  // tool captures `settings`, so we need to rebuild when settings change.
-  const tools = buildMainAgentTools(settings);
-
+export function createMainAgentTransport(opts: {
+  /** Read the current settings (model, API keys, provider). */
+  getSettings: () => AgentSettings;
+  /** Read the current (unsummarized) base system prompt. */
+  getSystemPrompt: () => string;
+}): ChatTransport<UIMessage> {
   return {
-    async sendMessages({ messages, body, abortSignal }) {
+    async sendMessages({ messages, body, abortSignal, chatId }) {
+      // Read the latest configuration on every call.
+      const settings = opts.getSettings();
+      const baseSystemPrompt = opts.getSystemPrompt();
+
       const bodyObj = (body ?? {}) as Record<string, unknown>;
       const agent = (bodyObj.agent as AgentName | undefined) ?? "main";
       const cfg = getProvider(settings, agent);
@@ -195,7 +217,19 @@ export function createMainAgentTransport(
         );
       }
 
-      const modelMessages = await convertToModelMessages(messages);
+      // Apply compaction: drop the summarized prefix from what the model sees,
+      // and fold the summary into the system prompt. `chatId` from the SDK
+      // (which equals the useChat `id` = activeChatId) keys the compaction
+      // state. Fall back to the full array if no compaction state exists.
+      const compaction = chatId ? getCompaction(chatId) : null;
+      const liveMessages = liveMessagesForModel(messages, compaction);
+      const systemPrompt = systemPromptWithSummary(baseSystemPrompt, compaction);
+
+      const modelMessages = await convertToModelMessages(liveMessages);
+
+      // Rebuild tools from current settings each call (the planner tool
+      // captures settings).
+      const tools = buildMainAgentTools(settings);
 
       // Use `.chat()` to force the Chat Completions API (/chat/completions).
       // The default `provider(modelId)` call uses OpenAI's Responses API
