@@ -80,6 +80,14 @@ body,
     height: 100%;
 }
 
+/* Safe-area insets for notch / status-bar handling on mobile. Exposed as
+   CSS variables so components can opt in (e.g. push the header below the
+   phone's top bar). Defaults to 0 on desktop, where the env() is empty. */
+:root {
+    --safe-top: env(safe-area-inset-top, 0px);
+    --safe-bottom: env(safe-area-inset-bottom, 0px);
+}
+
 body {
     background: var(--color-background);
     color: var(--color-foreground);
