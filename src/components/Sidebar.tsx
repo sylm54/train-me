@@ -120,9 +120,9 @@ export function MobileBottomNav({
   return (
     <nav
       className="fixed bottom-0 inset-x-0 z-50 lg:hidden border-t border-[var(--color-border)] bg-[var(--color-surface-muted)] overflow-x-auto scrollbar-none"
-      style={{ paddingBottom: "env(safe-area-inset-bottom, 0px)" }}
+      style={{ paddingBottom: "var(--safe-bottom, 0px)" }}
     >
-      <div className="flex items-center gap-0.5 px-1 py-1">
+      <div className="flex items-center gap-1 px-1 py-2">
         {items.map((item) => {
           const Icon = item.icon;
           const active = currentView === item.view;
@@ -133,7 +133,7 @@ export function MobileBottomNav({
               onClick={() => !item.disabled && onSelect(item.view)}
               title={item.label}
               className={[
-                "flex flex-col items-center gap-0.5 px-2.5 py-1 rounded-lg text-[10px] transition-colors whitespace-nowrap",
+                "flex flex-col items-center gap-1 px-3 py-1.5 rounded-lg text-[11px] transition-colors whitespace-nowrap",
                 active
                   ? "bg-[var(--color-pink-200)] text-[var(--color-foreground)] font-medium"
                   : "text-[var(--color-muted-foreground)] hover:bg-[var(--color-pink-100)] hover:text-[var(--color-foreground)]",
@@ -142,7 +142,7 @@ export function MobileBottomNav({
                 .filter(Boolean)
                 .join(" ")}
             >
-              <Icon size={16} />
+              <Icon size={18} />
               <span>{item.label}</span>
             </button>
           );

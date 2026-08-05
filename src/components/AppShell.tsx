@@ -24,7 +24,7 @@ export function AppShell({
         hiddenViews={hiddenViews}
       />
       <main
-        className="flex-1 min-w-0 flex flex-col overflow-hidden pb-14 lg:pb-0"
+        className="flex-1 min-w-0 flex flex-col overflow-hidden pb-16 lg:pb-0"
         style={{ paddingTop: "var(--safe-top, 0px)" }}
       >
         {children}
