@@ -94,6 +94,23 @@ export function clearCompaction(chatId: string): void {
   }
 }
 
+/**
+ * Clear compaction state for every chat. Walks localStorage and removes any
+ * key under our prefix. Used by the global chat reset.
+ */
+export function clearAllCompaction(): void {
+  try {
+    const toRemove: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith(COMPACT_PREFIX)) toRemove.push(key);
+    }
+    for (const key of toRemove) localStorage.removeItem(key);
+  } catch (e) {
+    console.warn("[compaction] failed to clear all compaction state:", e);
+  }
+}
+
 // ── boundary selection ─────────────────────────────────────────────────
 
 /**
