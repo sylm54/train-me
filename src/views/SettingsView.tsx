@@ -31,7 +31,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import { useSettings, DEFAULT_MODELS, STORAGE_KEY } from "@/lib/settings";
-import { loadMeta, loadMessages } from "@/lib/chatStore";
+import { loadMeta, loadMessages, clearAllChats } from "@/lib/chatStore";
 import { getCachedBaseUrl } from "@/lib/audioUrl";
 import type {
   AgentName,
@@ -213,6 +213,9 @@ export function SettingsView() {
     setResetBusy(true);
     try {
       await invoke("reset_app_data");
+      // Chats live entirely in frontend localStorage, so the backend reset
+      // doesn't touch them — clear them here too so the wipe is complete.
+      clearAllChats();
       setResetDone(true);
       setResetArmed(false);
       // Clear onboarding so the wizard reappears after the wipe (there
@@ -636,7 +639,8 @@ export function SettingsView() {
                 <div className="font-medium">Reset all app data</div>
                 <p className="text-[var(--color-muted-foreground)]">
                   Wipes prompts, scripts, journal, inventory, chastity state,
-                  the activity log, and rendered tracks.{" "}
+                  the activity log, rendered tracks, and saved chats (active
+                  and archived).{" "}
                   <span className="font-medium text-[var(--color-foreground)]">
                     Your API keys, model selection, and the downloaded TTS model
                     are preserved.

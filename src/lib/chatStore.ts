@@ -22,7 +22,7 @@
 import { useSyncExternalStore, useCallback } from "react";
 import { nanoid } from "nanoid";
 import type { UIMessage } from "ai";
-import { clearCompaction } from "./compaction";
+import { clearCompaction, clearAllCompaction } from "./compaction";
 
 /** localStorage key holding the chat metadata array. */
 const STORE_KEY = "train-me.chats.v1";
@@ -278,6 +278,25 @@ export function deleteChatPermanently(id: string) {
   deleteMessages(id);
   // Also drop any compaction state for this chat.
   clearCompaction(id);
+}
+
+/**
+ * Wipe every chat: metadata, all per-chat message arrays, and compaction
+ * state. Also clears the legacy single-transcript key. Used by the Settings
+ * "reset all app data" action so a reset leaves the user with no chat history
+ * (active or archived). Emits once so subscribers re-render.
+ */
+export function clearAllChats() {
+  const ids = readShape().chats.map((c) => c.id);
+  try {
+    for (const id of ids) localStorage.removeItem(MSG_PREFIX + id);
+    clearAllCompaction();
+    localStorage.removeItem(STORE_KEY);
+    localStorage.removeItem(LEGACY_KEY);
+  } catch (e) {
+    console.warn("[chatStore] failed to clear chats:", e);
+  }
+  emit();
 }
 
 /** Rename a chat (active or archived). */
