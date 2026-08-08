@@ -2,8 +2,8 @@ name: Build and Release
 
 on:
   push:
-    branches: [master]
-  workflow_dispatch:
+    tags:
+      - "v*"
 
 permissions:
   contents: write
@@ -146,7 +146,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.meta.outputs.tag }}
-          draft: true
+          draft: false
           files: train-me-${{ needs.meta.outputs.tag }}-arm64-v8a.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

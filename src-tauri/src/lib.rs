@@ -19,6 +19,8 @@ mod inventory;
 mod manifest;
 mod model_downloader;
 mod package_import;
+mod package_manifest;
+mod framework_updater;
 mod render_notify;
 mod sounds;
 mod tag_parser;
@@ -391,16 +393,79 @@ fn get_agent_dir(state: State<'_, AppState>) -> String {
     state.agent_dir.to_string_lossy().to_string()
 }
 
-/// Whether a framework has been imported: we treat the presence of
-/// `prompts/main_agent.md` as the signal that onboarding is complete.
-/// The frontend uses this to decide whether to show the onboarding flow.
+/// Whether a framework has been imported: a framework import writes an
+/// installed-framework record (`framework.json`) under the data dir, so the
+/// presence of that record is the signal that onboarding is complete. The
+/// frontend uses this to decide whether to show the onboarding flow.
 #[tauri::command]
 fn framework_installed(state: State<'_, AppState>) -> bool {
-    state
-        .data_dir
-        .join("prompts")
-        .join("main_agent.md")
-        .exists()
+    package_manifest::read_installed_framework(&state.data_dir).is_some()
+}
+
+/// The currently installed framework (identity + version), or `null` if none.
+/// Used by Settings to show which framework/version is present.
+#[tauri::command]
+fn get_installed_framework(
+    state: State<'_, AppState>,
+) -> Option<package_manifest::InstalledFramework> {
+    package_manifest::read_installed_framework(&state.data_dir)
+}
+
+/// Check the framework's update channel at `url` and report whether a newer
+/// version is available. Runs the (blocking) HTTP fetch on a blocking thread.
+#[tauri::command]
+async fn check_framework_update(
+    url: String,
+    state: State<'_, AppState>,
+) -> Result<framework_updater::UpdateCheck, String> {
+    let data_dir = state.data_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let installed = package_manifest::read_installed_framework(&data_dir);
+        framework_updater::check_update(&url, installed.as_ref())
+    })
+    .await
+    .map_err(|e| format!("Update check failed: {}", e))?
+}
+
+/// Download and install a framework from its update channel. Fetches the
+/// index at `url`, downloads + verifies (sha256) the ZIP, and runs the
+/// manifest-aware import pipeline. Emits `framework-download-progress`
+/// events with `{ downloaded, total }` as bytes arrive (throttled to ~5 Hz
+/// on the emit side by the UI, not here).
+#[tauri::command]
+async fn download_and_install_framework(
+    url: String,
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<package_import::ImportResult, String> {
+    let data_dir = state.data_dir.clone();
+    let agent_root = state.agent_dir.clone();
+    let prompts_root = state.data_dir.join("prompts");
+    let tmp_base = state.data_dir.join(".tmp");
+
+    tauri::async_runtime::spawn_blocking(move || -> Result<package_import::ImportResult, String> {
+        // 1. Fetch + parse the index.
+        let index = framework_updater::fetch_index(&url)?;
+
+        // 2. Download + verify + install, streaming progress to the UI.
+        let progress_app = app.clone();
+        let result = framework_updater::download_and_install(
+            &index,
+            &data_dir,
+            &agent_root,
+            &prompts_root,
+            &tmp_base,
+            |downloaded, total| {
+                let _ = progress_app.emit(
+                    "framework-download-progress",
+                    serde_json::json!({ "downloaded": downloaded, "total": total }),
+                );
+            },
+        )?;
+        Ok(result)
+    })
+    .await
+    .map_err(|e| format!("Install failed: {}", e))?
 }
 
 /// Result of a successful [`reset_app_data`] reset. Each flag names a
@@ -441,7 +506,10 @@ async fn reset_app_data(state: State<'_, AppState>) -> Result<ResetReport, Strin
 
     // 2. Prompts — wipe (no defaults are re-seeded; the user re-imports
     //    a framework, which the frontend will prompt for via onboarding).
+    //    Also drop the installed-framework record so the app returns to the
+    //    "no framework" onboarding state.
     wipe_dir_contents(&state.data_dir.join("prompts"))?;
+    package_manifest::clear_installed_framework(&state.data_dir);
     report.prompts = true;
 
     // 3. Chastity — reset to the default (unlocked, no countdown) state.
@@ -1629,8 +1697,12 @@ pub fn run() {
             get_agent_dir,
             // Onboarding: has a framework been imported?
             framework_installed,
+            get_installed_framework,
             // Package import
             package_import::import_package,
+            // Framework update channel (URL download + install)
+            check_framework_update,
+            download_and_install_framework,
             // App-data reset (preserves model/ + API keys)
             reset_app_data,
             // Cron computation for routine scheduling

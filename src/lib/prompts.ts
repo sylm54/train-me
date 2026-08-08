@@ -63,7 +63,7 @@ const featureEmbed = `
   - \`inventory wishlist <id>\` — show one entry.
   - \`inventory wishlist add <name> [category] [priority] [notes...]\` — add an entry.
   - \`inventory wishlist remove <id>\` — remove an entry.
-  - You have full read/write access to the wishlist.
+  - You have full read/write access to the wishlist. The User sees the wishlist in their UI.
 ### 5. Chastity
 - CLI Command: \`chastity\`
 - Capabilities:
