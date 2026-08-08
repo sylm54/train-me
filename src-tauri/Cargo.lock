@@ -5989,7 +5989,7 @@ dependencies = [
 
 [[package]]
 name = "train-me"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "aegis",
  "android_logger",
@@ -6031,6 +6031,7 @@ dependencies = [
  "tokio",
  "tower-http",
  "unicode-normalization",
+ "url",
  "zip",
 ]
 

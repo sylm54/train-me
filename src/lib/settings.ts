@@ -23,7 +23,7 @@ export const STORAGE_KEY = "train-me.settings.v1";
 
 /** Sensible default model choices. */
 export const DEFAULT_MODELS: Record<ProviderName, string> = {
-  openrouter: "deepseek/deepseek-v4-flash",
+  openrouter: "~deepseek/deepseek-v4-flash-latest",
   openai: "",
 };
 
@@ -48,6 +48,7 @@ const DEFAULT_SETTINGS: AgentSettings = {
   },
   chat: { ...DEFAULT_CHAT_SETTINGS },
   onboarded: false,
+  frameworkSourceUrl: "",
 };
 
 function load(): AgentSettings {
@@ -66,6 +67,7 @@ function load(): AgentSettings {
         ...(parsed.chat ?? {}),
       },
       onboarded: parsed.onboarded ?? false,
+      frameworkSourceUrl: parsed.frameworkSourceUrl ?? "",
     };
   } catch {
     return { ...DEFAULT_SETTINGS };
@@ -165,11 +167,22 @@ export function useSettings() {
     });
   }, []);
 
+  /** Set the framework update-channel URL (points at an index JSON).
+   * Pass an empty string to clear it. */
+  const setFrameworkSourceUrl = useCallback((url: string) => {
+    setSettings((prev) => {
+      const next: AgentSettings = { ...prev, frameworkSourceUrl: url };
+      save(next);
+      return next;
+    });
+  }, []);
+
   return {
     settings,
     setApiKey,
     setAgent,
     setChat,
+    setFrameworkSourceUrl,
     completeOnboarding,
     resetOnboarding,
   };

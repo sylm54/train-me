@@ -15,6 +15,7 @@ import {
   ChevronRight,
   Copy,
   Database,
+  Download,
   Eye,
   EyeOff,
   FileArchive,
@@ -22,8 +23,10 @@ import {
   FileText,
   Folder,
   FolderOpen,
+  Link,
   Loader2,
   PackageOpen,
+  RefreshCw,
   RotateCcw,
   Save,
   Send,
@@ -41,9 +44,17 @@ import type {
 } from "@/lib/types";
 import { tauriErrorToString } from "@/lib/types";
 import {
+  checkFrameworkUpdate,
+  formatBytes,
+  getInstalledFramework,
+  installFrameworkFromUrl,
   pickAndImportPackage,
+  summarizeImportResult,
+  type FrameworkDownloadProgress,
   type ImportResult,
+  type InstalledFramework,
   type PackageKind,
+  type UpdateCheck,
 } from "@/lib/packages";
 import { loadPrompt } from "@/lib/prompts";
 import {
@@ -76,7 +87,7 @@ const PROVIDER_LABELS: Record<ProviderName, string> = {
 /** Common model presets to ease configuration. */
 const MODEL_PRESETS: Record<ProviderName, string[]> = {
   openrouter: [
-    "deepseek/deepseek-v4-flash",
+    "~deepseek/deepseek-v4-flash-latest",
     "deepseek/deepseek-v4-pro",
     "openai/gpt-4o",
   ],
@@ -105,7 +116,7 @@ const AGENT_PROMPTS: { agent: AgentName; file: string; label: string }[] = [
 type PromptMode = "rendered" | "raw";
 
 export function SettingsView() {
-  const { settings, setApiKey, setAgent, setChat, resetOnboarding } =
+  const { settings, setApiKey, setAgent, setChat, setFrameworkSourceUrl, resetOnboarding } =
     useSettings();
   const [reveal, setReveal] = useState<Record<ProviderName, boolean>>({
     openrouter: false,
@@ -136,6 +147,20 @@ export function SettingsView() {
     framework: null,
     specialisation: null,
   });
+  // Currently installed framework (id/name/version), shown on the framework
+  // card. Refreshed after each framework import and on mount.
+  const [installedFramework, setInstalledFramework] =
+    useState<InstalledFramework | null>(null);
+
+  // Framework update channel state.
+  const [urlDraft, setUrlDraft] = useState(settings.frameworkSourceUrl);
+  const [checkBusy, setCheckBusy] = useState(false);
+  const [updateCheck, setUpdateCheck] = useState<UpdateCheck | null>(null);
+  const [updateError, setUpdateError] = useState<string | null>(null);
+  const [installBusy, setInstallBusy] = useState(false);
+  const [installProgress, setInstallProgress] =
+    useState<FrameworkDownloadProgress | null>(null);
+  const [installResult, setInstallResult] = useState<ImportResult | null>(null);
 
   // App-data reset state
   const [resetArmed, setResetArmed] = useState(false);
@@ -155,6 +180,7 @@ export function SettingsView() {
     invoke<ModelStatus>("get_model_status")
       .then(setModelStatus)
       .catch(() => {});
+    getInstalledFramework().then(setInstalledFramework);
   }, []);
 
   const flashSave = () => {
@@ -201,10 +227,59 @@ export function SettingsView() {
         return;
       }
       setImportResult((s) => ({ ...s, [kind]: res }));
+      if (kind === "framework") {
+        // Refresh the installed-framework record so the card shows the new
+        // version immediately.
+        getInstalledFramework().then(setInstalledFramework);
+      }
     } catch (e) {
       setImportError((s) => ({ ...s, [kind]: String(e) }));
     } finally {
       setImportBusy((s) => ({ ...s, [kind]: false }));
+    }
+  };
+
+  const saveFrameworkSourceUrl = () => {
+    setFrameworkSourceUrl(urlDraft.trim());
+    // A URL change invalidates the last check.
+    setUpdateCheck(null);
+    setUpdateError(null);
+  };
+
+  const handleCheckUpdate = async () => {
+    const url = settings.frameworkSourceUrl.trim();
+    if (!url) return;
+    setCheckBusy(true);
+    setUpdateError(null);
+    setUpdateCheck(null);
+    try {
+      const check = await checkFrameworkUpdate(url);
+      setUpdateCheck(check);
+    } catch (e) {
+      setUpdateError(String(e));
+    } finally {
+      setCheckBusy(false);
+    }
+  };
+
+  const handleInstallFromUrl = async () => {
+    const url = settings.frameworkSourceUrl.trim();
+    if (!url) return;
+    setInstallBusy(true);
+    setImportError((s) => ({ ...s, framework: null }));
+    setInstallProgress(null);
+    setInstallResult(null);
+    try {
+      const res = await installFrameworkFromUrl(url, (p) =>
+        setInstallProgress(p),
+      );
+      setInstallResult(res);
+      setInstallProgress(null);
+      getInstalledFramework().then(setInstalledFramework);
+    } catch (e) {
+      setImportError((s) => ({ ...s, framework: String(e) }));
+    } finally {
+      setInstallBusy(false);
     }
   };
 
@@ -458,7 +533,24 @@ export function SettingsView() {
             busy={importBusy.framework}
             result={importResult.framework}
             error={importError.framework}
+            installed={installedFramework}
             onImport={() => handleImportPackage("framework")}
+          />
+          <FrameworkUpdateCard
+            savedUrl={settings.frameworkSourceUrl}
+            urlDraft={urlDraft}
+            onUrlDraftChange={setUrlDraft}
+            onSaveUrl={saveFrameworkSourceUrl}
+            installed={installedFramework}
+            checkBusy={checkBusy}
+            updateCheck={updateCheck}
+            updateError={updateError}
+            onCheck={handleCheckUpdate}
+            installBusy={installBusy}
+            installProgress={installProgress}
+            installResult={installResult}
+            installError={importError.framework}
+            onInstall={handleInstallFromUrl}
           />
           <PackageCard
             kind="specialisation"
@@ -791,6 +883,7 @@ function PackageCard({
   busy,
   result,
   error,
+  installed,
   onImport,
 }: {
   kind: PackageKind;
@@ -799,6 +892,8 @@ function PackageCard({
   busy: boolean;
   result: ImportResult | null;
   error: string | null;
+  /** Installed framework record (framework card only); null hides the line. */
+  installed?: InstalledFramework | null;
   onImport: () => void;
 }) {
   return (
@@ -812,6 +907,15 @@ function PackageCard({
       <p className="text-xs text-[var(--color-muted-foreground)]">
         {description}
       </p>
+
+      {installed && (
+        <p className="text-xs text-[var(--color-muted-foreground)]">
+          Installed:{" "}
+          <span className="text-[var(--color-foreground)]">
+            {installed.name} {installed.version}
+          </span>
+        </p>
+      )}
 
       <div className="flex flex-wrap items-center gap-2">
         <button
@@ -839,11 +943,194 @@ function PackageCard({
         <p className="text-xs text-[var(--color-success)] flex items-start gap-1.5">
           <CheckCircle2 size={14} className="mt-0.5 shrink-0" />
           <span>
-            Imported {result.prompts_files} prompt file(s) and{" "}
-            {result.agent_files} agent file(s).
-            {result.note && (
+            {summarizeImportResult(result).main}
+            {summarizeImportResult(result).detail && (
               <span className="block text-[var(--color-muted-foreground)]">
-                {result.note}
+                {summarizeImportResult(result).detail}
+              </span>
+            )}
+          </span>
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Framework update channel card. Lets the user point at an index URL, check
+ * for a newer version, and download + install it with a live progress bar.
+ */
+function FrameworkUpdateCard({
+  savedUrl,
+  urlDraft,
+  onUrlDraftChange,
+  onSaveUrl,
+  installed,
+  checkBusy,
+  updateCheck,
+  updateError,
+  onCheck,
+  installBusy,
+  installProgress,
+  installResult,
+  installError,
+  onInstall,
+}: {
+  savedUrl: string;
+  urlDraft: string;
+  onUrlDraftChange: (v: string) => void;
+  onSaveUrl: () => void;
+  installed: InstalledFramework | null;
+  checkBusy: boolean;
+  updateCheck: UpdateCheck | null;
+  updateError: string | null;
+  onCheck: () => void;
+  installBusy: boolean;
+  installProgress: FrameworkDownloadProgress | null;
+  installResult: ImportResult | null;
+  installError: string | null;
+  onInstall: () => void;
+}) {
+  const urlSaved = urlDraft.trim() === savedUrl.trim();
+  const hasUrl = savedUrl.trim().length > 0;
+  const pct =
+    installProgress && installProgress.total > 0
+      ? Math.min(
+          100,
+          Math.round(
+            (installProgress.downloaded / installProgress.total) * 100,
+          ),
+        )
+      : installProgress && installProgress.total === 0
+        ? null
+        : 0;
+
+  return (
+    <div className="border border-[var(--color-border)] rounded-lg p-4 bg-[var(--color-surface)] space-y-3">
+      <div className="flex items-baseline justify-between gap-3">
+        <div className="text-sm font-medium">Update channel</div>
+        <code className="font-mono text-[10px] uppercase tracking-wider text-[var(--color-muted-foreground)] flex items-center gap-1">
+          <Link size={10} /> url
+        </code>
+      </div>
+      <p className="text-xs text-[var(--color-muted-foreground)]">
+        Point at an index URL to check for and install framework updates over
+        the network.
+      </p>
+
+      {/* URL input + save */}
+      <div className="flex flex-wrap items-center gap-2">
+        <input
+          type="url"
+          value={urlDraft}
+          onChange={(e) => onUrlDraftChange(e.target.value)}
+          placeholder="https://example.com/framework/index.json"
+          spellCheck={false}
+          className="flex-1 min-w-[200px] px-3 py-2 text-sm rounded-md border border-[var(--color-border)] bg-[var(--color-background)] focus:outline-none focus:border-[var(--color-pink-400)] font-mono text-xs"
+        />
+        <button
+          onClick={onSaveUrl}
+          disabled={urlSaved}
+          className="px-3 py-2 text-sm rounded-md border border-[var(--color-border)] hover:bg-[var(--color-pink-50)] disabled:opacity-50 inline-flex items-center gap-2"
+        >
+          <Save size={14} />
+          Save URL
+        </button>
+      </div>
+
+      {/* Check + install buttons */}
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          onClick={onCheck}
+          disabled={!hasUrl || checkBusy || installBusy}
+          className="px-3 py-2 text-sm rounded-md border border-[var(--color-border)] hover:bg-[var(--color-pink-50)] disabled:opacity-50 inline-flex items-center gap-2"
+        >
+          {checkBusy ? (
+            <Loader2 size={14} className="animate-spin" />
+          ) : (
+            <RefreshCw size={14} />
+          )}
+          Check for updates
+        </button>
+        {updateCheck?.update_available && (
+          <button
+            onClick={onInstall}
+            disabled={installBusy}
+            className="px-3 py-2 text-sm rounded-md bg-[var(--color-pink-400)] text-[var(--color-primary-foreground)] hover:bg-[var(--color-pink-500)] disabled:opacity-50 inline-flex items-center gap-2"
+          >
+            {installBusy ? (
+              <Loader2 size={14} className="animate-spin" />
+            ) : (
+              <Download size={14} />
+            )}
+            Install {updateCheck.latest_version}
+          </button>
+        )}
+      </div>
+
+      {/* Check result */}
+      {updateError && (
+        <p className="text-xs text-[var(--color-danger)] flex items-start gap-1.5">
+          <AlertCircle size={14} className="mt-0.5 shrink-0" />
+          <span className="break-words">{updateError}</span>
+        </p>
+      )}
+      {updateCheck && !updateError && (
+        <p className="text-xs text-[var(--color-muted-foreground)] flex items-start gap-1.5">
+          {updateCheck.update_available ? (
+            <AlertCircle size={14} className="mt-0.5 shrink-0 text-[var(--color-pink-400)]" />
+          ) : (
+            <CheckCircle2 size={14} className="mt-0.5 shrink-0" />
+          )}
+          <span>
+            {updateCheck.update_available
+              ? `Update available: ${updateCheck.latest_version}`
+              : `You're on the latest version${
+                  installed ? ` (${installed.version})` : ""
+                }.`}
+            {updateCheck.latest_description && (
+              <span className="block">{updateCheck.latest_description}</span>
+            )}
+          </span>
+        </p>
+      )}
+
+      {/* Install progress */}
+      {installBusy && installProgress && (
+        <div className="space-y-1">
+          <div className="h-1.5 rounded-full bg-[var(--color-surface-muted)] overflow-hidden">
+            <div
+              className="h-full bg-[var(--color-pink-400)] transition-[width] duration-150"
+              style={{ width: pct == null ? "100%" : `${pct}%` }}
+            />
+          </div>
+          <p className="text-[11px] text-[var(--color-muted-foreground)] font-mono">
+            {pct == null
+              ? `Downloading… ${formatBytes(installProgress.downloaded)}`
+              : `${pct}% · ${formatBytes(installProgress.downloaded)} / ${formatBytes(
+                  installProgress.total,
+                )}`}
+          </p>
+        </div>
+      )}
+
+      {/* Install error (shares the framework import-error slot) */}
+      {installError && !installBusy && (
+        <p className="text-xs text-[var(--color-danger)] flex items-start gap-1.5">
+          <AlertCircle size={14} className="mt-0.5 shrink-0" />
+          <span className="break-words">{installError}</span>
+        </p>
+      )}
+
+      {/* Install result */}
+      {installResult && !installBusy && (
+        <p className="text-xs text-[var(--color-success)] flex items-start gap-1.5">
+          <CheckCircle2 size={14} className="mt-0.5 shrink-0" />
+          <span>
+            {summarizeImportResult(installResult).main}
+            {summarizeImportResult(installResult).detail && (
+              <span className="block text-[var(--color-muted-foreground)]">
+                {summarizeImportResult(installResult).detail}
               </span>
             )}
           </span>

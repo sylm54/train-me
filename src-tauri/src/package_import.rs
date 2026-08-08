@@ -1,23 +1,37 @@
 //! Package import: extract a user-supplied ZIP archive into the app's
-//! data directories.
+//! data directories, honouring a mandatory [`package_manifest::Manifest`].
 //!
-//! A "package" is a ZIP file whose contents are merged into the running
-//! app's data area. Two package kinds are recognised:
+//! A "package" is a ZIP whose root must contain a `manifest.json`. Two
+//! package kinds are recognised:
 //!
 //! - **Framework** (`kind = "framework"`): a full agent framework. Its
 //!   `prompts/` folder is merged into `<data_dir>/prompts/` (the prompt
 //!   store, kept outside the sandbox). Everything else is merged into the
-//!   agent sandbox root (`<data_dir>/agent_data/`).
+//!   agent sandbox root (`<data_dir>/agent_data/`). On success an
+//!   installed-framework record is written to `<data_dir>/framework.json`.
 //!
 //! - **Specialisation** (`kind = "specialisation"`): like a framework,
 //!   but its non-prompt content is merged into `<agent_data>/special/`
 //!   instead of the sandbox root. `prompts/` is still routed to the prompt
-//!   store.
+//!   store. No installed-framework record is written (specialisations are
+//!   additive).
 //!
-//! Both kinds are designed to be imported on top of each other for
-//! updates: existing files with the same relative path are overwritten,
-//! unrelated files are left untouched. Directories are created on demand.
+//! ## Merge semantics
+//!
+//! The manifest drives three behaviours, applied in order:
+//!
+//! 1. **Cleanup** (pre-merge): explicit `remove` globs delete matching files.
+//!    On an update (same `id` already installed) `owned_files` globs also
+//!    prune any owned file that is absent from the new ZIP, so renamed or
+//!    removed files don't linger.
+//! 2. **Merge**: files are copied from the extracted ZIP into the prompt store
+//!    and content root, **skipping** any path that matches a `preserve` glob
+//!    and already exists on disk — this protects user-authored content such
+//!    as `USER.md` or `journal/**` from being clobbered on update.
+//! 3. **Record**: for a framework, `<data_dir>/framework.json` is
+//!    (over)written with the manifest's identity + version.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Cursor, Read, Seek};
 use std::path::{Path, PathBuf};
@@ -26,11 +40,15 @@ use std::time::Instant;
 use serde::Serialize;
 use tauri::{AppHandle, State};
 
+use crate::package_manifest::{
+    self, cleanup_before_merge, installed_from_manifest, write_installed_framework, Cleanup,
+    GlobSet, MergeRoots,
+};
 use crate::AppState;
 
 /// Where a package's non-prompt content should be written.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum PackageKind {
+pub(crate) enum PackageKind {
     /// Merge into the agent sandbox root (`agent_data/`).
     Framework,
     /// Merge into `agent_data/special/`.
@@ -38,7 +56,7 @@ enum PackageKind {
 }
 
 impl PackageKind {
-    fn parse(raw: &str) -> Result<Self, String> {
+    pub(crate) fn parse(raw: &str) -> Result<Self, String> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "framework" => Ok(PackageKind::Framework),
             "specialisation" | "specialization" => Ok(PackageKind::Specialisation),
@@ -49,7 +67,7 @@ impl PackageKind {
         }
     }
 
-    fn as_str(&self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             PackageKind::Framework => "framework",
             PackageKind::Specialisation => "specialisation",
@@ -62,19 +80,34 @@ impl PackageKind {
 pub struct ImportResult {
     /// Which kind was imported (`"framework"` / `"specialisation"`).
     pub kind: String,
+    /// Manifest identity of the imported package.
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub version: String,
     /// Number of files copied to `prompts/`.
     pub prompts_files: usize,
     /// Number of files copied into the agent area (sandbox root for
     /// frameworks, `special/` for specialisations).
     pub agent_files: usize,
-    /// Optional human-readable note (e.g., "no prompts/ folder found").
+    /// Number of existing files left untouched because a `preserve` glob
+    /// matched them (user content protected from overwrite).
+    pub preserved: usize,
+    /// Files deleted by explicit `remove` globs.
+    pub removed: usize,
+    /// Files deleted by `owned_files` pruning (owned + absent from new ZIP).
+    pub pruned: usize,
+    /// Whether this import was an update (same framework id already
+    /// installed) or a fresh install.
+    pub updated: bool,
+    /// Optional human-readable note.
     pub note: Option<String>,
 }
 
 /// Tauri command: import a package from a ZIP file path.
 ///
 /// `kind` must be `"framework"` or `"specialisation"`. See the module
-/// docs for the destination rules of each.
+/// docs for the destination rules and merge semantics of each.
 ///
 /// On Android the file picker returns a `content://` URI rather than a
 /// filesystem path. Such URIs are fully read into memory through the
@@ -100,83 +133,153 @@ pub async fn import_package(
 
     let prompts_root = state.data_dir.join("prompts");
     let agent_root = state.agent_dir.clone();
-
-    // For specialisations, non-prompt content lands under `special/`.
-    let content_root = match pkg_kind {
-        PackageKind::Framework => agent_root.clone(),
-        PackageKind::Specialisation => agent_root.join("special"),
-    };
-
-    // The extraction and merging are synchronous, blocking I/O — run them
-    // on a blocking thread so we don't stall the async runtime.
-    let kind_str = pkg_kind.as_str().to_string();
-    // Use the app's own data directory as the temp base so we don't
-    // depend on /data/local/tmp being writable (it isn't on Android
-    // emulators and some devices).
+    let data_dir = state.data_dir.clone();
     let tmp_base = state.data_dir.join(".tmp");
 
-    let result = tauri::async_runtime::spawn_blocking(move || -> Result<ImportResult, String> {
-        let bt0 = Instant::now();
-
-        // Extract to a temp directory first so we can validate/inspect before
-        // mutating the user's data folders.
-        fs::create_dir_all(&tmp_base).ok();
-        let temp = tempfile::tempdir_in(&tmp_base)
-            .map_err(|e| format!("Failed to create temp dir: {}", e))?;
-        log::info!("[import] tempdir took {:.2}s", bt0.elapsed().as_secs_f64());
-
-        extract_zip(zip_input, temp.path()).map_err(|e| format!("Failed to extract ZIP: {}", e))?;
-        log::info!(
-            "[import] extract_zip took {:.2}s",
-            bt0.elapsed().as_secs_f64()
-        );
-
-        // Determine the "package root" — either the temp dir itself, or its
-        // sole sub-directory if the archive contains a single top-level folder
-        // (a common convention when zipping a project folder).
-        let pkg_root = resolve_package_root(temp.path());
-
-        // Look for a `prompts/` folder inside the package root. If it's absent
-        // we still import the remaining files, but flag it in the result so
-        // the UI can warn the user.
-        let prompts_src = pkg_root.join("prompts");
-        let mut prompts_files = 0usize;
-        let mut note: Option<String> = None;
-
-        if prompts_src.is_dir() {
-            prompts_files = merge_dir(&prompts_src, &prompts_root)
-                .map_err(|e| format!("Failed to copy prompts: {}", e))?;
-            log::info!(
-                "[import] merge prompts ({}) took {:.2}s",
-                prompts_files,
-                bt0.elapsed().as_secs_f64()
-            );
-        } else {
-            note = Some("No 'prompts/' folder found in package.".to_string());
-        }
-
-        // Merge everything else (except the prompts/ folder we already handled)
-        // into the content root.
-        let agent_files = merge_package_into(&pkg_root, &content_root, &prompts_src)
-            .map_err(|e| format!("Failed to copy agent files: {}", e))?;
-        log::info!(
-            "[import] merge agent files ({}) took {:.2}s",
-            agent_files,
-            bt0.elapsed().as_secs_f64()
-        );
-
-        Ok(ImportResult {
-            kind: kind_str,
-            prompts_files,
-            agent_files,
-            note,
-        })
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        import_from_zip_input(zip_input, pkg_kind, &data_dir, &agent_root, &prompts_root, &tmp_base)
     })
     .await
     .map_err(|e| format!("Import task failed: {}", e))?;
 
     log::info!("[import] total took {:.2}s", t0.elapsed().as_secs_f64());
     result
+}
+
+/// Core import pipeline, run on a blocking thread. Shared by the
+/// [`import_package`] command (file picker) and the framework updater
+/// (downloaded bytes). Extracts the ZIP to a temp dir, parses the mandatory
+/// manifest, runs cleanup (`remove` + `owned_files` pruning on update), merges
+/// with `preserve` honoured, and writes the installed-framework record for
+/// frameworks.
+///
+/// `prompts_root` = `<data_dir>/prompts`, `agent_root` = `<data_dir>/agent_data`,
+/// `tmp_base` = a temp dir (the app's `.tmp`).
+pub(crate) fn import_from_zip_input<R: Read + Seek + Send + 'static>(
+    zip_input: R,
+    pkg_kind: PackageKind,
+    data_dir: &Path,
+    agent_root: &Path,
+    prompts_root: &Path,
+    tmp_base: &Path,
+) -> Result<ImportResult, String> {
+    let bt0 = Instant::now();
+
+    // For specialisations, non-prompt content lands under `special/`.
+    let content_root = match pkg_kind {
+        PackageKind::Framework => agent_root.to_path_buf(),
+        PackageKind::Specialisation => agent_root.join("special"),
+    };
+    let kind_str = pkg_kind.as_str().to_string();
+    let is_framework = pkg_kind == PackageKind::Framework;
+
+    // Extract to a temp directory first so we can validate/inspect before
+    // mutating the user's data folders.
+    fs::create_dir_all(tmp_base).ok();
+    let temp = tempfile::tempdir_in(tmp_base)
+        .map_err(|e| format!("Failed to create temp dir: {}", e))?;
+    log::info!("[import] tempdir took {:.2}s", bt0.elapsed().as_secs_f64());
+
+    extract_zip(zip_input, temp.path()).map_err(|e| format!("Failed to extract ZIP: {}", e))?;
+    log::info!(
+        "[import] extract_zip took {:.2}s",
+        bt0.elapsed().as_secs_f64()
+    );
+
+    // Determine the "package root" — either the temp dir itself, or its
+    // sole sub-directory if the archive contains a single top-level folder
+    // (a common convention when zipping a project folder).
+    let pkg_root = resolve_package_root(temp.path());
+
+    // The manifest is mandatory.
+    let manifest = package_manifest::Manifest::from_pkg_root(&pkg_root)?;
+    // Gate on min_app_version when knowable. The crate version is the
+    // running app version.
+    let app_version = env!("CARGO_PKG_VERSION");
+    if manifest.rejects_app_version(app_version) {
+        return Err(format!(
+            "This package requires app version {} or newer (you are running {}). \
+             Please update the app before importing.",
+            manifest.min_app_version.as_deref().unwrap_or("?"),
+            app_version
+        ));
+    }
+
+    let prompts_src = pkg_root.join("prompts");
+    let mut note: Option<String> = None;
+    if !prompts_src.is_dir() {
+        note = Some("No 'prompts/' folder found in package.".to_string());
+    }
+
+    // Detect update vs fresh install (frameworks only — they carry the
+    // installed record). An update is one with the same manifest id
+    // already present.
+    let installed = package_manifest::read_installed_framework(data_dir);
+    let is_update = is_framework
+        && installed.as_ref().map(|i| i.id == manifest.id).unwrap_or(false);
+
+    // Pre-merge cleanup: apply `remove` globs always, and `owned_files`
+    // pruning on a same-id update.
+    let new_zip_rels = enumerate_package_rels(&pkg_root);
+    let roots = MergeRoots {
+        prompts_root,
+        content_root: &content_root,
+    };
+    let Cleanup { removed, pruned } =
+        cleanup_before_merge(&roots, &manifest, is_update, &new_zip_rels);
+    log::info!(
+        "[import] cleanup: removed={}, pruned={}",
+        removed,
+        pruned
+    );
+
+    // Merge with `preserve` honoured. `preserve` globs are package-root
+    // relative, so we match against the same forward-slash rels.
+    let preserve = GlobSet::new(&manifest.preserve);
+    let mut preserved = 0usize;
+
+    let prompts_files = if prompts_src.is_dir() {
+        let (n, p) =
+            merge_dir(&prompts_src, prompts_root, "prompts/", &preserve)
+                .map_err(|e| format!("Failed to copy prompts: {}", e))?;
+        preserved += p;
+        n
+    } else {
+        0
+    };
+    let agent_files = {
+        let (n, p) = merge_package_into(&pkg_root, &content_root, &prompts_src, &preserve)
+            .map_err(|e| format!("Failed to copy agent files: {}", e))?;
+        preserved += p;
+        n
+    };
+
+    log::info!(
+        "[import] merge: prompts={}, agent={}, preserved={}",
+        prompts_files,
+        agent_files,
+        preserved
+    );
+
+    // Record the installed framework (frameworks only).
+    if is_framework {
+        write_installed_framework(data_dir, &installed_from_manifest(&manifest))?;
+    }
+
+    Ok(ImportResult {
+        kind: kind_str,
+        id: manifest.id,
+        name: manifest.name,
+        description: manifest.description,
+        version: manifest.version,
+        prompts_files,
+        agent_files,
+        preserved,
+        removed,
+        pruned,
+        updated: is_update,
+        note,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -329,38 +432,65 @@ fn resolve_package_root(dir: &Path) -> PathBuf {
 }
 
 /// Recursively merge `src` into `dest`, overwriting files that already
-/// exist. Returns the number of files copied.
-fn merge_dir(src: &Path, dest: &Path) -> io::Result<usize> {
+/// exist **unless** they match a `preserve` glob. `rel_prefix` is the
+/// package-root-relative prefix of the current directory (e.g. `"prompts/"`
+/// or `"journal/"`); a file's full rel for glob matching is
+/// `rel_prefix + file_name`. Returns `(files_copied, files_preserved)`.
+fn merge_dir(
+    src: &Path,
+    dest: &Path,
+    rel_prefix: &str,
+    preserve: &GlobSet,
+) -> io::Result<(usize, usize)> {
     if !src.is_dir() {
-        return Ok(0);
+        return Ok((0, 0));
     }
     fs::create_dir_all(dest)?;
-    let mut count = 0usize;
+    let mut copied = 0usize;
+    let mut preserved = 0usize;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let from = entry.path();
         let to = dest.join(entry.file_name());
+        let name = entry.file_name().to_string_lossy().to_string();
         let meta = entry.file_type()?;
         if meta.is_dir() {
-            count += merge_dir(&from, &to)?;
+            let child_prefix = format!("{rel_prefix}{name}/");
+            let (c, p) = merge_dir(&from, &to, &child_prefix, preserve)?;
+            copied += c;
+            preserved += p;
         } else if meta.is_file() {
             if let Some(parent) = to.parent() {
                 fs::create_dir_all(parent)?;
             }
+            // Preserve: if the file already exists on disk AND matches a
+            // preserve glob, leave it untouched.
+            let rel = format!("{rel_prefix}{name}");
+            if to.exists() && !preserve.is_empty() && preserve.matches(&rel) {
+                preserved += 1;
+                continue;
+            }
             fs::copy(&from, &to)?;
-            count += 1;
+            copied += 1;
         }
         // Symlinks are ignored — we don't follow them across the trust
         // boundary represented by an imported archive.
     }
-    Ok(count)
+    Ok((copied, preserved))
 }
 
 /// Merge the package root into `dest`, skipping the `prompts/` folder
-/// (which has already been merged into the prompts dir).
-fn merge_package_into(pkg_root: &Path, dest: &Path, prompts_src: &Path) -> io::Result<usize> {
+/// (which has already been merged into the prompts dir). Returns
+/// `(files_copied, files_preserved)`.
+fn merge_package_into(
+    pkg_root: &Path,
+    dest: &Path,
+    prompts_src: &Path,
+    preserve: &GlobSet,
+) -> io::Result<(usize, usize)> {
     fs::create_dir_all(dest)?;
-    let mut count = 0usize;
+    let mut copied = 0usize;
+    let mut preserved = 0usize;
     for entry in fs::read_dir(pkg_root)? {
         let entry = entry?;
         let from = entry.path();
@@ -371,16 +501,64 @@ fn merge_package_into(pkg_root: &Path, dest: &Path, prompts_src: &Path) -> io::R
         }
 
         let to = dest.join(entry.file_name());
+        let name = entry.file_name().to_string_lossy().to_string();
         let meta = entry.file_type()?;
         if meta.is_dir() {
-            count += merge_dir(&from, &to)?;
+            // Recurse with a package-root-relative prefix built from this
+            // entry's name, so preserve globs match against e.g.
+            // `journal/...`.
+            let rel_prefix = format!("{name}/");
+            let (c, p) = merge_dir(&from, &to, &rel_prefix, preserve)?;
+            copied += c;
+            preserved += p;
         } else if meta.is_file() {
             if let Some(parent) = to.parent() {
                 fs::create_dir_all(parent)?;
             }
+            if to.exists() && !preserve.is_empty() && preserve.matches(&name) {
+                preserved += 1;
+                continue;
+            }
             fs::copy(&from, &to)?;
-            count += 1;
+            copied += 1;
         }
     }
-    Ok(count)
+    Ok((copied, preserved))
+}
+
+/// Enumerate every file under `pkg_root` as a set of package-root-relative
+/// forward-slash paths (e.g. `prompts/a.md`, `rules/r1.md`,
+/// `manifest.json`). Used to decide which owned files are absent from the
+/// incoming ZIP during the pruning pass.
+fn enumerate_package_rels(pkg_root: &Path) -> HashSet<String> {
+    let mut set = HashSet::new();
+    collect_rels(pkg_root, pkg_root, &mut set);
+    set
+}
+
+/// Recursive helper for [`enumerate_package_rels`].
+fn collect_rels(base: &Path, dir: &Path, out: &mut HashSet<String>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let meta = match entry.file_type() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.is_dir() {
+            collect_rels(base, &path, out);
+        } else if meta.is_file() {
+            if let Ok(rel) = path.strip_prefix(base) {
+                let fwd: String = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                out.insert(fwd);
+            }
+        }
+    }
 }
