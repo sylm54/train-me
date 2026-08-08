@@ -9,38 +9,11 @@ permissions:
   contents: write
 
 jobs:
-  # Derive the release tag from package.json's `version` and short-circuit
-  # when a release for that version already exists. This is what makes the
-  # release "automatic": every push to master produces a draft release tagged
-  # `v<version>` (e.g. v0.8.2) without anyone cutting a tag by hand. Bump the
-  # version in package.json (+ src-tauri/tauri.conf.json) to cut a new release.
-  meta:
-    runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.derive.outputs.tag }}
-      skip: ${{ steps.derive.outputs.skip }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Derive tag from package.json
-        id: derive
-        run: |
-          set -euo pipefail
-          VERSION=$(jq -r '.version' package.json)
-          TAG="v${VERSION}"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          if git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
-            echo "Tag ${TAG} already exists — nothing new to release."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
-
+  # Triggered by a `v*` tag push. The tag name (e.g. `v0.9.0`) is the release
+  # version and is available as `github.ref_name`. To cut a release, bump the
+  # version in package.json (+ src-tauri/tauri.conf.json, Cargo.toml, Cargo.lock),
+  # commit, tag `v<version>`, and push the tag.
   build-windows:
-    needs: meta
-    if: needs.meta.outputs.skip != 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -64,16 +37,14 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ needs.meta.outputs.tag }}
-          releaseName: "train-me ${{ needs.meta.outputs.tag }}"
+          tagName: ${{ github.ref_name }}
+          releaseName: "train-me ${{ github.ref_name }}"
           releaseBody: "See the assets below to download and install this version."
           releaseDraft: true
           prerelease: false
           args: "--bundles msi"
 
   build-android:
-    needs: meta
-    if: needs.meta.outputs.skip != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -139,14 +110,14 @@ jobs:
             --ks-key-alias "${{ secrets.ANDROID_KEY_ALIAS }}" \
             --ks-pass "pass:${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" \
             --key-pass "pass:${{ secrets.ANDROID_KEY_PASSWORD }}" \
-            --out train-me-${{ needs.meta.outputs.tag }}-arm64-v8a.apk \
+            --out train-me-${{ github.ref_name }}-arm64-v8a.apk \
             aligned.apk
 
       - name: Upload APK to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.meta.outputs.tag }}
+          tag_name: ${{ github.ref_name }}
           draft: false
-          files: train-me-${{ needs.meta.outputs.tag }}-arm64-v8a.apk
+          files: train-me-${{ github.ref_name }}-arm64-v8a.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
