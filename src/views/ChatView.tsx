@@ -126,6 +126,14 @@ import {
   PromptInputSubmit,
   PromptInputTextarea,
 } from "@/components/ai-elements/prompt-input";
+import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  cancelQuestion,
+  respondToQuestion,
+  usePendingQuestions,
+  type PendingQuestion,
+} from "@/lib/ask-question";
 
 interface ChatViewProps {
   /** The id of the currently-active chat, owned by App. */
@@ -608,6 +616,11 @@ function ChatViewInner({
         </ConversationContent>
         <ConversationScrollButton />
       </Conversation>
+
+      {/* ── Pending agent questions (ask_question tool) ───────── */}
+      {/* Rendered above the composer so a blocking question is impossible */}
+      {/* to miss while the tool call awaits the user's answer.           */}
+      <PendingQuestions />
 
       {/* ── Input ──────────────────────────────────────────────── */}
       <PromptInput
@@ -1618,6 +1631,8 @@ function summarizeToolPart(part: UIMessage["parts"][number]): {
     }
     case "invoke_planner":
       return { label: "Planning" };
+    case "ask_question":
+      return { label: "Asked a question" };
     default:
       return { label: name };
   }
@@ -1641,4 +1656,122 @@ function getToolStatus(
     default:
       return "idle";
   }
+}
+
+/**
+ * Renders any questions the agent is currently blocking on (from the
+ * `ask_question` tool). Shown directly above the composer. Empty when there
+ * are none.
+ */
+function PendingQuestions() {
+  const questions = usePendingQuestions();
+  if (questions.length === 0) return null;
+  return (
+    <div className="flex flex-col gap-2 border-t border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2">
+      {questions.map((q) => (
+        <QuestionCard key={q.id} q={q} />
+      ))}
+    </div>
+  );
+}
+
+/**
+ * One pending question. Renders the prompt plus an input appropriate to the
+ * type: a textarea + send for "open", a vertical list of buttons for "choice",
+ * and a 1–10 button row for "rating". The ✕ dismisses (cancels) the question.
+ */
+function QuestionCard({ q }: { q: PendingQuestion }) {
+  const [text, setText] = useState("");
+
+  const submitOpen = () => {
+    const value = text.trim();
+    if (!value) return;
+    respondToQuestion(q.id, value);
+  };
+
+  return (
+    <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] p-3 shadow-sm">
+      <div className="flex items-start justify-between gap-2">
+        <p className="text-sm whitespace-pre-wrap text-[var(--color-foreground)]">
+          {q.prompt}
+        </p>
+        <Button
+          variant="ghost"
+          size="icon-xs"
+          onClick={() => cancelQuestion(q.id)}
+          aria-label="Dismiss question"
+          title="Dismiss"
+        >
+          <X size={14} />
+        </Button>
+      </div>
+
+      {q.hint && (
+        <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
+          {q.hint}
+        </p>
+      )}
+
+      {q.type === "open" && (
+        <div className="mt-2 flex items-end gap-2">
+          <Textarea
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={(e) => {
+              // Enter submits; Shift+Enter inserts a newline (matches the
+              // main composer's convention).
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                submitOpen();
+              }
+            }}
+            placeholder="Type your answer… (Shift+Enter for newline)"
+            className="min-h-9 max-h-40 resize-none"
+            autoFocus
+          />
+          <Button size="sm" onClick={submitOpen} disabled={!text.trim()}>
+            Send
+          </Button>
+        </div>
+      )}
+
+      {q.type === "choice" && (
+        <div className="mt-2 flex flex-col gap-1">
+          {q.choices?.map((choice, i) => (
+            <Button
+              key={i}
+              variant="outline"
+              size="sm"
+              className="justify-start"
+              onClick={() => respondToQuestion(q.id, choice)}
+            >
+              {choice}
+            </Button>
+          ))}
+        </div>
+      )}
+
+      {q.type === "rating" && (
+        <div className="mt-2">
+          <div className="flex flex-wrap gap-1">
+            {Array.from({ length: 10 }, (_, i) => i + 1).map((n) => (
+              <Button
+                key={n}
+                variant="outline"
+                size="sm"
+                className="h-8 w-8 p-0"
+                onClick={() => respondToQuestion(q.id, n)}
+              >
+                {n}
+              </Button>
+            ))}
+          </div>
+          <div className="mt-1 flex justify-between text-[10px] text-[var(--color-muted-foreground)]">
+            <span>1 · low</span>
+            <span>10 · high</span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
