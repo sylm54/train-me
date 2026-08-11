@@ -41,6 +41,9 @@ mod validators;
 ///                    that the agent must not touch
 /// `model_dir`     = `<app_data>/model`
 /// `tracks_dir`    = `<app_data>/tracks`
+/// `staging_dir`   = `<app_data>/.tmp/staging` — persistent holding area for
+///                    a framework extracted but not yet installed (so the
+///                    options step can survive a settings round-trip)
 /// `bash`          = bashkit sandbox mounted over `agent_dir`
 /// `audio_base_url` = base URL of the in-process audio server
 ///                    (`http://127.0.0.1:<port>?t=<token>`), used by the
@@ -51,6 +54,7 @@ pub struct AppState {
     pub state_dir: PathBuf,
     pub model_dir: PathBuf,
     pub tracks_dir: PathBuf,
+    pub staging_dir: PathBuf,
     pub audio_base_url: String,
     pub renderer: Arc<Mutex<Option<audio_renderer::AudioRenderer>>>,
     pub bash: Arc<bash::BashSandbox>,
@@ -427,45 +431,14 @@ async fn check_framework_update(
     .map_err(|e| format!("Update check failed: {}", e))?
 }
 
-/// Download and install a framework from its update channel. Fetches the
-/// index at `url`, downloads + verifies (sha256) the ZIP, and runs the
-/// manifest-aware import pipeline. Emits `framework-download-progress`
-/// events with `{ downloaded, total }` as bytes arrive (throttled to ~5 Hz
-/// on the emit side by the UI, not here).
+/// Fetch (but do not install) the framework index at `url`. Used by the
+/// onboarding gallery to show a framework's name + description before the
+/// user picks it. Runs the blocking HTTP fetch on a blocking thread.
 #[tauri::command]
-async fn download_and_install_framework(
-    url: String,
-    state: State<'_, AppState>,
-    app: tauri::AppHandle,
-) -> Result<package_import::ImportResult, String> {
-    let data_dir = state.data_dir.clone();
-    let agent_root = state.agent_dir.clone();
-    let prompts_root = state.data_dir.join("prompts");
-    let tmp_base = state.data_dir.join(".tmp");
-
-    tauri::async_runtime::spawn_blocking(move || -> Result<package_import::ImportResult, String> {
-        // 1. Fetch + parse the index.
-        let index = framework_updater::fetch_index(&url)?;
-
-        // 2. Download + verify + install, streaming progress to the UI.
-        let progress_app = app.clone();
-        let result = framework_updater::download_and_install(
-            &index,
-            &data_dir,
-            &agent_root,
-            &prompts_root,
-            &tmp_base,
-            |downloaded, total| {
-                let _ = progress_app.emit(
-                    "framework-download-progress",
-                    serde_json::json!({ "downloaded": downloaded, "total": total }),
-                );
-            },
-        )?;
-        Ok(result)
-    })
-    .await
-    .map_err(|e| format!("Install failed: {}", e))?
+async fn fetch_framework_index(url: String) -> Result<framework_updater::FrameworkIndex, String> {
+    tauri::async_runtime::spawn_blocking(move || framework_updater::fetch_index(&url))
+        .await
+        .map_err(|e| format!("Index fetch failed: {}", e))?
 }
 
 /// Result of a successful [`reset_app_data`] reset. Each flag names a
@@ -544,6 +517,10 @@ async fn reset_app_data(state: State<'_, AppState>) -> Result<ResetReport, Strin
             .map_err(|e| e.to_string())?;
     }
     report.activity = true;
+
+    // 7. Framework staging dir — discard anything staged (a half-set-up
+    //    framework shouldn't survive a full data wipe).
+    wipe_dir_contents(&state.staging_dir)?;
 
     Ok(report)
 }
@@ -1579,6 +1556,10 @@ pub fn run() {
             let state_dir = data_dir.join("state");
             let model_dir = data_dir.join("model");
             let tracks_dir = data_dir.join("tracks");
+            // Persistent staging area for a framework extracted but not yet
+            // installed (so the config-options step can survive a settings
+            // round-trip or app restart).
+            let staging_dir = data_dir.join(".tmp").join("staging");
 
             // Ensure they exist
             std::fs::create_dir_all(&data_dir).ok();
@@ -1586,6 +1567,7 @@ pub fn run() {
             std::fs::create_dir_all(&state_dir).ok();
             std::fs::create_dir_all(&model_dir).ok();
             std::fs::create_dir_all(&tracks_dir).ok();
+            std::fs::create_dir_all(&staging_dir).ok();
 
             // Ensure prompts/ exists (empty — no default prompts are
             // shipped; the user imports a framework during onboarding).
@@ -1655,6 +1637,7 @@ pub fn run() {
                 state_dir,
                 model_dir,
                 tracks_dir,
+                staging_dir,
                 audio_base_url,
                 renderer: Arc::new(Mutex::new(None)),
                 bash: Arc::new(bash_sandbox),
@@ -1698,11 +1681,15 @@ pub fn run() {
             // Onboarding: has a framework been imported?
             framework_installed,
             get_installed_framework,
-            // Package import
-            package_import::import_package,
-            // Framework update channel (URL download + install)
+            // Framework staging + install (stage → options → install)
+            package_import::stage_framework_from_file,
+            package_import::stage_framework_from_url,
+            package_import::get_staged_framework,
+            package_import::install_staged_framework,
+            package_import::discard_staged_framework,
+            // Framework update channel (version check against an index URL)
             check_framework_update,
-            download_and_install_framework,
+            fetch_framework_index,
             // App-data reset (preserves model/ + API keys)
             reset_app_data,
             // Cron computation for routine scheduling
@@ -1716,6 +1703,7 @@ pub fn run() {
             inventory::inventory_remove_item,
             inventory::inventory_list_wishlist,
             inventory::inventory_add_wishlist_item,
+            inventory::inventory_list_categories,
             inventory::inventory_update_wishlist_item,
             inventory::inventory_remove_wishlist_item,
             inventory::inventory_export_csv,

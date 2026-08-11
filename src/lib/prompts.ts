@@ -74,7 +74,7 @@ const featureEmbed = `
 ### 6. Journal (\`journal/*.md\`, \`journal/format.json\`)
 - The user may maintain personal journal entries in the \`.md\` files.
 - You may customize prompts and related settings by editing \`format.json\`.
-- Refer to \`example/format.json\` for the expected structure.
+- Refer to \`examples/format.json\` for the expected structure.
 
 ### 7. Voice Training (\`voice/*.md\`, \`voice/config.json\`)
 - Author training lessons as markdown files under \`voice/\` (one lesson per file). The filename stem is the lesson id (e.g. \`voice/pitch.md\` → id \`pitch\`).
