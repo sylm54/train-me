@@ -4,9 +4,11 @@
  * followed by a markdown body.
  *
  * Two tabs:
- *  - Schedule: a weekly strip + the selected day's routines in time order,
- *    plus an "Other schedules" section for routines that don't map to a
- *    fixed weekday (day-of-month, every-N-days, unparseable, or none).
+ *  - Schedule: a weekly strip + the selected day's routines in time order.
+ *    A routine that fires more than once a day (e.g. `0 8,20 * * *`) is shown
+ *    as one row per firing time. Routines that don't map to a fixed weekday
+ *    (day-of-month, every-N-days, unparseable, or none) go under
+ *    "Other schedules" so nothing is hidden.
  *  - All routines: every routine as a full card.
  */
 
@@ -40,7 +42,13 @@ import {
   relativeTime,
   type TrackStat,
 } from "@/lib/activity";
-import { formatTime, parseSchedule, type ParsedSchedule } from "@/lib/cron";
+import {
+  formatTime,
+  parseSchedule,
+  type DayOfWeek,
+  type ParsedSchedule,
+  type ScheduleInstance,
+} from "@/lib/cron";
 
 // ─── Types ──────────────────────────────────────────────────────────────
 
@@ -59,6 +67,16 @@ interface Routine {
   body: string | null;
   /** Per-file load error */
   loadError: string | null;
+}
+
+/**
+ * A single firing of a routine on the day grid. A routine with multiple daily
+ * times expands into several rows; each carries its routine so the Done button
+ * and stats stay keyed to the routine id.
+ */
+interface RoutineSlot {
+  routine: Routine;
+  instance: ScheduleInstance;
 }
 
 type Tab = "schedule" | "all";
@@ -142,6 +160,21 @@ const MONTHS = [
   "November",
   "December",
 ];
+
+/** Sort slots by time of day; untimed slots sort last, alphabetically. */
+function sortSlots(slots: RoutineSlot[]): RoutineSlot[] {
+  return [...slots].sort((a, b) => {
+    const ta = a.instance.time;
+    const tb = b.instance.time;
+    if (ta && tb) {
+      if (ta.hour !== tb.hour) return ta.hour - tb.hour;
+      return ta.minute - tb.minute;
+    }
+    if (ta) return -1;
+    if (tb) return 1;
+    return a.routine.displayName.localeCompare(b.routine.displayName);
+  });
+}
 
 // ─── Component ──────────────────────────────────────────────────────────
 
@@ -419,15 +452,28 @@ function ScheduleView({
     return d;
   }, []);
 
-  // Split routines into weekly (grid-eligible) vs. other.
-  const { weekly, other } = useMemo(() => {
-    const weekly: Routine[] = [];
+  // Split routines into weekly (grid-eligible) vs. other. A weekly routine
+  // expands into one slot per firing time, so a twice-daily routine produces
+  // two rows on each of its days.
+  const { slots, other } = useMemo(() => {
+    const slots: RoutineSlot[] = [];
     const other: Routine[] = [];
     for (const r of routines) {
-      if (r.parsed && r.parsed.weekly && r.parsed.daysOfWeek) weekly.push(r);
-      else other.push(r);
+      const parsed = r.parsed;
+      if (parsed && parsed.weekly && parsed.instances.length > 0) {
+        for (const instance of parsed.instances) {
+          if (instance.daysOfWeek && instance.daysOfWeek.length > 0) {
+            slots.push({ routine: r, instance });
+          } else {
+            other.push(r);
+            break;
+          }
+        }
+      } else {
+        other.push(r);
+      }
     }
-    return { weekly, other };
+    return { slots, other };
   }, [routines]);
 
   const weekStart = useMemo(() => startOfWeek(selectedDate), [selectedDate]);
@@ -436,31 +482,21 @@ function ScheduleView({
     [weekStart],
   );
 
-  // Map weekday (cron 0=Sun..6=Sat) → routines running that day, time-sorted.
+  // Map weekday (cron 0=Sun..6=Sat) → time-sorted slots running that day.
   const byWeekday = useMemo(() => {
-    const map = new Map<number, Routine[]>();
-    for (let i = 0; i < 7; i++) map.set(i, []);
-    for (const r of weekly) {
-      for (const dow of r.parsed!.daysOfWeek!) map.get(dow)!.push(r);
+    const map = new Map<DayOfWeek, RoutineSlot[]>();
+    for (let i = 0; i < 7; i++) map.set(i as DayOfWeek, []);
+    for (const slot of slots) {
+      for (const dow of slot.instance.daysOfWeek!) {
+        map.get(dow)!.push(slot);
+      }
     }
-    for (const list of map.values()) {
-      list.sort((a, b) => {
-        const ta = a.parsed!.time;
-        const tb = b.parsed!.time;
-        if (ta && tb) {
-          if (ta.hour !== tb.hour) return ta.hour - tb.hour;
-          return ta.minute - tb.minute;
-        }
-        if (ta) return -1;
-        if (tb) return 1;
-        return a.displayName.localeCompare(b.displayName);
-      });
-    }
+    for (const [dow, list] of map) map.set(dow, sortSlots(list));
     return map;
-  }, [weekly]);
+  }, [slots]);
 
   const selectedWeekday = selectedDate.getDay(); // 0=Sun..6=Sat
-  const dayRoutines = byWeekday.get(selectedWeekday) ?? [];
+  const daySlots = byWeekday.get(selectedWeekday as DayOfWeek) ?? [];
 
   const monthLabel = `${MONTHS[weekStart.getMonth()]} ${weekStart.getFullYear()}`;
 
@@ -494,7 +530,7 @@ function ScheduleView({
         <div className="grid grid-cols-7">
           {weekDays.map((day, i) => {
             const dow = day.getDay(); // 0=Sun..6=Sat
-            const hasRoutines = (byWeekday.get(dow)?.length ?? 0) > 0;
+            const hasRoutines = (byWeekday.get(dow as DayOfWeek)?.length ?? 0) > 0;
             const isToday = isSameDay(day, today);
             const isSelected = isSameDay(day, selectedDate);
             return (
@@ -551,13 +587,13 @@ function ScheduleView({
             </span>
           </h2>
           <span className="text-xs text-[var(--color-muted-foreground)]">
-            {dayRoutines.length === 0
+            {daySlots.length === 0
               ? "No routines"
-              : `${dayRoutines.length} ${dayRoutines.length === 1 ? "routine" : "routines"}`}
+              : `${daySlots.length} ${daySlots.length === 1 ? "slot" : "slots"}`}
           </span>
         </div>
 
-        {dayRoutines.length === 0 && (
+        {daySlots.length === 0 && (
           <div className="flex flex-col items-center text-center py-10 px-6 border border-dashed border-[var(--color-border)] rounded-lg">
             <p className="text-sm text-[var(--color-muted-foreground)]">
               Nothing scheduled this day.
@@ -566,12 +602,13 @@ function ScheduleView({
         )}
 
         <div className="space-y-3">
-          {dayRoutines.map((routine) => (
+          {daySlots.map((slot, i) => (
             <DayRoutineCard
-              key={routine.path}
-              routine={routine}
-              stats={stats.get(routine.id) ?? null}
-              onDone={() => void onDone(routine)}
+              key={`${slot.routine.path}-${i}`}
+              routine={slot.routine}
+              time={slot.instance.time}
+              stats={stats.get(slot.routine.id) ?? null}
+              onDone={() => void onDone(slot.routine)}
             />
           ))}
         </div>
@@ -603,34 +640,39 @@ function ScheduleView({
 
 interface DayRoutineCardProps {
   routine: Routine;
+  /** Firing time for this slot, or null if the schedule has no fixed time. */
+  time: { hour: number; minute: number } | null;
   stats: TrackStat | null;
   onDone: () => void;
 }
 
-function DayRoutineCard({ routine, stats, onDone }: DayRoutineCardProps) {
+function DayRoutineCard({ routine, time, stats, onDone }: DayRoutineCardProps) {
   const bodyReady = routine.body !== null;
   const bodyError = routine.loadError !== null;
-  const time = routine.parsed?.time ?? null;
+
+  // Split formatted time into a coarse label ("8 AM" / "8:30 AM") and a
+  // period ("AM"/"PM") for the time rail.
+  const timeLabel = time
+    ? formatTime(time.hour, time.minute).replace(":00", "")
+    : null;
+  const period = time ? (time.hour >= 12 ? "PM" : "AM") : null;
 
   return (
     <article className="border border-[var(--color-pink-200)] rounded-lg bg-[var(--color-surface)] overflow-hidden">
       <div className="flex items-stretch">
         {/* Time rail */}
         <div className="flex flex-col items-center justify-center px-3 py-3 bg-[var(--color-pink-50)] border-r border-[var(--color-border)] min-w-[4.5rem]">
-          {time ? (
+          {timeLabel && period ? (
             <>
               <span className="text-sm font-semibold tabular-nums text-[var(--color-pink-700)] leading-none">
-                {formatTime(time.hour, time.minute).replace(/:00/, "")}
+                {timeLabel}
               </span>
               <span className="text-[10px] font-medium text-[var(--color-muted-foreground)] mt-1">
-                {time.hour >= 12 ? "PM" : "AM"}
+                {period}
               </span>
             </>
           ) : (
-            <Clock
-              size={16}
-              className="text-[var(--color-muted-foreground)]"
-            />
+            <Clock size={16} className="text-[var(--color-muted-foreground)]" />
           )}
         </div>
 
