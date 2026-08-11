@@ -3,11 +3,15 @@
  *
  * Routines are scheduled with standard cron expressions in YAML frontmatter,
  * e.g. `schedule: 30 2 * * 2-4`. This module turns those into structured data
- * (which days, what time) for the Schedule view and into a readable label for
+ * (which days, what times) for the Schedule view and into a readable label for
  * the routine card.
  *
+ * A schedule resolves to one or more "instances" — each instance is a distinct
+ * time-of-day together with the weekdays it fires on. A twice-daily routine
+ * (e.g. `0 8,20 * * *`) produces two instances, so the day grid shows two rows.
+ *
  * Supports: asterisk, comma-lists (`1,3,5`), ranges (`2-4`), steps
- * (asterisk-slash-2, `1-5/2`), `@daily`/`@weekly`/etc. shorthands, and both
+ * (asterisk-slash-N, `1-5/2`), `@daily`/`@weekly`/etc. shorthands, and both
  * 5-field and 6-field (with seconds) expressions. Falls back to the raw
  * expression when it cannot be understood.
  */
@@ -17,22 +21,38 @@
 /** Days of week, 0 = Sunday … 6 = Saturday (cron convention). */
 export type DayOfWeek = 0 | 1 | 2 | 3 | 4 | 5 | 6;
 
+export interface TimeOfDay {
+  hour: number; // 0-23
+  minute: number; // 0-59
+}
+
+/**
+ * One firing time of a schedule. A schedule that triggers at multiple
+ * times of day (e.g. `0 8,20 * * *`) yields one instance per time.
+ */
+export interface ScheduleInstance {
+  /** Time of day, or null if the schedule has no fixed minute/hour. */
+  time: TimeOfDay | null;
+  /**
+   * Weekdays this instance fires on (0-6, deduped, sorted). Null when the
+   * schedule is not a simple weekly pattern (e.g. day-of-month).
+   */
+  daysOfWeek: DayOfWeek[] | null;
+  /** Human label for this instance, e.g. "Tue–Thu at 9:00 AM". */
+  human: string;
+}
+
 export interface ParsedSchedule {
   /** The original schedule string, verbatim. */
   raw: string;
-  /** Human-readable summary, e.g. "Tue–Thu at 9:00 AM". */
+  /** Top-level human-readable summary. */
   human: string;
-  /** Time of day as { hour: 0-23, minute: 0-59 }, or null if not a single fixed time. */
-  time: { hour: number; minute: number } | null;
+  /** One entry per distinct firing pattern the schedule resolves to. */
+  instances: ScheduleInstance[];
   /**
-   * Expanded set of weekdays the schedule fires on (0-6, deduped, sorted), or
-   * null when the schedule is not a simple weekly pattern (e.g. day-of-month).
-   */
-  daysOfWeek: DayOfWeek[] | null;
-  /**
-   * True when this schedule maps cleanly onto the weekly day grid: a fixed time
-   * and a DOW-only pattern (possibly `*`, meaning every day). DOM/month/step
-   * patterns set this false so the Schedule view can group them separately.
+   * True when every instance maps cleanly onto the weekly day grid (DOW-only).
+   * Day-of-month / every-N-days / unparseable schedules set this false so the
+   * Schedule view can group them under "Other schedules".
    */
   weekly: boolean;
 }
@@ -61,6 +81,9 @@ const NAMED_SCHEDULES: Record<string, string> = {
   "@hourly": "0 * * * *",
 };
 
+/** Above this many distinct times, treat as a frequency (e.g. "every 15 min"). */
+const MAX_DISCRETE_TIMES = 8;
+
 // ─── Field parsing ──────────────────────────────────────────────────────
 
 /** Bounds for each cron field. DOW uses 0-7 (both 0 and 7 mean Sunday). */
@@ -76,8 +99,8 @@ type FieldName = keyof typeof FIELD_BOUNDS;
 
 /**
  * Expand a single cron field into the set of integers it matches.
- * Supports asterisk, comma-lists (`1,3,5`), ranges (`2-4`), and steps
- * (asterisk-slash-2, `1-5/2`). Returns null when the field cannot be parsed.
+ * Supports asterisk, comma-lists, ranges, and steps. Returns null when the
+ * field cannot be parsed.
  */
 function expandField(field: string, name: FieldName): number[] | null {
   const bounds = FIELD_BOUNDS[name];
@@ -118,6 +141,8 @@ function expandField(field: string, name: FieldName): number[] | null {
   return out.size ? [...out].sort((a, b) => a - b) : null;
 }
 
+// ─── Formatting helpers ─────────────────────────────────────────────────
+
 /** Convert 24h hour + minute into "h:mm AM/PM". */
 export function formatTime(hour: number, minute: number): string {
   const period = hour >= 12 ? "PM" : "AM";
@@ -151,12 +176,9 @@ function ordinal(n: number): string {
 /** Humanize a list of weekdays (0-6). */
 function summarizeDays(days: DayOfWeek[]): string {
   if (days.length === 7) return "Daily";
-  // Weekdays Mon–Fri
   const isWeekdays =
-    days.length === 5 &&
-    [1, 2, 3, 4, 5].every((d) => days.includes(d as DayOfWeek));
+    days.length === 5 && [1, 2, 3, 4, 5].every((d) => days.includes(d as DayOfWeek));
   if (isWeekdays) return "Weekdays";
-  // Weekends Sat+Sun
   if (days.length === 2 && days.includes(0) && days.includes(6))
     return "Weekends";
 
@@ -196,9 +218,40 @@ function summarizeDom(domStr: string, days: number[]): string {
   return `Monthly on the ${days.map(ordinal).join(", ")}`;
 }
 
+/** Build a readable list of clock times, e.g. "8:00 AM & 8:00 PM". */
+function joinTimes(times: TimeOfDay[]): string {
+  const labels = times.map((t) => formatTime(t.hour, t.minute));
+  if (labels.length === 1) return labels[0];
+  return (
+    labels.slice(0, -1).join(", ") + " & " + labels[labels.length - 1]
+  );
+}
+
+/**
+ * For schedules with too many distinct times to list (e.g. every 15 minutes),
+ * produce a frequency label from the raw minute/hour fields. Returns null when
+ * no clean label applies (caller falls back to the raw expression).
+ */
+function frequencyLabel(minuteStr: string, hourStr: string): string | null {
+  const mStep = /^\*\/(\d+)$/.exec(minuteStr);
+  if (mStep) {
+    const n = parseInt(mStep[1], 10);
+    return `Every ${n} min${n === 1 ? "" : "s"}`;
+  }
+  if (minuteStr === "0" && hourStr === "*") return "Hourly";
+  const hStep = /^\*\/(\d+)$/.exec(hourStr);
+  if (hStep) {
+    const n = parseInt(hStep[1], 10);
+    return `Every ${n} hour${n === 1 ? "" : "s"}`;
+  }
+  return null;
+}
+
 // ─── Public API ─────────────────────────────────────────────────────────
 
-export function parseSchedule(raw: string | null | undefined): ParsedSchedule | null {
+export function parseSchedule(
+  raw: string | null | undefined,
+): ParsedSchedule | null {
   if (!raw) return null;
   const trimmed = raw.trim();
   if (!trimmed) return null;
@@ -220,51 +273,73 @@ export function parseSchedule(raw: string | null | undefined): ParsedSchedule | 
   const hours = expandField(hourStr, "hour");
   if (minutes === null || hours === null) return fallback(raw);
 
-  // Fixed time only when both fields resolve to a single value.
-  const fixedTime =
-    minutes.length === 1 && hours.length === 1
-      ? { hour: hours[0], minute: minutes[0] }
-      : null;
-  const timeLabel = fixedTime ? formatTime(fixedTime.hour, fixedTime.minute) : null;
-
+  // Determine the day pattern.
   const domIsStar = domStr === "*";
   const monthIsStar = monthStr === "*";
 
-  // ── Weekly patterns: DOM and month are unrestricted ──
+  // Weekly: DOM and month unrestricted.
+  let days: DayOfWeek[] | null = null;
+  let domLabel: string | null = null;
+  let dayLabel: string | null = null;
+  let weekly = false;
+
   if (domIsStar && monthIsStar) {
     const dowExpanded = expandField(dowStr, "dow");
     if (dowExpanded === null) return fallback(raw);
-    const days = normalizeDow(dowExpanded);
-    const dayLabel = summarizeDays(days);
-    const human = timeLabel ? `${dayLabel} at ${timeLabel}` : dayLabel;
+    days = normalizeDow(dowExpanded);
+    dayLabel = summarizeDays(days);
+    weekly = true;
+  } else if (monthIsStar && !domIsStar && dowStr === "*") {
+    const domExpanded = expandField(domStr, "dom");
+    if (domExpanded === null) return fallback(raw);
+    domLabel = summarizeDom(domStr, domExpanded);
+  } else {
+    // Both DOM and DOW restricted, or month restricted — too ambiguous to map
+    // onto a grid. Surface as a raw schedule under "Other schedules".
+    return fallback(raw);
+  }
+
+  // Resolve distinct firing times.
+  const allTimes: TimeOfDay[] = [];
+  for (const h of hours) {
+    for (const m of minutes) allTimes.push({ hour: h, minute: m });
+  }
+  allTimes.sort((a, b) => a.hour - b.hour || a.minute - b.minute);
+
+  const prefix = dayLabel ?? domLabel ?? "";
+
+  // Too many times to list → collapse to a frequency label.
+  if (allTimes.length > MAX_DISCRETE_TIMES) {
+    const freq = frequencyLabel(minuteStr, hourStr);
+    if (!freq) return fallback(raw);
+    const human = prefix ? `${prefix} · ${freq}` : freq;
     return {
       raw,
       human,
-      time: fixedTime,
-      daysOfWeek: days,
-      weekly: true,
+      instances: [{ time: null, daysOfWeek: days, human }],
+      weekly,
     };
   }
 
-  // ── Day-of-month patterns (month unrestricted) ──
-  if (monthIsStar && !domIsStar) {
-    const domExpanded = expandField(domStr, "dom");
-    if (domExpanded !== null) {
-      const domLabel = summarizeDom(domStr, domExpanded);
-      const human = timeLabel ? `${domLabel} at ${timeLabel}` : domLabel;
-      return {
-        raw,
-        human,
-        time: fixedTime,
-        daysOfWeek: null,
-        weekly: false,
-      };
-    }
-  }
+  // Discrete times → one instance per time.
+  const instances: ScheduleInstance[] = allTimes.map((t) => ({
+    time: t,
+    daysOfWeek: days,
+    human: prefix ? `${prefix} at ${formatTime(t.hour, t.minute)}` : formatTime(t.hour, t.minute),
+  }));
 
-  return fallback(raw);
+  const human = prefix
+    ? `${prefix} at ${joinTimes(allTimes)}`
+    : joinTimes(allTimes);
+
+  return { raw, human, instances, weekly };
 }
 
 function fallback(raw: string): ParsedSchedule {
-  return { raw, human: raw, time: null, daysOfWeek: null, weekly: false };
+  return {
+    raw,
+    human: raw,
+    instances: [{ time: null, daysOfWeek: null, human: raw }],
+    weekly: false,
+  };
 }
