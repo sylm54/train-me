@@ -17,6 +17,7 @@ import { tool } from "ai";
 import { z } from "zod";
 import { invoke } from "@tauri-apps/api/core";
 import type { BashResult, FileEntry, EditResult } from "./types";
+import { poseQuestion } from "./ask-question";
 
 /** Log a tool result to the console for debugging. Best-effort. */
 function logTool(name: string, input: unknown, result: unknown) {
@@ -306,6 +307,77 @@ export const validateFilesTool = tool({
   },
 });
 
+/**
+ * Ask the user a question and wait for their answer. Use this when you need
+ * information, a decision, a preference, or feedback from the user before
+ * proceeding — prefer it over guessing when the user's intent, preference, or
+ * consent is unclear. The call blocks until the user answers or cancels.
+ *
+ * Three question types:
+ *   - "open"   → free-text answer.
+ *   - "choice" → pick exactly one option from `choices`.
+ *   - "rating" → a whole number from 1 (low) to 10 (high).
+ *
+ * The result is `{ ok: true, type, answer }` on an answer (answer is a string
+ * for "open"/"choice", a number for "rating"), or `{ ok: false, reason }` if
+ * the user cancelled or the generation was aborted.
+ */
+export const askQuestionTool = tool({
+  description:
+    "Ask the user a question and wait for their answer. Use this whenever " +
+    "you need information, a decision, a preference, or feedback before " +
+    "proceeding — prefer it over guessing when the user's intent, " +
+    "preference, or consent is unclear. The call blocks until the user " +
+    "answers or cancels. Three types: 'open' (a free-text answer), 'choice' " +
+    "(pick one option from `choices`), and 'rating' (a whole number 1–10, " +
+    "where 1 is low and 10 is high).",
+  inputSchema: z.object({
+    type: z
+      .enum(["open", "choice", "rating"])
+      .describe(
+        "Question type: 'open' (free text), 'choice' (pick one of " +
+          "`choices`), or 'rating' (a whole number 1–10).",
+      ),
+    question: z
+      .string()
+      .describe(
+        "The question to ask the user. Phrase it so they can answer directly.",
+      ),
+    choices: z
+      .array(z.string())
+      .optional()
+      .describe(
+        "Required for type 'choice': two or more options the user picks " +
+          "one from. Omit for 'open' and 'rating'.",
+      ),
+    hint: z
+      .string()
+      .optional()
+      .describe(
+        "Optional short hint shown to the user (e.g. an example answer or " +
+          "extra context).",
+      ),
+  }),
+  execute: async ({ type, question, choices, hint }, { abortSignal }) => {
+    // A 'choice' question is meaningless without options. Don't bother the
+    // user — bounce it straight back to the model so it can retry correctly.
+    if (type === "choice" && (!choices || choices.length < 2)) {
+      return {
+        ok: false as const,
+        reason:
+          "A 'choice' question needs at least two options in `choices`. " +
+          "Retry with `choices` provided, or use type 'open'.",
+      };
+    }
+    const result = await poseQuestion(
+      { type, prompt: question, choices, hint },
+      abortSignal,
+    );
+    logTool("ask_question", { type, question }, result);
+    return result;
+  },
+});
+
 /** Map of all tools available to the main agent. */
 export const MAIN_AGENT_TOOLS = {
   bash: bashTool,
@@ -314,4 +386,5 @@ export const MAIN_AGENT_TOOLS = {
   edit_file: editFileTool,
   list_files: listFilesTool,
   validate_files: validateFilesTool,
+  ask_question: askQuestionTool,
 } as const;
