@@ -117,6 +117,7 @@ function priorityBadgeTone(p: string | null): {
 export function InventoryView() {
   const [items, setItems] = useState<InventoryItem[]>([]);
   const [wishlist, setWishlist] = useState<WishlistItem[]>([]);
+  const [categories, setCategories] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -133,12 +134,14 @@ export function InventoryView() {
     setLoading(true);
     setError(null);
     try {
-      const [it, wl] = await Promise.all([
+      const [it, wl, cats] = await Promise.all([
         invoke<InventoryItem[]>("inventory_list_items"),
         invoke<WishlistItem[]>("inventory_list_wishlist"),
+        invoke<string[]>("inventory_list_categories"),
       ]);
       setItems(it);
       setWishlist(wl);
+      setCategories(cats);
     } catch (e) {
       setError(tauriErrorToString(e));
     } finally {
@@ -309,6 +312,14 @@ export function InventoryView() {
 
   return (
     <div className="flex-1 overflow-y-auto">
+      {/* Shared category autocomplete source: distinct categories already
+          used across items + wishlist, so the category inputs can suggest
+          them while still allowing free-text entry for new categories. */}
+      <datalist id="inventory-categories">
+        {categories.map((c) => (
+          <option key={c} value={c} />
+        ))}
+      </datalist>
       <div className="max-w-5xl mx-auto p-4 sm:p-6 space-y-6">
         <header className="flex items-start justify-between gap-4">
           <div className="flex items-start gap-3">
@@ -749,10 +760,10 @@ function AddItemForm({ onCancel, onSubmit }: AddItemFormProps) {
           disabled={busy}
           autoFocus
         />
-        <Input
-          placeholder="Category (optional)"
+        <CategoryInput
+          listId="inventory-categories"
           value={category}
-          onChange={(e) => setCategory(e.target.value)}
+          onChange={setCategory}
           disabled={busy}
         />
         <Input
@@ -826,11 +837,11 @@ function EditItemRow({ item, onCancel, onSubmit }: EditItemRowProps) {
           disabled={busy}
           placeholder="Name"
         />
-        <Input
+        <CategoryInput
+          listId="inventory-categories"
           value={category}
-          onChange={(e) => setCategory(e.target.value)}
+          onChange={setCategory}
           disabled={busy}
-          placeholder="Category"
         />
         <Input
           value={quantity}
@@ -909,10 +920,10 @@ function AddWishlistForm({ onCancel, onSubmit }: AddWishlistFormProps) {
           disabled={busy}
           autoFocus
         />
-        <Input
-          placeholder="Category (optional)"
+        <CategoryInput
+          listId="inventory-categories"
           value={category}
-          onChange={(e) => setCategory(e.target.value)}
+          onChange={setCategory}
           disabled={busy}
         />
         <Input
@@ -939,5 +950,38 @@ function AddWishlistForm({ onCancel, onSubmit }: AddWishlistFormProps) {
         </Button>
       </div>
     </div>
+  );
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Category autocomplete input
+// ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * A text input for the inventory category, backed by a shared `<datalist>`
+ * (id `inventory-categories`) that's rendered once at the view root. The
+ * datalist lets the browser autocomplete from previously-used categories
+ * (distinct values across both `items` and `wishlist`); the field stays a
+ * free-text input so new categories can still be typed.
+ */
+function CategoryInput({
+  listId,
+  value,
+  onChange,
+  disabled,
+}: {
+  listId: string;
+  value: string;
+  onChange: (v: string) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <Input
+      list={listId}
+      placeholder="Category (optional)"
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      disabled={disabled}
+    />
   );
 }

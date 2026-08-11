@@ -64,9 +64,6 @@ export interface AgentSettings {
   chat: ChatSettings;
   /** Whether the user has completed the onboarding wizard. */
   onboarded: boolean;
-  /** URL of the framework's update channel (points at an index JSON).
-   * Stored empty when none is configured. */
-  frameworkSourceUrl: string;
 }
 
 /** Result of a bash command execution. */

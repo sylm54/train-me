@@ -427,6 +427,12 @@ pub fn ensure_prompts_dir(data_dir: &Path) -> std::io::Result<()> {
 /// Ensure the agent's writable data dir exists, with a few conventional
 /// subdirectories pre-created so the agent has obvious places to write.
 ///
+/// Also seeds `agent_data/examples/` with bundled example files (rule,
+/// routine, journal format, voice config) so the agent has canonical
+/// formatting references without depending on a framework to ship them.
+/// Existing files are never overwritten — only missing ones are written,
+/// so user/agent edits to the examples survive.
+///
 /// Note: `inventory/` is intentionally NOT created here — inventory lives
 /// in `<state_dir>/inventory.db`, accessed via the `inventory` builtin.
 pub fn ensure_agent_dir(data_dir: &Path) -> std::io::Result<()> {
@@ -444,6 +450,54 @@ pub fn ensure_agent_dir(data_dir: &Path) -> std::io::Result<()> {
         "voice",
     ] {
         std::fs::create_dir_all(agent.join(sub))?;
+    }
+    seed_examples(&agent)?;
+    Ok(())
+}
+
+/// Bundled example files (compiled into the binary with `include_str!` so
+/// the app ships them without relying on a framework). Written into
+/// `agent_data/examples/` on startup, but only when absent — existing files
+/// are left untouched so edits persist.
+///
+/// The system prompt (`{{features}}`) references these paths as the
+/// formatting standard for rules, routines, the journal format, and voice
+/// config.
+fn seed_examples(agent_dir: &Path) -> std::io::Result<()> {
+    /// One bundled example: its relative path under `examples/` and its
+    /// contents (embedded at compile time from the repo's `examples/` dir).
+    struct BundledExample {
+        rel: &'static str,
+        contents: &'static str,
+    }
+    const EXAMPLES: &[BundledExample] = &[
+        BundledExample {
+            rel: "examples/rule.md",
+            contents: include_str!("../../examples/rule.md"),
+        },
+        BundledExample {
+            rel: "examples/routine.md",
+            contents: include_str!("../../examples/routine.md"),
+        },
+        BundledExample {
+            rel: "examples/format.json",
+            contents: include_str!("../../examples/format.json"),
+        },
+        BundledExample {
+            rel: "examples/voice-config.json",
+            contents: include_str!("../../examples/voice-config.json"),
+        },
+    ];
+
+    for ex in EXAMPLES {
+        let path = agent_dir.join(ex.rel);
+        if path.exists() {
+            continue; // never overwrite an existing (possibly user-edited) file
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, ex.contents)?;
     }
     Ok(())
 }

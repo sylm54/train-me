@@ -1,29 +1,32 @@
-//! Package manifest: the mandatory `manifest.json` that every package
-//! (framework or specialisation) ZIP must declare at its root, plus the
-//! installed-state record the app keeps under `<data_dir>/framework.json`.
+//! Framework manifest: the mandatory `manifest.json` that every framework
+//! ZIP must declare at its root, plus the optional `config.json` (install-time
+//! option groups) and the installed-state record the app keeps under
+//! `<data_dir>/framework.json`.
 //!
 //! A [`Manifest`] is what the framework author ships inside the ZIP. It
 //! declares identity (`id`/`name`/`description`/`version`), compatibility
-//! (`min_app_version`), and the merge rules the importer honours:
+//! (`min_app_version`), and the merge rules the installer honours:
 //!
-//! - `owned_files` — globs (package-root relative) of files this package
+//! - `owned_files` — globs (destination-relative) of files this framework
 //!   claims. On an update (same `id` already installed) any owned file that
-//!   is **absent** from the new ZIP is pruned, so renamed/removed files
+//!   is **absent** from the new install is pruned, so renamed/removed files
 //!   don't linger.
 //! - `preserve` — globs of files that must never be overwritten if they
 //!   already exist on disk. Protects user-authored content
 //!   (`USER.md`, `journal/**`, …) during updates.
 //! - `remove` — explicit one-off removal globs, always applied.
 //!
-//! Globs are expressed relative to the **package root** (the ZIP root after
-//! [`crate::package_import::resolve_package_root`]). A `prompts/` prefix
-//! routes a glob to the prompt store; anything else routes to the content
-//! root (the agent sandbox root for frameworks, `special/` for
-//! specialisations). So `prompts/*.md` and `rules/*.md` are both valid,
-//! natural globs.
+//! Globs are expressed relative to the **destination** (the prompt store and
+//! the sandbox root). A `prompts/` prefix routes a glob to the prompt store;
+//! anything else routes to the sandbox root. So `prompts/*.md` and
+//! `rules/*.md` are both valid, natural globs.
+//!
+//! [`Config`] parses the optional `config.json` describing the framework's
+//! install-time option groups (radio/checkbox), each choice mapping to a part
+//! folder merged alongside `base/`.
 //!
 //! [`InstalledFramework`] is the on-disk record the app writes after a
-//! framework import. Its presence is what [`crate::framework_installed`]
+//! framework install. Its presence is what [`crate::framework_installed`]
 //! gates on (it replaced the old `prompts/main_agent.md` sentinel).
 
 use std::fs;
@@ -31,6 +34,7 @@ use std::path::{Path, PathBuf};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 
 // ============================================================================
 // Manifest (shipped inside the ZIP)
@@ -71,7 +75,7 @@ impl Manifest {
         if !path.exists() {
             return Err(format!(
                 "Package is missing a required manifest.json at its root. \
-                 Every package (framework or specialisation) must declare one."
+                 Every framework must declare one."
             ));
         }
         let text = fs::read_to_string(&path)
@@ -106,13 +110,127 @@ impl Manifest {
 }
 
 // ============================================================================
+// Config (config.json — optional, drives the install-time options UI)
+// ============================================================================
+
+/// One option the user can configure at install time. A `single` option is a
+/// radio group (exactly one choice selected); a `multiple` option is a set
+/// of checkboxes (any number). Each choice maps to a part folder under the
+/// framework root; the selected parts are merged alongside `base/` on install.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum OptionGroup {
+    /// A radio-style group: exactly one choice is selected.
+    Single {
+        id: String,
+        title: String,
+        #[serde(default)]
+        description: String,
+        /// The default choice id. Empty string = no default selection.
+        #[serde(default)]
+        default: String,
+        choices: Vec<Choice>,
+    },
+    /// A checkbox-style group: zero or more choices selected.
+    Multiple {
+        id: String,
+        title: String,
+        #[serde(default)]
+        description: String,
+        /// Default choice ids.
+        #[serde(default)]
+        default: Vec<String>,
+        choices: Vec<Choice>,
+    },
+}
+
+/// A single selectable choice within an [`OptionGroup`]. `part` names a
+/// folder at the framework root (other than `base`) whose `prompts/` and
+/// `agent_files/` are merged when this choice is active.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Choice {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+    pub part: String,
+}
+
+/// Parsed `config.json`. A missing file yields an empty config (a base-only
+/// framework with no options), so the minimal framework still installs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Config {
+    #[serde(default)]
+    pub options: Vec<OptionGroup>,
+}
+
+impl Config {
+    /// Read and parse `config.json` from `pkg_root`. Returns an empty config
+    /// if the file is missing (it's optional). A present-but-unparseable
+    /// file is an error.
+    pub fn from_pkg_root(pkg_root: &Path) -> Result<Self, String> {
+        let path = pkg_root.join("config.json");
+        if !path.exists() {
+            return Ok(Config::default());
+        }
+        let text = fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read config.json: {}", e))?;
+        let config: Config = serde_json::from_str(&text)
+            .map_err(|e| format!("Failed to parse config.json: {}", e))?;
+        Ok(config)
+    }
+
+    /// Resolve the set of part folders implied by a choices map. Includes
+    /// every part referenced by a selected choice. Invalid choice/group ids
+    /// in `choices` are silently ignored (a new config version may have
+    /// dropped an option the user previously set).
+    ///
+    /// `choices` is a loose JSON object: `{ "<group id>": "<choice id>" }`
+    /// for single groups, or `{ "<group id>": ["<choice id>", ...] }` for
+    /// multiple groups. Missing groups fall back to their declared default.
+    pub fn selected_parts(&self, choices: &JsonValue) -> Vec<String> {
+        let mut parts = Vec::new();
+        for group in &self.options {
+            match group {
+                OptionGroup::Single { id, choices: gchoices, default, .. } => {
+                    let selected = choices
+                        .get(id)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(default);
+                    if let Some(c) = gchoices.iter().find(|c| c.id == selected) {
+                        parts.push(c.part.clone());
+                    }
+                }
+                OptionGroup::Multiple { id, choices: gchoices, default, .. } => {
+                    let selected: Vec<&str> = choices
+                        .get(id)
+                        .and_then(|v| v.as_array())
+                        .map(|arr| arr.iter().filter_map(|x| x.as_str()).collect())
+                        .unwrap_or_else(|| default.iter().map(String::as_str).collect());
+                    for c in gchoices {
+                        if selected.iter().any(|s| *s == c.id) {
+                            parts.push(c.part.clone());
+                        }
+                    }
+                }
+            }
+        }
+        parts
+    }
+}
+
+// ============================================================================
 // Installed framework record (on-disk, <data_dir>/framework.json)
 // ============================================================================
 
 /// On-disk record of the currently installed framework. Written after a
-/// successful framework import; its presence is what `framework_installed`
-/// gates on. Only frameworks write this — specialisations are additive and
-/// not tracked here (yet).
+/// successful framework install; its presence is what `framework_installed`
+/// gates on.
+///
+/// `source_url` (the update-channel index URL the framework was installed
+/// from) and `choices` (the config.json selections made at install time)
+/// are saved so update checks and re-installs can happen without re-entry.
+/// Both default empty so an older `framework.json` without them still loads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledFramework {
     pub id: String,
@@ -121,6 +239,14 @@ pub struct InstalledFramework {
     pub version: String,
     /// RFC-3339 timestamp of when this version was installed.
     pub installed_at: String,
+    /// Update-channel index URL this framework was installed from, if any.
+    /// Empty when the framework was imported from a local ZIP.
+    #[serde(default)]
+    pub source_url: String,
+    /// The config.json choices made at install time, kept loose as JSON.
+    /// Shape: `{ "<option id>": "<choice id>" | ["<choice id>", ...] }`.
+    #[serde(default)]
+    pub choices: JsonValue,
 }
 
 const INSTALLED_FILE: &str = "framework.json";
@@ -149,14 +275,23 @@ pub fn clear_installed_framework(data_dir: &Path) {
     let _ = fs::remove_file(data_dir.join(INSTALLED_FILE));
 }
 
-/// Build an [`InstalledFramework`] from a freshly imported manifest.
-pub fn installed_from_manifest(mf: &Manifest) -> InstalledFramework {
+/// Build an [`InstalledFramework`] from a freshly installed manifest.
+/// `source_url` is the update-channel index URL the framework was installed
+/// from (empty for a local-ZIP install). `choices` is the config.json
+/// selection set the user made (kept loose as JSON).
+pub fn installed_from_manifest(
+    mf: &Manifest,
+    source_url: &str,
+    choices: &JsonValue,
+) -> InstalledFramework {
     InstalledFramework {
         id: mf.id.clone(),
         name: mf.name.clone(),
         description: mf.description.clone(),
         version: mf.version.clone(),
         installed_at: chrono::Utc::now().to_rfc3339(),
+        source_url: source_url.to_string(),
+        choices: choices.clone(),
     }
 }
 
@@ -540,6 +675,8 @@ mod tests {
             description: "d".into(),
             version: "1.2.3".into(),
             installed_at: "2026-08-07T12:00:00+00:00".into(),
+            source_url: "https://example.com/index.json".into(),
+            choices: serde_json::json!({ "intensity": "medium" }),
         };
         write_installed_framework(dir.path(), &rec).unwrap();
         let back = read_installed_framework(dir.path()).expect("should read back");

@@ -30,7 +30,6 @@
 //! is offered only when the index version is strictly greater.
 
 use std::fs;
-use std::io::Cursor;
 use std::path::Path;
 use std::time::Duration;
 
@@ -38,7 +37,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::package_manifest::{version_cmp, InstalledFramework};
-use crate::package_import::{self, import_from_zip_input, PackageKind};
 
 /// The index document published at the framework's update-channel URL.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +48,10 @@ pub struct FrameworkIndex {
     #[serde(default)]
     pub sha256: Option<String>,
     pub description: String,
+    /// Optional display name for the framework, surfaced in the UI before the
+    /// full ZIP is downloaded. Falls back to the manifest name if absent.
+    #[serde(default)]
+    pub name: Option<String>,
     /// Optional: refuse to install if the running app is older.
     #[serde(default)]
     pub min_app_version: Option<String>,
@@ -137,18 +139,18 @@ pub fn check_update(
 }
 
 /// Download the ZIP referenced by `index`, verify its SHA-256 (when the index
-/// advertises one), and run the manifest-aware import pipeline. `on_progress`
-/// receives `(downloaded_bytes, total_bytes)` where `total_bytes` is taken
-/// from the `Content-Length` header (0 if absent). The install itself runs on
-/// the caller's thread — callers should already be on a blocking thread.
-pub fn download_and_install<F: FnMut(u64, u64)>(
+/// advertises one), and return its bytes. `on_progress` receives
+/// `(downloaded_bytes, total_bytes)` where `total_bytes` is taken from the
+/// `Content-Length` header (0 if absent). Callers should already be on a
+/// blocking thread.
+///
+/// This is download + verify only — the staging/merge steps happen in
+/// [`package_import::stage_to_persistent`] / [`package_import::install_framework`].
+pub fn download_bytes<F: FnMut(u64, u64)>(
     index: &FrameworkIndex,
-    data_dir: &Path,
-    agent_root: &Path,
-    prompts_root: &Path,
     tmp_base: &Path,
     on_progress: F,
-) -> Result<package_import::ImportResult, String> {
+) -> Result<Vec<u8>, String> {
     // 1. Download (with retries) to a temp file under the app's .tmp.
     fs::create_dir_all(tmp_base).map_err(|e| format!("Failed to create temp dir: {}", e))?;
     let zip_path = tmp_base.join(format!(
@@ -161,7 +163,6 @@ pub fn download_and_install<F: FnMut(u64, u64)>(
     if let Some(expected) = index.sha256.as_deref() {
         let actual = sha256_hex(&zip_path)?;
         if !actual.eq_ignore_ascii_case(expected.trim()) {
-            // Best-effort cleanup of the bad download.
             let _ = fs::remove_file(&zip_path);
             return Err(format!(
                 "Checksum mismatch: download is {} but index expected {}.",
@@ -170,23 +171,15 @@ pub fn download_and_install<F: FnMut(u64, u64)>(
         }
     }
 
-    // 3. Read into memory and run the shared import pipeline. The bytes are
-    //    fully buffered so the import sees a seekable reader regardless of
-    //    the platform's file-seek semantics.
+    // 3. Read into memory and return. The bytes are fully buffered so the
+    //    staging step sees a seekable reader regardless of platform file-seek
+    //    semantics.
     let bytes = fs::read(&zip_path)
         .map_err(|e| format!("Failed to read downloaded ZIP: {}", e))?;
-    let result = import_from_zip_input(
-        Cursor::new(bytes),
-        PackageKind::Framework,
-        data_dir,
-        agent_root,
-        prompts_root,
-        tmp_base,
-    );
 
-    // Clean up the temp ZIP regardless of install outcome.
+    // Clean up the temp ZIP regardless of outcome.
     let _ = fs::remove_file(&zip_path);
-    result
+    Ok(bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +351,8 @@ mod tests {
             description: "d".into(),
             version: "2.0.0".into(),
             installed_at: "2026-01-01T00:00:00+00:00".into(),
+            source_url: String::new(),
+            choices: serde_json::Value::Null,
         };
         // Same version → no update. (We can't hit the network in a unit test,
         // so we exercise the comparison helper directly via the public fn's

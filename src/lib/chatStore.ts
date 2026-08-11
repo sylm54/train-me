@@ -285,14 +285,30 @@ export function deleteChatPermanently(id: string) {
  * state. Also clears the legacy single-transcript key. Used by the Settings
  * "reset all app data" action so a reset leaves the user with no chat history
  * (active or archived). Emits once so subscribers re-render.
+ *
+ * The metadata scan alone misses orphaned keys — messages/compaction entries
+ * for chats that were already deleted (their metadata is gone but their
+ * per-chat localStorage slots lingered). So we also walk every localStorage
+ * key and drop anything under our prefixes, guaranteeing a complete wipe.
  */
 export function clearAllChats() {
-  const ids = readShape().chats.map((c) => c.id);
   try {
-    for (const id of ids) localStorage.removeItem(MSG_PREFIX + id);
+    // Walk all keys so orphaned per-chat slots (messages + compaction) for
+    // already-deleted chats are removed too — not just current metadata.
+    const toRemove: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (
+        key &&
+        (key.startsWith(MSG_PREFIX) ||
+          key === STORE_KEY ||
+          key === LEGACY_KEY)
+      ) {
+        toRemove.push(key);
+      }
+    }
+    for (const key of toRemove) localStorage.removeItem(key);
     clearAllCompaction();
-    localStorage.removeItem(STORE_KEY);
-    localStorage.removeItem(LEGACY_KEY);
   } catch (e) {
     console.warn("[chatStore] failed to clear chats:", e);
   }

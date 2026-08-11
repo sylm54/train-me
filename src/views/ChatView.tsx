@@ -198,6 +198,27 @@ export function ChatView({
   const apiKeyMissing =
     !settings.apiKeys[settings.agents.main.provider] && !!transport;
 
+  // CRITICAL: do not mount ChatViewInner (which calls `useChat`) until the
+  // transport is ready. `useChat` captures its `transport` only at Chat-instance
+  // creation time and never re-reads it (only an `id` change recreates the
+  // Chat). If we passed `transport: undefined` on first mount — e.g. while the
+  // system prompt is still loading right after onboarding — the SDK would fall
+  // back to its built-in `DefaultChatTransport`, which POSTs to `/api/chat`.
+  // This is a Tauri app with no such server route, so the very first send after
+  // onboarding fails with a 404 until the user "Clear"s (which remounts with a
+  // new key, by which time the transport is ready). Mounting only once the
+  // transport exists guarantees `useChat` captures the real transport.
+  if (!transport) {
+    return (
+      <div className="flex flex-col h-full">
+        <div className="m-3 px-3 py-2 rounded-md bg-[var(--color-surface-muted)] border border-[var(--color-border)] text-xs text-[var(--color-muted-foreground)] flex items-center gap-2">
+          <Loader2 size={12} className="animate-spin" />
+          {promptError ? "Prompt load error — see Settings." : "Loading main agent prompt…"}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <ChatViewInner
       key={activeChatId}
@@ -217,7 +238,8 @@ export function ChatView({
 interface ChatViewInnerProps {
   activeChatId: string;
   onActiveChatChange: (id: string) => void;
-  transport: ReturnType<typeof createMainAgentTransport> | null;
+  // Non-null: ChatView only renders ChatViewInner once the transport is built.
+  transport: ReturnType<typeof createMainAgentTransport>;
   settings: AgentSettings;
   systemPrompt: string;
   promptLoading: boolean;
@@ -246,7 +268,7 @@ function ChatViewInner({
   const { messages, sendMessage, regenerate, status, error, setMessages, stop } =
     useChat({
       id: activeChatId,
-      transport: transport ?? undefined,
+      transport,
       onError: (e) => console.error("[chat] error:", e),
     });
 

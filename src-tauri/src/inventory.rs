@@ -376,6 +376,36 @@ pub async fn inventory_remove_wishlist_item(
     .map_err(|e| e.to_string())?
 }
 
+/// Distinct, non-empty categories used across both `items` and `wishlist`.
+/// Powers the inventory UI's category autocomplete. Sorted alphabetically.
+#[tauri::command]
+pub async fn inventory_list_categories(
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    let db_path = state.state_dir.join("inventory.db");
+    tauri::async_runtime::spawn_blocking(move || -> Result<Vec<String>, String> {
+        let conn = open_db(&db_path)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT category FROM items WHERE category IS NOT NULL AND category <> '' \
+                 UNION \
+                 SELECT category FROM wishlist WHERE category IS NOT NULL AND category <> '' \
+                 ORDER BY category",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| e.to_string())?);
+        }
+        Ok(out)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 // ============================================================================
 // Tauri commands — CSV im/export (UI-facing)
 // ============================================================================

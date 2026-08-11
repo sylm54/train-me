@@ -3,10 +3,12 @@
  *
  * Walks the user through the two things the app needs before it's useful:
  *   1. Configuring an LLM provider (API key + per-agent model selection).
- *   2. Importing a framework (a ZIP that supplies the agent's prompts and
+ *   2. Installing a framework (a ZIP that supplies the agent's prompts and
  *      sandbox content — the app ships none by default).
  *
- * On finish, `onComplete` is called so the app can swap to the main shell.
+ * The framework step is a small flow: pick from the gallery (or a URL / local
+ * ZIP) → stage → configure the framework's options → install. On finish,
+ * `onComplete` is called so the app can swap to the main shell.
  */
 
 import { useEffect, useState } from "react";
@@ -15,6 +17,8 @@ import {
   ArrowLeft,
   ArrowRight,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   Download,
   Eye,
   EyeOff,
@@ -24,122 +28,167 @@ import {
   Rocket,
   Sparkles,
 } from "lucide-react";
-import { useSettings, DEFAULT_MODELS } from "@/lib/settings";
+import { useSettings } from "@/lib/settings";
 import type { AgentName, ProviderName } from "@/lib/types";
+import { AGENT_LABELS, PROVIDER_LABELS } from "@/lib/models";
+import { ModelPicker } from "@/components/ModelPicker";
+import { FrameworkOptionsList } from "@/components/FrameworkOptions";
 import {
-  pickAndImportPackage,
-  isFrameworkInstalled,
-  installFrameworkFromUrl,
-  summarizeImportResult,
+  PREDEFINED_FRAMEWORKS,
+  defaultChoices,
+  discardStaged,
+  fetchFrameworkInfo,
   formatBytes,
+  getStaged,
+  installStaged,
+  isFrameworkInstalled,
+  stageFromFile,
+  stageFromUrl,
+  summarizeImportResult,
+  type FrameworkChoices,
   type FrameworkDownloadProgress,
   type ImportResult,
-} from "@/lib/packages";
-
-/**
- * Prebuilt framework channel URLs offered as quick picks during onboarding.
- * Each entry is the URL of an index document (see FRAMEWORKS.md). Leave empty
- * to hide the quick-pick row; populate to surface one-click installs.
- */
-const PREMADE_FRAMEWORK_URLS: string[] = ["https://github.com/sylm54/sissify-me/releases/download/stable/index.json"];
-
-const AGENT_LABELS: Record<AgentName, string> = {
-  main: "Main agent",
-  planner: "Hypno planner",
-};
-
-const PROVIDER_LABELS: Record<ProviderName, string> = {
-  openrouter: "OpenRouter",
-  openai: "OpenAI",
-};
-
-const MODEL_PRESETS: Record<ProviderName, string[]> = {
-  openrouter: [
-    "~deepseek/deepseek-v4-flash-latest",
-    "deepseek/deepseek-v4-pro",
-    "google/gemini-2.5-flash",
-    "openai/gpt-4o",
-    "google/gemini-2.5-flash",
-  ],
-  openai: ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "o4-mini"],
-};
+  type StagedFramework,
+} from "@/lib/frameworks";
 
 type Step = "welcome" | "models" | "framework";
 
 const STEP_ORDER: Step[] = ["welcome", "models", "framework"];
+
+/** Sub-state of the framework step. */
+type FrameworkPhase = "browse" | "config" | "installed";
 
 interface OnboardingViewProps {
   onComplete: () => void;
 }
 
 export function OnboardingView({ onComplete }: OnboardingViewProps) {
-  const { settings, setApiKey, setAgent, setFrameworkSourceUrl } =
-    useSettings();
+  const { settings, setApiKey, setAgent } = useSettings();
   const [step, setStep] = useState<Step>("welcome");
   const [reveal, setReveal] = useState<Record<ProviderName, boolean>>({
     openrouter: false,
     openai: false,
   });
 
-  // Framework import state (shared across the framework step). Both the
-  // file-picker flow and the URL flow feed into the same outcome display.
-  const [frameworkInstalled, setFrameworkInstalled] = useState(false);
-  const [importBusy, setImportBusy] = useState(false);
-  const [importResult, setImportResult] = useState<ImportResult | null>(null);
-  const [importError, setImportError] = useState<string | null>(null);
-
-  // URL install state.
+  // Framework step state (shared across the phase machine).
+  const [phase, setPhase] = useState<FrameworkPhase>("browse");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [progress, setProgress] = useState<FrameworkDownloadProgress | null>(
+    null,
+  );
+  const [staged, setStaged] = useState<StagedFramework | null>(null);
+  const [choices, setChoices] = useState<FrameworkChoices>({});
+  const [result, setResult] = useState<ImportResult | null>(null);
+  // Fetched gallery info per predefined URL (name + description + version).
+  const [gallery, setGallery] = useState<
+    Record<string, { name: string; description: string; version: string } | null>
+  >({});
+  // Collapsible "install from URL" / "choose ZIP" panels.
+  const [urlOpen, setUrlOpen] = useState(false);
   const [urlDraft, setUrlDraft] = useState("");
-  const [urlProgress, setUrlProgress] =
-    useState<FrameworkDownloadProgress | null>(null);
 
-  // On mount, check whether a framework is already present (e.g. the user
-  // imported one via Settings then re-ran onboarding).
+  // On mount: if a framework is already installed, jump straight to the
+  // "installed" phase so re-running onboarding reflects reality. Also
+  // pre-fill the gallery info. If something is staged (e.g. the user
+  // re-ran onboarding mid-config), resume at the config phase.
   useEffect(() => {
-    isFrameworkInstalled().then(setFrameworkInstalled);
+    void (async () => {
+      const [installed, stagedFw] = await Promise.all([
+        isFrameworkInstalled(),
+        getStaged(),
+      ]);
+      if (stagedFw) {
+        setStaged(stagedFw);
+        setChoices(defaultChoices(stagedFw.config));
+        setPhase("config");
+      } else if (installed) {
+        setPhase("installed");
+      }
+      // Fetch gallery info for each predefined framework (best-effort).
+      const entries = await Promise.all(
+        PREDEFINED_FRAMEWORKS.map(async ({ url }) => [
+          url,
+          await fetchFrameworkInfo(url),
+        ] as const),
+      );
+      setGallery(Object.fromEntries(entries));
+    })();
   }, []);
 
-  const handleImportFramework = async () => {
-    setImportError(null);
-    setImportResult(null);
-    setImportBusy(true);
+  // ── Staging actions ──────────────────────────────────────────────────
+  const handleStageUrl = async (url: string) => {
+    const trimmed = url.trim();
+    if (!trimmed) return;
+    setError(null);
+    setProgress(null);
+    setBusy(true);
     try {
-      const res = await pickAndImportPackage("framework");
-      if (!res) return; // cancelled
-      setImportResult(res);
-      const installed = await isFrameworkInstalled();
-      setFrameworkInstalled(installed);
+      const fw = await stageFromUrl(trimmed, (p) => setProgress(p));
+      setStaged(fw);
+      setChoices(defaultChoices(fw.config));
+      setProgress(null);
+      setPhase(fw.config.options.length > 0 ? "config" : "browse");
+      // If there are no options to configure, install immediately.
+      if (fw.config.options.length === 0) {
+        await runInstall(fw, {});
+      }
     } catch (e) {
-      setImportError(String(e));
+      setError(String(e));
     } finally {
-      setImportBusy(false);
+      setBusy(false);
     }
   };
 
-  // Install a framework from an update-channel URL (an index document, see
-  // FRAMEWORKS.md). On success the URL is persisted as the framework source
-  // so future update checks in Settings work without re-entry.
-  const handleInstallFromUrl = async (url: string) => {
-    const trimmed = url.trim();
-    if (!trimmed) return;
-    setImportError(null);
-    setImportResult(null);
-    setUrlProgress(null);
-    setImportBusy(true);
+  const handleStageFile = async () => {
+    setError(null);
+    setBusy(true);
     try {
-      const res = await installFrameworkFromUrl(trimmed, (p) =>
-        setUrlProgress(p),
-      );
-      setImportResult(res);
-      setUrlProgress(null);
-      setFrameworkSourceUrl(trimmed);
-      const installed = await isFrameworkInstalled();
-      setFrameworkInstalled(installed);
+      const fw = await stageFromFile();
+      if (!fw) return; // user cancelled the dialog
+      setStaged(fw);
+      setChoices(defaultChoices(fw.config));
+      setPhase(fw.config.options.length > 0 ? "config" : "browse");
+      if (fw.config.options.length === 0) {
+        await runInstall(fw, {});
+      }
     } catch (e) {
-      setImportError(String(e));
+      setError(String(e));
     } finally {
-      setImportBusy(false);
+      setBusy(false);
     }
+  };
+
+  const runInstall = async (fw: StagedFramework, chosen: FrameworkChoices) => {
+    setError(null);
+    setBusy(true);
+    try {
+      const res = await installStaged(chosen);
+      setResult(res);
+      setStaged(null);
+      setPhase("installed");
+    } catch (e) {
+      setError(String(e));
+      // Stay in the config phase so the user can retry.
+      setStaged(fw);
+      setPhase(fw.config.options.length > 0 ? "config" : "browse");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleApplyAndFinish = async () => {
+    if (staged) await runInstall(staged, choices);
+    onComplete();
+  };
+
+  const handleBackToBrowse = async () => {
+    // Discard whatever's staged and go back to the gallery.
+    await discardStaged().catch(() => {});
+    setStaged(null);
+    setChoices({});
+    setError(null);
+    setPhase("browse");
   };
 
   // The main agent's provider must have an API key before we can continue
@@ -157,6 +206,24 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
   const goBack = () => {
     const prev = STEP_ORDER[stepIndex - 1];
     if (prev) setStep(prev);
+  };
+
+  // Footer-Next behaviour depends on the framework phase.
+  const frameworkNextLabel = () => {
+    if (phase === "config") return "Apply & finish";
+    if (phase === "installed") return "Finish";
+    return "Next";
+  };
+  const frameworkNextDisabled =
+    step === "framework" && phase === "browse" && !staged;
+  const frameworkNextAction = () => {
+    if (phase === "config") {
+      void handleApplyAndFinish();
+    } else if (phase === "installed") {
+      onComplete();
+    } else {
+      goNext();
+    }
   };
 
   return (
@@ -207,16 +274,23 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
           )}
           {step === "framework" && (
             <FrameworkStep
-              installed={frameworkInstalled}
-              importBusy={importBusy}
-              importResult={importResult}
-              importError={importError}
-              onImport={handleImportFramework}
+              phase={phase}
+              gallery={gallery}
+              busy={busy}
+              error={error}
+              progress={progress}
+              staged={staged}
+              choices={choices}
+              onChoicesChange={setChoices}
+              result={result}
+              urlOpen={urlOpen}
+              onToggleUrl={() => setUrlOpen((o) => !o)}
               urlDraft={urlDraft}
               onUrlDraftChange={setUrlDraft}
-              urlProgress={urlProgress}
-              onInstallFromUrl={() => handleInstallFromUrl(urlDraft)}
-              onInstallPremade={handleInstallFromUrl}
+              onInstallPremade={handleStageUrl}
+              onInstallFromUrl={() => handleStageUrl(urlDraft)}
+              onChooseFile={handleStageFile}
+              onBackToBrowse={handleBackToBrowse}
             />
           )}
         </div>
@@ -243,23 +317,27 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
                 Skip setup
               </button>
             )}
-            {step === "framework" && !frameworkInstalled && (
+            {step === "framework" && phase === "browse" && (
               <button
                 onClick={onComplete}
                 className="text-xs text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)] underline hover:no-underline"
               >
-                Skip, import later
+                Skip, install later
               </button>
             )}
             <button
-              onClick={goNext}
-              disabled={step === "models" && !mainKeyPresent}
+              onClick={frameworkNextAction}
+              disabled={
+                (step === "models" && !mainKeyPresent) ||
+                frameworkNextDisabled ||
+                busy
+              }
               className="px-4 py-2 text-sm rounded-md bg-[var(--color-pink-400)] text-[var(--color-primary-foreground)] hover:bg-[var(--color-pink-500)] disabled:opacity-50 inline-flex items-center gap-2"
             >
               {step === "framework" ? (
                 <>
                   <Rocket size={14} />
-                  Finish
+                  {frameworkNextLabel()}
                 </>
               ) : (
                 <>
@@ -276,7 +354,7 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
 }
 
 // ---------------------------------------------------------------------------
-// Steps
+// Welcome step
 // ---------------------------------------------------------------------------
 
 function WelcomeStep() {
@@ -288,7 +366,7 @@ function WelcomeStep() {
         </h1>
         <p className="text-sm text-[var(--color-muted-foreground)] mt-2">
           A couple of steps and your agent will be ready. This app ships with
-          no built-in prompts or content — you bring those by importing a
+          no built-in prompts or content — you bring those by installing a
           framework, so you stay in full control.
         </p>
       </div>
@@ -301,8 +379,8 @@ function WelcomeStep() {
         />
         <FeatureCard
           icon={<PackageOpen size={16} />}
-          title="Import a framework"
-          body="A framework is a ZIP with the agent's prompts and sandbox content. You can layer specialisations on top later from Settings."
+          title="Install a framework"
+          body="A framework is a ZIP with the agent's prompts and sandbox content, organised into a base plus optional parts you can toggle."
         />
       </div>
     </div>
@@ -332,6 +410,10 @@ function FeatureCard({
     </div>
   );
 }
+
+// ---------------------------------------------------------------------------
+// Models step
+// ---------------------------------------------------------------------------
 
 function ModelsStep({
   settings,
@@ -405,40 +487,16 @@ function ModelsStep({
               key={agent}
               className="border border-[var(--color-border)] rounded-lg p-3 bg-[var(--color-surface)]"
             >
-              <label className="block text-xs font-medium mb-1.5">
+              <label className="block text-xs font-medium mb-2">
                 {AGENT_LABELS[agent]}
               </label>
-              <div className="flex items-center gap-2">
-                <select
-                  value={cfg.provider}
-                  onChange={(e) => {
-                    const provider = e.target.value as ProviderName;
-                    setAgent(agent, provider, DEFAULT_MODELS[provider]);
-                  }}
-                  className="text-sm border border-[var(--color-border)] rounded-md px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-[var(--color-pink-300)]"
-                >
-                  {Object.entries(PROVIDER_LABELS).map(([k, v]) => (
-                    <option key={k} value={k}>
-                      {v}
-                    </option>
-                  ))}
-                </select>
-                <input
-                  type="text"
-                  list={`ob-presets-${agent}`}
-                  value={cfg.model}
-                  onChange={(e) =>
-                    setAgent(agent, cfg.provider, e.target.value)
-                  }
-                  placeholder="model id"
-                  className="flex-1 font-mono text-sm border border-[var(--color-border)] rounded-md px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-[var(--color-pink-300)]"
-                />
-                <datalist id={`ob-presets-${agent}`}>
-                  {MODEL_PRESETS[cfg.provider].map((m) => (
-                    <option key={m} value={m} />
-                  ))}
-                </datalist>
-              </div>
+              <ModelPicker
+                agent={agent}
+                cfg={cfg}
+                onChange={(provider, model, extras) =>
+                  setAgent(agent, provider, model, extras)
+                }
+              />
             </div>
           );
         })}
@@ -466,36 +524,65 @@ function MissingKeyHint({
   );
 }
 
-function FrameworkStep({
-  installed,
-  importBusy,
-  importResult,
-  importError,
-  onImport,
-  urlDraft,
-  onUrlDraftChange,
-  urlProgress,
-  onInstallFromUrl,
-  onInstallPremade,
-}: {
-  installed: boolean;
-  importBusy: boolean;
-  importResult: ImportResult | null;
-  importError: string | null;
-  onImport: () => void;
+// ---------------------------------------------------------------------------
+// Framework step (browse → config → installed)
+// ---------------------------------------------------------------------------
+
+interface FrameworkStepProps {
+  phase: FrameworkPhase;
+  gallery: Record<
+    string,
+    { name: string; description: string; version: string } | null
+  >;
+  busy: boolean;
+  error: string | null;
+  progress: FrameworkDownloadProgress | null;
+  staged: StagedFramework | null;
+  choices: FrameworkChoices;
+  onChoicesChange: (c: FrameworkChoices) => void;
+  result: ImportResult | null;
+  urlOpen: boolean;
+  onToggleUrl: () => void;
   urlDraft: string;
   onUrlDraftChange: (v: string) => void;
-  urlProgress: FrameworkDownloadProgress | null;
-  onInstallFromUrl: () => void;
   onInstallPremade: (url: string) => void;
-}) {
+  onInstallFromUrl: () => void;
+  onChooseFile: () => void;
+  onBackToBrowse: () => void;
+}
+
+function FrameworkStep(props: FrameworkStepProps) {
+  if (props.phase === "config" && props.staged) {
+    return <FrameworkConfigStep {...props} staged={props.staged} />;
+  }
+  if (props.phase === "installed") {
+    return <FrameworkInstalledStep result={props.result} />;
+  }
+  return <FrameworkBrowseStep {...props} />;
+}
+
+// ── Browse ──
+
+function FrameworkBrowseStep({
+  gallery,
+  busy,
+  error,
+  progress,
+  urlOpen,
+  onToggleUrl,
+  urlDraft,
+  onUrlDraftChange,
+  onInstallPremade,
+  onInstallFromUrl,
+  onChooseFile,
+}: FrameworkStepProps) {
   const pct =
-    urlProgress && urlProgress.total > 0
+    progress && progress.total > 0
       ? Math.min(
           100,
-          Math.round((urlProgress.downloaded / urlProgress.total) * 100),
+          Math.round((progress.downloaded / progress.total) * 100),
         )
-      : urlProgress && urlProgress.total === 0
+      : progress && progress.total === 0
         ? null
         : 0;
 
@@ -503,158 +590,220 @@ function FrameworkStep({
     <div className="space-y-5">
       <div>
         <h2 className="text-xl font-semibold tracking-tight">
-          Import a framework
+          Install a framework
         </h2>
         <p className="text-sm text-[var(--color-muted-foreground)] mt-1">
-          A framework is a ZIP archive. Its <code>prompts/</code> folder
-          becomes the agent's prompt store; everything else lands in the
-          agent's sandbox. You can re-import over an existing framework to
-          update it.
+          Pick a framework below. It's downloaded and unpacked first, then
+          you can configure its options before it's applied.
         </p>
       </div>
 
-      <div className="border border-[var(--color-border)] rounded-lg p-4 bg-[var(--color-surface)] space-y-3">
-        <button
-          onClick={onImport}
-          disabled={importBusy}
-          className="px-3 py-2 text-sm rounded-md bg-[var(--color-pink-400)] text-[var(--color-primary-foreground)] hover:bg-[var(--color-pink-500)] disabled:opacity-50 inline-flex items-center gap-2"
-        >
-          {importBusy ? (
-            <Loader2 size={14} className="animate-spin" />
-          ) : (
-            <PackageOpen size={14} />
-          )}
-          Choose framework ZIP…
-        </button>
-
-        {installed && !importBusy && (
-          <p className="text-xs text-[var(--color-success)] flex items-start gap-1.5">
-            <CheckCircle2 size={14} className="mt-0.5 shrink-0" />
-            <span>
-              A framework is installed. You can import another to replace or
-              update it.
-            </span>
-          </p>
-        )}
-
-        {importError && (
-          <p className="text-xs text-[var(--color-danger)] flex items-start gap-1.5">
-            <AlertCircle size={14} className="mt-0.5 shrink-0" />
-            <span className="break-words">{importError}</span>
-          </p>
-        )}
-
-        {importResult && (
-          <p className="text-xs text-[var(--color-success)] flex items-start gap-1.5">
-            <CheckCircle2 size={14} className="mt-0.5 shrink-0" />
-            <span>
-              {summarizeImportResult(importResult).main}
-              {summarizeImportResult(importResult).detail && (
-                <span className="block text-[var(--color-muted-foreground)]">
-                  {summarizeImportResult(importResult).detail}
-                </span>
+      {/* Gallery of predefined frameworks (primary). */}
+      <div className="grid gap-2">
+        {PREDEFINED_FRAMEWORKS.map(({ url }) => {
+          const info = gallery[url];
+          return (
+            <button
+              key={url}
+              onClick={() => onInstallPremade(url)}
+              disabled={busy}
+              className="text-left border border-[var(--color-border)] rounded-lg p-3 bg-[var(--color-surface)] hover:bg-[var(--color-pink-50)] disabled:opacity-50 flex items-start gap-3"
+            >
+              <div className="size-8 rounded-md bg-[var(--color-pink-100)] text-[var(--color-pink-700)] grid place-items-center shrink-0">
+                <PackageOpen size={16} />
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-medium truncate">
+                    {info ? info.name : "Framework"}
+                  </span>
+                  {info?.version && (
+                    <code className="text-[10px] font-mono text-[var(--color-muted-foreground)] shrink-0">
+                      v{info.version}
+                    </code>
+                  )}
+                </div>
+                <p className="text-xs text-[var(--color-muted-foreground)] line-clamp-2">
+                  {info
+                    ? info.description
+                    : "Fetching details…"}
+                </p>
+              </div>
+              {busy ? (
+                <Loader2 size={14} className="animate-spin shrink-0 mt-1" />
+              ) : (
+                <ChevronRight size={14} className="shrink-0 mt-1 text-[var(--color-muted-foreground)]" />
               )}
-            </span>
-          </p>
-        )}
+            </button>
+          );
+        })}
       </div>
 
-      {/* ── Install from URL ───────────────────────────────────── */}
-      <div className="border border-[var(--color-border)] rounded-lg p-4 bg-[var(--color-surface)] space-y-3">
-        <div className="flex items-baseline justify-between gap-3">
-          <div className="text-sm font-medium">…or install from a URL</div>
-          <code className="font-mono text-[10px] uppercase tracking-wider text-[var(--color-muted-foreground)] flex items-center gap-1">
-            <Link size={10} /> url
-          </code>
-        </div>
-        <p className="text-xs text-[var(--color-muted-foreground)]">
-          Paste a framework channel URL (an index document) to download and
-          install it. The URL is saved as your update channel so future
-          updates can be checked from Settings.
-        </p>
-
-        {PREMADE_FRAMEWORK_URLS.length > 0 && (
-          <div className="flex flex-wrap gap-2">
-            {PREMADE_FRAMEWORK_URLS.map((url) => (
-              <button
-                key={url}
-                onClick={() => onInstallPremade(url)}
-                disabled={importBusy}
-                className="px-3 py-1.5 text-xs rounded-md border border-[var(--color-border)] hover:bg-[var(--color-pink-50)] disabled:opacity-50 inline-flex items-center gap-1.5"
-              >
-                <Download size={12} />
-                {url}
-              </button>
-            ))}
-          </div>
-        )}
-
-        <div className="flex flex-wrap items-center gap-2">
-          <input
-            type="url"
-            value={urlDraft}
-            onChange={(e) => onUrlDraftChange(e.target.value)}
-            placeholder="https://example.com/framework/index.json"
-            spellCheck={false}
-            disabled={importBusy}
-            className="flex-1 min-w-[200px] px-3 py-2 text-sm rounded-md border border-[var(--color-border)] bg-[var(--color-background)] focus:outline-none focus:border-[var(--color-pink-400)] font-mono text-xs disabled:opacity-50"
-          />
-          <button
-            onClick={onInstallFromUrl}
-            disabled={importBusy || !urlDraft.trim()}
-            className="px-3 py-2 text-sm rounded-md bg-[var(--color-pink-400)] text-[var(--color-primary-foreground)] hover:bg-[var(--color-pink-500)] disabled:opacity-50 inline-flex items-center gap-2"
-          >
-            {importBusy ? (
-              <Loader2 size={14} className="animate-spin" />
-            ) : (
-              <Download size={14} />
-            )}
-            Install from URL
-          </button>
-        </div>
-
-        {importBusy && urlProgress && (
-          <div className="space-y-1">
-            <div className="h-1.5 rounded-full bg-[var(--color-surface-muted)] overflow-hidden">
-              <div
-                className="h-full bg-[var(--color-pink-400)] transition-[width] duration-150"
-                style={{ width: pct == null ? "100%" : `${pct}%` }}
+      {/* Secondary: URL + local ZIP, collapsed. */}
+      <div className="border border-[var(--color-border)] rounded-lg bg-[var(--color-surface)]">
+        <button
+          onClick={onToggleUrl}
+          className="w-full flex items-center justify-between gap-2 px-4 py-3 text-sm font-medium"
+        >
+          <span className="flex items-center gap-2">
+            <Link size={14} />
+            Install from a URL or file
+          </span>
+          {urlOpen ? (
+            <ChevronDown size={14} />
+          ) : (
+            <ChevronRight size={14} />
+          )}
+        </button>
+        {urlOpen && (
+          <div className="px-4 pb-4 space-y-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <input
+                type="url"
+                value={urlDraft}
+                onChange={(e) => onUrlDraftChange(e.target.value)}
+                placeholder="https://example.com/framework/index.json"
+                spellCheck={false}
+                disabled={busy}
+                className="flex-1 min-w-[200px] px-3 py-2 text-sm rounded-md border border-[var(--color-border)] bg-[var(--color-background)] focus:outline-none focus:border-[var(--color-pink-400)] font-mono text-xs disabled:opacity-50"
               />
+              <button
+                onClick={onInstallFromUrl}
+                disabled={busy || !urlDraft.trim()}
+                className="px-3 py-2 text-sm rounded-md bg-[var(--color-pink-400)] text-[var(--color-primary-foreground)] hover:bg-[var(--color-pink-500)] disabled:opacity-50 inline-flex items-center gap-2"
+              >
+                {busy ? (
+                  <Loader2 size={14} className="animate-spin" />
+                ) : (
+                  <Download size={14} />
+                )}
+                Install from URL
+              </button>
             </div>
-            <p className="text-[11px] text-[var(--color-muted-foreground)] font-mono">
-              {pct == null
-                ? `Downloading… ${formatBytes(urlProgress.downloaded)}`
-                : `${pct}% · ${formatBytes(urlProgress.downloaded)} / ${formatBytes(
-                    urlProgress.total,
-                  )}`}
-            </p>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={onChooseFile}
+                disabled={busy}
+                className="px-3 py-2 text-sm rounded-md border border-[var(--color-border)] hover:bg-[var(--color-pink-50)] disabled:opacity-50 inline-flex items-center gap-2"
+              >
+                <PackageOpen size={14} />
+                Choose framework ZIP…
+              </button>
+            </div>
           </div>
         )}
       </div>
 
-      <div className="rounded-lg bg-[var(--color-surface-muted)] border border-[var(--color-border)] p-3 text-xs text-[var(--color-muted-foreground)] space-y-1">
-        <div className="font-medium text-[var(--color-foreground)]">
-          ZIP layout
+      {busy && progress && (
+        <div className="space-y-1">
+          <div className="h-1.5 rounded-full bg-[var(--color-surface-muted)] overflow-hidden">
+            <div
+              className="h-full bg-[var(--color-pink-400)] transition-[width] duration-150"
+              style={{ width: pct == null ? "100%" : `${pct}%` }}
+            />
+          </div>
+          <p className="text-[11px] text-[var(--color-muted-foreground)] font-mono">
+            {pct == null
+              ? `Downloading… ${formatBytes(progress.downloaded)}`
+              : `${pct}% · ${formatBytes(progress.downloaded)} / ${formatBytes(
+                  progress.total,
+                )}`}
+          </p>
         </div>
-        <code className="block font-mono text-[11px] leading-5">
-          my-framework.zip
-          <br />
-          ├─ manifest.json (required)
-          <br />
-          ├─ prompts/ → app prompt store
-          <br />
-          └─ (everything else) → agent sandbox
-        </code>
-        <p className="pt-1">
-          The <code>manifest.json</code> declares the framework's id, name,
-          version, and which files it owns, preserves, or removes on update.
-          Re-importing over an existing framework updates it in place.
+      )}
+
+      {error && (
+        <p className="text-xs text-[var(--color-danger)] flex items-start gap-1.5">
+          <AlertCircle size={14} className="mt-0.5 shrink-0" />
+          <span className="break-words">{error}</span>
         </p>
-        <p className="pt-1">
-          Specialisations (added later from Settings) work the same way but
-          write to <code>special/</code> inside the sandbox.
+      )}
+
+      <div className="rounded-lg bg-[var(--color-surface-muted)] border border-[var(--color-border)] p-3 text-xs text-[var(--color-muted-foreground)]">
+        A framework is a base of prompts + agent files, plus optional parts
+        you toggle on. After picking one, you configure the parts before it's
+        applied. Re-installing over an existing framework updates it in place.
+      </div>
+    </div>
+  );
+}
+
+// ── Config ──
+
+function FrameworkConfigStep({
+  staged,
+  choices,
+  onChoicesChange,
+  onBackToBrowse,
+  busy,
+  error,
+}: FrameworkStepProps & { staged: StagedFramework }) {
+  return (
+    <div className="space-y-5">
+      <div>
+        <h2 className="text-xl font-semibold tracking-tight">
+          Configure {staged.manifest.name}
+        </h2>
+        <p className="text-sm text-[var(--color-muted-foreground)] mt-1">
+          {staged.manifest.description}
         </p>
       </div>
+
+      <FrameworkOptionsList
+        options={staged.config.options}
+        choices={choices}
+        onChange={onChoicesChange}
+      />
+
+      {error && (
+        <p className="text-xs text-[var(--color-danger)] flex items-start gap-1.5">
+          <AlertCircle size={14} className="mt-0.5 shrink-0" />
+          <span className="break-words">{error}</span>
+        </p>
+      )}
+
+      <div className="flex items-center gap-2">
+        <button
+          onClick={onBackToBrowse}
+          disabled={busy}
+          className="px-3 py-2 text-sm rounded-md border border-[var(--color-border)] hover:bg-[var(--color-pink-50)] disabled:opacity-50"
+        >
+          Back
+        </button>
+        <p className="text-xs text-[var(--color-muted-foreground)]">
+          {busy
+            ? "Installing…"
+            : "Choose your options, then Apply & finish in the footer."}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// ── Installed ──
+
+function FrameworkInstalledStep({ result }: { result: ImportResult | null }) {
+  return (
+    <div className="space-y-5">
+      <div>
+        <h2 className="text-xl font-semibold tracking-tight">You're all set</h2>
+        <p className="text-sm text-[var(--color-muted-foreground)] mt-1">
+          A framework is installed. You can change it any time from Settings.
+        </p>
+      </div>
+      {result && (
+        <p className="text-xs text-[var(--color-success)] flex items-start gap-1.5">
+          <CheckCircle2 size={14} className="mt-0.5 shrink-0" />
+          <span>
+            {summarizeImportResult(result).main}
+            {summarizeImportResult(result).detail && (
+              <span className="block text-[var(--color-muted-foreground)]">
+                {summarizeImportResult(result).detail}
+              </span>
+            )}
+          </span>
+        </p>
+      )}
     </div>
   );
 }

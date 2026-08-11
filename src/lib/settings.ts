@@ -14,18 +14,13 @@ import type {
   ReasoningEffort,
   ChatSettings,
 } from "./types";
+import { DEFAULT_MODEL_ID } from "./models";
 
 import { ensureNotificationPermission } from "./notifications";
 
 /** localStorage key under which settings (incl. API keys) are persisted.
  * Exported so the full-data backup can read the raw stored value. */
 export const STORAGE_KEY = "train-me.settings.v1";
-
-/** Sensible default model choices. */
-export const DEFAULT_MODELS: Record<ProviderName, string> = {
-  openrouter: "~deepseek/deepseek-v4-flash-latest",
-  openai: "",
-};
 
 /** Default chat behaviour settings. */
 export const DEFAULT_CHAT_SETTINGS: ChatSettings = {
@@ -43,12 +38,11 @@ export const DEFAULT_CHAT_SETTINGS: ChatSettings = {
 const DEFAULT_SETTINGS: AgentSettings = {
   apiKeys: {},
   agents: {
-    main: { provider: "openrouter", model: DEFAULT_MODELS.openrouter },
-    planner: { provider: "openrouter", model: DEFAULT_MODELS.openrouter },
+    main: { provider: "openrouter", model: DEFAULT_MODEL_ID.openrouter },
+    planner: { provider: "openrouter", model: DEFAULT_MODEL_ID.openrouter },
   },
   chat: { ...DEFAULT_CHAT_SETTINGS },
   onboarded: false,
-  frameworkSourceUrl: "",
 };
 
 function load(): AgentSettings {
@@ -67,7 +61,6 @@ function load(): AgentSettings {
         ...(parsed.chat ?? {}),
       },
       onboarded: parsed.onboarded ?? false,
-      frameworkSourceUrl: parsed.frameworkSourceUrl ?? "",
     };
   } catch {
     return { ...DEFAULT_SETTINGS };
@@ -167,22 +160,11 @@ export function useSettings() {
     });
   }, []);
 
-  /** Set the framework update-channel URL (points at an index JSON).
-   * Pass an empty string to clear it. */
-  const setFrameworkSourceUrl = useCallback((url: string) => {
-    setSettings((prev) => {
-      const next: AgentSettings = { ...prev, frameworkSourceUrl: url };
-      save(next);
-      return next;
-    });
-  }, []);
-
   return {
     settings,
     setApiKey,
     setAgent,
     setChat,
-    setFrameworkSourceUrl,
     completeOnboarding,
     resetOnboarding,
   };

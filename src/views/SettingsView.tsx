@@ -33,29 +33,40 @@ import {
   Server,
   Sparkles,
 } from "lucide-react";
-import { useSettings, DEFAULT_MODELS, STORAGE_KEY } from "@/lib/settings";
+import { useSettings, STORAGE_KEY } from "@/lib/settings";
 import { loadMeta, loadMessages, clearAllChats } from "@/lib/chatStore";
 import { getCachedBaseUrl } from "@/lib/audioUrl";
 import type {
   AgentName,
   FileEntry,
   ProviderName,
-  ReasoningEffort,
 } from "@/lib/types";
 import { tauriErrorToString } from "@/lib/types";
 import {
   checkFrameworkUpdate,
+  defaultChoices,
+  discardStaged,
   formatBytes,
   getInstalledFramework,
-  installFrameworkFromUrl,
-  pickAndImportPackage,
+  getStaged,
+  installStaged,
+  reconcileChoices,
+  stageFromFile,
+  stageFromUrl,
   summarizeImportResult,
+  type FrameworkChoices,
   type FrameworkDownloadProgress,
   type ImportResult,
   type InstalledFramework,
-  type PackageKind,
+  type StagedFramework,
   type UpdateCheck,
-} from "@/lib/packages";
+} from "@/lib/frameworks";
+import {
+  AGENT_LABELS,
+  PROVIDER_LABELS,
+} from "@/lib/models";
+import { ModelPicker } from "@/components/ModelPicker";
+import { FrameworkOptionsList } from "@/components/FrameworkOptions";
 import { loadPrompt } from "@/lib/prompts";
 import {
   ensureGlobalListener,
@@ -74,39 +85,6 @@ interface ModelStatus {
   speakers: string[];
 }
 
-const AGENT_LABELS: Record<AgentName, string> = {
-  main: "Main agent",
-  planner: "Hypno planner",
-};
-
-const PROVIDER_LABELS: Record<ProviderName, string> = {
-  openrouter: "OpenRouter",
-  openai: "OpenAI",
-};
-
-/** Common model presets to ease configuration. */
-const MODEL_PRESETS: Record<ProviderName, string[]> = {
-  openrouter: [
-    "~deepseek/deepseek-v4-flash-latest",
-    "deepseek/deepseek-v4-pro",
-    "openai/gpt-4o",
-  ],
-  openai: ["gpt-4o", "gpt-4.1"],
-};
-
-const REASONING_OPTIONS: {
-  value: ReasoningEffort | "";
-  label: string;
-}[] = [
-  { value: "", label: "Disabled" },
-  { value: "high", label: "High" },
-  { value: "medium", label: "Medium" },
-  { value: "low", label: "Low" },
-  { value: "xhigh", label: "Extra High" },
-  { value: "minimal", label: "Minimal" },
-  { value: "none", label: "None" },
-];
-
 /** System-prompt files that back each agent, shown in the debug section. */
 const AGENT_PROMPTS: { agent: AgentName; file: string; label: string }[] = [
   { agent: "main", file: "main_agent.md", label: "Main agent" },
@@ -116,7 +94,7 @@ const AGENT_PROMPTS: { agent: AgentName; file: string; label: string }[] = [
 type PromptMode = "rendered" | "raw";
 
 export function SettingsView() {
-  const { settings, setApiKey, setAgent, setChat, setFrameworkSourceUrl, resetOnboarding } =
+  const { settings, setApiKey, setAgent, setChat, resetOnboarding } =
     useSettings();
   const [reveal, setReveal] = useState<Record<ProviderName, boolean>>({
     openrouter: false,
@@ -129,38 +107,29 @@ export function SettingsView() {
   const [ttsBusy, setTtsBusy] = useState(false);
   const [ttsError, setTtsError] = useState<string | null>(null);
 
-  // Package import state, tracked per kind so each card shows its own
-  // result without clobbering the other.
-  const [importBusy, setImportBusy] = useState<Record<PackageKind, boolean>>({
-    framework: false,
-    specialisation: false,
-  });
-  const [importResult, setImportResult] = useState<
-    Record<PackageKind, ImportResult | null>
-  >({
-    framework: null,
-    specialisation: null,
-  });
-  const [importError, setImportError] = useState<
-    Record<PackageKind, string | null>
-  >({
-    framework: null,
-    specialisation: null,
-  });
-  // Currently installed framework (id/name/version), shown on the framework
-  // card. Refreshed after each framework import and on mount.
+  // Currently installed framework (id/name/version/choices), shown on the
+  // framework card. Refreshed after each install and on mount.
   const [installedFramework, setInstalledFramework] =
     useState<InstalledFramework | null>(null);
 
-  // Framework update channel state.
-  const [urlDraft, setUrlDraft] = useState(settings.frameworkSourceUrl);
+  // Framework staging + install state (stage → configure → install). The
+  // framework lives in the backend staging area between stage and install.
+  const [staged, setStaged] = useState<StagedFramework | null>(null);
+  const [choices, setChoices] = useState<FrameworkChoices>({});
+  const [frameworkBusy, setFrameworkBusy] = useState(false);
+  const [frameworkError, setFrameworkError] = useState<string | null>(null);
+  const [frameworkProgress, setFrameworkProgress] =
+    useState<FrameworkDownloadProgress | null>(null);
+  const [frameworkResult, setFrameworkResult] = useState<ImportResult | null>(
+    null,
+  );
+
+  // Framework update channel state. The source URL is read from the
+  // installed record (editable here).
+  const [urlDraft, setUrlDraft] = useState("");
   const [checkBusy, setCheckBusy] = useState(false);
   const [updateCheck, setUpdateCheck] = useState<UpdateCheck | null>(null);
   const [updateError, setUpdateError] = useState<string | null>(null);
-  const [installBusy, setInstallBusy] = useState(false);
-  const [installProgress, setInstallProgress] =
-    useState<FrameworkDownloadProgress | null>(null);
-  const [installResult, setInstallResult] = useState<ImportResult | null>(null);
 
   // App-data reset state
   const [resetArmed, setResetArmed] = useState(false);
@@ -180,7 +149,18 @@ export function SettingsView() {
     invoke<ModelStatus>("get_model_status")
       .then(setModelStatus)
       .catch(() => {});
-    getInstalledFramework().then(setInstalledFramework);
+    // Load the installed framework, its source URL, and any staged framework
+    // (so re-entering Settings mid-configure resumes the options step).
+    getInstalledFramework().then((installed) => {
+      setInstalledFramework(installed);
+      setUrlDraft(installed?.source_url ?? "");
+    });
+    getStaged().then((fw) => {
+      if (fw) {
+        setStaged(fw);
+        setChoices(defaultChoices(fw.config));
+      }
+    });
   }, []);
 
   const flashSave = () => {
@@ -216,38 +196,111 @@ export function SettingsView() {
     }
   };
 
-  const handleImportPackage = async (kind: PackageKind) => {
-    setImportError((s) => ({ ...s, [kind]: null }));
-    setImportResult((s) => ({ ...s, [kind]: null }));
-    setImportBusy((s) => ({ ...s, [kind]: true }));
+  // ── Framework staging + install ───────────────────────────────────
+
+  /** Stage from a picked local ZIP, then advance to configure (or install). */
+  const handleStageFromFile = async () => {
+    setFrameworkError(null);
+    setFrameworkBusy(true);
     try {
-      const res = await pickAndImportPackage(kind);
-      if (!res) {
-        // user cancelled the dialog
-        return;
-      }
-      setImportResult((s) => ({ ...s, [kind]: res }));
-      if (kind === "framework") {
-        // Refresh the installed-framework record so the card shows the new
-        // version immediately.
-        getInstalledFramework().then(setInstalledFramework);
-      }
+      const fw = await stageFromFile();
+      if (!fw) return; // user cancelled
+      enterConfigure(fw, null);
     } catch (e) {
-      setImportError((s) => ({ ...s, [kind]: String(e) }));
+      setFrameworkError(String(e));
     } finally {
-      setImportBusy((s) => ({ ...s, [kind]: false }));
+      setFrameworkBusy(false);
     }
   };
 
+  /**
+   * Stage from a URL (the installed source URL, an update channel, or a
+   * pasted URL). Streams download progress to the progress bar.
+   */
+  const handleStageFromUrl = async (url: string) => {
+    const trimmed = url.trim();
+    if (!trimmed) return;
+    setFrameworkError(null);
+    setFrameworkProgress(null);
+    setFrameworkBusy(true);
+    try {
+      const fw = await stageFromUrl(trimmed, (p) => setFrameworkProgress(p));
+      setFrameworkProgress(null);
+      // On update, pre-fill with the previously-installed choices.
+      enterConfigure(fw, installedFramework);
+    } catch (e) {
+      setFrameworkError(String(e));
+    } finally {
+      setFrameworkBusy(false);
+    }
+  };
+
+  /** Move into the configure phase, seeding choices appropriately. */
+  const enterConfigure = (
+    fw: StagedFramework,
+    prev: InstalledFramework | null,
+  ) => {
+    const savedChoices = prev
+      ? (prev.choices as FrameworkChoices | null)
+      : null;
+    setStaged(fw);
+    setChoices(
+      savedChoices
+        ? reconcileChoices(fw.config, savedChoices)
+        : defaultChoices(fw.config),
+    );
+    // If the framework has no options, install immediately.
+    if (fw.config.options.length === 0) {
+      void runInstall(fw, {});
+    }
+  };
+
+  /** Install the staged framework with the current choices. */
+  const runInstall = async (fw: StagedFramework, chosen: FrameworkChoices) => {
+    setFrameworkError(null);
+    setFrameworkBusy(true);
+    try {
+      const res = await installStaged(chosen);
+      setFrameworkResult(res);
+      setStaged(null);
+      setChoices({});
+      const installed = await getInstalledFramework();
+      setInstalledFramework(installed);
+      setUrlDraft(installed?.source_url ?? "");
+      setUpdateCheck(null);
+    } catch (e) {
+      setFrameworkError(String(e));
+      setStaged(fw); // stay in configure so the user can retry
+    } finally {
+      setFrameworkBusy(false);
+    }
+  };
+
+  const handleApplyInstall = async () => {
+    if (staged) await runInstall(staged, choices);
+  };
+
+  const handleCancelStage = async () => {
+    await discardStaged().catch(() => {});
+    setStaged(null);
+    setChoices({});
+    setFrameworkError(null);
+  };
+
   const saveFrameworkSourceUrl = () => {
-    setFrameworkSourceUrl(urlDraft.trim());
-    // A URL change invalidates the last check.
+    // Persisting the source URL is now implicit — it's saved with the
+    // installed record on install. Here we just re-run an update check
+    // against the new draft and (if it parses) stage it for review.
+    const url = urlDraft.trim();
+    setInstalledFramework((prev) =>
+      prev ? { ...prev, source_url: url } : prev,
+    );
     setUpdateCheck(null);
     setUpdateError(null);
   };
 
   const handleCheckUpdate = async () => {
-    const url = settings.frameworkSourceUrl.trim();
+    const url = (installedFramework?.source_url ?? urlDraft).trim();
     if (!url) return;
     setCheckBusy(true);
     setUpdateError(null);
@@ -259,27 +312,6 @@ export function SettingsView() {
       setUpdateError(String(e));
     } finally {
       setCheckBusy(false);
-    }
-  };
-
-  const handleInstallFromUrl = async () => {
-    const url = settings.frameworkSourceUrl.trim();
-    if (!url) return;
-    setInstallBusy(true);
-    setImportError((s) => ({ ...s, framework: null }));
-    setInstallProgress(null);
-    setInstallResult(null);
-    try {
-      const res = await installFrameworkFromUrl(url, (p) =>
-        setInstallProgress(p),
-      );
-      setInstallResult(res);
-      setInstallProgress(null);
-      getInstalledFramework().then(setInstalledFramework);
-    } catch (e) {
-      setImportError((s) => ({ ...s, framework: String(e) }));
-    } finally {
-      setInstallBusy(false);
     }
   };
 
@@ -399,66 +431,17 @@ export function SettingsView() {
                 key={agent}
                 className="border border-[var(--color-border)] rounded-lg p-4 bg-[var(--color-surface)]"
               >
-                <label className="block text-sm font-medium mb-1.5">
+                <label className="block text-sm font-medium mb-2">
                   {AGENT_LABELS[agent]}
                 </label>
-                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
-                  <select
-                    value={cfg.provider}
-                    onChange={(e) => {
-                      const provider = e.target.value as ProviderName;
-                      setAgent(agent, provider, DEFAULT_MODELS[provider]);
-                      flashSave();
-                    }}
-                    className="text-sm border border-[var(--color-border)] rounded-md px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-[var(--color-pink-300)]"
-                  >
-                    {Object.entries(PROVIDER_LABELS).map(([k, v]) => (
-                      <option key={k} value={k}>
-                        {v}
-                      </option>
-                    ))}
-                  </select>
-                  <input
-                    type="text"
-                    list={`presets-${agent}`}
-                    value={cfg.model}
-                    onChange={(e) => {
-                      setAgent(agent, cfg.provider, e.target.value);
-                      flashSave();
-                    }}
-                    placeholder="model id, e.g. anthropic/claude-3.5-sonnet"
-                    className="w-full sm:flex-1 font-mono text-sm border border-[var(--color-border)] rounded-md px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-[var(--color-pink-300)]"
-                  />
-                  <datalist id={`presets-${agent}`}>
-                    {MODEL_PRESETS[cfg.provider].map((m) => (
-                      <option key={m} value={m} />
-                    ))}
-                  </datalist>
-                </div>
-                <div className="flex items-center gap-2 mt-2">
-                  <label className="text-xs text-[var(--color-muted-foreground)] shrink-0">
-                    Reasoning:
-                  </label>
-                  <select
-                    value={cfg.reasoningEffort ?? ""}
-                    onChange={(e) => {
-                      const effort = (e.target.value || undefined) as
-                        | ReasoningEffort
-                        | undefined;
-                      setAgent(agent, cfg.provider, cfg.model, {
-                        reasoningEffort: effort,
-                      });
-                      flashSave();
-                    }}
-                    className="text-sm border border-[var(--color-border)] rounded-md px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-[var(--color-pink-300)]"
-                  >
-                    {REASONING_OPTIONS.map((opt) => (
-                      <option key={opt.value} value={opt.value}>
-                        {opt.label}
-                      </option>
-                    ))}
-                  </select>
-                </div>
+                <ModelPicker
+                  agent={agent}
+                  cfg={cfg}
+                  onChange={(provider, model, extras) => {
+                    setAgent(agent, provider, model, extras);
+                    flashSave();
+                  }}
+                />
               </div>
             );
           })}
@@ -521,46 +504,51 @@ export function SettingsView() {
           </div>
         </section>
 
-        {/* ── Package import ──────────────────────────────────────── */}
+        {/* ── Framework ──────────────────────────────────────────── */}
         <section className="space-y-4">
           <h2 className="text-sm uppercase tracking-wider text-[var(--color-muted-foreground)]">
-            Packages
+            Framework
           </h2>
-          <PackageCard
-            kind="framework"
-            title="Framework"
-            description="A full framework that specifies how the agent behaves."
-            busy={importBusy.framework}
-            result={importResult.framework}
-            error={importError.framework}
-            installed={installedFramework}
-            onImport={() => handleImportPackage("framework")}
-          />
-          <FrameworkUpdateCard
-            savedUrl={settings.frameworkSourceUrl}
-            urlDraft={urlDraft}
-            onUrlDraftChange={setUrlDraft}
-            onSaveUrl={saveFrameworkSourceUrl}
-            installed={installedFramework}
-            checkBusy={checkBusy}
-            updateCheck={updateCheck}
-            updateError={updateError}
-            onCheck={handleCheckUpdate}
-            installBusy={installBusy}
-            installProgress={installProgress}
-            installResult={installResult}
-            installError={importError.framework}
-            onInstall={handleInstallFromUrl}
-          />
-          <PackageCard
-            kind="specialisation"
-            title="Specialisation"
-            description="Customisations for specifics."
-            busy={importBusy.specialisation}
-            result={importResult.specialisation}
-            error={importError.specialisation}
-            onImport={() => handleImportPackage("specialisation")}
-          />
+          {staged ? (
+            <FrameworkConfigureCard
+              staged={staged}
+              choices={choices}
+              onChoicesChange={setChoices}
+              busy={frameworkBusy}
+              error={frameworkError}
+              onApply={handleApplyInstall}
+              onCancel={handleCancelStage}
+            />
+          ) : (
+            <>
+              <FrameworkInstalledCard
+                installed={installedFramework}
+                busy={frameworkBusy}
+                progress={frameworkProgress}
+                error={frameworkError}
+                result={frameworkResult}
+                onImportFile={handleStageFromFile}
+              />
+              <FrameworkUpdateCard
+                installed={installedFramework}
+                urlDraft={urlDraft}
+                onUrlDraftChange={setUrlDraft}
+                onSaveUrl={saveFrameworkSourceUrl}
+                checkBusy={checkBusy}
+                updateCheck={updateCheck}
+                updateError={updateError}
+                onCheck={handleCheckUpdate}
+                stageBusy={frameworkBusy}
+                progress={frameworkProgress}
+                onInstallUpdate={() =>
+                  handleStageFromUrl(
+                    installedFramework?.source_url || urlDraft,
+                  )
+                }
+                onStageFromUrl={() => handleStageFromUrl(urlDraft)}
+              />
+            </>
+          )}
         </section>
 
         {/* ── Backup ─────────────────────────────────────────────── */}
@@ -875,62 +863,97 @@ function ChatNumberField({
   );
 }
 
-/** A single package-import card (framework or specialisation). */
-function PackageCard({
-  kind,
-  title,
-  description,
-  busy,
-  result,
-  error,
+/**
+ * Card showing the currently installed framework (name/version/choices) with
+ * an "import from file" action. Install-from-URL lives in the update card.
+ */
+function FrameworkInstalledCard({
   installed,
-  onImport,
+  busy,
+  progress,
+  error,
+  result,
+  onImportFile,
 }: {
-  kind: PackageKind;
-  title: string;
-  description: string;
+  installed: InstalledFramework | null;
   busy: boolean;
-  result: ImportResult | null;
+  progress: FrameworkDownloadProgress | null;
   error: string | null;
-  /** Installed framework record (framework card only); null hides the line. */
-  installed?: InstalledFramework | null;
-  onImport: () => void;
+  result: ImportResult | null;
+  onImportFile: () => void;
 }) {
+  const pct =
+    progress && progress.total > 0
+      ? Math.min(100, Math.round((progress.downloaded / progress.total) * 100))
+      : progress && progress.total === 0
+        ? null
+        : 0;
+
   return (
     <div className="border border-[var(--color-border)] rounded-lg p-4 bg-[var(--color-surface)] space-y-3">
       <div className="flex items-baseline justify-between gap-3">
-        <div className="text-sm font-medium">{title}</div>
+        <div className="text-sm font-medium">Installed framework</div>
         <code className="font-mono text-[10px] uppercase tracking-wider text-[var(--color-muted-foreground)]">
-          {kind}
+          framework
         </code>
       </div>
-      <p className="text-xs text-[var(--color-muted-foreground)]">
-        {description}
-      </p>
 
-      {installed && (
+      {installed ? (
+        <div className="space-y-1">
+          <p className="text-sm">
+            <span className="font-medium">{installed.name}</span>{" "}
+            <code className="text-xs font-mono text-[var(--color-muted-foreground)]">
+              v{installed.version}
+            </code>
+          </p>
+          {installed.description && (
+            <p className="text-xs text-[var(--color-muted-foreground)]">
+              {installed.description}
+            </p>
+          )}
+          <p className="text-xs text-[var(--color-muted-foreground)]">
+            Choices: {summarizeChoices(installed.choices)}
+          </p>
+        </div>
+      ) : (
         <p className="text-xs text-[var(--color-muted-foreground)]">
-          Installed:{" "}
-          <span className="text-[var(--color-foreground)]">
-            {installed.name} {installed.version}
-          </span>
+          No framework installed yet. Import one from a file, or use the
+          update channel below.
         </p>
       )}
 
       <div className="flex flex-wrap items-center gap-2">
         <button
-          onClick={onImport}
+          onClick={onImportFile}
           disabled={busy}
-          className="px-3 py-2 text-sm rounded-md bg-[var(--color-pink-400)] text-[var(--color-primary-foreground)] hover:bg-[var(--color-pink-500)] disabled:opacity-50 inline-flex items-center gap-2"
+          className="px-3 py-2 text-sm rounded-md border border-[var(--color-border)] hover:bg-[var(--color-pink-50)] disabled:opacity-50 inline-flex items-center gap-2"
         >
           {busy ? (
             <Loader2 size={14} className="animate-spin" />
           ) : (
             <PackageOpen size={14} />
           )}
-          Import {title}
+          Replace from file…
         </button>
       </div>
+
+      {busy && progress && (
+        <div className="space-y-1">
+          <div className="h-1.5 rounded-full bg-[var(--color-surface-muted)] overflow-hidden">
+            <div
+              className="h-full bg-[var(--color-pink-400)] transition-[width] duration-150"
+              style={{ width: pct == null ? "100%" : `${pct}%` }}
+            />
+          </div>
+          <p className="text-[11px] text-[var(--color-muted-foreground)] font-mono">
+            {pct == null
+              ? `Downloading… ${formatBytes(progress.downloaded)}`
+              : `${pct}% · ${formatBytes(progress.downloaded)} / ${formatBytes(
+                  progress.total,
+                )}`}
+          </p>
+        </div>
+      )}
 
       {error && (
         <p className="text-xs text-[var(--color-danger)] flex items-start gap-1.5">
@@ -939,7 +962,7 @@ function PackageCard({
         </p>
       )}
 
-      {result && (
+      {result && !busy && (
         <p className="text-xs text-[var(--color-success)] flex items-start gap-1.5">
           <CheckCircle2 size={14} className="mt-0.5 shrink-0" />
           <span>
@@ -957,51 +980,122 @@ function PackageCard({
 }
 
 /**
- * Framework update channel card. Lets the user point at an index URL, check
- * for a newer version, and download + install it with a live progress bar.
+ * Card shown while a framework is staged but not yet installed. Renders the
+ * framework's option groups and an Apply / Cancel pair.
+ */
+function FrameworkConfigureCard({
+  staged,
+  choices,
+  onChoicesChange,
+  busy,
+  error,
+  onApply,
+  onCancel,
+}: {
+  staged: StagedFramework;
+  choices: FrameworkChoices;
+  onChoicesChange: (c: FrameworkChoices) => void;
+  busy: boolean;
+  error: string | null;
+  onApply: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="border border-[var(--color-border)] rounded-lg p-4 bg-[var(--color-surface)] space-y-3">
+      <div className="space-y-0.5">
+        <div className="text-sm font-medium">
+          Configure {staged.manifest.name}{" "}
+          <code className="text-xs font-mono text-[var(--color-muted-foreground)]">
+            v{staged.manifest.version}
+          </code>
+        </div>
+        {staged.manifest.description && (
+          <p className="text-xs text-[var(--color-muted-foreground)]">
+            {staged.manifest.description}
+          </p>
+        )}
+      </div>
+
+      <FrameworkOptionsList
+        options={staged.config.options}
+        choices={choices}
+        onChange={onChoicesChange}
+      />
+
+      {error && (
+        <p className="text-xs text-[var(--color-danger)] flex items-start gap-1.5">
+          <AlertCircle size={14} className="mt-0.5 shrink-0" />
+          <span className="break-words">{error}</span>
+        </p>
+      )}
+
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          onClick={onApply}
+          disabled={busy}
+          className="px-3 py-2 text-sm rounded-md bg-[var(--color-pink-400)] text-[var(--color-primary-foreground)] hover:bg-[var(--color-pink-500)] disabled:opacity-50 inline-flex items-center gap-2"
+        >
+          {busy ? (
+            <Loader2 size={14} className="animate-spin" />
+          ) : (
+            <PackageOpen size={14} />
+          )}
+          Apply install
+        </button>
+        <button
+          onClick={onCancel}
+          disabled={busy}
+          className="px-3 py-2 text-sm rounded-md border border-[var(--color-border)] hover:bg-[var(--color-pink-50)] disabled:opacity-50"
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Framework update channel card. Lets the user set the source URL, check for
+ * a newer version, and stage an update (or a fresh install from a URL) for
+ * review before it's applied.
  */
 function FrameworkUpdateCard({
-  savedUrl,
+  installed,
   urlDraft,
   onUrlDraftChange,
   onSaveUrl,
-  installed,
   checkBusy,
   updateCheck,
   updateError,
   onCheck,
-  installBusy,
-  installProgress,
-  installResult,
-  installError,
-  onInstall,
+  stageBusy,
+  progress,
+  onInstallUpdate,
+  onStageFromUrl,
 }: {
-  savedUrl: string;
+  installed: InstalledFramework | null;
   urlDraft: string;
   onUrlDraftChange: (v: string) => void;
   onSaveUrl: () => void;
-  installed: InstalledFramework | null;
   checkBusy: boolean;
   updateCheck: UpdateCheck | null;
   updateError: string | null;
   onCheck: () => void;
-  installBusy: boolean;
-  installProgress: FrameworkDownloadProgress | null;
-  installResult: ImportResult | null;
-  installError: string | null;
-  onInstall: () => void;
+  stageBusy: boolean;
+  progress: FrameworkDownloadProgress | null;
+  onInstallUpdate: () => void;
+  onStageFromUrl: () => void;
 }) {
+  const savedUrl = installed?.source_url ?? "";
   const urlSaved = urlDraft.trim() === savedUrl.trim();
-  const hasUrl = savedUrl.trim().length > 0;
+  const hasUrl = savedUrl.trim().length > 0 || urlDraft.trim().length > 0;
   const pct =
-    installProgress && installProgress.total > 0
+    progress && progress.total > 0
       ? Math.min(
           100,
-          Math.round(
-            (installProgress.downloaded / installProgress.total) * 100,
-          ),
+          Math.round((progress.downloaded / progress.total) * 100),
         )
-      : installProgress && installProgress.total === 0
+      : progress && progress.total === 0
         ? null
         : 0;
 
@@ -1014,8 +1108,9 @@ function FrameworkUpdateCard({
         </code>
       </div>
       <p className="text-xs text-[var(--color-muted-foreground)]">
-        Point at an index URL to check for and install framework updates over
-        the network.
+        Point at an index URL to check for updates and stage them for review
+        before applying. Installing an update keeps your previous choices where
+        the new version still supports them.
       </p>
 
       {/* URL input + save */}
@@ -1026,7 +1121,8 @@ function FrameworkUpdateCard({
           onChange={(e) => onUrlDraftChange(e.target.value)}
           placeholder="https://example.com/framework/index.json"
           spellCheck={false}
-          className="flex-1 min-w-[200px] px-3 py-2 text-sm rounded-md border border-[var(--color-border)] bg-[var(--color-background)] focus:outline-none focus:border-[var(--color-pink-400)] font-mono text-xs"
+          disabled={stageBusy}
+          className="flex-1 min-w-[200px] px-3 py-2 text-sm rounded-md border border-[var(--color-border)] bg-[var(--color-background)] focus:outline-none focus:border-[var(--color-pink-400)] font-mono text-xs disabled:opacity-50"
         />
         <button
           onClick={onSaveUrl}
@@ -1042,7 +1138,7 @@ function FrameworkUpdateCard({
       <div className="flex flex-wrap items-center gap-2">
         <button
           onClick={onCheck}
-          disabled={!hasUrl || checkBusy || installBusy}
+          disabled={!hasUrl || checkBusy || stageBusy}
           className="px-3 py-2 text-sm rounded-md border border-[var(--color-border)] hover:bg-[var(--color-pink-50)] disabled:opacity-50 inline-flex items-center gap-2"
         >
           {checkBusy ? (
@@ -1054,18 +1150,30 @@ function FrameworkUpdateCard({
         </button>
         {updateCheck?.update_available && (
           <button
-            onClick={onInstall}
-            disabled={installBusy}
+            onClick={onInstallUpdate}
+            disabled={stageBusy}
             className="px-3 py-2 text-sm rounded-md bg-[var(--color-pink-400)] text-[var(--color-primary-foreground)] hover:bg-[var(--color-pink-500)] disabled:opacity-50 inline-flex items-center gap-2"
           >
-            {installBusy ? (
+            {stageBusy ? (
               <Loader2 size={14} className="animate-spin" />
             ) : (
               <Download size={14} />
             )}
-            Install {updateCheck.latest_version}
+            Stage {updateCheck.latest_version}
           </button>
         )}
+        <button
+          onClick={onStageFromUrl}
+          disabled={stageBusy || !urlDraft.trim()}
+          className="px-3 py-2 text-sm rounded-md border border-[var(--color-border)] hover:bg-[var(--color-pink-50)] disabled:opacity-50 inline-flex items-center gap-2"
+        >
+          {stageBusy ? (
+            <Loader2 size={14} className="animate-spin" />
+          ) : (
+            <PackageOpen size={14} />
+          )}
+          Stage from URL
+        </button>
       </div>
 
       {/* Check result */}
@@ -1095,8 +1203,8 @@ function FrameworkUpdateCard({
         </p>
       )}
 
-      {/* Install progress */}
-      {installBusy && installProgress && (
+      {/* Download progress */}
+      {stageBusy && progress && (
         <div className="space-y-1">
           <div className="h-1.5 rounded-full bg-[var(--color-surface-muted)] overflow-hidden">
             <div
@@ -1106,38 +1214,31 @@ function FrameworkUpdateCard({
           </div>
           <p className="text-[11px] text-[var(--color-muted-foreground)] font-mono">
             {pct == null
-              ? `Downloading… ${formatBytes(installProgress.downloaded)}`
-              : `${pct}% · ${formatBytes(installProgress.downloaded)} / ${formatBytes(
-                  installProgress.total,
+              ? `Downloading… ${formatBytes(progress.downloaded)}`
+              : `${pct}% · ${formatBytes(progress.downloaded)} / ${formatBytes(
+                  progress.total,
                 )}`}
           </p>
         </div>
       )}
-
-      {/* Install error (shares the framework import-error slot) */}
-      {installError && !installBusy && (
-        <p className="text-xs text-[var(--color-danger)] flex items-start gap-1.5">
-          <AlertCircle size={14} className="mt-0.5 shrink-0" />
-          <span className="break-words">{installError}</span>
-        </p>
-      )}
-
-      {/* Install result */}
-      {installResult && !installBusy && (
-        <p className="text-xs text-[var(--color-success)] flex items-start gap-1.5">
-          <CheckCircle2 size={14} className="mt-0.5 shrink-0" />
-          <span>
-            {summarizeImportResult(installResult).main}
-            {summarizeImportResult(installResult).detail && (
-              <span className="block text-[var(--color-muted-foreground)]">
-                {summarizeImportResult(installResult).detail}
-              </span>
-            )}
-          </span>
-        </p>
-      )}
     </div>
   );
+}
+
+/**
+ * Render an installed framework's saved choices as a readable summary, e.g.
+ * "Intensity: medium · Extras: journal, fitness". Returns "default" when the
+ * choices blob is empty/null.
+ */
+function summarizeChoices(choices: Record<string, unknown>): string {
+  const entries = Object.entries(choices);
+  if (entries.length === 0) return "default";
+  return entries
+    .map(([k, v]) => {
+      const val = Array.isArray(v) ? v.join(", ") : String(v);
+      return `${k}: ${val || "—"}`;
+    })
+    .join(" · ");
 }
 
 /** A card that inspects one agent's system prompt (rendered + raw). */
