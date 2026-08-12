@@ -1753,7 +1753,7 @@ function QuestionCard({ q }: { q: PendingQuestion }) {
       )}
 
       {q.type === "single-choice" && (
-        <div className="mt-2 flex flex-col gap-1">
+        <div className="mt-2 flex flex-col gap-1 max-h-[40vh] overflow-y-auto min-h-0">
           {q.choices?.map((choice, i) => (
             <Button
               key={i}
@@ -1769,35 +1769,42 @@ function QuestionCard({ q }: { q: PendingQuestion }) {
       )}
 
       {q.type === "multi-choice" && (
-        <div className="mt-2 flex flex-col gap-1">
-          {q.choices?.map((choice, i) => {
-            const isSelected = selected.includes(i);
-            return (
-              <Button
-                key={i}
-                variant={isSelected ? "default" : "outline"}
-                size="sm"
-                className="justify-start"
-                aria-pressed={isSelected}
-                onClick={() =>
-                  setSelected((prev) =>
-                    prev.includes(i)
-                      ? prev.filter((x) => x !== i)
-                      : [...prev, i],
-                  )
-                }
-              >
-                <span className="flex items-center gap-2">
-                  <Check
-                    size={14}
-                    className={isSelected ? "opacity-100" : "opacity-0"}
-                  />
-                  {choice}
-                </span>
-              </Button>
-            );
-          })}
-          <div className="mt-1 flex items-center justify-between gap-2">
+        <div className="mt-2 flex flex-col gap-2">
+          {/* Cap + scroll the option list: the card sits between the
+              conversation and the composer, both of which clip overflow, so
+              without a bound a long list pushes lower choices and the submit
+              button off-screen (notably unreachable on Android). */}
+          <div className="flex flex-col gap-1 max-h-[40vh] overflow-y-auto min-h-0">
+            {q.choices?.map((choice, i) => {
+              const isSelected = selected.includes(i);
+              return (
+                <Button
+                  key={i}
+                  variant={isSelected ? "default" : "outline"}
+                  size="sm"
+                  className="justify-start"
+                  aria-pressed={isSelected}
+                  onClick={() =>
+                    setSelected((prev) =>
+                      prev.includes(i)
+                        ? prev.filter((x) => x !== i)
+                        : [...prev, i],
+                    )
+                  }
+                >
+                  <span className="flex items-center gap-2">
+                    <Check
+                      size={14}
+                      className={isSelected ? "opacity-100" : "opacity-0"}
+                    />
+                    {choice}
+                  </span>
+                </Button>
+              );
+            })}
+          </div>
+          {/* Submit stays outside the scroll area so it's always reachable. */}
+          <div className="flex items-center justify-between gap-2 shrink-0">
             <span className="text-[10px] text-[var(--color-muted-foreground)]">
               {selected.length === 0
                 ? "Select one or more options"
