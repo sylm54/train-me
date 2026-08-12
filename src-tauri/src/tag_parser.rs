@@ -153,6 +153,46 @@ pub enum Node {
         role: SectionRole,
         children: Vec<Node>,
     },
+
+    /// A metronome over its (non-interactive) children. The renderer bakes the
+    /// children into one `Static` clip, computes a beat schedule over that
+    /// clip's duration, and renders a short click sample (named by `sound`); at
+    /// playback the player triggers that sample at each beat via Web Audio and
+    /// drives an on-screen meter from the schedule. `pattern` is a string of
+    /// `X` (accent) / `x` (normal) / `.` (rest); default `x` (every beat).
+    Beatmeter {
+        bpm: f32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pattern: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sound: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        volume: Option<f32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        accent_gain: Option<f32>,
+        children: Vec<Node>,
+    },
+
+    /// Interactive scalar prompt. At playback the player pauses and asks the
+    /// listener for a value in `[min, max]`; the chosen value is recorded (via
+    /// the player's `onResolve`) and playback continues. Has no rendered audio
+    /// of its own, so it contributes a zero-duration segment.
+    Rating {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+        min: u32,
+        max: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        default: Option<u32>,
+    },
+
+    /// Non-blocking interrupt. The `main` part plays with `button` armed; if
+    /// the listener presses it, `main` is preempted and `fallback` plays. Two
+    /// `<part>` children distinguished by `role="main"` / `role="fallback"`.
+    React {
+        button: String,
+        parts: Vec<OverlayPart>,
+    },
 }
 
 /// A part within an overlay.
@@ -166,6 +206,10 @@ pub struct OverlayPart {
     pub speed: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// `<react>` only: `"main"` or `"fallback"`. Ignored (and errored) on
+    /// `<part>` inside `<overlay>`/`<random>`/`<scramble>`/`<choice>`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     pub children: Vec<Node>,
 }
 
@@ -256,6 +300,9 @@ impl TagParser {
             "scramble" => self.parse_scramble_tag(),
             "choice" => self.parse_choice_tag(),
             "intro" | "main" | "outro" => self.parse_section_tag(&tag_name),
+            "beatmeter" => self.parse_beatmeter_tag(),
+            "rating" => self.parse_rating_tag(),
+            "react" => self.parse_react_tag(),
             other => bail!("Unknown tag: <{}>", other),
         }
     }
@@ -446,6 +493,7 @@ impl TagParser {
                     volume: None,
                     speed: None,
                     label: None,
+                    role: None,
                     children: vec![node],
                 });
             } else {
@@ -461,6 +509,7 @@ impl TagParser {
                     volume: None,
                     speed: None,
                     label: None,
+                    role: None,
                     children: vec![node],
                 });
             }
@@ -499,6 +548,7 @@ impl TagParser {
         let volume = attrs.get("volume").cloned();
         let speed = attrs.get("speed").cloned();
         let label = attrs.get("label").cloned();
+        let role = attrs.get("role").cloned();
 
         self.expect_str(">")?;
         let children = self.parse_nodes()?;
@@ -509,6 +559,7 @@ impl TagParser {
             volume,
             speed,
             label,
+            role,
             children: filter_empty_text(children),
         })
     }
@@ -592,6 +643,71 @@ impl TagParser {
             role,
             children: filter_empty_text(children),
         })
+    }
+
+    /// Parse `<beatmeter>` — a metronome container over its non-interactive
+    /// children. Attributes: `bpm` (default 120), `pattern` (default every
+    /// beat), `sound` (default `click`), `volume` (default 0.5), `accent-gain`
+    /// (default 1.5). Semantic checks (valid sound/pattern, non-interactive
+    /// children, not inside background/overlay) happen in `validate`.
+    fn parse_beatmeter_tag(&mut self) -> Result<Node> {
+        let attrs = self.read_attributes();
+        let bpm = attrs
+            .get("bpm")
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(120.0);
+        let pattern = attrs.get("pattern").cloned();
+        let sound = attrs.get("sound").cloned();
+        let volume = attrs.get("volume").and_then(|v| v.parse::<f32>().ok());
+        let accent_gain = attrs.get("accent-gain").and_then(|v| v.parse::<f32>().ok());
+
+        if self.peek_str("/>") {
+            self.expect_str("/>")?;
+            bail!("<beatmeter> tag must have children");
+        }
+        self.expect_str(">")?;
+        let children = self.parse_nodes()?;
+        self.expect_closing("beatmeter")?;
+        Ok(Node::Beatmeter {
+            bpm,
+            pattern,
+            sound,
+            volume,
+            accent_gain,
+            children: filter_empty_text(children),
+        })
+    }
+
+    /// Parse `<rating/>` — a self-closing scalar prompt. Attributes: `prompt`
+    /// (optional), `min` (default 1), `max` (default 5), `default` (optional).
+    fn parse_rating_tag(&mut self) -> Result<Node> {
+        let attrs = self.read_attributes();
+        self.skip_ws();
+        let prompt = attrs.get("prompt").cloned();
+        let min = attrs.get("min").and_then(|v| v.parse::<u32>().ok()).unwrap_or(1);
+        let max = attrs.get("max").and_then(|v| v.parse::<u32>().ok()).unwrap_or(5);
+        let default = attrs.get("default").and_then(|v| v.parse::<u32>().ok());
+        self.expect_str("/>")?;
+        Ok(Node::Rating {
+            prompt,
+            min,
+            max,
+            default,
+        })
+    }
+
+    /// Parse `<react>` — a non-blocking interrupt container whose two `<part>`
+    /// children are distinguished by `role="main"` / `role="fallback"`. Uses
+    /// the shared parts container; role validation happens in `validate`.
+    fn parse_react_tag(&mut self) -> Result<Node> {
+        let attrs = self.read_attributes();
+        let button = attrs
+            .get("button")
+            .cloned()
+            .unwrap_or_else(|| "Continue".to_string());
+        self.expect_str(">")?;
+        let parts = self.parse_parts_container("react")?;
+        Ok(Node::React { button, parts })
     }
 
     // --- Helper methods ---
@@ -793,7 +909,8 @@ fn extract_text_recursive(node: &Node, texts: &mut Vec<String>) {
         | Node::Loop { children, .. }
         | Node::Background { children, .. }
         | Node::Until { children, .. }
-        | Node::Section { children, .. } => {
+        | Node::Section { children, .. }
+        | Node::Beatmeter { children, .. } => {
             for child in children {
                 extract_text_recursive(child, texts);
             }
@@ -805,14 +922,16 @@ fn extract_text_recursive(node: &Node, texts: &mut Vec<String>) {
                 }
             }
         }
-        Node::Random { parts } | Node::Scramble { parts } | Node::Choice { options: parts, .. } => {
+        Node::Random { parts } | Node::Scramble { parts } | Node::Choice { options: parts, .. }
+        | Node::React { parts, .. } => {
             for part in parts {
                 for child in &part.children {
                     extract_text_recursive(child, texts);
                 }
             }
         }
-        Node::Pause { .. } | Node::Sound { .. } | Node::Tone { .. } | Node::Include { .. } => {}
+        Node::Pause { .. } | Node::Sound { .. } | Node::Tone { .. } | Node::Include { .. }
+        | Node::Rating { .. } => {}
     }
 }
 
@@ -1041,7 +1160,103 @@ fn validate_nodes(
             | Node::Scramble { parts }
             | Node::Choice { options: parts, .. } => {
                 for part in parts {
+                    // `role` is only meaningful on a `<part>` inside `<react>`.
+                    if part.role.is_some() {
+                        errors.push(
+                            "<part role=\"…\"> is only valid inside <react>".to_string(),
+                        );
+                    }
                     validate_nodes(&part.children, errors, seen_includes, breadcrumb);
+                }
+            }
+
+            Node::React { button: _, parts } => {
+                let mains = parts
+                    .iter()
+                    .filter(|p| p.role.as_deref() == Some("main"))
+                    .count();
+                let fallbacks = parts
+                    .iter()
+                    .filter(|p| p.role.as_deref() == Some("fallback"))
+                    .count();
+                if mains != 1 {
+                    errors.push(
+                        "<react> requires exactly one <part role=\"main\">".to_string(),
+                    );
+                }
+                if fallbacks != 1 {
+                    errors.push(
+                        "<react> requires exactly one <part role=\"fallback\">".to_string(),
+                    );
+                }
+                // Any unrecognized role is also an error.
+                for p in parts {
+                    if let Some(r) = &p.role {
+                        if r != "main" && r != "fallback" {
+                            errors.push(format!(
+                                "<part role=\"{}\"> is not valid in <react> (use \"main\" or \"fallback\")",
+                                r
+                            ));
+                        }
+                    }
+                }
+                breadcrumb.push("<react>".to_string());
+                for part in parts {
+                    validate_nodes(&part.children, errors, seen_includes, breadcrumb);
+                }
+                breadcrumb.pop();
+            }
+
+            Node::Beatmeter {
+                bpm,
+                pattern,
+                sound,
+                children,
+                ..
+            } => {
+                if *bpm <= 0.0 {
+                    errors.push(format!(
+                        "<beatmeter> bpm must be > 0 (got {})",
+                        bpm
+                    ));
+                }
+                // Validate the click sound (default `click`, which is valid).
+                let sound_name = sound.as_deref().unwrap_or("click");
+                if !VALID_SOUND_TYPES.contains(&sound_name) {
+                    errors.push(format!(
+                        "Unknown sound '{}' in <beatmeter sound=\"{}\">. Valid sound types: {}",
+                        sound_name,
+                        sound_name,
+                        VALID_SOUND_TYPES.join(", ")
+                    ));
+                }
+                // Validate the pattern string: only X (accent) / x (normal) / . (rest).
+                if let Some(p) = pattern {
+                    if p.is_empty() {
+                        errors.push(
+                            "<beatmeter> pattern is empty — use at least one of X/x/. (or omit it for every beat)"
+                                .to_string(),
+                        );
+                    } else if let Some(bad) = p.chars().find(|c| !matches!(c, 'X' | 'x' | '.')) {
+                        errors.push(format!(
+                            "Invalid pattern char '{}' in <beatmeter pattern=\"{}\">. Only X (accent), x (normal), . (rest) are allowed",
+                            bad, p
+                        ));
+                    }
+                }
+                breadcrumb.push("<beatmeter>".to_string());
+                validate_nodes(children, errors, seen_includes, breadcrumb);
+                breadcrumb.pop();
+            }
+
+            Node::Rating {
+                min, max, ..
+            } => {
+                if *min > *max {
+                    errors.push(format!(
+                        "<rating> min ({}) must be ≤ max ({})",
+                        min, max
+                    ));
                 }
             }
 

@@ -34,6 +34,10 @@ export function nominalDuration(seg: Segment): number {
       return seg.options.reduce((sum, o) => sum + nominalDuration(o), 0);
     case "choice":
       return seg.options.length ? nominalDuration(seg.options[0].segment) : 0;
+    case "rating":
+      return 0;
+    case "react":
+      return nominalDuration(seg.main);
     case "loop":
       return nominalDuration(seg.child) * seg.loops;
     case "overlay":
@@ -57,6 +61,8 @@ export function containsInteractive(seg: Segment): boolean {
     case "random":
     case "scramble":
     case "choice":
+    case "rating":
+    case "react":
       return true;
     case "static":
     case "import":

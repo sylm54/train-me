@@ -39,6 +39,12 @@ pub enum Segment {
     Static {
         file: String,
         duration: f32,
+        /// Beat schedule when this clip was authored under a `<beatmeter>`,
+        /// absent otherwise. Carries the click sample path + resolved beat
+        /// times so the player can drive a runtime metronome + on-screen
+        /// meter without re-deriving anything.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        beatmeter: Option<BeatmeterMeta>,
     },
 
     /// Loop the inner clip until the user presses `button`. An optional
@@ -76,6 +82,23 @@ pub enum Segment {
         #[serde(skip_serializing_if = "Option::is_none")]
         prompt: Option<String>,
         options: Vec<ChoiceOption>,
+    },
+
+    /// Interactive scalar prompt; the user supplies a value in `[min, max]`.
+    /// No audio of its own → contributes zero duration.
+    Rating {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+        min: u32,
+        max: u32,
+    },
+
+    /// Non-blocking interrupt. `main` plays with `button` armed; on press,
+    /// `main` is preempted and `fallback` plays. Duration counts only `main`.
+    React {
+        button: String,
+        main: Box<Segment>,
+        fallback: Box<Segment>,
     },
 
     /// Repeat `child` exactly `loops` times.
@@ -129,6 +152,28 @@ pub struct OverlayPartSegment {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speed: Option<String>,
     pub segment: Segment,
+}
+
+/// Beat schedule attached to a `Static` clip authored under a `<beatmeter>`.
+/// The renderer resolves the schedule (applying bpm/pattern) to flat `beats`
+/// and renders the click `sample` WAV once; the player triggers that sample at
+/// each beat via Web Audio and drives the on-screen meter from `beats`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BeatmeterMeta {
+    /// Path (relative to the manifest dir) of the rendered click sample WAV.
+    pub sample: String,
+    /// Base gain for every click (0.0–1.5).
+    pub volume: f32,
+    /// Multiplier applied to `volume` on accented beats (`X` in the pattern).
+    pub accent_gain: f32,
+    /// Resolved beat times (seconds from clip start) + accent flag.
+    pub beats: Vec<BeatMark>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BeatMark {
+    pub time: f32,
+    pub accent: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -294,7 +339,10 @@ pub(crate) fn contains_split(node: &Node) -> bool {
         | Node::Random { .. }
         | Node::Scramble { .. }
         | Node::Choice { .. }
-        | Node::Include { .. } => true,
+        | Node::Include { .. }
+        | Node::Beatmeter { .. }
+        | Node::Rating { .. }
+        | Node::React { .. } => true,
 
         Node::Voice { children, .. }
         | Node::Speed { children, .. }
@@ -331,6 +379,8 @@ pub(crate) fn nominal_duration(seg: &Segment) -> f32 {
             .first()
             .map(|o| nominal_duration(&o.segment))
             .unwrap_or(0.0),
+        Segment::Rating { .. } => 0.0,
+        Segment::React { main, .. } => nominal_duration(main),
         Segment::Loop { loops, child } => nominal_duration(child) * (*loops as f32),
         Segment::Overlay { duration, parts } => {
             if let Some(d) = duration {
@@ -398,6 +448,18 @@ pub(crate) fn resolve_paths_recursive(value: &mut serde_json::Value, base_dir: &
                     value["waiting_sound"] = json!(abs.to_string_lossy().to_string());
                 }
             }
+            if ty.as_deref() == Some("static") {
+                // The beat click sample path lives under beatmeter.sample.
+                if let Some(s) = value
+                    .get("beatmeter")
+                    .and_then(|b| b.get("sample"))
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string())
+                {
+                    let abs = normalize_lexical(&base_dir.join(&s));
+                    value["beatmeter"]["sample"] = json!(abs.to_string_lossy().to_string());
+                }
+            }
         }
         Some("import") => {
             if let Some(m) = value
@@ -463,6 +525,14 @@ pub(crate) fn resolve_paths_recursive(value: &mut serde_json::Value, base_dir: &
                 resolve_paths_recursive(seg, base_dir);
             }
         }
+        Some("react") => {
+            if let Some(seg) = value.get_mut("main") {
+                resolve_paths_recursive(seg, base_dir);
+            }
+            if let Some(seg) = value.get_mut("fallback") {
+                resolve_paths_recursive(seg, base_dir);
+            }
+        }
         _ => {}
     }
 }
@@ -522,6 +592,7 @@ mod tests {
                 volume: None,
                 speed: None,
                 label: None,
+                role: None,
                 children: vec![Node::Random { parts: vec![] }],
             }],
         }));
@@ -587,16 +658,19 @@ mod tests {
                 Segment::Static {
                     file: "a.wav".into(),
                     duration: 2.0,
+                    beatmeter: None,
                 },
                 Segment::Random {
                     options: vec![
                         Segment::Static {
                             file: "b.wav".into(),
                             duration: 3.0,
+                            beatmeter: None,
                         },
                         Segment::Static {
                             file: "c.wav".into(),
                             duration: 5.0,
+                            beatmeter: None,
                         },
                     ],
                 },
@@ -605,6 +679,7 @@ mod tests {
                     child: Box::new(Segment::Static {
                         file: "d.wav".into(),
                         duration: 1.0,
+                        beatmeter: None,
                     }),
                 },
             ],
@@ -620,10 +695,12 @@ mod tests {
                         Segment::Static {
                             file: "x.wav".into(),
                             duration: 1.0,
+                            beatmeter: None,
                         },
                         Segment::Static {
                             file: "y.wav".into(),
                             duration: 2.0,
+                            beatmeter: None,
                         },
                     ],
                 },
@@ -633,6 +710,7 @@ mod tests {
                     layer: Box::new(Segment::Static {
                         file: "bg.wav".into(),
                         duration: 100.0,
+                        beatmeter: None,
                     }),
                 },
             ],
@@ -689,6 +767,7 @@ mod tests {
             child: Box::new(Segment::Static {
                 file: "a.wav".into(),
                 duration: 10.0,
+                beatmeter: None,
             }),
         };
         assert!((nominal_duration(&seg) - 10.0).abs() < 1e-6);
@@ -761,5 +840,56 @@ mod tests {
                 .replace('\\', "/"),
             "/app/tracks/top1/seg-001.wav"
         );
+    }
+
+    #[test]
+    fn test_contains_split_beatmeter() {
+        // A <beatmeter> is itself a split point (the walker emits its own Static).
+        assert!(contains_split(&Node::Beatmeter {
+            bpm: 120.0,
+            pattern: None,
+            sound: None,
+            volume: None,
+            accent_gain: None,
+            children: vec![Node::Text("hi".into())],
+        }));
+    }
+
+    #[test]
+    fn test_resolve_paths_recursive_beatmeter_sample() {
+        use serde_json::json;
+        // A static segment with a beatmeter: both the clip `file` and the
+        // click `sample` must be resolved to absolute paths.
+        let mut val = json!({
+            "type": "static",
+            "file": "seg-000.wav",
+            "duration": 4.0,
+            "beatmeter": {
+                "sample": "beat-click.wav",
+                "volume": 0.5,
+                "accent_gain": 1.5,
+                "beats": [{"time": 0.0, "accent": true}]
+            }
+        });
+        let base = Path::new("/app/tracks/top1");
+        resolve_paths_recursive(&mut val, base);
+        assert_eq!(
+            val.get("file").unwrap().as_str().unwrap().replace('\\', "/"),
+            "/app/tracks/top1/seg-000.wav"
+        );
+        assert_eq!(
+            val.get("beatmeter")
+                .unwrap()
+                .get("sample")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .replace('\\', "/"),
+            "/app/tracks/top1/beat-click.wav"
+        );
+        // A static without a beatmeter is unaffected (no sample key added).
+        let mut bare = json!({"type": "static", "file": "seg-001.wav", "duration": 1.0});
+        resolve_paths_recursive(&mut bare, base);
+        assert!(bare.get("beatmeter").is_none());
     }
 }

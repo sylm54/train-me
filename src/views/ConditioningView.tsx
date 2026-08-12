@@ -45,7 +45,13 @@ import {
   relativeTime,
   type TrackStat,
 } from "@/lib/activity";
-import { ActivePrompt, ManifestPlayer, Segment } from "@/lib/manifestPlayer";
+import { useSettings } from "@/lib/settings";
+import {
+  ActivePrompt,
+  ManifestPlayer,
+  ProgressState,
+  Segment,
+} from "@/lib/manifestPlayer";
 import {
   analyzeSections,
   formatDuration,
@@ -133,6 +139,8 @@ function deriveId(jsonPath: string): string {
 // ──────────────────────────────────────────────────────────────────────────
 
 export function ConditioningView() {
+  const { settings } = useSettings();
+  const beatOffsetMs = settings.playback.beatOffsetMs;
   const [scripts, setScripts] = useState<ConditioningScript[]>([]);
   const [loading, setLoading] = useState(true);
   const [globalError, setGlobalError] = useState<string | null>(null);
@@ -171,6 +179,8 @@ export function ConditioningView() {
   const [activePrompt, setActivePrompt] = useState<ActivePrompt | null>(null);
   const [isPlaying, setIsPlaying] = useState(true);
   const [playerError, setPlayerError] = useState<string | null>(null);
+  /** Per-frame beatmeter state for the on-screen meter (null when idle). */
+  const [beatState, setBeatState] = useState<ProgressState | null>(null);
   const playerRef = useRef<ManifestPlayer | null>(null);
   // True while this view instance is mounted. Used to guard player setup and
   // the play-after-render transition (so navigating away mid-render doesn't
@@ -495,6 +505,7 @@ export function ConditioningView() {
     playerRef.current = null;
     setActivePrompt(null);
     setPlayerError(null);
+    setBeatState(null);
   }, []);
 
   /**
@@ -531,12 +542,14 @@ export function ConditioningView() {
         teardownPlayer();
         setIsPlaying(true);
         setPlayingScript(current);
+        setBeatState(null);
 
         const player = new ManifestPlayer({
           onPrompt: (p) => setActivePrompt(p),
           onPlayingChange: (playing) => {
             setIsPlaying(playing);
           },
+          onProgress: (s) => setBeatState(s),
           onEnded: () => {
             // A completed listen: log it (details = the stable script id, which
             // the tracking aggregator groups on) then refresh stats so the
@@ -549,6 +562,16 @@ export function ConditioningView() {
           onError: (e) => {
             setPlayerError(e.message || String(e));
           },
+          onResolve: (info) => {
+            // Record the listener's interactive decisions alongside play
+            // events. `details` is free-form JSON the agent can read via its
+            // sqlite builtin to adapt future scripts (e.g. "picked easier 3x").
+            void logActivity(
+              "conditioning",
+              "choice",
+              JSON.stringify({ id: current.id, ...info }),
+            );
+          },
           readImport: async (manifestPath: string) => {
             const res = await invoke<ReadManifestResult>("read_manifest", {
               manifestPath,
@@ -558,6 +581,8 @@ export function ConditioningView() {
           // Pass the chosen repeat count so `<main>` loops accordingly. For
           // scripts without sections this is simply ignored.
           mainRepeats,
+          // User-tunable click latency offset for `<beatmeter>` segments.
+          beatOffsetMs,
         });
         playerRef.current = player;
         void player.start(tree.root);
@@ -570,7 +595,7 @@ export function ConditioningView() {
         }
       }
     },
-    [renderScript, teardownPlayer, mainRepeats, refreshStats],
+    [renderScript, teardownPlayer, mainRepeats, refreshStats, beatOffsetMs],
   );
 
   const handleClosePlayer = useCallback(() => {
@@ -740,10 +765,13 @@ export function ConditioningView() {
           isPlaying={isPlaying}
           prompt={activePrompt}
           error={playerError}
+          beatState={beatState}
           onTogglePlayPause={togglePlayPause}
           onClose={handleClosePlayer}
           onContinueUntil={() => playerRef.current?.continueUntil()}
           onChoose={(i) => playerRef.current?.choose(i)}
+          onRate={(v) => playerRef.current?.rate(v)}
+          onReact={() => playerRef.current?.react()}
         />
       )}
     </div>
@@ -1181,12 +1209,18 @@ interface PlayerProps {
   isPlaying: boolean;
   prompt: ActivePrompt | null;
   error: string | null;
+  /** Per-frame beatmeter state; null when no `<beatmeter>` segment is active. */
+  beatState: ProgressState | null;
   onTogglePlayPause: () => void;
   onClose: () => void;
   /** Advance past an active `until` prompt. */
   onContinueUntil: () => void;
   /** Resolve an active `choice` prompt with an option index. */
   onChoose: (index: number) => void;
+  /** Resolve an active `rating` prompt with a value in [min, max]. */
+  onRate: (value: number) => void;
+  /** Press the active `<react>` button (preempts main → fallback). */
+  onReact: () => void;
 }
 
 /**
@@ -1200,10 +1234,13 @@ function Player({
   isPlaying,
   prompt,
   error,
+  beatState,
   onTogglePlayPause,
   onClose,
   onContinueUntil,
   onChoose,
+  onRate,
+  onReact,
 }: PlayerProps) {
   // Keyboard: space toggles play/pause, escape exits.
   useEffect(() => {
@@ -1260,6 +1297,9 @@ function Player({
           {title}
         </h2>
 
+        {/* Scrolling beat meter for an active `<beatmeter>` segment. */}
+        {beatState?.beatmeter && <Beatmeter state={beatState} />}
+
         {/* Playback error surfaced by the engine. */}
         {error && (
           <div className="mt-8 max-w-md rounded-xl border border-red-400/30 bg-red-500/10 p-4 text-sm text-red-100 flex items-start gap-2">
@@ -1281,6 +1321,11 @@ function Player({
                 {prompt.prompt ?? "Choose"}
               </p>
             )}
+            {prompt.kind === "rating" && (
+              <p className="text-center text-[11px] uppercase tracking-[0.2em] text-[var(--color-pink-200)]/50">
+                {prompt.prompt ?? "Rate"}
+              </p>
+            )}
             {prompt.kind === "until" && prompt.text && (
               <p className="text-center text-sm text-[var(--color-pink-100)]/90 leading-relaxed">
                 {prompt.text}
@@ -1297,6 +1342,25 @@ function Player({
                   {opt.label ?? `Option ${i + 1}`}
                 </button>
               ))}
+            {prompt.kind === "rating" &&
+              prompt.min != null &&
+              prompt.max != null && (
+                <div className="flex flex-wrap items-center justify-center gap-2">
+                  {Array.from(
+                    { length: prompt.max - prompt.min + 1 },
+                    (_, i) => prompt.min! + i,
+                  ).map((v) => (
+                    <button
+                      key={v}
+                      type="button"
+                      onClick={() => onRate(v)}
+                      className="size-12 rounded-full grid place-items-center text-sm font-semibold text-white bg-white/5 ring-1 ring-white/10 hover:bg-[var(--color-pink-500)]/30 hover:ring-[var(--color-pink-400)]/40 transition-colors"
+                    >
+                      {v}
+                    </button>
+                  ))}
+                </div>
+              )}
           </div>
         )}
       </div>
@@ -1331,6 +1395,88 @@ function Player({
           </button>
         </div>
       )}
+
+      {/* The `react` interrupt button — visible throughout `main` playback so
+          the listener can signal they can't keep up; pressing cuts to the
+          fallback content. Styled as a deliberate, high-contrast escape. */}
+      {prompt && prompt.kind === "react" && (
+        <div className="relative z-10 flex justify-center pb-4">
+          <button
+            type="button"
+            onClick={onReact}
+            className="inline-flex items-center gap-1.5 rounded-full bg-red-500/20 px-6 py-2.5 text-sm font-medium text-red-50 ring-1 ring-red-400/40 hover:bg-red-500/30 transition-colors"
+          >
+            {prompt.button}
+          </button>
+        </div>
+      )}
     </div>
   );
 }
+
+// ──────────────────────────────────────────────────────────────────────────
+// Beatmeter — scrolling rhythm meter for an active <beatmeter> segment
+// ──────────────────────────────────────────────────────────────────────────
+
+/** How far ahead (seconds) the meter shows beats approaching the hit line. */
+const BEAT_LOOKAHEAD_S = 3;
+
+/**
+ * Beat markers enter from the right and travel left toward the hit line,
+ * reaching it exactly when the click sounds (the click itself is triggered by
+ * the player's Web Audio scheduler). Accent beats (`X` in the pattern) render
+ * taller and brighter; rests (`.`) produce no marker.
+ */
+function Beatmeter({ state }: { state: ProgressState }) {
+  const { currentTime, beatmeter } = state;
+  if (!beatmeter) return null;
+
+  // Beats slightly in the past are kept so a marker visibly crosses the line
+  // and exits rather than vanishing the instant it lands.
+  const visible = beatmeter.beats.filter(
+    (b) => b.time >= currentTime - 0.2 && b.time <= currentTime + BEAT_LOOKAHEAD_S,
+  );
+
+  // x-fraction in [0,1]: 0 at the hit line (left), 1 at the right edge.
+  // Beats further in the future sit further right.
+  const HIT_LINE_PCT = 6; // hit line inset from the left edge
+  const leftPct = (dt: number) => HIT_LINE_PCT + (dt / BEAT_LOOKAHEAD_S) * (100 - HIT_LINE_PCT);
+
+  return (
+    <div className="mt-8 w-full max-w-xl">
+      <div className="relative h-20 overflow-hidden rounded-2xl border border-white/10 bg-black/30 backdrop-blur-sm">
+        {/* Hit line */}
+        <div
+          className="absolute top-0 bottom-0 w-px bg-[var(--color-pink-300)]/70 shadow-[0_0_8px_rgba(244,166,192,0.6)]"
+          style={{ left: `${HIT_LINE_PCT}%` }}
+        />
+        {/* Center guide */}
+        <div className="absolute inset-x-0 top-1/2 h-px bg-white/5" />
+        {visible.map((b, i) => {
+          const dt = b.time - currentTime;
+          const left = leftPct(dt);
+          if (left < 0 || left > 100) return null;
+          return (
+            <div
+              key={i}
+              className="absolute -translate-x-1/2 rounded-full transition-none"
+              style={{
+                left: `${left}%`,
+                top: b.accent ? "10%" : "30%",
+                bottom: b.accent ? "10%" : "30%",
+                width: b.accent ? 5 : 3,
+                background: b.accent
+                  ? "var(--color-pink-300)"
+                  : "rgba(244,166,192,0.45)",
+                boxShadow: b.accent
+                  ? "0 0 10px rgba(244,166,192,0.7)"
+                  : "none",
+              }}
+            />
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+

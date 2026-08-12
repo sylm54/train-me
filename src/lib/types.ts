@@ -56,12 +56,32 @@ export interface ChatSettings {
   idleClearMinutes: number;
 }
 
+/**
+ * Playback settings for the conditioning player. User-tunable from Settings →
+ * Playback.
+ */
+export interface PlaybackSettings {
+  /**
+   * Signed offset (ms) applied to `<beatmeter>` click scheduling, compensating
+   * for latency offset between the media-element audio path and the Web Audio
+   * click path. `0` = no adjustment.
+   */
+  beatOffsetMs: number;
+}
+
+/** Default playback settings. */
+export const DEFAULT_PLAYBACK_SETTINGS: PlaybackSettings = {
+  beatOffsetMs: 0,
+};
+
 /** Complete settings persisted to localStorage. */
 export interface AgentSettings {
   apiKeys: ApiKeys;
   agents: Record<AgentName, AgentModelConfig>;
   /** Chat behaviour (context limit, compaction, idle clear). */
   chat: ChatSettings;
+  /** Conditioning playback settings (beat offset, etc.). */
+  playback: PlaybackSettings;
   /** Whether the user has completed the onboarding wizard. */
   onboarded: boolean;
 }

@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use crate::expression::{self, Expr};
 use crate::helper::{load_text_to_speech, load_voice_style, write_wav_file, Style, TextToSpeech};
 use crate::manifest::{
-    self, nominal_duration, relative_path, sha8_of_path, ChoiceOption, Manifest,
-    OverlayPartSegment, Segment, WalkCtx,
+    self, nominal_duration, relative_path, sha8_of_path, BeatMark, BeatmeterMeta, ChoiceOption,
+    Manifest, OverlayPartSegment, Segment, WalkCtx,
 };
 use crate::model_downloader;
 use crate::sounds::SoundType;
@@ -158,7 +158,8 @@ pub fn count_speakable_nodes(nodes: &[Node]) -> usize {
             | Node::Effect { children, .. }
             | Node::Background { children, .. }
             | Node::Until { children, .. }
-            | Node::Section { children, .. } => {
+            | Node::Section { children, .. }
+            | Node::Beatmeter { children, .. } => {
                 count += count_speakable_nodes(children);
             }
             Node::Loop { loops, children } => {
@@ -169,7 +170,7 @@ pub fn count_speakable_nodes(nodes: &[Node]) -> usize {
                     count += count_speakable_nodes(&part.children);
                 }
             }
-            Node::Random { parts } | Node::Scramble { parts } => {
+            Node::Random { parts } | Node::Scramble { parts } | Node::React { parts, .. } => {
                 // Upper-bound estimate: count all parts (only one will be picked
                 // for Random, but we can't know which at count time).
                 for part in parts {
@@ -181,7 +182,7 @@ pub fn count_speakable_nodes(nodes: &[Node]) -> usize {
                     count += count_speakable_nodes(&part.children);
                 }
             }
-            Node::Include { .. } => {}
+            Node::Include { .. } | Node::Rating { .. } => {}
         }
     }
     count
@@ -579,6 +580,34 @@ impl AudioRenderer {
                     // the inherited context (transparent to flat synthesis).
                     let (samples, dur) =
                         self.render_nodes(children, default_speaker, volume_scale, speed_scale)?;
+                    foreground.extend_from_slice(&samples);
+                    _total_duration += dur;
+                }
+
+                Node::Beatmeter { children, .. } => {
+                    // Flat path: the metronome is a runtime concern (clicks are
+                    // triggered by Web Audio at playback). Render the wrapped
+                    // content inline, exactly as if the wrapper were absent.
+                    let (samples, dur) =
+                        self.render_nodes(children, default_speaker, volume_scale, speed_scale)?;
+                    foreground.extend_from_slice(&samples);
+                    _total_duration += dur;
+                }
+
+                Node::Rating { .. } => {
+                    // A runtime scalar prompt — no audio in the flat path.
+                }
+
+                Node::React { parts, .. } => {
+                    // Flat fallback: render the `main` part only (fallback is
+                    // press-only, and the flat path has no interactivity).
+                    let main_nodes: &[Node] = parts
+                        .iter()
+                        .find(|p| p.role.as_deref() == Some("main"))
+                        .map(|p| p.children.as_slice())
+                        .unwrap_or(&[]);
+                    let (samples, dur) =
+                        self.render_nodes(main_nodes, default_speaker, volume_scale, speed_scale)?;
                     foreground.extend_from_slice(&samples);
                     _total_duration += dur;
                 }
@@ -1160,6 +1189,42 @@ impl AudioRenderer {
                     foreground.extend_from_slice(&samples);
                     _total_duration += dur;
                 }
+
+                Node::Beatmeter { children, .. } => {
+                    // Flat tracked path: render the wrapped content inline (the
+                    // metronome is a runtime concern). Mirrors the Section arm.
+                    let (samples, dur) = self.render_nodes_tracked(
+                        children,
+                        default_speaker,
+                        volume_scale,
+                        speed_scale,
+                        tracker,
+                    )?;
+                    foreground.extend_from_slice(&samples);
+                    _total_duration += dur;
+                }
+
+                Node::Rating { .. } => {
+                    // A runtime scalar prompt — no audio in the flat path.
+                }
+
+                Node::React { parts, .. } => {
+                    // Flat tracked fallback: render the `main` part only.
+                    let main_nodes: &[Node] = parts
+                        .iter()
+                        .find(|p| p.role.as_deref() == Some("main"))
+                        .map(|p| p.children.as_slice())
+                        .unwrap_or(&[]);
+                    let (samples, dur) = self.render_nodes_tracked(
+                        main_nodes,
+                        default_speaker,
+                        volume_scale,
+                        speed_scale,
+                        tracker,
+                    )?;
+                    foreground.extend_from_slice(&samples);
+                    _total_duration += dur;
+                }
             }
         }
 
@@ -1546,7 +1611,11 @@ impl AudioRenderer {
         };
         let file = self.write_seg(out_dir, counter, &samples)?;
         let duration = samples.len() as f32 / self.sample_rate as f32;
-        children.push(Segment::Static { file, duration });
+        children.push(Segment::Static {
+            file,
+            duration,
+            beatmeter: None,
+        });
         buf.clear();
         Ok(())
     }
@@ -1666,6 +1735,110 @@ impl AudioRenderer {
                 Ok(Segment::Choice {
                     prompt: prompt.clone(),
                     options,
+                })
+            }
+
+            Node::Rating { prompt, min, max, .. } => {
+                if ctx.forbid_pause {
+                    bail!("<rating> is not allowed inside <background> or <overlay>");
+                }
+                Ok(Segment::Rating {
+                    prompt: prompt.clone(),
+                    min: *min,
+                    max: *max,
+                })
+            }
+
+            Node::React { button, parts } => {
+                if ctx.forbid_pause {
+                    bail!("<react> is not allowed inside <background> or <overlay>");
+                }
+                // `validate` guarantees exactly one main + one fallback; resolve
+                // them defensively here regardless.
+                let mut main_seg: Option<Segment> = None;
+                let mut fallback_seg: Option<Segment> = None;
+                for p in parts {
+                    let seg = self.walk_part(
+                        p, ctx, out_dir, script_dir, agent_dir, tracks_dir, counter, visited,
+                        progress,
+                    )?;
+                    match p.role.as_deref() {
+                        Some("main") => main_seg = Some(seg),
+                        Some("fallback") => fallback_seg = Some(seg),
+                        _ => {}
+                    }
+                }
+                let main = main_seg.ok_or_else(|| {
+                    anyhow::anyhow!("<react> requires a <part role=\"main\">")
+                })?;
+                let fallback = fallback_seg.ok_or_else(|| {
+                    anyhow::anyhow!("<react> requires a <part role=\"fallback\">")
+                })?;
+                Ok(Segment::React {
+                    button: button.clone(),
+                    main: Box::new(main),
+                    fallback: Box::new(fallback),
+                })
+            }
+
+            Node::Beatmeter {
+                bpm,
+                pattern,
+                sound,
+                volume,
+                accent_gain,
+                children,
+            } => {
+                if ctx.forbid_pause {
+                    bail!("<beatmeter> is not allowed inside <background> or <overlay>");
+                }
+                // The wrapped content must be non-interactive: a beat schedule
+                // is only meaningful over a single continuous clip, so any split
+                // (until/choice/random/…/nested beatmeter/include) is rejected.
+                if children.iter().any(manifest::contains_split) {
+                    bail!(
+                        "<beatmeter> may only wrap non-interactive content (no <until>/<choice>/<random>/<scramble>/<include>/<beatmeter>)"
+                    );
+                }
+                // Bake the wrapped content into one clip.
+                let (samples, _dur) = if let Some(tracker) = progress {
+                    self.render_nodes_tracked(
+                        children,
+                        &ctx.speaker,
+                        ctx.volume_scale,
+                        ctx.speed_scale,
+                        tracker,
+                    )?
+                } else {
+                    self.render_nodes(children, &ctx.speaker, ctx.volume_scale, ctx.speed_scale)?
+                };
+                let file = self.write_seg(out_dir, counter, &samples)?;
+                let duration = samples.len() as f32 / self.sample_rate as f32;
+
+                // Resolve the beat schedule over the clip's duration.
+                let beats = compute_beats(*bpm, pattern.as_deref(), duration);
+
+                // Render the click sample once (gain 1.0 — the player applies
+                // `volume`/`accent_gain` at trigger time). A stable filename
+                // means identical sounds are written once and reused.
+                let sound_name = sound.as_deref().unwrap_or("click");
+                let (click_samples, _) = self.render_sound(sound_name, 1.0)?;
+                let sample_file = format!("beat-{}.wav", sound_name);
+                write_wav_file(
+                    out_dir.join(&sample_file),
+                    &click_samples,
+                    self.sample_rate as i32,
+                )?;
+
+                Ok(Segment::Static {
+                    file,
+                    duration,
+                    beatmeter: Some(BeatmeterMeta {
+                        sample: sample_file,
+                        volume: volume.unwrap_or(0.5),
+                        accent_gain: accent_gain.unwrap_or(1.5),
+                        beats,
+                    }),
                 })
             }
 
@@ -1907,6 +2080,35 @@ fn truncate_label(text: &str, max_len: usize) -> String {
 // Manifest walker free helpers
 // ============================================================================
 
+/// Resolve a `<beatmeter>` bpm/pattern into a flat list of beat marks over a
+/// clip of `duration` seconds. The pattern cycles per beat: `X` = accent, `x` =
+/// normal, `.` = rest (no mark). Defaults to `"x"` (every beat, no accent).
+fn compute_beats(bpm: f32, pattern: Option<&str>, duration: f32) -> Vec<BeatMark> {
+    let interval = 60.0 / bpm.max(0.001);
+    let pat: Vec<char> = pattern
+        .filter(|p| !p.is_empty())
+        .unwrap_or("x")
+        .chars()
+        .collect();
+    let plen = pat.len().max(1);
+    let mut beats = Vec::new();
+    let mut i = 0u32;
+    loop {
+        let t = i as f32 * interval;
+        if t >= duration {
+            break;
+        }
+        match pat[(i as usize) % plen] {
+            'X' => beats.push(BeatMark { time: t, accent: true }),
+            'x' => beats.push(BeatMark { time: t, accent: false }),
+            // '.' (rest) and any stray char (validated elsewhere) → no mark.
+            _ => {}
+        }
+        i += 1;
+    }
+    beats
+}
+
 /// True if `dir` contains at least one `.wav` file (freshness precondition).
 fn has_any_wav(dir: &Path) -> bool {
     let Ok(entries) = fs::read_dir(dir) else {
@@ -2105,13 +2307,41 @@ fn resolve_includes_in_node(
             vec![Node::Choice { prompt, options }]
         }
 
+        Node::React { button, parts } => {
+            let parts = resolve_overlay_parts(parts, base_dir, visited);
+            vec![Node::React { button, parts }]
+        }
+
         Node::Section { role, children } => {
             let children = resolve_includes_inner(children, base_dir, visited);
             vec![Node::Section { role, children }]
         }
 
+        Node::Beatmeter {
+            bpm,
+            pattern,
+            sound,
+            volume,
+            accent_gain,
+            children,
+        } => {
+            let children = resolve_includes_inner(children, base_dir, visited);
+            vec![Node::Beatmeter {
+                bpm,
+                pattern,
+                sound,
+                volume,
+                accent_gain,
+                children,
+            }]
+        }
+
         // Leaves with no nested children — pass through unchanged.
-        Node::Text(_) | Node::Pause { .. } | Node::Sound { .. } | Node::Tone { .. } => vec![node],
+        Node::Text(_)
+        | Node::Pause { .. }
+        | Node::Sound { .. }
+        | Node::Tone { .. }
+        | Node::Rating { .. } => vec![node],
     }
 }
 
@@ -2130,6 +2360,7 @@ fn resolve_overlay_parts(
             volume: part.volume,
             speed: part.speed,
             label: part.label,
+            role: part.role,
             children: resolve_includes_inner(part.children, base_dir, visited),
         })
         .collect()
@@ -3336,7 +3567,8 @@ mod tests {
             | Node::Loop { children, .. }
             | Node::Background { children, .. }
             | Node::Until { children, .. }
-            | Node::Section { children, .. } => {
+            | Node::Section { children, .. }
+            | Node::Beatmeter { children, .. } => {
                 for child in children {
                     collect_text_recursive(child, texts);
                 }
@@ -3350,14 +3582,16 @@ mod tests {
             }
             Node::Random { parts }
             | Node::Scramble { parts }
-            | Node::Choice { options: parts, .. } => {
+            | Node::Choice { options: parts, .. }
+            | Node::React { parts, .. } => {
                 for part in parts {
                     for child in &part.children {
                         collect_text_recursive(child, texts);
                     }
                 }
             }
-            Node::Pause { .. } | Node::Sound { .. } | Node::Tone { .. } | Node::Include { .. } => {}
+            Node::Pause { .. } | Node::Sound { .. } | Node::Tone { .. } | Node::Include { .. }
+            | Node::Rating { .. } => {}
         }
     }
 

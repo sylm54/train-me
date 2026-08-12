@@ -94,7 +94,7 @@ const AGENT_PROMPTS: { agent: AgentName; file: string; label: string }[] = [
 type PromptMode = "rendered" | "raw";
 
 export function SettingsView() {
-  const { settings, setApiKey, setAgent, setChat, resetOnboarding } =
+  const { settings, setApiKey, setAgent, setChat, setPlayback, resetOnboarding } =
     useSettings();
   const [reveal, setReveal] = useState<Record<ProviderName, boolean>>({
     openrouter: false,
@@ -501,6 +501,34 @@ export function SettingsView() {
                 {formatMinutes(settings.chat.idleClearMinutes)} of inactivity.
               </p>
             )}
+          </div>
+        </section>
+
+        {/* ── Playback ──────────────────────────────────────────── */}
+        <section className="space-y-4">
+          <h2 className="text-sm uppercase tracking-wider text-[var(--color-muted-foreground)]">
+            Playback
+          </h2>
+          <div className="border border-[var(--color-border)] rounded-lg p-4 bg-[var(--color-surface)] space-y-4">
+            <p className="text-xs text-[var(--color-muted-foreground)]">
+              Settings for the conditioning player. Scripts that use a{" "}
+              <code className="font-mono">&lt;beatmeter&gt;</code> play an audible
+              click on each beat; this offset nudges that click earlier (−) or
+              later (+) to line it up with the speech if the two audio paths lag
+              differently on your device.
+            </p>
+
+            <ChatNumberField
+              label="Beat click offset (ms)"
+              value={settings.playback.beatOffsetMs}
+              min={-50}
+              step={1}
+              hint="Signed offset in milliseconds applied to beatmeter click timing. 0 = no adjustment; increase if clicks land behind the beat, decrease if ahead."
+              onChange={(v) => {
+                setPlayback({ beatOffsetMs: v });
+                flashSave();
+              }}
+            />
           </div>
         </section>
 
