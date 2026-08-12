@@ -125,8 +125,15 @@ export function useSettings() {
             [agent]: {
               provider,
               model,
+              // Distinguish "extras omitted" (keep the previous effort, e.g.
+              // when only the model id is being edited) from "reasoningEffort
+              // explicitly undefined" (the user picked "Disabled" → clear it).
+              // A bare `??` would treat the latter as absent and silently drop
+              // the change.
               reasoningEffort:
-                extras?.reasoningEffort ?? prev.agents[agent].reasoningEffort,
+                extras && "reasoningEffort" in extras
+                  ? extras.reasoningEffort
+                  : prev.agents[agent].reasoningEffort,
             },
           },
         };
@@ -138,8 +145,15 @@ export function useSettings() {
   );
 
   const completeOnboarding = useCallback(() => {
-    setSettings((prev) => {
-      const next: AgentSettings = { ...prev, onboarded: true };
+    setSettings(() => {
+      // Re-read the freshest persisted state before flipping the flag.
+      // OnboardingView maintains its own useSettings() instance and writes the
+      // user's keys/models through save(), but the `storage` event only syncs
+      // *other* windows — so this hook's in-memory state is stale by the time
+      // the user finishes. Spreading `prev` here would clobber the just-entered
+      // API key and reasoning effort with a stale snapshot; load() reflects the
+      // values the onboarding UI actually persisted.
+      const next: AgentSettings = { ...load(), onboarded: true };
       save(next);
       return next;
     });
