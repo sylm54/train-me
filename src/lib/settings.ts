@@ -13,8 +13,10 @@ import type {
   ProviderName,
   ReasoningEffort,
   ChatSettings,
+  PlaybackSettings,
 } from "./types";
 import { DEFAULT_MODEL_ID } from "./models";
+import { DEFAULT_PLAYBACK_SETTINGS } from "./types";
 
 import { ensureNotificationPermission } from "./notifications";
 
@@ -42,6 +44,7 @@ const DEFAULT_SETTINGS: AgentSettings = {
     planner: { provider: "openrouter", model: DEFAULT_MODEL_ID.openrouter },
   },
   chat: { ...DEFAULT_CHAT_SETTINGS },
+  playback: { ...DEFAULT_PLAYBACK_SETTINGS },
   onboarded: false,
 };
 
@@ -59,6 +62,10 @@ function load(): AgentSettings {
       chat: {
         ...DEFAULT_SETTINGS.chat,
         ...(parsed.chat ?? {}),
+      },
+      playback: {
+        ...DEFAULT_SETTINGS.playback,
+        ...(parsed.playback ?? {}),
       },
       onboarded: parsed.onboarded ?? false,
     };
@@ -160,11 +167,24 @@ export function useSettings() {
     });
   }, []);
 
+  /** Update the playback settings (beat offset, etc.). */
+  const setPlayback = useCallback((patch: Partial<PlaybackSettings>) => {
+    setSettings((prev) => {
+      const next: AgentSettings = {
+        ...prev,
+        playback: { ...prev.playback, ...patch },
+      };
+      save(next);
+      return next;
+    });
+  }, []);
+
   return {
     settings,
     setApiKey,
     setAgent,
     setChat,
+    setPlayback,
     completeOnboarding,
     resetOnboarding,
   };

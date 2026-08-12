@@ -162,11 +162,12 @@ Applies an audio effect to the rendered inner content.
 Children are \`<part>\` elements; any non-part tag or text is wrapped in an implicit part.
 - \`duration\` — optional; If specified, the overlay's length is fixed to this duration (seconds). Otherwise, it extends to the longest part.
 
-##### \`<part>\` — container (children required), valid inside \`<overlay>\`, \`<random>\`, \`<scramble>\`, and \`<choice>\`
+##### \`<part>\` — container (children required), valid inside \`<overlay>\`, \`<random>\`, \`<scramble>\`, \`<choice>\`, and \`<react>\`
 - \`looped\` — optional; bool (\`<overlay>\` only). When true, the part repeats until the longest part ends. One part must be non-looped or the overlay must have a fixed duration to prevent infinite loops.
 - \`volume\` — optional; scalar.
 - \`speed\` — optional; scalar.
 - \`label\` — optional; string (\`<choice>\` only). The button text shown for this option at the choice point.
+- \`role\` — optional; string (\`<react>\` only). \`"main"\` or \`"fallback"\` (exactly one of each). Invalid on a \`<part>\` anywhere else.
 
 #### \`<loop>\` — container (children required)
 - \`loops\` — default \`2\`; integer >1. Repeats inner content sequentially (not concurrently).
@@ -192,6 +193,26 @@ At each playback, ALL parts are played once in a freshly-shuffled order.
 #### \`<choice>\` — container; \`<part label="…">\` children
 Interactive branch. At playback the player pauses and shows one button per part (using each part's \`label\`); the part the listener picks is the one that plays. \`prompt\` is an optional shared question shown above the buttons. Like \`<until>\`, not allowed inside a \`<background>\` layer or \`<overlay>\` part.
 - \`prompt\` — optional; string.
+
+#### \`<rating>\` — self-closing
+Interactive scalar prompt. At playback the player pauses and shows a row of numbered buttons from \`min\` to \`max\`; the value the listener picks is recorded (to the activity log) and playback continues. No audio of its own. Like \`<until>\`, not allowed inside a \`<background>\` layer or \`<overlay>\` part.
+- \`prompt\` — optional; string shown above the buttons.
+- \`min\` — default \`1\`; integer.
+- \`max\` — default \`5\`; integer (must be ≥ \`min\`).
+- \`default\` — optional; informational only.
+
+#### \`<react>\` — container; exactly two \`<part role="…">\` children
+Non-blocking interrupt. The \`role="main"\` part plays with \`button\` armed; while it plays the listener can press the button (e.g. "I can't keep up"), which **immediately cuts** the main content and plays the \`role="fallback"\` part. If main finishes untouched, the fallback is skipped. Both parts may contain any non-interactive content. Not allowed inside a \`<background>\` layer or \`<overlay>\` part.
+- \`button\` — default \`Continue\`; the interrupt button's label.
+- \`role\` — required on each \`<part>\`; \`"main"\` or \`"fallback"\` (exactly one of each). \`role\` is invalid on a \`<part>\` anywhere else.
+
+#### \`<beatmeter>\` — container (children required)
+A metronome over its (non-interactive) children. The renderer bakes the children into one clip, computes a beat schedule over that clip's duration, and renders a short click sample; at playback the player triggers the click on each beat (via Web Audio) and scrolls an on-screen beat meter the listener can follow. The children must contain no interactive tag (\`<until>\`/\`<random>\`/\`<scramble>\`/\`<choice>\`/\`<react>\`/\`<include>\`/\`<beatmeter>\`). Not allowed inside a \`<background>\` layer or \`<overlay>\` part.
+- \`bpm\` — default \`120\`; beats per minute, must be > 0.
+- \`pattern\` — optional; a string of \`X\` (accented beat), \`x\` (normal beat), \`.\` (rest, no click) that cycles per beat. Default \`x\` (every beat, no accent). Example: \`X.x.x.x.\` accents the downbeat of a 4/4 bar.
+- \`sound\` — default \`click\`; a sound type name (see Sound types) rendered as the click sample.
+- \`volume\` — default \`0.5\`; base click gain (0.0–1.5).
+- \`accent-gain\` — default \`1.5\`; multiplier applied to \`volume\` on accented (\`X\`) beats.
 
 #### \`<include>\` — self-closing (requires \`src\`)
 - \`src\` — required. Pulls in another XML file by path. Nested includes are supported with circular-include detection. In manifest mode, an include is rendered as its OWN manifest (deduped on disk by source path, so the same file included twice is stored and rendered once) and referenced by the parent; context (voice/speed/volume) is RESET at the include boundary, so an included file should declare its own \`<voice>\`. Each included file has its own content hash, so editing a sub-file re-renders only that sub-manifest.
@@ -253,8 +274,8 @@ Constant folding: literals, binops of constants, and \`@max\`/\`@min\`/\`@step\`
 - \`<tone>\` and \`<background>\` are background layers: aligned to their start position, then looped (tones) to the enclosing scope's foreground length.
 - \`<overlay>\` mixes all parts concurrently (all start together). \`<loop>\` repeats sequentially.
 - \`<include>\` renders to a deduped sub-manifest (context resets at the boundary); each file is hashed separately for incremental re-rendering.
-- Interactive tags \`<until>\`/\`<random>\`/\`<scramble>\`/\`<choice>\` produce segment boundaries; decisions for \`<random>\`/\`<scramble>\`/\`<choice>\` happen per-playback, so each listen can differ. \`<until>\` and \`<choice>\` are rejected inside \`<background>\`/\`<overlay>\` (they would block a concurrent stream); \`<random>\`/\`<scramble>\`/\`<loop>\`/\`<include>\` are allowed there. A \`<background>\` whose layer contains no interactive tag is baked into its surrounding segment; one with an interactive layer plays on a parallel track scoped to its enclosing sequence.
-- Note that <interactive> is not a valid tag; use <until>, <random>, <scramble>, or <choice> instead.
+- Interactive tags \`<until>\`/\`<random>\`/\`<scramble>\`/\`<choice>\`/\`<rating>\`/\`<react>\` produce segment boundaries; decisions for \`<random>\`/\`<scramble>\`/\`<choice>\` happen per-playback, so each listen can differ. \`<until>\`, \`<choice>\`, \`<rating>\`, \`<react>\`, and \`<beatmeter>\` are rejected inside \`<background>\`/\`<overlay>\` (they would block or conflict with a concurrent stream); \`<random>\`/\`<scramble>\`/\`<loop>\`/\`<include>\` are allowed there. A \`<background>\` whose layer contains no interactive tag is baked into its surrounding segment; one with an interactive layer plays on a parallel track scoped to its enclosing sequence. The listener's \`<choice>\`/\`<rating>\`/\`<react>\` decisions are recorded to the activity log (\`feature = conditioning\`, \`action = choice\`).
+- Note that <interactive> is not a valid tag; use <until>, <random>, <scramble>, <choice>, <rating>, or <react> instead.
 - \`<intro>\`/\`<main>\`/\`<outro>\` are optional structural markers (transparent to audio). When a non-interactive \`<main>\` is present, the listener gets a pre-play "Repeat length" slider that loops \`<main>\` to extend the session up to 10h; intro/outro always play once.
 ### Example
 
@@ -321,6 +342,27 @@ Constant folding: literals, binops of constants, and \`@max\`/\`@min\`/\`@step\`
   <part label="Down">Down, sinking further with every breath.</part>
   <part label="Further">Further away, letting go completely.</part>
 </choice>
+
+<!-- A scalar prompt; the chosen value is recorded, then playback continues -->
+<rating prompt="How deeply are you focused right now?" min="1" max="5"/>
+
+<!-- A non-blocking interrupt: the coaching plays with the button armed; if the
+     listener can't keep up, pressing it cuts to the easier fallback -->
+<react button="Can't keep up">
+  <part role="main">
+    <voice speaker="female">Hold this pace for ten more seconds. You've got it.</voice>
+    <pause duration="10"/>
+  </part>
+  <part role="fallback">
+    <voice speaker="female">No problem — let's slow it right down. Catch your breath.</voice>
+  </part>
+</react>
+
+<!-- A metronome over a coaching block: clicks on each beat at 100 BPM with a
+     4/4 accent pattern, plus an on-screen beat meter. -->
+<beatmeter bpm="100" pattern="X.x.x.x." sound="click" volume="0.5">
+  <voice speaker="male">Match the beat. Steady now.</voice>
+</beatmeter>
 
 <!-- Structural sections: intro/outro play once, main repeats via the slider.
      Because this <main> has no interactive tag, the listener can extend the

@@ -681,16 +681,19 @@ fn collect_include_srcs(nodes: &[crate::tag_parser::Node]) -> Vec<String> {
                 | Node::Background { children, .. }
                 | Node::Until { children, .. }
                 | Node::Loop { children, .. }
-                | Node::Section { children, .. } => rec(children, out),
+                | Node::Section { children, .. }
+                | Node::Beatmeter { children, .. } => rec(children, out),
                 Node::Overlay { parts, .. }
                 | Node::Random { parts }
                 | Node::Scramble { parts }
-                | Node::Choice { options: parts, .. } => {
+                | Node::Choice { options: parts, .. }
+                | Node::React { parts, .. } => {
                     for part in parts {
                         rec(&part.children, out);
                     }
                 }
-                Node::Text(_) | Node::Pause { .. } | Node::Sound { .. } | Node::Tone { .. } => {}
+                Node::Text(_) | Node::Pause { .. } | Node::Sound { .. } | Node::Tone { .. }
+                | Node::Rating { .. } => {}
             }
         }
     }

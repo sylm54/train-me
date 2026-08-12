@@ -938,13 +938,15 @@ fn collect_includes(
             | tag_parser::Node::Background { children, .. }
             | tag_parser::Node::Until { children, .. }
             | tag_parser::Node::Loop { children, .. }
-            | tag_parser::Node::Section { children, .. } => {
+            | tag_parser::Node::Section { children, .. }
+            | tag_parser::Node::Beatmeter { children, .. } => {
                 collect_includes(children, script_dir, agent_dir, out, visited, warnings);
             }
             tag_parser::Node::Overlay { parts, .. }
             | tag_parser::Node::Random { parts }
             | tag_parser::Node::Scramble { parts }
-            | tag_parser::Node::Choice { options: parts, .. } => {
+            | tag_parser::Node::Choice { options: parts, .. }
+            | tag_parser::Node::React { parts, .. } => {
                 for part in parts {
                     collect_includes(
                         &part.children, script_dir, agent_dir, out, visited, warnings,
@@ -955,7 +957,8 @@ fn collect_includes(
             tag_parser::Node::Text(_)
             | tag_parser::Node::Pause { .. }
             | tag_parser::Node::Sound { .. }
-            | tag_parser::Node::Tone { .. } => {}
+            | tag_parser::Node::Tone { .. }
+            | tag_parser::Node::Rating { .. } => {}
         }
     }
 }
