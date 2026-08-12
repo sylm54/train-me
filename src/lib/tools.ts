@@ -313,14 +313,16 @@ export const validateFilesTool = tool({
  * proceeding — prefer it over guessing when the user's intent, preference, or
  * consent is unclear. The call blocks until the user answers or cancels.
  *
- * Three question types:
- *   - "open"   → free-text answer.
- *   - "choice" → pick exactly one option from `choices`.
- *   - "rating" → a whole number from 1 (low) to 10 (high).
+ * Four question types:
+ *   - "open"          → free-text answer.
+ *   - "single-choice" → pick exactly one option from `choices`.
+ *   - "multi-choice"  → pick one or more options from `choices`.
+ *   - "rating"        → a whole number from 1 (low) to 10 (high).
  *
  * The result is `{ ok: true, type, answer }` on an answer (answer is a string
- * for "open"/"choice", a number for "rating"), or `{ ok: false, reason }` if
- * the user cancelled or the generation was aborted.
+ * for "open"/"single-choice", a string array for "multi-choice", a number for
+ * "rating"), or `{ ok: false, reason }` if the user cancelled or the
+ * generation was aborted.
  */
 export const askQuestionTool = tool({
   description:
@@ -328,14 +330,18 @@ export const askQuestionTool = tool({
     "you need information, a decision, a preference, or feedback before " +
     "proceeding — prefer it over guessing when the user's intent, " +
     "preference, or consent is unclear. The call blocks until the user " +
-    "answers or cancels. Three types: 'open' (a free-text answer), 'choice' " +
-    "(pick one option from `choices`), and 'rating' (a whole number 1–10, " +
-    "where 1 is low and 10 is high).",
+    "answers or cancels. Four types: 'open' (a free-text answer), " +
+    "'single-choice' (pick exactly one option from `choices`), " +
+    "'multi-choice' (pick one or more options from `choices`), and 'rating' " +
+    "(a whole number 1–10, where 1 is low and 10 is high). Prefer " +
+    "'single-choice' when one option must win; use 'multi-choice' only when " +
+    "selecting several is meaningful.",
   inputSchema: z.object({
     type: z
-      .enum(["open", "choice", "rating"])
+      .enum(["open", "single-choice", "multi-choice", "rating"])
       .describe(
-        "Question type: 'open' (free text), 'choice' (pick one of " +
+        "Question type: 'open' (free text), 'single-choice' (pick exactly " +
+          "one of `choices`), 'multi-choice' (pick one or more of " +
           "`choices`), or 'rating' (a whole number 1–10).",
       ),
     question: z
@@ -347,8 +353,8 @@ export const askQuestionTool = tool({
       .array(z.string())
       .optional()
       .describe(
-        "Required for type 'choice': two or more options the user picks " +
-          "one from. Omit for 'open' and 'rating'.",
+        "Required for 'single-choice' and 'multi-choice': two or more " +
+          "options the user picks from. Omit for 'open' and 'rating'.",
       ),
     hint: z
       .string()
@@ -359,14 +365,18 @@ export const askQuestionTool = tool({
       ),
   }),
   execute: async ({ type, question, choices, hint }, { abortSignal }) => {
-    // A 'choice' question is meaningless without options. Don't bother the
+    // A choice question is meaningless without options. Don't bother the
     // user — bounce it straight back to the model so it can retry correctly.
-    if (type === "choice" && (!choices || choices.length < 2)) {
+    if (
+      (type === "single-choice" || type === "multi-choice") &&
+      (!choices || choices.length < 2)
+    ) {
       return {
         ok: false as const,
         reason:
-          "A 'choice' question needs at least two options in `choices`. " +
-          "Retry with `choices` provided, or use type 'open'.",
+          "A 'single-choice'/'multi-choice' question needs at least two " +
+          "options in `choices`. Retry with `choices` provided, or use type " +
+          "'open'.",
       };
     }
     const result = await poseQuestion(

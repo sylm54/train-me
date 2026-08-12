@@ -1677,16 +1677,28 @@ function PendingQuestions() {
 
 /**
  * One pending question. Renders the prompt plus an input appropriate to the
- * type: a textarea + send for "open", a vertical list of buttons for "choice",
- * and a 1–10 button row for "rating". The ✕ dismisses (cancels) the question.
+ * type: a textarea + send for "open", buttons for "single-choice" (pick one)
+ * and "multi-choice" (pick several, then submit), and a 1–10 button row for
+ * "rating". The ✕ dismisses (cancels) the question.
  */
 function QuestionCard({ q }: { q: PendingQuestion }) {
   const [text, setText] = useState("");
+  // Indices of selected options for "multi-choice".
+  const [selected, setSelected] = useState<number[]>([]);
 
   const submitOpen = () => {
     const value = text.trim();
     if (!value) return;
     respondToQuestion(q.id, value);
+  };
+
+  const submitMulti = () => {
+    if (selected.length === 0) return;
+    const answers = selected
+      .map((i) => q.choices?.[i])
+      .filter((c): c is string => typeof c === "string");
+    if (answers.length === 0) return;
+    respondToQuestion(q.id, answers);
   };
 
   return (
@@ -1718,12 +1730,17 @@ function QuestionCard({ q }: { q: PendingQuestion }) {
             value={text}
             onChange={(e) => setText(e.target.value)}
             onKeyDown={(e) => {
-              // Enter submits; Shift+Enter inserts a newline (matches the
-              // main composer's convention).
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                submitOpen();
-              }
+              if (e.key !== "Enter") return;
+              // Let IME composition (e.g. CJK input) handle Enter itself.
+              if (e.nativeEvent.isComposing) return;
+              // Shift+Enter inserts a newline.
+              if (e.shiftKey) return;
+              // On touch-primary devices (mobile), Enter inserts a newline
+              // rather than submitting — use the Send button to commit
+              // (matches the main composer's convention).
+              if (window.matchMedia("(pointer: coarse)").matches) return;
+              e.preventDefault();
+              submitOpen();
             }}
             placeholder="Type your answer… (Shift+Enter for newline)"
             className="min-h-9 max-h-40 resize-none"
@@ -1735,7 +1752,7 @@ function QuestionCard({ q }: { q: PendingQuestion }) {
         </div>
       )}
 
-      {q.type === "choice" && (
+      {q.type === "single-choice" && (
         <div className="mt-2 flex flex-col gap-1">
           {q.choices?.map((choice, i) => (
             <Button
@@ -1748,6 +1765,52 @@ function QuestionCard({ q }: { q: PendingQuestion }) {
               {choice}
             </Button>
           ))}
+        </div>
+      )}
+
+      {q.type === "multi-choice" && (
+        <div className="mt-2 flex flex-col gap-1">
+          {q.choices?.map((choice, i) => {
+            const isSelected = selected.includes(i);
+            return (
+              <Button
+                key={i}
+                variant={isSelected ? "default" : "outline"}
+                size="sm"
+                className="justify-start"
+                aria-pressed={isSelected}
+                onClick={() =>
+                  setSelected((prev) =>
+                    prev.includes(i)
+                      ? prev.filter((x) => x !== i)
+                      : [...prev, i],
+                  )
+                }
+              >
+                <span className="flex items-center gap-2">
+                  <Check
+                    size={14}
+                    className={isSelected ? "opacity-100" : "opacity-0"}
+                  />
+                  {choice}
+                </span>
+              </Button>
+            );
+          })}
+          <div className="mt-1 flex items-center justify-between gap-2">
+            <span className="text-[10px] text-[var(--color-muted-foreground)]">
+              {selected.length === 0
+                ? "Select one or more options"
+                : `${selected.length} selected`}
+            </span>
+            <Button
+              size="sm"
+              onClick={submitMulti}
+              disabled={selected.length === 0}
+            >
+              Submit
+            </Button>
+          </div>
         </div>
       )}
 

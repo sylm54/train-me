@@ -17,7 +17,11 @@
 import { useEffect, useState } from "react";
 
 /** Kind of question. Mirrors the `ask_question` tool's `type` field. */
-export type QuestionType = "open" | "choice" | "rating";
+export type QuestionType =
+  | "open"
+  | "single-choice"
+  | "multi-choice"
+  | "rating";
 
 /** A question awaiting the user's answer. */
 export interface PendingQuestion {
@@ -26,7 +30,7 @@ export interface PendingQuestion {
   type: QuestionType;
   /** The question text to show the user. */
   prompt: string;
-  /** For "choice": the options the user picks one from. */
+  /** For "single-choice"/"multi-choice": the options shown to the user. */
   choices?: string[];
   /** Optional short hint shown beneath the prompt (e.g. an example). */
   hint?: string;
@@ -34,10 +38,11 @@ export interface PendingQuestion {
 
 /**
  * What `poseQuestion` resolves with — and what the tool returns to the LLM.
- * On success, `answer` is a string ("open"/"choice") or a number ("rating").
+ * On success, `answer` is a string ("open"/"single-choice"), a string array
+ * ("multi-choice"), or a number ("rating").
  */
 export type QuestionResult =
-  | { ok: true; type: QuestionType; answer: string | number }
+  | { ok: true; type: QuestionType; answer: string | number | string[] }
   | { ok: false; reason: string };
 
 interface PendingEntry {
@@ -115,7 +120,7 @@ export function poseQuestion(
 /** Called by the UI when the user answers. No-op if the id is unknown. */
 export function respondToQuestion(
   id: string,
-  answer: string | number,
+  answer: string | number | string[],
 ): void {
   const entry = pending.get(id);
   if (!entry) return;
