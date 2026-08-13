@@ -810,7 +810,7 @@ function ContextFooter({
         {subagentStack.length > 0 ? (
           <span className="flex items-center gap-1 truncate">
             {subagentStack.map((sa, i) => (
-              <span key={sa.agent} className="flex items-center gap-1">
+              <span key={sa.depth} className="flex items-center gap-1">
                 {i > 0 && <span className="opacity-30 mx-0.5">›</span>}
                 <span
                   className="size-1.5 rounded-full shrink-0"
@@ -825,6 +825,9 @@ function ContextFooter({
                 >
                   {sa.agent}
                 </span>
+                {sa.depth > 1 && (
+                  <span className="opacity-50 shrink-0">L{sa.depth}</span>
+                )}
               </span>
             ))}
             <span className="opacity-40">·</span>
@@ -1214,6 +1217,8 @@ const SUBAGENT_COLOR: Record<"planner", string> = {
 
 interface ActiveSubagent {
   agent: "planner";
+  /** Chain depth (1 = spawned by main, 2 = by a depth-1 planner, …). */
+  depth: number;
   label: string;
   startedAt: number;
   /** Reserved for retry-aware tool steps (currently unused). */
@@ -1223,6 +1228,8 @@ interface ActiveSubagent {
 /** One recorded subagent tool call (for the expandable history). */
 interface ToolHistoryEntry {
   agent: "planner";
+  /** Depth of the planner that performed this call. */
+  depth: number;
   toolName: string;
   label: string;
   detail?: string;
@@ -1238,12 +1245,14 @@ interface Totals {
 
 /**
  * Walk the event stream and derive (a) cumulative token + spend totals,
- * (b) the currently-active subagent, and (c) the planner's tool-call
- * history (for the expandable list under the progress indicator).
+ * (b) the currently-active delegation stack, and (c) the full tool-call
+ * history across all planner levels.
  *
- * A `start` with no matching `end` means the planner is still running. Tool
- * history is accumulated in order. (There is no longer a nested writer
- * subagent — the planner authors and validates scripts directly.)
+ * Subagents are strictly nested (a child fully completes within its
+ * parent's run), so we model activity as a push/pop stack keyed by the
+ * event's `depth`: `start` pushes a frame, `end` pops it, and `step` /
+ * `tool` events are attributed to the frame at their depth. Frames left
+ * open at the end of the stream are the still-running delegation chain.
  */
 function deriveStats(events: AgentEvent[]): {
   totals: Totals;
@@ -1254,11 +1263,7 @@ function deriveStats(events: AgentEvent[]): {
   let promptTokens = 0;
   let completionTokens = 0;
 
-  // Track open activity for the planner + the most recent step label.
-  let open = false;
-  let label = "";
-  let attempt: number | undefined = undefined;
-  let startedAt = 0;
+  const stack: ActiveSubagent[] = [];
   const toolHistory: ToolHistoryEntry[] = [];
 
   for (const e of events) {
@@ -1269,18 +1274,27 @@ function deriveStats(events: AgentEvent[]): {
         break;
       }
       case "subagent-start":
-        open = true;
-        label = e.label;
-        startedAt = e.ts;
-        attempt = undefined;
+        stack.push({
+          agent: e.agent,
+          depth: e.depth,
+          label: e.label,
+          startedAt: e.ts,
+          attempt: undefined,
+        });
         break;
-      case "subagent-step":
-        label = e.label;
-        attempt = e.attempt;
+      case "subagent-step": {
+        // Update the matching frame (the running one at this depth).
+        const frame = stack.find((s) => s.depth === e.depth);
+        if (frame) {
+          frame.label = e.label;
+          frame.attempt = e.attempt;
+        }
         break;
+      }
       case "subagent-tool":
         toolHistory.push({
           agent: e.agent,
+          depth: e.depth,
           toolName: e.toolName,
           label: e.label,
           detail: e.detail,
@@ -1289,31 +1303,31 @@ function deriveStats(events: AgentEvent[]): {
           ts: e.ts,
         });
         break;
-      case "subagent-end":
-        open = false;
+      case "subagent-end": {
+        // Pop the frame at this depth. With strict nesting it's the top;
+        // searching from the end is robust if events ever arrive slightly
+        // out of order. (Manual loop because Array.findLastIndex is ES2023
+        // and our lib target is ES2022.)
+        let idx = -1;
+        for (let j = stack.length - 1; j >= 0; j--) {
+          if (stack[j].depth === e.depth) {
+            idx = j;
+            break;
+          }
+        }
+        if (idx >= 0) stack.splice(idx, 1);
         break;
+      }
     }
   }
 
-  // The stack is a single-element list when the planner is running.
-  const subagentStack: ActiveSubagent[] = open
-    ? [
-        {
-          agent: "planner",
-          label: label || "Planning",
-          startedAt,
-          attempt,
-        },
-      ]
-    : [];
-
   const activeSubagent =
-    subagentStack.length > 0 ? subagentStack[subagentStack.length - 1] : null;
+    stack.length > 0 ? stack[stack.length - 1] : null;
 
   return {
     totals: { promptTokens, completionTokens },
     activeSubagent,
-    subagentStack,
+    subagentStack: stack,
     toolHistory,
   };
 }
@@ -1356,9 +1370,15 @@ function SubagentProgressIndicator({
     );
   }
 
-  // Tool history for whichever subagents are active.
-  const activeAgents = new Set(stack.map((s) => s.agent));
-  const relevantHistory = toolHistory.filter((h) => activeAgents.has(h.agent));
+  // Tool history for the innermost active level — i.e. the agent actually
+  // doing work right now. Outer (waiting) levels' past calls aren't useful
+  // while a child runs, so we focus the list on the current depth.
+  const innermostDepth =
+    stack.length > 0 ? stack[stack.length - 1].depth : null;
+  const relevantHistory =
+    innermostDepth != null
+      ? toolHistory.filter((h) => h.depth === innermostDepth)
+      : [];
 
   return (
     <div className="flex flex-col gap-0.5 pl-1 py-1">
@@ -1368,14 +1388,15 @@ function SubagentProgressIndicator({
 
         return (
           <div
-            key={sa.agent}
+            key={sa.depth}
             className={`flex items-center gap-1.5 text-xs ${
-              i > 0 ? "ml-3" : ""
-            } ${
               isInnermost
                 ? "text-[var(--color-foreground)]"
                 : "text-[var(--color-muted-foreground)]"
             }`}
+            // Indent each nested level so the delegation chain reads as a
+            // hierarchy (depth 1 flush, each deeper level shifted right).
+            style={{ marginLeft: i * 14 }}
           >
             {/* Color dot */}
             <span
@@ -1395,6 +1416,11 @@ function SubagentProgressIndicator({
               </span>
             )}
             <span className="capitalize font-medium">{sa.agent}</span>
+            {/* Show the recursion depth only when actually nested, so the
+                common single-level case looks exactly as before. */}
+            {sa.depth > 1 && (
+              <span className="opacity-50 shrink-0">L{sa.depth}</span>
+            )}
             <span className="opacity-40">·</span>
             <span className={isInnermost ? "" : "opacity-70"}>{sa.label}</span>
             {isInnermost && sa.attempt && sa.attempt > 1 && (

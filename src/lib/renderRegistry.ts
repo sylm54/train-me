@@ -36,6 +36,28 @@ export interface RenderEntry {
   label: string;
   /** Present only when `status === "error"`. */
   error: string | null;
+  /**
+   * Epoch ms when the render started (set by {@link markStart}), for the
+   * elapsed-time readout. Covers the whole wait, including the frontend model
+   * load and the pre-walk "Reading/Parsing script…" phases. `null` once the
+   * render reaches a terminal state.
+   */
+  startedAt: number | null;
+  /**
+   * Epoch ms when the walker first reported a non-zero `total` — i.e. the
+   * moment the "Synthesizing audio…" step-counting phase began. Used together
+   * with {@link countedStep} to estimate remaining time from the per-step rate.
+   * `null` until the walker seeds the total (and for renders that never reach
+   * the walk, e.g. a freshness short-circuit).
+   */
+  countedAt: number | null;
+  /**
+   * The `step` value observed when {@link countedAt} was stamped. Steps
+   * completed since the count began = `step - countedStep`, the denominator for
+   * the per-step rate. Captured at count time (not assumed 0/1) because the
+   * ~2 Hz throttle can coalesce the very first ticks.
+   */
+  countedStep: number;
 }
 
 /** Shape of the backend's `render-manifest-progress` event payload. */
@@ -109,12 +131,21 @@ export function ensureGlobalListener(): Promise<void> {
           // events for renders whose view instance already marked done/error.
           const cur = store.get(script);
           if (!cur || cur.status !== "rendering") return;
+          // The first time the walker reports a non-zero `total`, stamp the
+          // rate baseline (timestamp + step) so the UI can estimate remaining
+          // time from the per-step rate. The throttle can coalesce the very
+          // first ticks, so capture the actual `step` here rather than assuming
+          // 0/1.
+          const countBegins = total > 0 && cur.countedAt == null;
           setEntry(script, {
             status: "rendering",
             step,
             total,
             label,
             error: null,
+            startedAt: cur.startedAt,
+            countedAt: countBegins ? Date.now() : cur.countedAt,
+            countedStep: countBegins ? step : cur.countedStep,
           });
         },
       );
@@ -143,6 +174,9 @@ export function markStart(scriptPath: string): void {
     total: 0,
     label: "",
     error: null,
+    startedAt: Date.now(),
+    countedAt: null,
+    countedStep: 0,
   });
 }
 
@@ -167,6 +201,9 @@ export function markDone(scriptPath: string): void {
     total: 0,
     label: "",
     error: null,
+    startedAt: null,
+    countedAt: null,
+    countedStep: 0,
   });
 }
 
@@ -178,6 +215,9 @@ export function markError(scriptPath: string, message: string): void {
     total: 0,
     label: "",
     error: message,
+    startedAt: null,
+    countedAt: null,
+    countedStep: 0,
   });
 }
 

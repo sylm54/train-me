@@ -122,11 +122,14 @@ export function buildProviderOptions(
  * prompts, validate_files) plus the `invoke_planner` subagent tool. The
  * planner tool is rebuilt whenever `settings` change because it captures
  * the settings to spawn the planner LLM call.
+ *
+ * The planner is spawned at chain depth 1; it may recurse further up to
+ * `MAX_SUBAGENT_DEPTH` (see `subagents.ts`).
  */
 export function buildMainAgentTools(settings: AgentSettings): ToolSet {
   return {
     ...MAIN_AGENT_TOOLS,
-    invoke_planner: buildInvokePlannerTool(settings),
+    invoke_planner: buildInvokePlannerTool(settings, 1),
   };
 }
 

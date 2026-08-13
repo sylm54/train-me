@@ -871,6 +871,38 @@ function ScriptDetail({
 }: ScriptDetailProps) {
   const { meta, metaError, manifest, stale } = script;
 
+  // Live "how long / how much longer" readout under the progress bar. The
+  // elapsed counter ticks every second via a local interval — the registry
+  // only re-renders us on backend progress events (~2 Hz), which isn't smooth
+  // enough for a clock. `startedAt` covers the whole wait (frontend model load
+  // + pre-walk phases + walk); the ETA is derived from the per-step rate since
+  // the walker first reported a non-zero total (`countedAt`/`countedStep` in
+  // the registry). We require at least two steps measured so the estimate
+  // isn't a single noisy sample.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!rendering) return;
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [rendering]);
+
+  const elapsedMs =
+    progress?.startedAt != null ? Math.max(0, now - progress.startedAt) : 0;
+
+  let etaMs: number | null = null;
+  if (
+    progress &&
+    progress.total > 0 &&
+    progress.countedAt != null &&
+    progress.step - progress.countedStep >= 2
+  ) {
+    const measured = progress.step - progress.countedStep;
+    const countedElapsed = Math.max(0, now - progress.countedAt);
+    const perStep = countedElapsed / measured;
+    const remainingSteps = Math.max(0, progress.total - progress.step);
+    etaMs = perStep * remainingSteps;
+  }
+
   // Resolve the primary action from current state.
   const modelDownloaded = modelStatus?.downloaded ?? false;
   const modelLoaded = modelStatus?.loaded ?? false;
@@ -1040,6 +1072,20 @@ function ScriptDetail({
                 <div className="h-full w-1/3 rounded-full bg-[var(--color-pink-500)] animate-[render-indeterminate_1.1s_ease-in-out_infinite]" />
               </div>
             )}
+
+            {/* Elapsed wall time (ticks every second) and an ETA derived from
+                the per-step rate once enough steps have been measured. Elapsed
+                always shows — even during the pre-count indeterminate phase —
+                so a slow/mobile load visibly counts up instead of looking
+                frozen. The ETA is hidden until at least two steps have been
+                measured (single-sample estimates jump around) and once it drops
+                below a second (the render is essentially done). */}
+            <div className="flex items-center justify-between text-[11px] text-[var(--color-muted-foreground)] tabular-nums">
+              <span>{formatDuration(elapsedMs / 1000)} elapsed</span>
+              {etaMs != null && etaMs >= 1000 ? (
+                <span>~{formatDuration(etaMs / 1000)} left</span>
+              ) : null}
+            </div>
           </div>
         )}
 
