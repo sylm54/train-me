@@ -6,8 +6,10 @@
  *
  * Supported directives:
  *
- *   {{{embed 'path/to/file.md'}}}     Inline the contents of `prompts/path/to/file.md`.
+ *   {{embed 'path/to/file.md'}}       Inline the contents of `prompts/path/to/file.md`.
  *                                     Embeds can be nested; circular embeds are skipped.
+ *                                     A leading `./` is allowed. The legacy
+ *                                     `{{{embed ...}}}` triple-brace form also works.
  *
  *   {{include './USER.md'}}           Inline a file from the agent's writable directory
  *                                     (`agent_data/`). The path is relative to that dir;
@@ -396,8 +398,11 @@ const STATIC_EMBED_RE = new RegExp(
   "g",
 );
 
+// Accept both `{{embed ...}}` (consistent with the other directives) and the
+// legacy `{{{embed ...}}}` triple-brace form. A leading `./` on the path is
+// handled by the backend's `resolve_under`.
 const EMBED_RE = new RegExp(
-  "\\{\\{\\{embed\\s+['\"]([^'\"]+)['\"]\\s*\\}\\}\\}",
+  "\\{{2,3}embed\\s+['\"]([^'\"]+)['\"]\\s*\\}{2,3}",
   "g",
 );
 const INCLUDE_RE = new RegExp(
