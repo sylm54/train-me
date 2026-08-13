@@ -17,6 +17,12 @@
  *                  traces still go to the browser console via the
  *                  subagent logger.
  *
+ * Subagents are recursive: a planner may spawn another planner (up to a
+ * fixed depth cap, enforced in `subagents.ts`). Every subagent event
+ * carries a `depth` (1 = spawned directly by the main agent, 2 = spawned
+ * by a depth-1 planner, …) so the UI can render the full delegation chain
+ * and attribute each tool call to the level that performed it.
+ *
  * Events are best-effort: a listener that throws never breaks a producer.
  */
 
@@ -36,12 +42,19 @@ export type AgentEvent =
   | {
       type: "subagent-start";
       agent: Exclude<AgentRole, "main">;
+      /**
+       * Recursion depth: 1 = spawned directly by the main agent, 2 = spawned
+       * by a depth-1 planner, etc. Uniquely identifies the frame within the
+       * current delegation stack (frames are strictly nested).
+       */
+      depth: number;
       label: string;
       ts: number;
     }
   | {
       type: "subagent-step";
       agent: Exclude<AgentRole, "main">;
+      depth: number;
       label: string;
       /** Optional detail (e.g. a friendly path) shown after the label. */
       detail?: string;
@@ -53,6 +66,7 @@ export type AgentEvent =
       /** One completed tool call by a subagent; accumulated into the history. */
       type: "subagent-tool";
       agent: Exclude<AgentRole, "main">;
+      depth: number;
       toolName: string;
       /** Friendly label (e.g. "Reading file"). */
       label: string;
@@ -64,7 +78,12 @@ export type AgentEvent =
       ok: boolean;
       ts: number;
     }
-  | { type: "subagent-end"; agent: Exclude<AgentRole, "main">; ts: number };
+  | {
+      type: "subagent-end";
+      agent: Exclude<AgentRole, "main">;
+      depth: number;
+      ts: number;
+    };
 
 type Listener = (e: AgentEvent) => void;
 

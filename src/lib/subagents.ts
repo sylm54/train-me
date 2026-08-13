@@ -1,24 +1,29 @@
 /**
- * Subagent orchestration: hypno planner.
+ * Subagent orchestration: hypno planner (recursive).
  *
  * The planner is spawned from the frontend via its own `streamText` call.
- * It is *not* exposed to the user — only the main agent sees `invoke_planner`.
+ * It is *not* exposed to the user — only its parent (the main agent, or
+ * another planner) sees `invoke_planner`.
  *
- * Lifecycle:
+ * Lifecycle (recursive):
  *
  *   Main agent
- *     └─ tool: invoke_planner(task: string)
+ *     └─ tool: invoke_planner(task)          → planner @ depth 1
  *          └─ streamText(planner prompt, planner tools)
- *               ├─ tool: bash / read_file / write_file / edit_file / list_files
- *               └─ tool: validate_files (path-aware)
+ *               ├─ bash / read_file / write_file / edit_file / list_files
+ *               ├─ validate_files (path-aware)
+ *               └─ tool: invoke_planner(task) → planner @ depth 2
+ *                    └─ … (up to MAX_SUBAGENT_DEPTH)
  *
  * The planner writes XML scripts directly with `write_file`/`edit_file` and
  * validates them with `validate_files` (optionally scoped to a path). Its
- * final text becomes the `invoke_planner` tool result the main agent sees.
+ * final text becomes the `invoke_planner` tool result the parent sees.
  *
- * (The writer subagent that used to sit below the planner has been removed —
- * the planner now authors and lints scripts itself. See `validate_files` for
- * the XML syntax + import-validity checks.)
+ * Recursion cap: a planner running at chain depth `d` is given the
+ * `invoke_planner` tool (which spawns depth `d+1`) only while
+ * `d < MAX_SUBAGENT_DEPTH`. The deepest level simply has no spawn tool, so
+ * it authors and validates directly — exceeding the cap is structurally
+ * impossible, not merely discouraged.
  *
  * All subagent activity is mirrored to the browser devtools console
  * (search for `[planner]`). Each invocation opens a collapsed
@@ -54,10 +59,27 @@ import { emitAgentEvent, type AgentRole } from "./agent-events";
 
 type SubagentName = "planner";
 
+/**
+ * Maximum planner chain depth. Depth 1 = spawned by the main agent; each
+ * nested spawn increments by one. A planner at this depth gets no
+ * `invoke_planner` tool and works directly, so this is a hard, structural
+ * cap on recursion. Tune to balance decomposition vs. token/latency cost.
+ */
+export const MAX_SUBAGENT_DEPTH = 3;
+
 /** Distinct console-marker colour for the planner so it's easy to scan. */
 const LOG_STYLES: Record<SubagentName, string> = {
   planner: "color:#d946ef;font-weight:bold", // pink-500
 };
+
+/**
+ * Console tag for a subagent at a given depth, e.g. `[planner]` for the
+ * first level and `[planner·2]`, `[planner·3]` for nested ones, so the
+ * recursion depth is visible when scanning flat devtools logs.
+ */
+function tag(agent: SubagentName, depth: number): string {
+  return depth > 1 ? `[${agent}·${depth}]` : `[${agent}]`;
+}
 
 /** Cap previews so a single tool result doesn't drown the console. */
 const PREVIEW_MAX = 240;
@@ -106,9 +128,14 @@ function preview(value: unknown): unknown {
   return value;
 }
 
-/** Emit a prefixed console.log entry for the given subagent. */
-function log(agent: SubagentName, message: string, ...args: unknown[]) {
-  console.log(`%c[${agent}]`, LOG_STYLES[agent], message, ...args);
+/** Emit a prefixed console.log entry for the given subagent + depth. */
+function log(
+  agent: SubagentName,
+  depth: number,
+  message: string,
+  ...args: unknown[]
+) {
+  console.log(`%c${tag(agent, depth)}`, LOG_STYLES[agent], message, ...args);
 }
 
 // ── UI progress events ────────────────────────────────────────────────
@@ -133,10 +160,11 @@ const STEP_LABEL: Record<string, string> = {
 };
 
 /** Push a subagent-start event so the UI can show "Planning…" etc. */
-function emitStart(agent: SubagentName) {
+function emitStart(agent: SubagentName, depth: number) {
   emitAgentEvent({
     type: "subagent-start",
     agent,
+    depth,
     label: START_LABEL[agent],
     ts: Date.now(),
   });
@@ -145,6 +173,7 @@ function emitStart(agent: SubagentName) {
 /** Update the current step label for a running subagent. */
 function emitStep(
   agent: SubagentName,
+  depth: number,
   toolName: string,
   detail?: string,
   attempt?: number,
@@ -152,6 +181,7 @@ function emitStep(
   emitAgentEvent({
     type: "subagent-step",
     agent,
+    depth,
     label: STEP_LABEL[toolName] ?? toolName,
     detail,
     attempt,
@@ -162,6 +192,7 @@ function emitStep(
 /** Record one completed subagent tool call in the UI history feed. */
 function emitTool(
   agent: SubagentName,
+  depth: number,
   toolName: string,
   detail: string | undefined,
   attempt: number | undefined,
@@ -170,6 +201,7 @@ function emitTool(
   emitAgentEvent({
     type: "subagent-tool",
     agent,
+    depth,
     toolName,
     label: STEP_LABEL[toolName] ?? toolName,
     detail,
@@ -180,8 +212,8 @@ function emitTool(
 }
 
 /** Pop a subagent activity when its run completes. */
-function emitEnd(agent: SubagentName) {
-  emitAgentEvent({ type: "subagent-end", agent, ts: Date.now() });
+function emitEnd(agent: SubagentName, depth: number) {
+  emitAgentEvent({ type: "subagent-end", agent, depth, ts: Date.now() });
 }
 
 /** Report normalized token usage for a subagent run to the UI bus. */
@@ -224,6 +256,8 @@ function reportUsage(agent: SubagentName, usage: unknown) {
 async function runSubagent(opts: {
   settings: AgentSettings;
   agent: SubagentName;
+  /** Chain depth of this run (1 = spawned by main, 2 = by a depth-1 planner…). */
+  depth: number;
   systemPrompt: string;
   messages: UIMessage[];
   tools: ToolSet;
@@ -232,6 +266,7 @@ async function runSubagent(opts: {
   if (!cfg) {
     log(
       opts.agent,
+      opts.depth,
       "✗ no API key for provider",
       opts.settings.agents[opts.agent].provider,
     );
@@ -243,9 +278,10 @@ async function runSubagent(opts: {
 
   log(
     opts.agent,
+    opts.depth,
     `▶ starting (${opts.settings.agents[opts.agent].provider}/${cfg.model})`,
   );
-  emitStart(opts.agent);
+  emitStart(opts.agent, opts.depth);
 
   // Declared outside the try so the `finally` block can read its usage.
   // `streamText` runs synchronously, but the awaited message conversion
@@ -285,7 +321,14 @@ async function runSubagent(opts: {
       ok: boolean,
       input?: unknown,
     ) => {
-      emitTool(opts.agent, toolName, toolDetail(toolName, input), undefined, ok);
+      emitTool(
+        opts.agent,
+        opts.depth,
+        toolName,
+        toolDetail(toolName, input),
+        undefined,
+        ok,
+      );
       toolInputBuffers.delete(id);
       toolNamesById.delete(id);
     };
@@ -299,7 +342,7 @@ async function runSubagent(opts: {
 
         case "text-end":
           if (pendingText.trim()) {
-            log(opts.agent, "💬 text", preview(pendingText.trim()));
+            log(opts.agent, opts.depth, "💬 text", preview(pendingText.trim()));
           }
           pendingText = "";
           break;
@@ -310,11 +353,11 @@ async function runSubagent(opts: {
           // parent agent. We just open a console group for it so it can be
           // inspected during debugging.
           if (pendingText.trim()) {
-            log(opts.agent, "💬 text", preview(pendingText.trim()));
+            log(opts.agent, opts.depth, "💬 text", preview(pendingText.trim()));
             pendingText = "";
           }
           console.groupCollapsed(
-            `%c[${opts.agent}]`,
+            `%c${tag(opts.agent, opts.depth)}`,
             LOG_STYLES[opts.agent],
             "💭 reasoning",
           );
@@ -331,7 +374,7 @@ async function runSubagent(opts: {
         case "tool-input-start": {
           // Flush any text that preceded this tool call.
           if (pendingText.trim()) {
-            log(opts.agent, "💬 text", preview(pendingText.trim()));
+            log(opts.agent, opts.depth, "💬 text", preview(pendingText.trim()));
             pendingText = "";
           }
           // Discard any text accumulated so far — it was inter-step
@@ -340,11 +383,11 @@ async function runSubagent(opts: {
           // assistant message (after the final tool call returns).
           finalText = "";
           const dynamic = "dynamic" in part && part.dynamic ? " (dynamic)" : "";
-          log(opts.agent, `🔧 tool call: ${part.toolName}${dynamic}`);
+          log(opts.agent, opts.depth, `🔧 tool call: ${part.toolName}${dynamic}`);
           toolInputBuffers.set(part.id, "");
           toolNamesById.set(part.id, part.toolName);
           // Surface a friendly step label to the UI progress feed.
-          emitStep(opts.agent, part.toolName, undefined, undefined);
+          emitStep(opts.agent, opts.depth, part.toolName, undefined, undefined);
           break;
         }
 
@@ -363,7 +406,7 @@ async function runSubagent(opts: {
         case "tool-result": {
           // The `output` field is the JSON the tool's execute() returned.
           const outputPreview = preview("output" in part ? part.output : part);
-          log(opts.agent, `↳ ${part.toolName} result`, outputPreview);
+          log(opts.agent, opts.depth, `↳ ${part.toolName} result`, outputPreview);
           const input =
             "input" in part ? (part as { input?: unknown }).input : undefined;
           finishToolCall(part.toolCallId, part.toolName, true, input);
@@ -375,7 +418,7 @@ async function runSubagent(opts: {
             "errorText" in part && typeof part.errorText === "string"
               ? part.errorText
               : "unknown tool error";
-          log(opts.agent, `✗ ${part.toolName} error`, msg);
+          log(opts.agent, opts.depth, `✗ ${part.toolName} error`, msg);
           const input =
             "input" in part ? (part as { input?: unknown }).input : undefined;
           finishToolCall(part.toolCallId, part.toolName, false, input);
@@ -387,17 +430,18 @@ async function runSubagent(opts: {
             "error" in part && part.error instanceof Error
               ? part.error.message
               : String(part);
-          log(opts.agent, "✗ stream error", msg);
+          log(opts.agent, opts.depth, "✗ stream error", msg);
           break;
         }
 
         case "finish": {
           if (pendingText.trim()) {
-            log(opts.agent, "💬 text", preview(pendingText.trim()));
+            log(opts.agent, opts.depth, "💬 text", preview(pendingText.trim()));
             pendingText = "";
           }
           log(
             opts.agent,
+            opts.depth,
             `■ finish`,
             `reason=${("finishReason" in part ? part.finishReason : "?") as string}`,
           );
@@ -424,7 +468,7 @@ async function runSubagent(opts: {
         // ignore — usage is best-effort
       }
     }
-    emitEnd(opts.agent);
+    emitEnd(opts.agent, opts.depth);
   }
 }
 
@@ -436,11 +480,15 @@ async function runSubagent(opts: {
  * Build the planner subagent's toolset.
  *
  * The planner authors scripts directly with `write_file`/`edit_file` and
- * validates them with `validate_files` (optionally scoped to a path). There
- * is no longer a separate writer subagent.
+ * validates them with `validate_files` (optionally scoped to a path).
+ *
+ * Recursion: a planner running at chain `depth` is handed `invoke_planner`
+ * (which spawns a planner at `depth + 1`) only while `depth <
+ * MAX_SUBAGENT_DEPTH`. The deepest allowed level simply has no spawn tool,
+ * so it works directly — the recursion cap is structural, not advisory.
  */
-function buildPlannerTools() {
-  return {
+function buildPlannerTools(settings: AgentSettings, depth: number): ToolSet {
+  const tools: ToolSet = {
     bash: bashTool,
     read_file: readFileTool,
     write_file: writeFileTool,
@@ -448,54 +496,68 @@ function buildPlannerTools() {
     list_files: listFilesTool,
     validate_files: validateFilesTool,
   };
+  if (depth < MAX_SUBAGENT_DEPTH) {
+    tools.invoke_planner = buildInvokePlannerTool(settings, depth + 1);
+  }
+  return tools;
 }
 
 /**
- * Invoke the planner subagent with a high-level task from the main agent.
+ * Invoke the planner subagent with a high-level task from its parent (the
+ * main agent, or another planner when recursing).
  *
+ * `depth` is the chain depth of the planner to run (1 = spawned by main).
  * Loads the planner prompt from disk on every invocation so the user can
  * edit it and see changes immediately.
  */
 export async function invokePlanner(opts: {
   settings: AgentSettings;
   task: string;
+  /** Chain depth of the planner to run (1 = spawned by the main agent). */
+  depth: number;
 }): Promise<string> {
   const plannerPrompt = await loadPrompt("hypno_planner.md");
 
   if (!plannerPrompt) {
-    log("planner", "✗ prompts/hypno_planner.md missing or empty");
+    log("planner", opts.depth, "✗ prompts/hypno_planner.md missing or empty");
     throw new Error(
       "prompts/hypno_planner.md is empty or missing. " +
         "Add a system prompt for the planner before invoking it.",
     );
   }
 
-  console.groupCollapsed(`%c[planner]`, LOG_STYLES.planner, `▶ invoke_planner`);
-  log("planner", "task", preview(opts.task));
+  console.groupCollapsed(
+    `%c${tag("planner", opts.depth)}`,
+    LOG_STYLES.planner,
+    `▶ invoke_planner`,
+  );
+  log("planner", opts.depth, "task", preview(opts.task));
 
   try {
     const messages: UIMessage[] = [
       {
-        id: `planner-user-${Date.now()}`,
+        id: `planner-user-${Date.now()}-${opts.depth}`,
         role: "user",
         parts: [{ type: "text", text: opts.task }],
       },
     ];
 
-    const tools = buildPlannerTools();
+    const tools = buildPlannerTools(opts.settings, opts.depth);
 
     const out = await runSubagent({
       settings: opts.settings,
       agent: "planner",
+      depth: opts.depth,
       systemPrompt: plannerPrompt,
       messages,
       tools,
     });
-    log("planner", "✔ planner done");
+    log("planner", opts.depth, "✔ planner done");
     return out;
   } catch (e) {
     log(
       "planner",
+      opts.depth,
       "✗ planner failed",
       e instanceof Error ? e.message : String(e),
     );
@@ -506,18 +568,24 @@ export async function invokePlanner(opts: {
 }
 
 /**
- * Build the `invoke_planner` tool as exposed to the main agent.
+ * Build the `invoke_planner` tool as exposed to a parent agent (the main
+ * agent at depth 1, or a planner at deeper levels).
  *
- * The tool takes a single `task` string and returns the planner's final
- * answer (which the main agent sees as the tool result).
+ * `depth` is the chain depth of the planner this tool will spawn. The tool
+ * takes a single `task` string and returns the planner's final answer
+ * (which the parent sees as the tool result).
  */
-export function buildInvokePlannerTool(settings: AgentSettings) {
+export function buildInvokePlannerTool(settings: AgentSettings, depth: number) {
   return tool({
     description:
-      "Spawn the Hypno Planner subagent to create one or more new " +
-      "conditioning scripts (or other scripted training content). The " +
-      "planner will write JSON metadata, delegate the XML writing to " +
-      "Use this whenever the user asks to *create*, *design*, or *plan* new scripts or update existing ones.",
+      "Spawn the Hypno Planner subagent to create or update conditioning " +
+      "scripts (and other scripted training content). The planner authors " +
+      "the JSON metadata + XML scripts directly and validates them. The " +
+      "planner may itself spawn further planners to decompose large or " +
+      "multi-part tasks, up to a fixed recursion depth; beyond that it " +
+      "does the work directly. Use this whenever the user asks to create, " +
+      "design, plan, or update conditioning scripts. Provide a fully " +
+      "self-contained brief — the planner does not see this chat.",
     inputSchema: z.object({
       task: z
         .string()
@@ -530,17 +598,26 @@ export function buildInvokePlannerTool(settings: AgentSettings) {
         ),
     }),
     execute: async ({ task }) => {
+      // Identify who is spawning the planner, for the console trace. depth
+      // here is the SPAWNED planner's level, so the caller is the main
+      // agent when depth === 1, otherwise the planner one level up.
+      const callerTag =
+        depth === 1 ? "main" : tag("planner", depth - 1);
       console.groupCollapsed(
-        `%c[main]`,
-        "color:#10b981;font-weight:bold",
+        `%c[${callerTag}]`,
+        depth === 1
+          ? "color:#10b981;font-weight:bold"
+          : LOG_STYLES.planner,
         `▶ invoke_planner tool`,
       );
       console.log("task", preview(task));
       try {
-        const output = await invokePlanner({ settings, task });
+        const output = await invokePlanner({ settings, task, depth });
         console.log(
-          "%c[main]",
-          "color:#10b981;font-weight:bold",
+          `%c[${callerTag}]`,
+          depth === 1
+            ? "color:#10b981;font-weight:bold"
+            : LOG_STYLES.planner,
           "✔ invoke_planner result",
           preview(output),
         );
@@ -548,8 +625,10 @@ export function buildInvokePlannerTool(settings: AgentSettings) {
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         console.log(
-          "%c[main]",
-          "color:#10b981;font-weight:bold",
+          `%c[${callerTag}]`,
+          depth === 1
+            ? "color:#10b981;font-weight:bold"
+            : LOG_STYLES.planner,
           "✗ invoke_planner error",
           msg,
         );
