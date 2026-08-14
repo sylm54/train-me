@@ -34,15 +34,21 @@ export type ApiKeys = Partial<Record<ProviderName, string>>;
  */
 export interface ChatSettings {
   /**
-   * Current-context-size threshold at which auto-compact fires. The meter
-   * tracks the actual size of what was last sent to the model (the last
-   * prompt-token count). When it reaches this limit, the older turns are
-   * summarized by the model and replaced with a summary injected into the
-   * system prompt. The full transcript is never removed from the UI or disk
-   * (it's always at `chats/<id>.xml`), so nothing is lost. Match this to
-   * your model's context window.
+   * Percentage (50–95) of the main model's context window at which
+   * auto-compact fires. The meter tracks the actual size of what was last
+   * sent to the model (the last prompt-token count), so when it crosses this
+   * share of the window, the older turns are summarized by the model and
+   * replaced with a summary injected into the system prompt. The full
+   * transcript is never removed from the UI or disk (it's always at
+   * `chats/<id>.xml`), so nothing is lost.
    */
-  contextLimit: number;
+  compactThresholdPct: number;
+  /**
+   * Manual context-window override (tokens) for the main model. `0` resolves
+   * the window automatically: OpenRouter's live catalog → curated preset →
+   * 128k default (see `contextUsage.ts`).
+   */
+  contextWindowOverride: number;
   /**
    * Number of recent user/assistant messages always kept live (never folded
    * into the summary) when auto-compacting. Older turns beyond this window

@@ -1,8 +1,8 @@
 /**
  * Summarizing auto-compact.
  *
- * Older design: when the running token estimate crossed `contextLimit`, the
- * oldest turns were *deleted* from the live message array. They vanished from
+ * Older design: when the running token estimate crossed the context limit,
+ * the oldest turns were *deleted* from the live message array. They vanished from
  * the UI (only recoverable from `chats/<id>.xml` on the agent disk) and — worse
  * — the deletion could split an assistant tool call from its tool result,
  * producing a message sequence the provider rejects.

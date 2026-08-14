@@ -8,9 +8,11 @@
  *
  * Two kinds of events flow through here:
  *
- *  - `usage`     — token usage per agent role, emitted when a `streamText`
- *                  call finishes. The UI accumulates these to show a
- *                  running token / spend total.
+ *  - `usage`     — token usage per agent role, emitted when each `streamText`
+ *                  step finishes (the main agent's tool loop emits one per
+ *                  step, so the context meter advances during long turns).
+ *                  The UI accumulates these to show a running token total and
+ *                  anchors its live context-size estimate on the latest one.
  *  - `subagent*` — lifecycle + step events for the planner, so the
  *                  UI can show high-level progress ("Planning…",
  *                  "Validating files…") without exposing internals. Exact
@@ -38,7 +40,24 @@ export interface Usage {
 }
 
 export type AgentEvent =
-  | { type: "usage"; role: AgentRole; usage: Usage; ts: number }
+  | {
+      type: "usage";
+      role: AgentRole;
+      usage: Usage;
+      ts: number;
+      /**
+       * Char size of what was sent in this call (system prompt + live
+       * messages), main role only. Lets the UI calibrate its char→token
+       * estimate between reports (see `contextUsage.ts`).
+       */
+      contextChars?: number;
+      /**
+       * Which chat the call belonged to (main role only) — usage events are
+       * global, and a background generation in another chat must not move
+       * this chat's context meter.
+       */
+      chatId?: string;
+    }
   | {
       type: "subagent-start";
       agent: Exclude<AgentRole, "main">;

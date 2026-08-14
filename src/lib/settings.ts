@@ -19,6 +19,7 @@ import { DEFAULT_MODEL_ID } from "./models";
 import { DEFAULT_PLAYBACK_SETTINGS } from "./types";
 
 import { ensureNotificationPermission } from "./notifications";
+import { migrateChatSettings } from "./contextUsage";
 
 /** localStorage key under which settings (incl. API keys) are persisted.
  * Exported so the full-data backup can read the raw stored value. */
@@ -26,10 +27,12 @@ export const STORAGE_KEY = "train-me.settings.v1";
 
 /** Default chat behaviour settings. */
 export const DEFAULT_CHAT_SETTINGS: ChatSettings = {
-  // 120k tokens: a safe ceiling for most mid-tier models. Auto-compact
-  // summarizes the older turns before the live context grows past this,
-  // so requests stay within the model's window.
-  contextLimit: 120_000,
+  // Auto-compact when the live context reaches 85% of the model's window,
+  // leaving headroom for the answer (incl. reasoning) tokens it still owes.
+  compactThresholdPct: 85,
+  // 0 = resolve the context window automatically (OpenRouter catalog →
+  // curated preset → 128k default).
+  contextWindowOverride: 0,
   // Keep the last 6 user/assistant turns live when compacting — enough
   // recent context to stay conversational while older turns are summarized.
   compactKeepTurns: 6,
@@ -59,10 +62,11 @@ function load(): AgentSettings {
         ...DEFAULT_SETTINGS.agents,
         ...(parsed.agents ?? {}),
       } as AgentSettings["agents"],
-      chat: {
-        ...DEFAULT_SETTINGS.chat,
-        ...(parsed.chat ?? {}),
-      },
+      chat: migrateChatSettings(
+        parsed.chat ?? {},
+        (parsed.agents?.main ?? DEFAULT_SETTINGS.agents.main),
+        DEFAULT_SETTINGS.chat,
+      ),
       playback: {
         ...DEFAULT_SETTINGS.playback,
         ...(parsed.playback ?? {}),

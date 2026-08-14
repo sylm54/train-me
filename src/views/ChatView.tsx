@@ -11,13 +11,16 @@
  * `chats/<id>.xml` on the agent's disk) rather than destroying it; a true
  * delete is only available from the archive list.
  *
- * Context meter: the footer shows the CURRENT context size (the last
- * prompt-token count reported by the model) against the configured limit,
- * with a coloured bar and a "% context left" readout. When the limit is
- * reached, the older turns are SUMMARIZED by the model: the summary is
+ * Context meter: the footer shows how full the model's context window is,
+ * as a continuous estimate anchored on the last actual per-step usage report
+ * (see `lib/contextUsage.ts`) — so the bar keeps moving during long turns
+ * instead of jumping once per completed call. A notch on the bar marks the
+ * auto-compact threshold (% of the window, from Settings). When the estimate
+ * crosses it, a BLOCKING modal opens ("Compacting conversation…") while the
+ * older turns are SUMMARIZED by the model, then shows the summary: it's
  * injected into the system prompt and the summarized prefix is dropped from
- * what's sent — but the full transcript is never removed from the UI or disk,
- * and a one-time modal explains what happened. (See `lib/compaction.ts`.)
+ * what's sent — but the full transcript is never removed from the UI or disk.
+ * (See `lib/compaction.ts`.)
  *
  * Design: the UI shows *progress*, not internals. Tool calls render as
  * compact one-liners (e.g. "Edited file · path/foo.ts"); reasoning just
@@ -26,6 +29,11 @@
  * Exact inputs/outputs are mirrored to the browser console by the agent
  * runtime. A status bar surfaces running token totals and high-level
  * subagent activity (Planning / Validating files).
+ *
+ * Stream liveness: the running indicator differentiates "waiting for the
+ * model" (request sent, no token yet), "thinking" (reasoning streaming),
+ * and "working" (text/tools streaming), and warns when no chunk has arrived
+ * for a while — so a stuck stream is distinguishable from slow thinking.
  *
  * Failure recovery: if a generation finishes without producing any assistant
  * content (the "message sent but nothing happened" symptom), an inline
@@ -89,7 +97,24 @@ import {
   type ChatMeta,
 } from "@/lib/chatStore";
 import { writeChatXml } from "@/lib/chatExport";
-import { runCompaction, type CompactionState } from "@/lib/compaction";
+import {
+  findCompactionBoundary,
+  getCompaction,
+  liveMessagesForModel,
+  runCompaction,
+  systemPromptWithSummary,
+  type CompactionState,
+} from "@/lib/compaction";
+import {
+  clearContextAnchor,
+  contextCharsOf,
+  estimateContextTokens,
+  formatTokenCount,
+  getContextAnchor,
+  saveContextAnchor,
+  useContextWindow,
+  type ContextAnchor,
+} from "@/lib/contextUsage";
 
 // AI Elements primitives
 import {
@@ -353,6 +378,35 @@ function ChatViewInner({
     wasGenerating.current = isGenerating;
   }, [isGenerating, messages, activeChatId, error]);
 
+  // ── Stream liveness: "thinking" vs "waiting on the network" ────────
+  // The SDK bumps `messages` on every stream chunk (reasoning/text deltas,
+  // tool part updates), so the timestamp of the last bump is a heartbeat.
+  // Combined with the kind of the trailing part we can tell the user whether
+  // the model is connecting, actively thinking, or streaming — and flag a
+  // likely stall (nothing arrived for a while) in warning colour so a dead
+  // stream is distinguishable from slow-but-alive thinking.
+  const lastStreamActivityRef = useRef(Date.now());
+  useEffect(() => {
+    lastStreamActivityRef.current = Date.now();
+  }, [messages, status]);
+
+  const generationStartedAtRef = useRef(Date.now());
+  const prevGeneratingRef = useRef(false);
+  useEffect(() => {
+    if (isGenerating && !prevGeneratingRef.current) {
+      generationStartedAtRef.current = Date.now();
+      lastStreamActivityRef.current = Date.now();
+    }
+    prevGeneratingRef.current = isGenerating;
+  }, [isGenerating]);
+
+  const streamPhase: StreamPhase =
+    status === "submitted"
+      ? "connecting"
+      : trailingPartIsReasoning(messages)
+        ? "thinking"
+        : "active";
+
   const [input, setInput] = useState("");
 
   // Agent activity (token usage + subagent progress) arrives over the
@@ -401,22 +455,39 @@ function ChatViewInner({
     onActiveChatChange(c.id);
   }, [activeChatId, messages, onActiveChatChange]);
 
-  // ── Auto-compact: summarize oldest turns when the context limit is hit ──
-  // The token estimate tracks the CURRENT context size (the last prompt-token
-  // count reported by the model), not a cumulative lifetime total — so it
-  // matches the `contextLimit` setting (a model context-window ceiling) and
-  // naturally drops again after summarizing. When it crosses the limit we ask
-  // the model to summarize the older prefix; the transport then drops that
-  // prefix from what it sends and injects the summary into the system prompt.
-  // The UI `messages` array is NEVER truncated here — the full history stays
+  // ── Context meter + auto-compact ────────────────────────────────────
+  // The meter anchors on the last actual per-step usage report and advances
+  // continuously between reports (char growth → estimated tokens, see
+  // lib/contextUsage.ts). The threshold is a % of the model's context window
+  // (resolved live from OpenRouter / presets / manual override). Crossing it
+  // at turn end opens the blocking CompactionModal — visible over any view,
+  // since ChatView stays mounted — while one summarization pass runs; the
+  // next send then reports a small context again, which re-arms the latch.
+  // The UI `messages` array is NEVER truncated — the full history stays
   // visible (and on disk at chats/<id>.xml).
-  const { contextLimit, compactKeepTurns } = settings.chat;
+  const { compactThresholdPct, compactKeepTurns } = settings.chat;
+  const contextWindow = useContextWindow(
+    settings.agents.main,
+    settings.chat.contextWindowOverride,
+  );
+  const thresholdTokens = Math.round(
+    (contextWindow.tokens * compactThresholdPct) / 100,
+  );
+  const [anchorResetAt, setAnchorResetAt] = useState(0);
+  const { tokens: contextTokens, anchor } = useContextUsage(
+    events,
+    messages,
+    systemPrompt,
+    activeChatId,
+    anchorResetAt,
+  );
+
   const compactedRef = useRef(false);
   const compactingRef = useRef(false);
-  const [summaryNotice, setSummaryNotice] = useState<CompactionState | null>(
+  const lastCompactFailRef = useRef(0);
+  const [compactionUi, setCompactionUi] = useState<CompactionUiState | null>(
     null,
   );
-  const tokenEstimate = useTokenEstimate(events);
 
   // Keep latest settings in a ref so the async summarize callback reads
   // current values rather than a stale snapshot from when the effect ran.
@@ -425,39 +496,62 @@ function ChatViewInner({
 
   useEffect(() => {
     if (compactedRef.current || compactingRef.current) return;
-    if (tokenEstimate < contextLimit) return;
+    if (contextTokens < thresholdTokens) return;
     if (messages.length === 0) return;
     if (isGenerating) return; // don't summarize mid-stream
     if (apiKeyMissing) return; // need the key to call the summarizer
+    // After a failure, wait out the cooldown instead of re-opening the
+    // blocking modal (and re-calling the summarizer) on every update.
+    if (
+      Date.now() - lastCompactFailRef.current <
+      COMPACT_FAIL_COOLDOWN_MS
+    ) {
+      return;
+    }
+    // Nothing can be compacted (the keep-turns window already reaches the
+    // start of the conversation) — latch so we don't re-check forever.
+    if (findCompactionBoundary(messages, compactKeepTurns) === 0) {
+      compactedRef.current = true;
+      return;
+    }
 
-    let cancelled = false;
     compactingRef.current = true;
+    setCompactionUi({ phase: "running" });
     (async () => {
-      const before = messages.length;
-      const state = await runCompaction(
-        settingsRef.current,
-        activeChatId,
-        messages,
-        compactKeepTurns,
-      );
-      if (cancelled) return;
-      if (state) {
-        compactedRef.current = true;
-        setSummaryNotice(state);
-        console.info(
-          `[chat] summarized ${activeChatId}: compacted prefix ` +
-            `(${state.lastSummarizedId}) — ${before} messages still fully visible`,
+      try {
+        const state = await runCompaction(
+          settingsRef.current,
+          activeChatId,
+          messages,
+          compactKeepTurns,
         );
+        if (state) {
+          compactedRef.current = true;
+          setCompactionUi({ phase: "done", state });
+          // The live context just shrank (summarized prefix dropped, summary
+          // injected) — rebase the meter onto the live estimate until the
+          // next actual report arrives.
+          clearContextAnchor(activeChatId);
+          setAnchorResetAt(Date.now());
+          console.info(
+            `[chat] summarized ${activeChatId}: compacted prefix ` +
+              `(${state.lastSummarizedId}) — ${messages.length} messages still fully visible`,
+          );
+        } else {
+          // Summarization genuinely failed (runCompaction already fell back
+          // to keeping the old context). Tell the user briefly, then retry
+          // automatically after the cooldown.
+          lastCompactFailRef.current = Date.now();
+          setCompactionUi({ phase: "failed" });
+          window.setTimeout(() => setCompactionUi(null), 2500);
+        }
+      } finally {
+        compactingRef.current = false;
       }
-      compactingRef.current = false;
     })();
-    return () => {
-      cancelled = true;
-      compactingRef.current = false;
-    };
   }, [
-    tokenEstimate,
-    contextLimit,
+    contextTokens,
+    thresholdTokens,
     compactKeepTurns,
     messages,
     isGenerating,
@@ -465,16 +559,19 @@ function ChatViewInner({
     activeChatId,
   ]);
 
-  // Reset the compacted latch once the context has shrunk well below the limit
-  // (after summarizing, the next sent prompt is small again, so the estimate
-  // drops and this latch frees up a future compaction).
+  // Re-arm the compact latch once the ACTUAL reported context has shrunk well
+  // below the threshold (after a compaction, the next send's usage report is
+  // small again). Anchored on the report — not the streaming estimate — so it
+  // can't flutter while the estimate grows during a turn.
   useEffect(() => {
-    if (tokenEstimate < contextLimit * 0.5) compactedRef.current = false;
-  }, [tokenEstimate, contextLimit]);
+    if (anchor && anchor.tokens < thresholdTokens * 0.8) {
+      compactedRef.current = false;
+    }
+  }, [anchor, thresholdTokens]);
 
   // ── Derive active subagent + tool history from the event stream ──────
-  // (Token totals come from useTokenEstimate above, used by the context
-  // meter; this derives the subagent progress UI state.)
+  // (The context meter is computed above from useContextUsage; this derives
+  // the subagent progress UI state.)
   const { activeSubagent, subagentStack, toolHistory } = useMemo(
     () => deriveStats(events),
     [events],
@@ -598,13 +695,16 @@ function ChatViewInner({
           {/* Persistent "agent is running" indicator with subagent
               hierarchy. Shows the running planner with elapsed time. The
               ticking seconds prove the system is alive even during long
-              generations. */}
+              generations; the stream phase (connecting / thinking /
+              streaming) plus the token heartbeat flag a stuck stream. */}
           {isGenerating && (
             <SubagentProgressIndicator
               stack={subagentStack}
-              status={status}
+              phase={streamPhase}
               now={now}
               toolHistory={toolHistory}
+              msSinceActivity={now - lastStreamActivityRef.current}
+              startedAt={generationStartedAtRef.current}
             />
           )}
 
@@ -652,16 +752,24 @@ function ChatViewInner({
       {/* ── Status footer: subagent breadcrumb + context meter ─── */}
       <ContextFooter
         isGenerating={isGenerating}
+        phase={streamPhase}
+        isCompacting={compactionUi?.phase === "running"}
         subagentStack={subagentStack}
         activeSubagent={activeSubagent}
-        tokenEstimate={tokenEstimate}
-        contextLimit={contextLimit}
+        contextTokens={contextTokens}
+        contextWindowTokens={contextWindow.tokens}
+        thresholdPct={compactThresholdPct}
         messageCount={messages.length}
         onClear={archiveCurrent}
       />
 
-      {/* ── Summary notice: shown once when auto-compact summarizes ── */}
-      <SummarizedModal state={summaryNotice} onClose={() => setSummaryNotice(null)} />
+      {/* ── Compaction modal: blocks while summarizing, then shows the
+          summary. Portals to document.body, so it's visible over any
+          view — the user always knows compaction is happening. ── */}
+      <CompactionModal
+        ui={compactionUi}
+        onClose={() => setCompactionUi(null)}
+      />
 
       {/* ── Switcher sheet (active + archived chats) ──────────── */}
       <ChatSwitcherSheet
@@ -690,34 +798,82 @@ function ChatViewInner({
   );
 }
 
-// ── Token estimate ────────────────────────────────────────────────────
+// ── Context usage estimate ────────────────────────────────────────────
+
+/** Cooldown before auto-compact retries after a failed summarization. */
+const COMPACT_FAIL_COOLDOWN_MS = 30_000;
 
 /**
- * Track the CURRENT context size from the usage event stream: the
- * prompt-token count of the most recent main-agent call (the size of what was
- * actually sent to the model), plus its completion tokens so the meter keeps
- * moving while a long answer streams.
+ * Track the CURRENT context size continuously.
  *
- * This is deliberately NOT a cumulative lifetime sum. The `contextLimit`
- * setting is a model context-window ceiling, so the meter must reflect how
- * full the window is *right now*. Because it tracks current size, the
- * estimate drops again after auto-compact summarizes the older prefix — which
- * is exactly what lets compaction stay rare instead of re-firing on every
- * send. Each `useChat`-keyed remount (chat switch) starts a fresh event
- * window, so the estimate is per-chat.
+ * The anchor is the most recent main-agent usage report for THIS chat (its
+ * prompt+completion tokens are the actual context size at that step; events
+ * from other chats are ignored, and a persisted anchor restores the meter
+ * after a chat switch or restart). Between anchors the estimate advances with
+ * the visible char growth of what the model sees — recomputed on every
+ * `messages` change, i.e. every stream chunk — converted at a ratio
+ * calibrated from the anchor itself (see `lib/contextUsage.ts`).
+ *
+ * This is deliberately NOT a cumulative lifetime sum: the meter must reflect
+ * how full the window is *right now*. `resetAt` (set when a compaction
+ * completes) invalidates anchors older than that moment so the meter
+ * immediately reflects the freed context instead of holding a stale-high
+ * anchor until the next send.
  */
-function useTokenEstimate(events: AgentEvent[]): number {
-  return useMemo(() => {
-    let lastPrompt = 0;
-    let lastCompletion = 0;
+function useContextUsage(
+  events: AgentEvent[],
+  messages: UIMessage[],
+  systemPrompt: string,
+  chatId: string,
+  resetAt: number,
+): { tokens: number; anchor: ContextAnchor | null } {
+  // Latest main-agent usage event for this chat = the anchor.
+  const anchorEvent = useMemo(() => {
+    let last: Extract<AgentEvent, { type: "usage" }> | null = null;
     for (const e of events) {
-      if (e.type === "usage" && e.role === "main") {
-        lastPrompt = e.usage.promptTokens;
-        lastCompletion = e.usage.completionTokens;
+      if (e.type === "usage" && e.role === "main" && e.chatId === chatId) {
+        last = e;
       }
     }
-    return lastPrompt + lastCompletion;
-  }, [events]);
+    return last;
+  }, [events, chatId]);
+
+  const anchor = useMemo<ContextAnchor | null>(() => {
+    if (anchorEvent && anchorEvent.ts > resetAt) {
+      const chars = anchorEvent.contextChars;
+      if (typeof chars === "number" && chars > 0) {
+        return {
+          tokens:
+            anchorEvent.usage.promptTokens +
+            anchorEvent.usage.completionTokens,
+          chars,
+          updatedAt: anchorEvent.ts,
+        };
+      }
+    }
+    // Fall back to the persisted anchor (chat switch / app restart), unless
+    // it predates a compaction reset.
+    const persisted = getContextAnchor(chatId);
+    return persisted && persisted.updatedAt > resetAt ? persisted : null;
+  }, [anchorEvent, chatId, resetAt]);
+
+  // Persist the anchor so the meter survives chat switches and restarts.
+  useEffect(() => {
+    if (anchor) saveContextAnchor(chatId, anchor);
+  }, [anchor, chatId]);
+
+  // Live char size of what the model sees: summary-injected system prompt +
+  // live messages (summarized prefix dropped). Re-reads compaction state on
+  // every recompute so a just-finished compaction is reflected promptly.
+  const charsNow = useMemo(() => {
+    const compaction = getCompaction(chatId);
+    return contextCharsOf(
+      liveMessagesForModel(messages, compaction),
+      systemPromptWithSummary(systemPrompt, compaction),
+    );
+  }, [messages, systemPrompt, chatId, anchor]);
+
+  return { tokens: estimateContextTokens(anchor, charsNow), anchor };
 }
 
 // ── Chat header ───────────────────────────────────────────────────────
@@ -780,35 +936,53 @@ function ChatHeader({
 
 function ContextFooter({
   isGenerating,
+  phase,
+  isCompacting,
   subagentStack,
   activeSubagent,
-  tokenEstimate,
-  contextLimit,
+  contextTokens,
+  contextWindowTokens,
+  thresholdPct,
   messageCount,
   onClear,
 }: {
   isGenerating: boolean;
+  phase: StreamPhase;
+  /** True while an auto-compact summarization pass is running. */
+  isCompacting: boolean;
   subagentStack: ActiveSubagent[];
   activeSubagent: ActiveSubagent | null;
-  tokenEstimate: number;
-  contextLimit: number;
+  /** Estimated current context size (tokens). */
+  contextTokens: number;
+  /** The model's full context window (tokens) — the meter denominator. */
+  contextWindowTokens: number;
+  /** Auto-compact threshold, in % of the context window (bar notch). */
+  thresholdPct: number;
   messageCount: number;
   onClear: () => void;
 }) {
   const pct =
-    contextLimit > 0 ? Math.min(100, (tokenEstimate / contextLimit) * 100) : 0;
+    contextWindowTokens > 0
+      ? Math.min(100, (contextTokens / contextWindowTokens) * 100)
+      : 0;
+  // Colour zones are relative to the threshold: warning within 10 points
+  // below it, danger at/above it.
   const barColor =
-    pct >= 90
+    pct >= thresholdPct
       ? "var(--color-danger)"
-      : pct >= 70
+      : pct >= thresholdPct - 10
         ? "var(--color-warning)"
         : "var(--color-pink-400)";
-  const remainingPct = Math.max(0, Math.round(100 - pct));
 
   return (
     <div className="px-3 py-1.5 text-[11px] text-[var(--color-muted-foreground)] border-t border-[var(--color-border)] bg-[var(--color-surface-muted)] flex items-center gap-3 min-h-[28px]">
       <div className="flex items-center gap-1.5 min-w-0 flex-1">
-        {subagentStack.length > 0 ? (
+        {isCompacting ? (
+          <span className="flex items-center gap-1.5">
+            <Loader2 size={11} className="animate-spin" />
+            Summarizing…
+          </span>
+        ) : subagentStack.length > 0 ? (
           <span className="flex items-center gap-1 truncate">
             {subagentStack.map((sa, i) => (
               <span key={sa.depth} className="flex items-center gap-1">
@@ -842,35 +1016,48 @@ function ContextFooter({
         ) : isGenerating ? (
           <span className="flex items-center gap-1.5">
             <Loader2 size={11} className="animate-spin" />
-            Working…
+            {phase === "connecting"
+              ? "Waiting…"
+              : phase === "thinking"
+                ? "Thinking…"
+                : "Working…"}
           </span>
         ) : (
           <span className="opacity-60">Idle</span>
         )}
       </div>
 
-      {/* Context meter — always visible (mobile + desktop). Shows the current
-          context size vs. the limit; older turns are summarized when full. */}
+      {/* Context meter — always visible (mobile + desktop). Bar shows how
+          full the model's context window is; the notch marks the % at which
+          auto-compact summarizes the older turns. */}
       <div
         className="flex items-center gap-2 shrink-0 tabular-nums"
-        title={`${remainingPct}% context left (older turns are summarized when full)`}
+        title={`${Math.round(pct)}% of context used — older turns are summarized at ${thresholdPct}%`}
       >
         {/* Compact bar (small enough for mobile) */}
-        <div className="flex w-16 h-1.5 rounded-full bg-[var(--color-border)] overflow-hidden">
+        <div className="relative flex w-16 h-1.5 rounded-full bg-[var(--color-border)] overflow-hidden">
           <div
-            className="h-full rounded-full transition-all duration-300"
+            className="h-full rounded-full transition-all duration-500"
             style={{ width: `${pct}%`, background: barColor }}
+          />
+          {/* Threshold notch */}
+          <div
+            className="absolute top-0 bottom-0 w-px bg-[var(--color-foreground)] opacity-40"
+            style={{ left: `${thresholdPct}%` }}
           />
         </div>
         {/* Percentage (always shown) */}
         <span
-          className={pct >= 90 ? "text-[var(--color-danger)] font-medium" : ""}
+          className={
+            pct >= thresholdPct ? "text-[var(--color-danger)] font-medium" : ""
+          }
         >
           {Math.round(pct)}%
         </span>
         {/* Full counts only on wider screens */}
         <span className="hidden sm:inline opacity-60">
-          {tokenEstimate.toLocaleString()} / {formatTokens(contextLimit)}
+          {formatTokenCount(contextTokens)} /{" "}
+          {formatTokenCount(contextWindowTokens)}
         </span>
       </div>
 
@@ -885,12 +1072,6 @@ function ContextFooter({
       )}
     </div>
   );
-}
-
-/** Format a token count compactly: 120000 → "120k". */
-function formatTokens(n: number): string {
-  if (n >= 1000) return `${Math.round(n / 1000)}k`;
-  return String(n);
 }
 
 // ── Empty-response recovery banner ─────────────────────────────────────
@@ -916,46 +1097,110 @@ function EmptyResponseBanner({ onRetry }: { onRetry: () => void }) {
   );
 }
 
-// ── Summarized modal ───────────────────────────────────────────────────
+// ── Compaction modal ───────────────────────────────────────────────────
 
 /**
- * One-time modal shown right after auto-compact summarizes the older turns.
- * Explains what happened and reassures the user that the full history is
- * still visible in the chat (and on disk). Dismissing it doesn't undo
- * anything — the summary is already in effect.
+ * The auto-compact modal, in three phases:
+ *
+ *  - "running" — opens the moment compaction starts and BLOCKS (no close
+ *    button, no escape, no outside click) while the summarizer runs. This is
+ *    deliberate: compaction used to happen silently and pop a summary notice
+ *    at a seemingly random later moment. Now the user always sees it happen.
+ *    The dialog portals to document.body and ChatView stays mounted across
+ *    view switches, so the block is visible wherever the user navigated.
+ *  - "done"    — the summary, with a dismiss ("Got it"). Dismissal is
+ *    cosmetic; the summary is already in effect.
+ *  - "failed"  — a brief notice that summarization failed and will retry
+ *    (auto-closed by the caller after a couple of seconds).
  */
-function SummarizedModal({
-  state,
+type CompactionUiState =
+  | { phase: "running" }
+  | { phase: "done"; state: CompactionState }
+  | { phase: "failed" };
+
+function CompactionModal({
+  ui,
   onClose,
 }: {
-  state: CompactionState | null;
+  ui: CompactionUiState | null;
   onClose: () => void;
 }) {
+  const running = ui?.phase === "running";
   return (
-    <Dialog open={!!state} onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="sm:max-w-lg flex flex-col gap-3 max-h-[80vh]">
-        <DialogTitle className="flex items-center gap-2 text-sm font-semibold">
-          <ScrollText size={15} className="text-[var(--color-pink-500)]" />
-          Conversation summarized
-        </DialogTitle>
-        <DialogDescription className="text-xs text-[var(--color-muted-foreground)]">
-          The chat's context grew large, so the older turns were summarized to
-          keep things running smoothly. The full history is still visible below
-          and saved on disk — nothing was deleted.
-        </DialogDescription>
-        {state?.summary && (
-          <div className="text-xs leading-relaxed overflow-y-auto rounded-md border border-[var(--color-border)] bg-[var(--color-surface-muted)] p-3 whitespace-pre-wrap">
-            {state.summary}
-          </div>
+    <Dialog
+      open={!!ui}
+      onOpenChange={(o) => {
+        if (!o && !running) onClose();
+      }}
+    >
+      <DialogContent
+        className="sm:max-w-lg flex flex-col gap-3 max-h-[80vh]"
+        showCloseButton={!running}
+        onEscapeKeyDown={(e) => {
+          if (running) e.preventDefault();
+        }}
+        onInteractOutside={(e) => {
+          if (running) e.preventDefault();
+        }}
+      >
+        {ui?.phase === "running" && (
+          <>
+            <DialogTitle className="flex items-center gap-2 text-sm font-semibold">
+              <Loader2
+                size={15}
+                className="animate-spin text-[var(--color-pink-500)]"
+              />
+              Compacting conversation…
+            </DialogTitle>
+            <DialogDescription className="text-xs text-[var(--color-muted-foreground)]">
+              The context is nearly full, so the older turns are being
+              summarized to free space. This usually takes a few seconds — the
+              full history stays visible in the chat and on disk, nothing is
+              deleted.
+            </DialogDescription>
+          </>
         )}
-        <div className="flex justify-end">
-          <button
-            onClick={onClose}
-            className="inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md bg-[var(--color-pink-400)] text-[var(--color-primary-foreground)] hover:bg-[var(--color-pink-500)]"
-          >
-            <Check size={13} /> Got it
-          </button>
-        </div>
+        {ui?.phase === "failed" && (
+          <>
+            <DialogTitle className="flex items-center gap-2 text-sm font-semibold">
+              <AlertCircle
+                size={15}
+                className="text-[var(--color-warning)]"
+              />
+              Couldn't summarize
+            </DialogTitle>
+            <DialogDescription className="text-xs text-[var(--color-muted-foreground)]">
+              Auto-compact failed, so the chat continues with the full
+              context. It will retry automatically in a bit.
+            </DialogDescription>
+          </>
+        )}
+        {ui?.phase === "done" && (
+          <>
+            <DialogTitle className="flex items-center gap-2 text-sm font-semibold">
+              <ScrollText size={15} className="text-[var(--color-pink-500)]" />
+              Conversation summarized
+            </DialogTitle>
+            <DialogDescription className="text-xs text-[var(--color-muted-foreground)]">
+              The chat's context grew large, so the older turns were summarized
+              to keep things running smoothly. The full history is still
+              visible below and saved on disk — nothing was deleted.
+            </DialogDescription>
+            {ui.state.summary && (
+              <div className="text-xs leading-relaxed overflow-y-auto rounded-md border border-[var(--color-border)] bg-[var(--color-surface-muted)] p-3 whitespace-pre-wrap">
+                {ui.state.summary}
+              </div>
+            )}
+            <div className="flex justify-end">
+              <button
+                onClick={onClose}
+                className="inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md bg-[var(--color-pink-400)] text-[var(--color-primary-foreground)] hover:bg-[var(--color-pink-500)]"
+              >
+                <Check size={13} /> Got it
+              </button>
+            </div>
+          </>
+        )}
       </DialogContent>
     </Dialog>
   );
@@ -1343,31 +1588,162 @@ function formatElapsed(seconds: number): string {
   return `${m}m ${s}s`;
 }
 
+// ── Stream phase: thinking vs waiting on the network ──────────────────
+
+/**
+ * After this long without any stream chunk we flag a possible stall. Long
+ * silences are normal while a model reasons (some providers batch reasoning
+ * tokens), so the threshold is generous; crossing it shows a hint, not an
+ * error.
+ */
+const STREAM_STALL_WARN_MS = 10_000;
+
+/**
+ * What the main-agent stream is observably doing right now:
+ *  - "connecting": request sent, not a single token back yet.
+ *  - "thinking":   the trailing activity is reasoning — silence here is
+ *                  most likely the model working, not a dead stream.
+ *  - "active":     text/tool output is streaming.
+ */
+type StreamPhase = "connecting" | "thinking" | "active";
+
+/**
+ * True when the newest meaningful part of the trailing assistant message is
+ * reasoning — i.e. any current silence is most likely the model thinking
+ * rather than a stuck connection.
+ */
+function trailingPartIsReasoning(messages: UIMessage[]): boolean {
+  const last = messages[messages.length - 1];
+  if (!last || last.role !== "assistant") return false;
+  const parts = last.parts ?? [];
+  for (let j = parts.length - 1; j >= 0; j--) {
+    const p = parts[j];
+    if (p.type === "reasoning") return true;
+    if (p.type === "text" && ((p as { text?: string }).text ?? "").length > 0)
+      return false;
+    if (p.type.startsWith("tool-")) return false;
+  }
+  return false;
+}
+
+/**
+ * Single-line stream status for the main agent (no subagent active).
+ * Combines the phase with the token heartbeat (time since the last stream
+ * chunk) so the user can tell a slow-but-alive generation from a stuck one.
+ */
+function StreamPhaseRow({
+  phase,
+  startedAt,
+  msSinceActivity,
+  now,
+}: {
+  phase: StreamPhase;
+  /** When the current generation started (for the connecting elapsed time). */
+  startedAt: number;
+  /** Time since the last stream chunk — the heartbeat. */
+  msSinceActivity: number;
+  now: number;
+}) {
+  const stalled = msSinceActivity > STREAM_STALL_WARN_MS;
+  const stallSecs = Math.floor(msSinceActivity / 1000);
+
+  if (phase === "connecting") {
+    const waitSecs = Math.max(0, Math.round((now - startedAt) / 1000));
+    return (
+      <div className="flex items-center gap-2 text-xs text-[var(--color-muted-foreground)] pl-1">
+        {stalled ? (
+          <AlertCircle size={13} className="shrink-0 text-[var(--color-warning)]" />
+        ) : (
+          <Loader2
+            size={13}
+            className="shrink-0 animate-spin text-[var(--color-pink-500)]"
+          />
+        )}
+        <span>Waiting for model…</span>
+        <span className="tabular-nums opacity-50 shrink-0">
+          {formatElapsed(waitSecs)}
+        </span>
+        {stalled && (
+          <span className="text-[var(--color-warning)]">
+            no response yet — check network
+          </span>
+        )}
+      </div>
+    );
+  }
+
+  if (phase === "thinking") {
+    return (
+      <div className="flex items-center gap-2 text-xs text-[var(--color-muted-foreground)] pl-1">
+        <Brain
+          size={13}
+          className="shrink-0 text-[var(--color-pink-500)] animate-[pulse-subtle_2s_ease-in-out_infinite]"
+        />
+        <span>Thinking…</span>
+        {/* Reasoning can pause between batches, so a quiet heartbeat here is
+            informational, not a warning. */}
+        {stalled && (
+          <span className="tabular-nums opacity-50 shrink-0">
+            · no tokens for {formatElapsed(stallSecs)}
+          </span>
+        )}
+      </div>
+    );
+  }
+
+  // "active": text/tool output was streaming. Silence this long after
+  // visible output is suspicious — flag it so the user knows to stop/retry.
+  if (stalled) {
+    return (
+      <div className="flex items-center gap-2 text-xs text-[var(--color-warning)] pl-1">
+        <AlertCircle size={13} className="shrink-0" />
+        <span>
+          No data for {formatElapsed(stallSecs)} — the stream may be stuck.
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex items-center gap-2 text-xs text-[var(--color-muted-foreground)] pl-1">
+      <Loader2
+        size={13}
+        className="shrink-0 animate-spin text-[var(--color-pink-500)]"
+      />
+      <span>Working…</span>
+    </div>
+  );
+}
+
 /**
  * Stacked progress indicator showing the full subagent delegation chain plus
  * an expandable tool-call history for the active subagent.
  */
 function SubagentProgressIndicator({
   stack,
-  status,
+  phase,
   now,
   toolHistory,
+  msSinceActivity,
+  startedAt,
 }: {
   stack: ActiveSubagent[];
-  status: string;
+  phase: StreamPhase;
   now: number;
   toolHistory: ToolHistoryEntry[];
+  msSinceActivity: number;
+  startedAt: number;
 }) {
-  // No subagent active — show generic working indicator.
+  // No subagent active — show the main-agent stream phase indicator
+  // (connecting / thinking / streaming, with a stall warning).
   if (stack.length === 0) {
     return (
-      <div className="flex items-center gap-2 text-xs text-[var(--color-muted-foreground)] pl-1">
-        <Loader2
-          size={13}
-          className="animate-spin text-[var(--color-pink-500)]"
-        />
-        <span>{status === "submitted" ? "Thinking…" : "Working…"}</span>
-      </div>
+      <StreamPhaseRow
+        phase={phase}
+        startedAt={startedAt}
+        msSinceActivity={msSinceActivity}
+        now={now}
+      />
     );
   }
 

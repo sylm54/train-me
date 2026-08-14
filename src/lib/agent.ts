@@ -27,16 +27,25 @@ import {
   liveMessagesForModel,
   systemPromptWithSummary,
 } from "./compaction";
+import { contextCharsOf } from "./contextUsage";
 
 /**
  * Report token usage for an agent role to the UI event bus.
  *
- * The AI SDK exposes usage as a promise that resolves when streaming
- * completes; we normalize it (handling both v5 and v6 field names) and
- * emit a single event per finished call. Failures are ignored — usage is
- * informational, never load-bearing.
+ * The AI SDK exposes usage per finished step; we normalize it (handling both
+ * v5 and v6 field names) and emit one event per step. For the main agent the
+ * prompt tokens of a step are the *actual context size at that moment* — the
+ * value the context meter is anchored on (see `contextUsage.ts`). Deliberately
+ * NOT the stream's cumulative `totalUsage`: the tool loop re-sends the whole
+ * context every step, so summing across steps would over-count and make the
+ * meter overshoot. Failures are ignored — usage is informational, never
+ * load-bearing.
  */
-function reportUsage(role: AgentRole, usage: unknown) {
+function reportUsage(
+  role: AgentRole,
+  usage: unknown,
+  opts?: { contextChars?: number; chatId?: string },
+) {
   try {
     const u = (usage ?? {}) as Record<string, number | undefined>;
     const promptTokens = u.promptTokens ?? u.inputTokens ?? 0;
@@ -50,6 +59,8 @@ function reportUsage(role: AgentRole, usage: unknown) {
         completionTokens,
         totalTokens: u.totalTokens ?? promptTokens + completionTokens,
       },
+      contextChars: opts?.contextChars,
+      chatId: opts?.chatId,
     });
   } catch (e) {
     console.warn("[agent] usage report failed:", e);
@@ -228,6 +239,10 @@ export function createMainAgentTransport(opts: {
       const liveMessages = liveMessagesForModel(messages, compaction);
       const systemPrompt = systemPromptWithSummary(baseSystemPrompt, compaction);
 
+      // Char size of what we're sending — attached to usage events so the UI
+      // can calibrate its char→token estimate between step reports.
+      const contextChars = contextCharsOf(liveMessages, systemPrompt);
+
       const modelMessages = await convertToModelMessages(liveMessages);
 
       // Rebuild tools from current settings each call (the planner tool
@@ -251,13 +266,12 @@ export function createMainAgentTransport(opts: {
         providerOptions: buildProviderOptions(settings, agent) as Parameters<
           typeof streamText
         >[0]["providerOptions"],
+        // Report usage per step (LLM call). A step's prompt tokens ARE the
+        // current context size, so the meter advances after each tool round
+        // of a long turn instead of only when the whole turn settles.
+        onStepFinish: ({ usage }) =>
+          reportUsage("main", usage, { contextChars, chatId: chatId ?? undefined }),
       });
-
-      // Surface cumulative token usage to the UI once the run settles.
-      // `totalUsage` is a PromiseLike on the streamText result.
-      Promise.resolve(result.totalUsage)
-        .then((u) => reportUsage("main", u))
-        .catch(() => {});
 
       return result.toUIMessageStream().pipeThrough(stripReasoningFromStream());
     },

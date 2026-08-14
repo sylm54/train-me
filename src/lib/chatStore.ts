@@ -23,6 +23,10 @@ import { useSyncExternalStore, useCallback } from "react";
 import { nanoid } from "nanoid";
 import type { UIMessage } from "ai";
 import { clearCompaction, clearAllCompaction } from "./compaction";
+import {
+  clearContextAnchor,
+  clearAllContextAnchors,
+} from "./contextUsage";
 
 /** localStorage key holding the chat metadata array. */
 const STORE_KEY = "train-me.chats.v1";
@@ -276,8 +280,9 @@ export function deleteChatPermanently(id: string) {
   const chats = readShape().chats.filter((c) => c.id !== id);
   writeShape({ version: 1, chats });
   deleteMessages(id);
-  // Also drop any compaction state for this chat.
+  // Also drop any compaction state + context-size anchor for this chat.
   clearCompaction(id);
+  clearContextAnchor(id);
 }
 
 /**
@@ -309,6 +314,7 @@ export function clearAllChats() {
     }
     for (const key of toRemove) localStorage.removeItem(key);
     clearAllCompaction();
+    clearAllContextAnchors();
   } catch (e) {
     console.warn("[chatStore] failed to clear chats:", e);
   }
