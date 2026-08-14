@@ -65,6 +65,10 @@ import {
   AGENT_LABELS,
   PROVIDER_LABELS,
 } from "@/lib/models";
+import {
+  formatTokenCount,
+  useContextWindow,
+} from "@/lib/contextUsage";
 import { ModelPicker } from "@/components/ModelPicker";
 import { FrameworkOptionsList } from "@/components/FrameworkOptions";
 import { loadPrompt } from "@/lib/prompts";
@@ -96,6 +100,12 @@ type PromptMode = "rendered" | "raw";
 export function SettingsView() {
   const { settings, setApiKey, setAgent, setChat, setPlayback, resetOnboarding } =
     useSettings();
+  // Resolved context window for the main model (live catalog / preset /
+  // manual override) — shown next to the auto-summarize threshold.
+  const contextWindow = useContextWindow(
+    settings.agents.main,
+    settings.chat.contextWindowOverride,
+  );
   const [reveal, setReveal] = useState<Record<ProviderName, boolean>>({
     openrouter: false,
     openai: false,
@@ -462,14 +472,64 @@ export function SettingsView() {
               agent's disk.
             </p>
 
+            <div>
+              <label className="block text-sm font-medium mb-1.5">
+                Auto-summarize at (% of context)
+              </label>
+              <div className="flex items-center gap-3">
+                <input
+                  type="range"
+                  min={50}
+                  max={95}
+                  step={1}
+                  value={settings.chat.compactThresholdPct}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (Number.isFinite(v)) {
+                      setChat({
+                        compactThresholdPct: Math.min(
+                          95,
+                          Math.max(50, Math.round(v)),
+                        ),
+                      });
+                      flashSave();
+                    }
+                  }}
+                  className="flex-1 accent-[var(--color-pink-400)]"
+                />
+                <span className="w-10 text-right font-mono text-sm tabular-nums">
+                  {settings.chat.compactThresholdPct}%
+                </span>
+              </div>
+              <p className="text-[11px] text-[var(--color-muted-foreground)] mt-1">
+                Share of the main model's context window at which older turns
+                are summarized into the system prompt — currently ≈{" "}
+                {formatTokenCount(
+                  Math.round(
+                    (contextWindow.tokens *
+                      settings.chat.compactThresholdPct) /
+                      100,
+                  ),
+                )}{" "}
+                of {formatTokenCount(contextWindow.tokens)} tokens.
+              </p>
+            </div>
             <ChatNumberField
-              label="Auto-summarize at (tokens)"
-              value={settings.chat.contextLimit}
-              min={1000}
+              label="Context window override (tokens)"
+              value={settings.chat.contextWindowOverride}
+              min={0}
               step={1000}
-              hint="Current context size at which older turns are summarized into the system prompt. Match this to your model's context window."
+              hint={
+                contextWindow.source === "manual"
+                  ? "Manual override in effect."
+                  : contextWindow.source === "live"
+                    ? `Resolved automatically from OpenRouter for ${settings.agents.main.model}. Set a value here to override.`
+                    : contextWindow.source === "preset"
+                      ? `Resolved from the curated model list for ${settings.agents.main.model}. Set a value here to override.`
+                      : "Unknown model — using a 128k default. Set your model's window here for an accurate meter."
+              }
               onChange={(v) => {
-                setChat({ contextLimit: v });
+                setChat({ contextWindowOverride: v });
                 flashSave();
               }}
             />
