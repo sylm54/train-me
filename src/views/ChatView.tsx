@@ -55,6 +55,7 @@ import {
   ChevronDown,
   Clock,
   Loader2,
+  MessageCircleQuestion,
   MessageSquarePlus,
   MoreVertical,
   Pencil,
@@ -1495,12 +1496,17 @@ function ToolHistoryList({ entries }: { entries: ToolHistoryEntry[] }) {
  * render as compact one-liners — just a friendly verb + the affected path
  * where relevant. Reasoning renders as a bare "Thinking…" label with no
  * content. Text parts render inline as the message body.
+ *
+ * `ask_question` exchanges are the exception: they're conversation, not
+ * internals — the user typed a real answer — so they render as full Q&A
+ * cards inline at the point the agent asked, never collapsed.
  */
 function ActivityParts({ message }: { message: UIMessage }) {
   const parts = message.parts;
   if (!parts || parts.length === 0) return null;
 
-  // Split into the non-activity (text) children and the activity parts.
+  // Split into the non-activity (text + question cards) children and the
+  // activity parts.
   const textChildren: React.ReactNode[] = [];
   const activity: { index: number; part: UIMessage["parts"][number] }[] = [];
 
@@ -1513,6 +1519,12 @@ function ActivityParts({ message }: { message: UIMessage }) {
         >
           {part.text}
         </MessageResponse>,
+      );
+    } else if (part.type === "tool-ask_question") {
+      // Interleave with the text so the card sits where the agent asked —
+      // the reply that follows then reads as a reaction to the answer.
+      textChildren.push(
+        <AskedQuestionCard key={`qa-${message.id}-${i}`} part={part} />,
       );
     } else if (part.type === "reasoning") {
       // Skip empty, non-streaming reasoning shells — the SDK can emit
@@ -1657,8 +1669,6 @@ function summarizeToolPart(part: UIMessage["parts"][number]): {
     }
     case "invoke_planner":
       return { label: "Planning" };
-    case "ask_question":
-      return { label: "Asked a question" };
     default:
       return { label: name };
   }
@@ -1682,6 +1692,129 @@ function getToolStatus(
     default:
       return "idle";
   }
+}
+
+// ── Rendered ask_question exchanges (persisted in the transcript) ───
+
+/** Input of the `ask_question` tool as stored on the tool part. */
+interface AskedQuestionInput {
+  type?: string;
+  question?: string;
+  choices?: string[];
+  hint?: string;
+}
+
+/** Output of the `ask_question` tool (the `QuestionResult`). */
+type AskedQuestionOutput =
+  | { ok: true; type?: string; answer?: string | number | string[] }
+  | { ok: false; reason?: string };
+
+/** Format an answer for display: strings verbatim, arrays joined. */
+function formatAnswer(answer: string | number | string[]): string {
+  return Array.isArray(answer) ? answer.join(", ") : String(answer);
+}
+
+/**
+ * A completed (or in-flight) `ask_question` exchange rendered inline in the
+ * conversation, at the point the agent asked. Shows the question, the offered
+ * choices (with the picked ones highlighted), and the user's answer once the
+ * tool resolves — so scrolling back through the chat keeps the back-and-forth.
+ *
+ * While the tool is still awaiting the user, the card shows a waiting state;
+ * the interactive answering UI stays in `PendingQuestions` above the composer.
+ */
+function AskedQuestionCard({
+  part,
+}: {
+  part: UIMessage["parts"][number];
+}) {
+  const input =
+    ((part as { input?: AskedQuestionInput }).input ?? {}) as AskedQuestionInput;
+  const state = (part as { state?: string }).state;
+  const settled = state === "output-available";
+  const output = settled
+    ? ((part as { output?: AskedQuestionOutput }).output ?? undefined)
+    : undefined;
+
+  const prompt = (input.question ?? "").trim();
+  // Malformed part (no question text) — nothing meaningful to show.
+  if (!prompt) return null;
+
+  // Answers already chosen, for highlighting choice chips.
+  const picked =
+    output && output.ok && Array.isArray(output.answer)
+      ? new Set(output.answer.map(String))
+      : output && output.ok
+        ? new Set([String(output.answer)])
+        : new Set<string>();
+
+  return (
+    <div className="my-1.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] p-3 shadow-sm">
+      <div className="flex items-start gap-2">
+        <MessageCircleQuestion
+          size={15}
+          className="mt-0.5 shrink-0 text-[var(--color-muted-foreground)]"
+        />
+        <p className="text-sm whitespace-pre-wrap text-[var(--color-foreground)]">
+          {prompt}
+        </p>
+      </div>
+
+      {input.hint && (
+        <p className="mt-1 pl-6 text-xs text-[var(--color-muted-foreground)]">
+          {input.hint}
+        </p>
+      )}
+
+      {input.choices && input.choices.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-1.5 pl-6">
+          {input.choices.map((choice, i) => {
+            const isPicked = picked.has(choice);
+            return (
+              <span
+                key={i}
+                className={`inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs ${
+                  isPicked
+                    ? "border-[var(--color-pink-300)] bg-[var(--color-pink-100)] text-[var(--color-foreground)]"
+                    : "border-[var(--color-border)] text-[var(--color-muted-foreground)]"
+                }`}
+              >
+                {isPicked && <Check size={11} />}
+                {choice}
+              </span>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Answer / waiting state */}
+      <div className="mt-2 pl-6">
+        {settled ? (
+          output && output.ok ? (
+            <p className="text-sm whitespace-pre-wrap text-[var(--color-foreground)]">
+              <span className="text-xs font-medium uppercase tracking-wide text-[var(--color-muted-foreground)]">
+                You:{" "}
+              </span>
+              {formatAnswer(output.answer ?? "")}
+            </p>
+          ) : (
+            <p className="text-xs italic text-[var(--color-muted-foreground)]">
+              Unanswered — {output && !output.ok ? output.reason : "no result"}
+            </p>
+          )
+        ) : state === "output-error" || state === "output-denied" ? (
+          <p className="text-xs italic text-[var(--color-muted-foreground)]">
+            Unanswered — the run was stopped
+          </p>
+        ) : (
+          <p className="flex items-center gap-1.5 text-xs text-[var(--color-muted-foreground)]">
+            <Loader2 size={11} className="animate-spin" />
+            Waiting for your answer…
+          </p>
+        )}
+      </div>
+    </div>
+  );
 }
 
 /**

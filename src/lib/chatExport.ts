@@ -7,6 +7,11 @@
  * `user` / `assistant` text turns and write a compact XML document to
  * `agent_data/chats/<id>.xml` via the existing `write_data_file` Tauri command.
  *
+ * One exception: `ask_question` exchanges are user-visible conversation, not
+ * internals — the user typed a real answer at the agent's request — so each
+ * one is emitted as a paired assistant question turn + user answer turn, in
+ * place, wherever the tool call occurred.
+ *
  * This is what makes auto-compact safe: even when older turns are summarized
  * (and dropped from what's sent to the model), the full original transcript
  * is never lost — it's always recoverable from disk via `read_file`.
@@ -25,21 +30,58 @@ function escapeXml(text: string): string {
     .replace(/'/g, "&apos;");
 }
 
-/** Extract the concatenated text content of a message's text parts. */
-function messageText(message: UIMessage): string {
-  if (!message.parts) return "";
-  return message.parts
-    .filter((p) => p.type === "text")
-    .map((p) => (p as { text?: string }).text ?? "")
-    .join("")
-    .trim();
+/** Shape of the `ask_question` tool's input as stored on the tool part. */
+interface AskQuestionInput {
+  type?: string;
+  question?: string;
+  choices?: string[];
+  hint?: string;
+}
+
+/** Shape of the `ask_question` tool's output (the `QuestionResult`). */
+type AskQuestionOutput =
+  | { ok: true; type?: string; answer?: string | number | string[] }
+  | { ok: false; reason?: string };
+
+/**
+ * Render one `ask_question` exchange as transcript lines: the agent's question
+ * (plus offered choices / hint) followed by the user's answer. Returns null
+ * for malformed parts (no question text) so they're silently skipped.
+ */
+function askQuestionTurns(
+  input: AskQuestionInput,
+  output: AskQuestionOutput | undefined,
+): { question: string; answer: string } | null {
+  const question = (input.question ?? "").trim();
+  if (!question) return null;
+
+  let q = `[question] ${question}`;
+  if (input.choices && input.choices.length > 0) {
+    q += ` Options: ${input.choices.join(" | ")}`;
+  }
+  if (input.hint) q += ` (hint: ${input.hint})`;
+
+  let a: string;
+  if (!output) {
+    a = "[answer] (none — the exchange never completed)";
+  } else if (output.ok) {
+    const answer = Array.isArray(output.answer)
+      ? output.answer.join("; ")
+      : String(output.answer);
+    a = `[answer] ${answer}`;
+  } else {
+    a = `[answer] (none — ${output.reason ?? "cancelled"})`;
+  }
+
+  return { question: q, answer: a };
 }
 
 /**
  * Convert a message array into a simplified XML transcript containing only
  * user and assistant text turns. Tool calls, tool results, and reasoning are
- * dropped. Empty turns are skipped. The `id` and `generated` timestamp anchor
- * the document on disk.
+ * dropped — except `ask_question` exchanges, which become paired
+ * question/answer turns at the point they occurred. Empty turns are skipped.
+ * The `id` and `generated` timestamp anchor the document on disk.
  */
 export function messagesToChatXml(
   messages: UIMessage[],
@@ -51,11 +93,42 @@ export function messagesToChatXml(
     `<chat id="${escapeXml(id)}" generated="${escapeXml(new Date(generatedAt).toISOString())}">`,
   ];
 
+  const pushTurn = (role: string, text: string) =>
+    lines.push(`  <turn role="${role}">${escapeXml(text)}</turn>`);
+
   for (const m of messages) {
     if (m.role !== "user" && m.role !== "assistant") continue;
-    const text = messageText(m);
-    if (!text) continue;
-    lines.push(`  <turn role="${m.role}">${escapeXml(text)}</turn>`);
+
+    // Buffer text so consecutive text parts still collapse into one turn,
+    // flushing whenever an ask_question exchange interrupts them (to keep
+    // the Q&A at its position in the conversation).
+    let textBuffer = "";
+    const flushText = () => {
+      const trimmed = textBuffer.trim();
+      if (trimmed) pushTurn(m.role, trimmed);
+      textBuffer = "";
+    };
+
+    for (const part of m.parts ?? []) {
+      if (part.type === "text") {
+        textBuffer += (part as { text?: string }).text ?? "";
+      } else if (
+        m.role === "assistant" &&
+        part.type === "tool-ask_question"
+      ) {
+        const qa = askQuestionTurns(
+          ((part as { input?: AskQuestionInput }).input ?? {}),
+          part.state === "output-available"
+            ? (part as { output?: AskQuestionOutput }).output
+            : undefined,
+        );
+        if (!qa) continue;
+        flushText();
+        pushTurn("assistant", qa.question);
+        pushTurn("user", qa.answer);
+      }
+    }
+    flushText();
   }
 
   lines.push("</chat>");
