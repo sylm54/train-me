@@ -65,13 +65,13 @@ Always run the linter after editing — it catches dangling refs, invalid durati
 
 ## Tooling: the framework CLI
 
-The CLI lives in the train-me repo at `tools/framework-cli/` (Bun + TypeScript; mirrors the app's Rust validators). Install it as a dev dependency:
+The CLI lives in the train-me repo at `tools/framework-cli/` (Bun + TypeScript; mirrors the app's Rust validators). It is published as the **`framework-cli` branch** of the repo — a root-level copy of the folder, kept in sync by CI — because no package manager supports subpath git dependencies. Install the branch as a dev dependency with whichever package manager the project uses (the CLI itself runs on [Bun](https://bun.sh)):
 
 ```
-bun add -d github:sylm54/train-me/tools/framework-cli
+npm i -D github:sylm54/train-me#framework-cli      # or pnpm/bun add -d
 ```
 
-(If the git-subpath install ever fails, copy the `tools/framework-cli/` folder into the project and use `bun tools/framework-cli/src/cli.ts …` instead.)
+(Offline fallback: copy the `tools/framework-cli/` folder into the project and run `bun tools/framework-cli/src/cli.ts …`.)
 
 Commands (run from the framework root, or pass a directory):
 
@@ -106,7 +106,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
         with: { bun-version: latest }
-      - run: bun install
+      - run: npm ci || npm i
       - run: bunx tm-framework lint
 
   package:
@@ -116,7 +116,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
         with: { bun-version: latest }
-      - run: bun install
+      - run: npm ci || npm i
       - run: bunx tm-framework package
       - name: Rolling stable release
         env:
