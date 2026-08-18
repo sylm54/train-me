@@ -1,0 +1,34 @@
+name: Framework CLI branch
+
+# Keeps the `framework-cli` branch a root-level copy of
+# tools/framework-cli/ so the CLI is installable as a plain git
+# dependency from every package manager (bun/npm/pnpm don't support
+# subpath git deps):
+#
+#   npm i -D github:sylm54/train-me#framework-cli
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "tools/framework-cli/**"
+      - ".github/workflows/framework-cli.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  split:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Subtree-split tools/framework-cli → framework-cli branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git subtree split --prefix=tools/framework-cli -b framework-cli origin/master
+          git push -f origin framework-cli
