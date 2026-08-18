@@ -37,66 +37,44 @@ import {
 
 const featureEmbed = `
 ## Features Overview
-### 1. Conditioning (\`conditioning/*.json\`)
-- Each .json file corresponds to one audio file.
-- File contents describe the associated audio.
-- Creation of new/Managing conditioning files is restricted to the dedicated hypno planner agent. The main agent should never modify these files directly; instead, it should instruct the HypnoPlanner subagent to create or update conditioning entries as needed.
-- Listening stats (last listen, listen streak, listen count) are auto-derived by the app from the activity log when a user finishes playing a script — do NOT store any stat/counter/last-listened fields inside the conditioning JSON; the app owns them and they would be clobbered on your next edit.
 
-### 2. Rules (\`rules/*.md\`)
-- Each file represents one rule that the user is expected to follow.
-- Refer to \`examples/rule.md\` for the correct formatting standard.
-- Create one rule file for each distinct rule you want to enforce.
-- Compliance stats (days clean, last broken, times broken) are auto-derived by the app from the activity log when the user logs "Broke Rule" — do NOT store any stat/counter/last-broken fields inside the rule markdown; the app owns them.
+The app's entire feature surface is the file grammar from FORMAT.md: you author container files under the sandbox, the engine (schedules, gating, actions, points) runs them for the user from the Today view, and the user's session runner enforces every gated element page by page. Worked examples for every file type live in \`examples/\`.
 
-### 3. Routines (\`routines/*.md\`)
-- Each file defines one routine for the user.
-- Refer to \`examples/routine.md\` for the proper formatting standard.
-- Create one routine file for each distinct routine you want to establish. For routines that vary by day, time, or other conditions, create separate files with clear naming to indicate their context.
-- The \`schedule:\` frontmatter field is a cron expression. Both 5-field (\`30 2 * * *\` = daily at 02:30) and 6-field (\`0 30 2 * * *\`, with a leading seconds field) forms are accepted; \`@daily\`/\`@hourly\`/etc. shorthands also work.
-- Completion stats (done streak, last done, times done) are auto-derived by the app from the activity log when the user logs "Done Routine" — do NOT store any stat/counter/last-done fields inside the routine markdown; the app owns them.
+### Routines (\`routines/*.md\`)
+- Front-matter: \`format: 2\` (required), \`title\`, optional \`schedule\` (cron; absent = on-demand), optional \`timeframe\` (completion window), \`success\`/\`failure\` actions, and for on-demand routines \`cooldown\` + \`limit\` (anti-farming: a routine without an explicit \`limit\` defaults to one rewarded completion per day).
+- Body: pages split on \`---\` lines. Pages contain markdown, \`- [ ]\` checklist items, links to \`.xml\` scripts, and \`\`\`\`feature\` blocks. EVERY checklist item, audio link, and feature block on a page must be completed before the next page unlocks; finishing the last page fires the success actions, giving up fires the failure actions.
+- Feature block types: \`voice\` (analyzers pitch/resonance/intonation/weight/loudness/genderspace with minHz/maxHz/targetHz/targetCentroid/targetDb/requiredScore/holdRatio/duration), \`wait\` (duration), \`chastity\` (state: locked|unlocked, confirmed against the app-tracked device state), \`input\` (field), \`choice\` (options), \`slider\` (min/max/label), \`audio\` (src → .xml script).
 
-### 4. Inventory
-- **Items**: records items owned by the user, use the inventory cli to manage/browse inventory.
-  - Read-only for you: use the bash command \`inventory items\` to list all, \`inventory items <id>\` to show one.
-  - Managed by the user via the UI.
-- **Wishlist**: things the user should acquire.
-  - \`inventory wishlist\` — list all entries.
-  - \`inventory wishlist <id>\` — show one entry.
-  - \`inventory wishlist add <name> [category] [priority] [notes...]\` — add an entry.
-  - \`inventory wishlist remove <id>\` — remove an entry.
-  - You have full read/write access to the wishlist. The User sees the wishlist in their UI.
-### 5. Chastity
-- CLI Command: \`chastity\`
-- Capabilities:
-  - \`chastity info\` — Displays current lock status.
-  - \`chastity unlock\` — Unlocks the user.
-- The user is responsible for locking themselves. Once locked, only you can unlock them by using the \`chastity unlock\` command in bash.
+### Habits (\`habits/*.md\`)
+- Front-matter: \`title\`, \`type: max|min\`, \`count\` (default 1), \`success\`/\`failure\` actions. Body: the positive-case description.
+- \`max\`: the daily logged count must stay at or under \`count\`; the first log over the limit fires the failure actions immediately and breaks the streak. A prohibition ("no X") is \`type: max, count: 0\`.
+- \`min\`: success fires the moment \`count\` is reached; failure at day-end if it wasn't.
 
-### 6. Journal (\`journal/*.md\`, \`journal/format.json\`)
-- The user may maintain personal journal entries in the \`.md\` files.
-- You may customize prompts and related settings by editing \`format.json\`.
-- Refer to \`examples/format.json\` for the expected structure.
+### Task templates (\`tasks/*.md\`)
+- Front-matter: \`title\`, optional \`description\`/\`timeframe\`, ordered \`timeouts\` (escalation actions at \`after\` durations), \`max_timeout\` (hard cap), \`success\`/\`failure\`. Body: the same page + feature model as routines.
+- Instances are assigned by the \`task\` action (or by you); each instance tracks its own deadline and fires its timeout escalation.
 
-### 7. Voice Training (\`voice/*.md\`, \`voice/config.json\`)
-- Author training lessons as markdown files under \`voice/\` (one lesson per file). The filename stem is the lesson id (e.g. \`voice/pitch.md\` → id \`pitch\`).
-- Each lesson is shown to the user as a clickable card; opening it shows the markdown instructions plus a real-time training screen with a Start/Stop mic button and live metric visualizations.
-- Configure which metric trackers each lesson enables by editing \`voice/config.json\`. Refer to \`examples/voice-config.json\` for the expected structure.
-- Top-level keys: \`title\`, \`defaultTrackers\` (used when a lesson defines none), and \`lessons\` (a map of lesson id → \`{ title?, trackers? }\`).
-- Each tracker entry is \`{ id, config?, displayText? }\`. \`id\` must be one of the built-in trackers:
-  - \`pitch\` — fundamental frequency vs a target band. Config: \`minHz\`, \`maxHz\`, \`targetHz\`.
-  - \`resonance\` — spectral-centroid brightness proxy. Config: \`targetCentroid\`.
-  - \`intonation\` — pitch contour over time + variation score. Config: none required.
-  - \`weight\` — harmonics-to-noise proxy for vocal lightness/cleanliness. Config: \`targetDb\`.
-  - \`loudness\` — RMS volume meter. Config: none required.
-  - \`genderspace\` — 2D pitch × brightness scatter toward the feminine quadrant. Config: none required.
-- \`displayText\` is a short coaching hint shown above the tracker's visualization.
-- When the user stops recording, the session summary (per-tracker metrics) is appended to the activity log under feature \`voice\`; you can read past sessions via the \`sqlite\` builtin to track progress over time.
+### Store (\`store/*.json\`)
+- \`title\`, \`price\` (points), optional \`stock\` + \`restock\` cron, and \`action\` (or an array). The user buys entries from Today; stock restocks lazily from the cron.
 
-### 8. Activity Tracking
-- Stored in \`activity.db\` SQLite
-- Use sqlite to query it directly (read-only by convention).
-- Schema:
+### Actions (used by success/failure/timeouts/store)
+- \`points\` (delta), \`task\` (template name → assigns an instance), \`script\` (xml path → queued for the user to play), \`notification\` (text), \`exemption\` (duration + scope habits|routines|tasks|all — suspends failure actions AND protects streaks; \`all\` is the blanket pause), \`roulette\` (weighted outcomes, \`weight: 0\` disables an outcome).
+
+### Points (\`points\` bash builtin)
+- Append-only ledger; the balance is never rewritten. \`points info\` shows balance + recent entries; \`points grant <n> "reason"\` / \`points deduct <n> "reason"\` append visible, reasoned deltas. Negative balances are just a number.
+
+### Audio scripts (TTS XML, e.g. \`hypnos/*.xml\`)
+- Referenced by \`audio\` feature blocks, markdown links, and \`script\` actions. The app pre-renders every referenced script in the background (content-hash keyed; orphans are collected) — you never render manually. Playbacks log under feature \`script\`; interactive decisions (<choice>, rating) log there too. Authoring docs: the TTS Tag System section of this prompt.
+
+### Chastity (\`chastity\` bash builtin)
+- \`chastity info\` — current lock status. \`chastity unlock\` — unlocks. The user locks themselves; once locked, only you can unlock.
+
+### Inventory (\`inventory\` bash builtin)
+- \`inventory items\` / \`inventory items <id>\` — read-only list of owned items.
+- \`inventory wishlist\` — list; \`inventory wishlist add <name> [category] [priority] [notes...]\` / \`inventory wishlist remove <id>\` — full read/write. The user manages items via the UI.
+
+### Activity log (\`activity.db\` SQLite)
+- Query it read-only via the \`sqlite\` builtin. Schema:
 CREATE TABLE IF NOT EXISTS activity (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     ts       TEXT    NOT NULL,
@@ -104,12 +82,11 @@ CREATE TABLE IF NOT EXISTS activity (
     action   TEXT    NOT NULL,
     details  TEXT    NOT NULL DEFAULT ''
 );
-- Note the ts column is a RFC 3339 and ISO 8601 date and time string.
+- \`ts\` is RFC 3339. The engine logs routine/habit/task/store events; voice sessions log under \`voice\`, script playbacks under \`script\`.
 
-### 9. Validating feature files
-- The \`validate_files\` tool scans every feature config file (routines, rules, conditioning, journal format, voice config) for parse/schema errors and dangling in-app links, and reports what is wrong and how to fix it. For conditioning entries it also validates the referenced XML script: tag syntax, semantic tag checks, and \`<include>\` import validity (dangling and circular includes are errors). An optional \`path\` argument narrows the scope to files at or under that path.
-- Call it after creating or editing any feature file, and fix every reported \`error\` before considering the task done. \`warning\`s are not fatal but usually indicate something unintended.
-- The \`{{features}}\` block in the system prompt lists which files each feature reads, so the agent knows what \`validate_files\` will check.
+### Validating feature files (\`validate_files\` tool)
+- Scans every container file (routines, habits, tasks, store) for parse/schema errors, dangling in-app links, and invalid actions; validates every referenced XML script (tag syntax, semantics, \`<include>\` trees — dangling and circular includes are errors); warns about unreferenced scripts under \`hypnos/\`. Optional \`path\` narrows the scope.
+- Call it after creating or editing any feature file and fix every reported \`error\` before considering the task done. \`warning\`s are not fatal but usually indicate something unintended.
 `.trim();
 
 const ttsTagsEmbed = `
@@ -276,7 +253,7 @@ Constant folding: literals, binops of constants, and \`@max\`/\`@min\`/\`@step\`
 - \`<tone>\` and \`<background>\` are background layers: aligned to their start position, then looped (tones) to the enclosing scope's foreground length.
 - \`<overlay>\` mixes all parts concurrently (all start together). \`<loop>\` repeats sequentially.
 - \`<include>\` renders to a deduped sub-manifest (context resets at the boundary); each file is hashed separately for incremental re-rendering.
-- Interactive tags \`<until>\`/\`<random>\`/\`<scramble>\`/\`<choice>\`/\`<rating>\`/\`<react>\` produce segment boundaries; decisions for \`<random>\`/\`<scramble>\`/\`<choice>\` happen per-playback, so each listen can differ. \`<until>\`, \`<choice>\`, \`<rating>\`, \`<react>\`, and \`<beatmeter>\` are rejected inside \`<background>\`/\`<overlay>\` (they would block or conflict with a concurrent stream); \`<random>\`/\`<scramble>\`/\`<loop>\`/\`<include>\` are allowed there. A \`<background>\` whose layer contains no interactive tag is baked into its surrounding segment; one with an interactive layer plays on a parallel track scoped to its enclosing sequence. The listener's \`<choice>\`/\`<rating>\`/\`<react>\` decisions are recorded to the activity log (\`feature = conditioning\`, \`action = choice\`).
+- Interactive tags \`<until>\`/\`<random>\`/\`<scramble>\`/\`<choice>\`/\`<rating>\`/\`<react>\` produce segment boundaries; decisions for \`<random>\`/\`<scramble>\`/\`<choice>\` happen per-playback, so each listen can differ. \`<until>\`, \`<choice>\`, \`<rating>\`, \`<react>\`, and \`<beatmeter>\` are rejected inside \`<background>\`/\`<overlay>\` (they would block or conflict with a concurrent stream); \`<random>\`/\`<scramble>\`/\`<loop>\`/\`<include>\` are allowed there. A \`<background>\` whose layer contains no interactive tag is baked into its surrounding segment; one with an interactive layer plays on a parallel track scoped to its enclosing sequence. The listener's \`<choice>\`/\`<rating>\`/\`<react>\` decisions are recorded to the activity log (\`feature = script\`, \`action = choice\`).
 - Note that <interactive> is not a valid tag; use <until>, <random>, <scramble>, <choice>, <rating>, or <react> instead.
 - \`<intro>\`/\`<main>\`/\`<outro>\` are optional structural markers (transparent to audio). When a non-interactive \`<main>\` is present, the listener gets a pre-play "Repeat length" slider that loops \`<main>\` to extend the session up to 10h; intro/outro always play once.
 ### Example

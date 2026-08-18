@@ -50,10 +50,12 @@ import {
   type ImportResult,
   type StagedFramework,
 } from "@/lib/frameworks";
+import { fetchOnboardingState } from "@/lib/onboarding";
+import { OnboardingFlow } from "@/components/OnboardingFlow";
 
-type Step = "welcome" | "models" | "framework";
+type Step = "welcome" | "models" | "framework" | "questions";
 
-const STEP_ORDER: Step[] = ["welcome", "models", "framework"];
+const STEP_ORDER: Step[] = ["welcome", "models", "framework", "questions"];
 
 /** Sub-state of the framework step. */
 type FrameworkPhase = "browse" | "config" | "installed";
@@ -87,6 +89,8 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
   // Collapsible "install from URL" / "choose ZIP" panels.
   const [urlOpen, setUrlOpen] = useState(false);
   const [urlDraft, setUrlDraft] = useState("");
+  // Framework onboarding questions (asked after install).
+  const [onboardingPending, setOnboardingPending] = useState(false);
 
   // On mount: if a framework is already installed, jump straight to the
   // "installed" phase so re-running onboarding reflects reality. Also
@@ -115,6 +119,15 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
       setGallery(Object.fromEntries(entries));
     })();
   }, []);
+
+  // Load the framework's onboarding questions once the framework step is
+  // relevant (mounted with an installed framework, or after install).
+  useEffect(() => {
+    if (step !== "framework" && step !== "questions") return;
+    fetchOnboardingState()
+      .then((state) => setOnboardingPending(state.pending_count > 0))
+      .catch(() => setOnboardingPending(false));
+  }, [step]);
 
   // ── Staging actions ──────────────────────────────────────────────────
   const handleStageUrl = async (url: string) => {
@@ -220,11 +233,17 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
     if (phase === "config") {
       void handleApplyAndFinish();
     } else if (phase === "installed") {
-      onComplete();
+      // Framework questions come between install and finishing.
+      if (onboardingPending) {
+        goNext();
+      } else {
+        onComplete();
+      }
     } else {
       goNext();
     }
   };
+
 
   return (
     <div className="h-full w-full overflow-y-auto bg-[var(--color-background)]">
@@ -293,6 +312,19 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
               onBackToBrowse={handleBackToBrowse}
             />
           )}
+          {step === "questions" && (
+            <div className="space-y-4">
+              <div>
+                <h1 className="text-lg font-bold">A few questions first</h1>
+                <p className="text-sm text-[var(--color-muted-foreground)] mt-1">
+                  The framework uses these answers to customize your training
+                  from the start — the agent reads them later, so it won't
+                  re-ask in chat.
+                </p>
+              </div>
+              <OnboardingFlow onFinish={onComplete} />
+            </div>
+          )}
         </div>
 
         {/* ── Footer nav ────────────────────────────────────────── */}
@@ -325,27 +357,29 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
                 Skip, install later
               </button>
             )}
-            <button
-              onClick={frameworkNextAction}
-              disabled={
-                (step === "models" && !mainKeyPresent) ||
-                frameworkNextDisabled ||
-                busy
-              }
-              className="px-4 py-2 text-sm rounded-md bg-[var(--color-pink-400)] text-[var(--color-primary-foreground)] hover:bg-[var(--color-pink-500)] disabled:opacity-50 inline-flex items-center gap-2"
-            >
-              {step === "framework" ? (
-                <>
-                  <Rocket size={14} />
-                  {frameworkNextLabel()}
-                </>
-              ) : (
-                <>
-                  Next
-                  <ArrowRight size={14} />
-                </>
-              )}
-            </button>
+            {step !== "questions" && (
+              <button
+                onClick={frameworkNextAction}
+                disabled={
+                  (step === "models" && !mainKeyPresent) ||
+                  frameworkNextDisabled ||
+                  busy
+                }
+                className="px-4 py-2 text-sm rounded-md bg-[var(--color-pink-400)] text-[var(--color-primary-foreground)] hover:bg-[var(--color-pink-500)] disabled:opacity-50 inline-flex items-center gap-2"
+              >
+                {step === "framework" ? (
+                  <>
+                    <Rocket size={14} />
+                    {frameworkNextLabel()}
+                  </>
+                ) : (
+                  <>
+                    Next
+                    <ArrowRight size={14} />
+                  </>
+                )}
+              </button>
+            )}
           </div>
         </div>
       </div>

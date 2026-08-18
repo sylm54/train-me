@@ -578,13 +578,13 @@ export async function invokePlanner(opts: {
 export function buildInvokePlannerTool(settings: AgentSettings, depth: number) {
   return tool({
     description:
-      "Spawn the Hypno Planner subagent to create or update conditioning " +
+      "Spawn the Hypno Planner subagent to create or update TTS audio " +
       "scripts (and other scripted training content). The planner authors " +
       "the JSON metadata + XML scripts directly and validates them. The " +
       "planner may itself spawn further planners to decompose large or " +
       "multi-part tasks, up to a fixed recursion depth; beyond that it " +
       "does the work directly. Use this whenever the user asks to create, " +
-      "design, plan, or update conditioning scripts. Provide a fully " +
+      "design, plan, or update audio scripts. Provide a fully " +
       "self-contained brief — the planner does not see this chat.",
     inputSchema: z.object({
       task: z

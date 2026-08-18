@@ -261,27 +261,27 @@ export interface ValidationReport {
 }
 
 /**
- * Validate feature config files (and, for conditioning, their referenced
- * XML scripts) for parse/schema/import errors and dangling in-app links.
- * Call this after creating or editing feature files, or whenever a feature
- * isn't behaving as expected. Read-only.
+ * Validate feature files (and their referenced XML scripts) for
+ * parse/schema/import errors and dangling in-app links. Call this after
+ * creating or editing feature files, or whenever a feature isn't behaving
+ * as expected. Read-only.
  */
 export const validateFilesTool = tool({
   description:
-    "Validate feature config files for parse errors, schema problems, " +
-    "and dangling references. Checks routines/*.md (frontmatter + cron " +
-    "schedule), rules/*.md, conditioning/*.json (metadata PLUS the " +
-    "referenced XML script: tag syntax, semantic tag checks, and <include> " +
-    "import validity — dangling and circular includes are errors), " +
-    "journal/format.json fields, and voice/config.json trackers, plus any " +
+    "Validate feature files for parse errors, schema problems, " +
+    "and dangling references. Checks routines/*.md (pages, feature " +
+    "blocks, actions), habits/*.md, tasks/*.md, and store/*.json, " +
+    "plus every XML script they reference (audio features and script " +
+    "actions: tag syntax, semantic tag checks, and <include> import " +
+    "validity — dangling and circular includes are errors), and any " +
     "in-app markdown links they contain. Returns a per-file report; each " +
     "problem says what is wrong and, when possible, how to fix it. " +
-    "XML scripts under hypnos/ that no conditioning entry references are " +
+    "XML scripts under hypnos/ that no feature file references are " +
     "reported as a warning (still linted). " +
     "Optional `path` narrows the scope to files at or under that path " +
-    "(relative to agent_data/, forward slashes) — e.g. 'conditioning', " +
-    "'conditioning/foo.json', or 'hypnos'. Scoping a conditioning entry " +
-    "still pulls in its full XML include tree. Omit `path` to validate " +
+    "(relative to agent_data/, forward slashes) — e.g. 'routines', " +
+    "'routines/foo.md', or 'hypnos'. Scoping a container still pulls in " +
+    "its full XML include tree. Omit `path` to validate " +
     "everything. Call after creating/editing files, or when something " +
     "isn't working, and fix any reported errors before considering the " +
     "task done.",
@@ -292,7 +292,7 @@ export const validateFilesTool = tool({
       .describe(
         "Optional scope: only validate files at or under this path " +
           "(relative to agent_data/, forward slashes). " +
-          "e.g. 'conditioning', 'conditioning/foo.json', 'hypnos'. " +
+          "e.g. 'routines', 'routines/foo.md', 'hypnos'. " +
           "Omit to validate all feature files.",
       ),
   }),

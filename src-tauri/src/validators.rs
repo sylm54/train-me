@@ -3,11 +3,13 @@
 //! The agent manages several kinds of user-facing feature files under
 //! `agent_data/`:
 //!
-//!   - `routines/*.md`         (frontmatter `schedule` cron + markdown body)
-//!   - `rules/*.md`             (free-form markdown)
-//!   - `conditioning/*.json`   (TTS metadata sidecar)
-//!   - `journal/format.json`   (journal field definitions)
-//!   - `voice/config.json`     (voice-training tracker config)
+//!   - `routines/*.md` (v1: `schedule` cron frontmatter; v2 when the
+//!     frontmatter has `format: 2` — parsed by `format.rs`, see FORMAT.md)
+//!   - `conditioning/*.json` (TTS metadata sidecar)
+//!   - `journal/format.json` (journal field definitions)
+//!   - `voice/config.json` (voice-training tracker config)
+//!   - `habits/*.md`, `tasks/*.md`, `store/*.json` (v2-only containers,
+//!     parsed by `format.rs`)
 //!
 //! Most of these are parsed leniently at runtime: a bad cron silently
 //! never schedules, an unknown tracker id is dropped, a dangling in-app
@@ -18,10 +20,6 @@
 //! and how to fix it, so the agent can self-correct after creating or
 //! editing files. It is read-only: it never writes.
 //!
-//! The parsing rules below deliberately mirror the frontend parsers
-//! (see `JournalView`, `ConditioningView`, `RoutinesView`, `RulesView`,
-//! `voice/config.ts`, `voice/registry.ts`, `links.ts`) so the validator's
-//! verdict matches what actually happens at runtime.
 
 use std::path::{Path, PathBuf};
 
@@ -127,107 +125,6 @@ pub fn normalize_cron(expr: &str) -> String {
     }
 }
 
-/// Validate a cron expression after normalization. Returns a `Problem`
-/// describing the field-count/range error, or `Ok(())` if it parses.
-fn validate_cron(raw: &str) -> Result<(), String> {
-    use cron::Schedule as CronSchedule;
-    use std::str::FromStr;
-
-    let normalized = normalize_cron(raw);
-    let normalized_fields = normalized.split_whitespace().count();
-
-    match CronSchedule::from_str(&normalized) {
-        Ok(_) => Ok(()),
-        Err(_) => {
-            // The crate's error is opaque, so produce a human-facing hint.
-            let raw_fields = raw.trim().split_whitespace().count();
-            let hint = match raw_fields {
-                0 => "schedule is empty".to_string(),
-                1..=4 => format!(
-                    "schedule has {raw_fields} field{}; cron needs 5 (min hour dom month dow) \
-                     or 6 (sec min hour dom month dow)",
-                    if raw_fields == 1 { "" } else { "s" }
-                ),
-                5 => "schedule has 5 fields but still failed to parse; \
-                     check ranges (min 0-59, hour 0-23, dom 1-31, month 1-12, dow 0-6/1-7)"
-                    .to_string(),
-                _ => format!(
-                    "schedule has {raw_fields} fields; check ranges \
-                     (sec 0-59, min 0-59, hour 0-23, dom 1-31, month 1-12, dow 1-7)"
-                ),
-            };
-            let _ = normalized_fields; // kept for future debugging
-            Err(hint)
-        }
-    }
-}
-
-// ============================================================================
-// Frontmatter parsing (mirrors RoutinesView.parseFrontmatter)
-// ============================================================================
-
-/// Extract the YAML-ish frontmatter block and body. Mirrors the frontend
-/// regex `^---\s*\n([\s\S]*?)\n---\s*\n?([\s\S]*)$`.
-///
-/// Returns `(frontmatter, body)`. If no frontmatter block is present,
-/// `frontmatter` is empty and `body` is the whole content.
-fn split_frontmatter(content: &str) -> (String, String) {
-    // Must start at byte 0: a leading line that is `---` (+ optional
-    // trailing whitespace), then a newline.
-    if !content.starts_with("---") {
-        return (String::new(), content.to_string());
-    }
-    // First line is the opening `---`.
-    let after_open = match content.find('\n') {
-        Some(i) => &content[i + 1..],
-        None => return (String::new(), content.to_string()),
-    };
-    // The opening line must be only `---` + trailing whitespace.
-    let first_line = &content[..content.find('\n').unwrap_or(content.len())];
-    if first_line.trim() != "---" {
-        return (String::new(), content.to_string());
-    }
-
-    // Find the closing `---` line.
-    let mut cursor = 0;
-    let mut close: Option<usize> = None;
-    for line in after_open.split_inclusive('\n') {
-        if line.trim_end() == "---" {
-            close = Some(cursor);
-            break;
-        }
-        cursor += line.len();
-    }
-    let Some(close_off) = close else {
-        // Unclosed frontmatter: treat as no frontmatter (frontend does too).
-        return (String::new(), content.to_string());
-    };
-
-    let fm = after_open[..close_off].to_string();
-    // Body = everything after the closing `---` line (including its newline).
-    let body_start_in_after = close_off + {
-        // length of the closing line including its trailing newline
-        let rest = &after_open[close_off..];
-        rest.find('\n').map(|i| i + 1).unwrap_or(rest.len())
-    };
-    let body = after_open[body_start_in_after..].to_string();
-    (fm, body)
-}
-
-/// Read `schedule:` out of frontmatter the way the frontend does:
-/// first line starting with `schedule:`, value = rest of line, trimmed.
-fn frontmatter_schedule(fm: &str) -> Option<String> {
-    for line in fm.lines() {
-        if let Some(rest) = line.strip_prefix("schedule:") {
-            let v = rest.trim();
-            if !v.is_empty() {
-                return Some(v.to_string());
-            }
-        }
-    }
-    None
-}
-
 // ============================================================================
 // Markdown link extraction + in-app resolution (mirrors links.ts)
 // ============================================================================
@@ -257,11 +154,7 @@ fn extract_md_links(body: &str) -> Vec<MdLink> {
                     if let Some(close_paren) = find_unescaped(bytes, j + 1, b')') {
                         let target = &body[j + 1..close_paren];
                         // Strip an optional title, e.g. `(path "title")`.
-                        let target_clean = target
-                            .split_whitespace()
-                            .next()
-                            .unwrap_or("")
-                            .trim();
+                        let target_clean = target.split_whitespace().next().unwrap_or("").trim();
                         if !is_image && !target_clean.is_empty() {
                             links.push(MdLink {
                                 target: target_clean.to_string(),
@@ -324,20 +217,14 @@ fn in_app_link_target(href: &str) -> Option<String> {
 
     // Bare feature names route to a view but have no file target.
     match h {
-        "chastity" | "inventory" | "inventory/items" | "conditioning" | "rules"
-        | "rule" | "routines" | "journal" | "voice" => return None,
+        "chastity" | "inventory" | "inventory/items" | "routines" | "today" => return None,
         _ => {}
     }
 
     let head = segs[0].to_ascii_lowercase();
-    // Map a recognized first segment to the on-disk directory. `rules` is the
-    // real dir; `rule/` is accepted as a legacy alias.
+    // Map a recognized first segment to the on-disk directory.
     let dir = match head.as_str() {
-        "conditioning" => "conditioning",
-        "rule" | "rules" => "rules",
         "routines" | "routine" => "routines",
-        "journal" => "journal",
-        "voice" => "voice",
         // inventory items live in SQLite, not a file → nothing to check.
         "inventory" => return None,
         _ => return None,
@@ -353,115 +240,6 @@ fn in_app_link_target(href: &str) -> Option<String> {
 // ============================================================================
 // Per-file-type validators
 // ============================================================================
-
-/// `routines/*.md`
-fn validate_routine(rel_path: &str, content: &str, agent_dir: &Path) -> FileReport {
-    let mut report = FileReport::new(rel_path);
-
-    if !rel_path.to_ascii_lowercase().ends_with(".md") {
-        report.push(err("routine files must use the .md extension"));
-        return report;
-    }
-
-    let (fm, body) = split_frontmatter(content);
-
-    match frontmatter_schedule(&fm) {
-        None => report.push(warn(
-            "no `schedule:` field in frontmatter — this routine will render but never \
-             schedule a notification",
-        )),
-        Some(schedule) => {
-            if let Some(msg) = validate_cron(&schedule).err() {
-                report.push(Problem {
-                    severity: "error".to_string(),
-                    message: format!("invalid cron schedule `{schedule}`: {msg}"),
-                    fix: Some(format!(
-                        "use 5-field (e.g. `30 2 * * *` = daily at 02:30) or 6-field \
-                         (e.g. `0 30 2 * * *`); set `schedule:` in the frontmatter"
-                    )),
-                });
-            }
-        }
-    }
-
-    check_md_links(&body, agent_dir, &mut report);
-    report
-}
-
-/// `rules/*.md`
-fn validate_rule(rel_path: &str, content: &str, agent_dir: &Path) -> FileReport {
-    let mut report = FileReport::new(rel_path);
-    if !rel_path.to_ascii_lowercase().ends_with(".md") {
-        report.push(err("rule files must use the .md extension"));
-        return report;
-    }
-    // Rules have no required frontmatter; links are still checked.
-    check_md_links(content, agent_dir, &mut report);
-    report
-}
-
-/// `conditioning/*.json`. Returns the JSON metadata report first, followed by
-/// one `FileReport` per `.xml` reachable from `script_path` (syntax, semantic,
-/// and `<include>` import validity). When the metadata is broken we return
-/// just the JSON report — there's no reliable `script_path` to chase.
-fn validate_conditioning(rel_path: &str, content: &str, agent_dir: &Path) -> Vec<FileReport> {
-    let mut report = FileReport::new(rel_path);
-    let parsed: serde_json::Value = match serde_json::from_str(content) {
-        Ok(v) => v,
-        Err(e) => {
-            report.push(err(format!("invalid JSON: {e}")));
-            return vec![report];
-        }
-    };
-    let obj = match parsed.as_object() {
-        Some(o) => o,
-        None => {
-            report.push(err("conditioning metadata must be a JSON object"));
-            return vec![report];
-        }
-    };
-
-    let nonempty_string = |key: &str| -> Option<&str> {
-        obj.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty())
-    };
-
-    for key in ["title", "description", "script_path"] {
-        match nonempty_string(key) {
-            None => report.push(err(format!(
-                "missing required field `{key}` (must be a non-empty string)"
-            ))),
-            Some(_) => {}
-        }
-    }
-    match obj.get("tags") {
-        None => report.push(err("missing required field `tags`")),
-        Some(t) => {
-            let arr = t.as_array().ok_or_else(|| {
-                report.push(err("`tags` must be an array of strings"));
-            });
-            if let Ok(arr) = arr {
-                if !arr.iter().all(|v| v.is_string()) {
-                    report.push(err("`tags` must be an array of strings"));
-                }
-            }
-        }
-    }
-
-    // If the metadata is structurally broken (no usable script_path), stop
-    // here — `validate_script_tree` would just echo the same missing-script
-    // error. Only descend when there's a non-empty script_path.
-    let script_path = match nonempty_string("script_path") {
-        Some(s) => s,
-        None => return vec![report],
-    };
-
-    // Validate the referenced XML tree (root + all transitively-included
-    // files). `validate_script_tree` itself reports a missing/escaping
-    // script_path as an error, so drop the old warning-only existence check.
-    let mut reports = vec![report];
-    reports.extend(validate_script_tree(script_path, agent_dir));
-    reports
-}
 
 // ============================================================================
 // Conditioning script validation (XML syntax + import validity)
@@ -508,11 +286,7 @@ fn normalize_under(root: &Path, joined: &Path) -> Result<PathBuf, String> {
 /// does: relative to the including script's directory first, then relative to
 /// `agent_dir`. Returns `Err` with a message if neither exists or the resolved
 /// path escapes `agent_dir` — the caller turns that into a diagnostic.
-fn resolve_include(
-    src: &str,
-    script_dir: &Path,
-    agent_dir: &Path,
-) -> Result<PathBuf, String> {
+fn resolve_include(src: &str, script_dir: &Path, agent_dir: &Path) -> Result<PathBuf, String> {
     let rel = script_dir.join(src);
     if rel.exists() {
         if let Ok(n) = normalize_under(agent_dir, &rel) {
@@ -692,7 +466,10 @@ fn collect_include_srcs(nodes: &[crate::tag_parser::Node]) -> Vec<String> {
                         rec(&part.children, out);
                     }
                 }
-                Node::Text(_) | Node::Pause { .. } | Node::Sound { .. } | Node::Tone { .. }
+                Node::Text(_)
+                | Node::Pause { .. }
+                | Node::Sound { .. }
+                | Node::Tone { .. }
                 | Node::Rating { .. } => {}
             }
         }
@@ -701,243 +478,207 @@ fn collect_include_srcs(nodes: &[crate::tag_parser::Node]) -> Vec<String> {
     out
 }
 
-/// `journal/format.json`
-fn validate_journal_format(rel_path: &str, content: &str) -> FileReport {
-    let mut report = FileReport::new(rel_path);
-    let parsed: serde_json::Value = match serde_json::from_str(content) {
-        Ok(v) => v,
-        Err(e) => {
-            report.push(err(format!("invalid JSON: {e}")));
-            return report;
-        }
-    };
-    let arr = match parsed.as_array() {
-        Some(a) => a,
-        None => {
-            report.push(err("format.json must be an array of fields"));
-            return report;
-        }
-    };
-    if arr.is_empty() {
-        report.push(warn("format.json is empty — the journal will show no prompts"));
+// ============================================================================
+// v2 feature-format validators (routines with `format: 2`, habits, tasks,
+// store entries — grammar parsed by `format.rs`, see FORMAT.md)
+// ============================================================================
+
+/// Convert a parser diagnostic into a report problem, prefixing the line
+/// number when the parser knows it.
+fn diag_problem(d: crate::format::Diag) -> Problem {
+    Problem {
+        severity: match d.severity {
+            crate::format::Severity::Error => "error".to_string(),
+            crate::format::Severity::Warning => "warning".to_string(),
+        },
+        message: match d.line {
+            Some(line) => format!("line {line}: {}", d.message),
+            None => d.message,
+        },
+        fix: d.fix,
     }
-    for (i, entry) in arr.iter().enumerate() {
-        let obj = match entry.as_object() {
-            Some(o) => o,
-            None => {
-                report.push(err(format!("field #{i}: must be an object")));
-                continue;
-            }
-        };
-        let typ = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if !matches!(typ, "freeform" | "scale" | "choice") {
-            report.push(Problem {
-                severity: "error".to_string(),
-                message: format!(
-                    "field #{i}: `type` must be one of freeform, scale, choice (got `{typ}`)"
-                ),
-                fix: Some("set `type` to `freeform`, `scale`, or `choice`".to_string()),
-            });
-        }
-        match obj.get("prompt").and_then(|v| v.as_str()) {
-            None => report.push(err(format!("field #{i}: missing string `prompt`"))),
-            Some(p) if p.is_empty() => {
-                report.push(err(format!("field #{i}: `prompt` is empty")))
-            }
-            Some(_) => {}
-        }
-        if typ == "choice" {
-            match obj.get("options") {
-                None => report.push(err(format!(
-                    "field #{i}: `type` is `choice` but `options` is missing"
-                ))),
-                Some(o) => {
-                    let arr = match o.as_array() {
-                        Some(a) => a,
-                        None => {
-                            report.push(err(format!(
-                                "field #{i}: `options` must be an array of strings"
-                            )));
-                            continue;
-                        }
-                    };
-                    if arr.is_empty() {
-                        report.push(err(format!(
-                            "field #{i}: `options` must have at least one entry"
-                        )));
-                    } else if !arr.iter().all(|v| v.is_string()) {
-                        report.push(err(format!(
-                            "field #{i}: `options` must be an array of strings"
-                        )));
-                    }
-                }
-            }
-        }
-    }
-    report
 }
 
-/// Valid voice-training tracker ids (mirrors `voice/registry.ts`).
-const VOICE_TRACKERS: &[&str] = &[
-    "pitch",
-    "resonance",
-    "intonation",
-    "weight",
-    "loudness",
-    "genderspace",
-];
-
-/// `voice/config.json`
-fn validate_voice_config(rel_path: &str, content: &str, agent_dir: &Path) -> FileReport {
-    let mut report = FileReport::new(rel_path);
-    let parsed: serde_json::Value = match serde_json::from_str(content) {
-        Ok(v) => v,
-        Err(e) => {
-            report.push(err(format!("invalid JSON: {e}")));
-            return report;
-        }
-    };
-    let obj = match parsed.as_object() {
-        Some(o) => o,
-        None => {
-            report.push(err("voice config must be a JSON object"));
-            return report;
-        }
-    };
-
-    if let Some(title) = obj.get("title") {
-        if !title.is_string() {
-            report.push(err("`title` must be a string"));
+/// Filesystem checks shared by every v2 container: referenced XML scripts
+/// (from `audio` features and `script` actions) must exist and their
+/// include trees must lint clean; `task` actions must reference an
+/// existing template. Existence problems land on `report`; each linted
+/// script tree comes back as its own `FileReport` (matching the
+/// conditioning precedent, so the caller can mark them reachable).
+fn check_v2_refs(
+    scripts: &[String],
+    templates: &[String],
+    agent_dir: &Path,
+    report: &mut FileReport,
+) -> Vec<FileReport> {
+    let mut extra = Vec::new();
+    let mut scripts = scripts.to_vec();
+    scripts.sort();
+    scripts.dedup();
+    for src in &scripts {
+        match crate::bash::resolve_under(agent_dir, src) {
+            Err(msg) => report.push(err(format!("script reference `{src}` {msg}"))),
+            Ok(p) if p.exists() => extra.extend(validate_script_tree(src, agent_dir)),
+            Ok(_) => report.push(Problem {
+                severity: "error".to_string(),
+                message: format!("referenced script `{src}` does not exist"),
+                fix: Some(format!("create `{src}` or fix the reference")),
+            }),
         }
     }
-
-    // Validate a tracker spec object: known id, warn on unknown config keys.
-    let validate_spec = |spec: &serde_json::Map<String, serde_json::Value>,
-                         where_: &str,
-                         report: &mut FileReport| {
-        let id = match spec.get("id").and_then(|v| v.as_str()) {
-            None => {
-                report.push(err(format!("{where_}: tracker spec is missing a string `id`")));
-                return;
-            }
-            Some(s) => s.to_string(),
-        };
-        if !VOICE_TRACKERS.contains(&id.as_str()) {
-            report.push(Problem {
+    let mut templates = templates.to_vec();
+    templates.sort();
+    templates.dedup();
+    for template in &templates {
+        let rel = crate::format::template_to_path(template);
+        match crate::bash::resolve_under(agent_dir, &rel) {
+            Ok(p) if p.exists() => {}
+            _ => report.push(Problem {
                 severity: "error".to_string(),
                 message: format!(
-                    "{where_}: unknown tracker id `{id}` — the app silently drops it"
+                    "`task` action references template `{template}`, but `{rel}` does not exist"
                 ),
-                fix: Some(format!(
-                    "use one of: {}",
-                    VOICE_TRACKERS.join(", ")
-                )),
-            });
-            return;
-        }
-        // Known per-tracker config keys (from voice/trackers/*.tsx).
-        let known: &[&str] = match id.as_str() {
-            "pitch" => &["minHz", "maxHz", "targetHz", "displayMinHz", "displayMaxHz"],
-            "resonance" => &["targetCentroid", "displayMinHz", "displayMaxHz"],
-            "intonation" => &["displayMinHz", "displayMaxHz"],
-            "weight" => &["targetDb"],
-            "loudness" => &[],
-            "genderspace" => &["displayMinHz", "displayMaxHz"],
-            _ => &[],
-        };
-        if let Some(cfg) = spec.get("config").and_then(|v| v.as_object()) {
-            for key in cfg.keys() {
-                if key == "displayText" {
-                    continue;
-                }
-                if !known.contains(&key.as_str()) {
-                    report.push(warn(format!(
-                        "{where_}: tracker `{id}` has unknown config key `{key}` (ignored)"
-                    )));
-                }
-            }
-        }
-    };
-
-    if let Some(dt) = obj.get("defaultTrackers") {
-        match dt.as_array() {
-            None => report.push(err("`defaultTrackers` must be an array")),
-            Some(arr) => {
-                for (i, spec) in arr.iter().enumerate() {
-                    match spec.as_object() {
-                        Some(o) => validate_spec(o, &format!("defaultTrackers[{i}]"), &mut report),
-                        None => report.push(err(format!(
-                            "defaultTrackers[{i}]: must be an object with an `id`"
-                        ))),
-                    }
-                }
-            }
+                fix: Some(format!("create `{rel}` or fix the template name")),
+            }),
         }
     }
+    extra
+}
 
-    if let Some(lessons) = obj.get("lessons") {
-        match lessons.as_object() {
-            None => report.push(err("`lessons` must be an object (map of lesson id → config)")),
-            Some(map) => {
-                for (lesson_id, lesson) in map {
-                    let lobj = match lesson.as_object() {
-                        Some(o) => o,
-                        None => {
-                            report.push(err(format!(
-                                "lessons.`{lesson_id}`: must be an object"
-                            )));
-                            continue;
-                        }
-                    };
-                    if let Some(title) = lobj.get("title") {
-                        if !title.is_string() {
-                            report.push(err(format!(
-                                "lessons.`{lesson_id}`: `title` must be a string"
-                            )));
-                        }
-                    }
-                    if let Some(trackers) = lobj.get("trackers") {
-                        match trackers.as_array() {
-                            None => report.push(err(format!(
-                                "lessons.`{lesson_id}`: `trackers` must be an array"
-                            ))),
-                            Some(arr) => {
-                                for (i, spec) in arr.iter().enumerate() {
-                                    match spec.as_object() {
-                                        Some(o) => validate_spec(
-                                            o,
-                                            &format!("lessons.`{lesson_id}`.trackers[{i}]"),
-                                            &mut report,
-                                        ),
-                                        None => report.push(err(format!(
-                                            "lessons.`{lesson_id}`.trackers[{i}]: must be an object with an `id`"
-                                        ))),
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // Each lesson key should correspond to a voice/<key>.md file.
-                    let lesson_md = format!("voice/{lesson_id}.md");
-                    if let Ok(p) = crate::bash::resolve_under(agent_dir, &lesson_md) {
-                        if !p.exists() {
-                            report.push(Problem {
-                                severity: "warning".to_string(),
-                                message: format!(
-                                    "lesson `{lesson_id}` is configured but `voice/{lesson_id}.md` does not exist"
-                                ),
-                                fix: Some(format!(
-                                    "create `voice/{lesson_id}.md` with the lesson instructions"
-                                )),
-                            });
-                        }
-                    }
-                }
-            }
-        }
+/// Gather script + template refs from a container's actions and run the
+/// shared filesystem checks. Helper for the four validators below.
+fn check_action_refs(
+    success: &[crate::format::Action],
+    failure: &[crate::format::Action],
+    agent_dir: &Path,
+    report: &mut FileReport,
+) -> Vec<FileReport> {
+    let mut refs = crate::format::ActionRefs::default();
+    crate::format::collect_action_refs(success, &mut refs);
+    crate::format::collect_action_refs(failure, &mut refs);
+    check_v2_refs(&refs.scripts, &refs.templates, agent_dir, report)
+}
+
+/// `routines/*.md` with `format: 2`. Returns the routine's own report plus
+/// one `FileReport` per XML script tree reachable from its `audio`
+/// features and `script` actions.
+fn validate_routine_v2(rel_path: &str, content: &str, agent_dir: &Path) -> Vec<FileReport> {
+    let mut report = FileReport::new(rel_path);
+    if !rel_path.to_ascii_lowercase().ends_with(".md") {
+        report.push(err("routine files must use the .md extension"));
+        return vec![report];
     }
 
-    report
+    let (routine, diags) = crate::format::parse_routine(content);
+    for d in diags {
+        report.push(diag_problem(d));
+    }
+
+    let (_, body) = crate::format::split_frontmatter(content);
+    check_md_links(&body, agent_dir, &mut report);
+
+    let mut extra = Vec::new();
+    if let Some(r) = &routine {
+        extra.extend(check_action_refs(
+            &r.success,
+            &r.failure,
+            agent_dir,
+            &mut report,
+        ));
+        let scripts = crate::format::audio_feature_srcs(&r.pages);
+        extra.extend(check_v2_refs(&scripts, &[], agent_dir, &mut report));
+    }
+
+    let mut reports = vec![report];
+    reports.extend(extra);
+    reports
+}
+
+/// `habits/*.md` (always v2).
+fn validate_habit(rel_path: &str, content: &str, agent_dir: &Path) -> Vec<FileReport> {
+    let mut report = FileReport::new(rel_path);
+    if !rel_path.to_ascii_lowercase().ends_with(".md") {
+        report.push(err("habit files must use the .md extension"));
+        return vec![report];
+    }
+
+    let (habit, diags) = crate::format::parse_habit(content);
+    for d in diags {
+        report.push(diag_problem(d));
+    }
+
+    let (_, body) = crate::format::split_frontmatter(content);
+    check_md_links(&body, agent_dir, &mut report);
+
+    let mut extra = Vec::new();
+    if let Some(h) = &habit {
+        extra.extend(check_action_refs(
+            &h.success,
+            &h.failure,
+            agent_dir,
+            &mut report,
+        ));
+    }
+
+    let mut reports = vec![report];
+    reports.extend(extra);
+    reports
+}
+
+/// `tasks/*.md` (always v2). Same page-model checks as routines.
+fn validate_task(rel_path: &str, content: &str, agent_dir: &Path) -> Vec<FileReport> {
+    let mut report = FileReport::new(rel_path);
+    if !rel_path.to_ascii_lowercase().ends_with(".md") {
+        report.push(err("task files must use the .md extension"));
+        return vec![report];
+    }
+
+    let (task, diags) = crate::format::parse_task(content);
+    for d in diags {
+        report.push(diag_problem(d));
+    }
+
+    let (_, body) = crate::format::split_frontmatter(content);
+    check_md_links(&body, agent_dir, &mut report);
+
+    let mut extra = Vec::new();
+    if let Some(t) = &task {
+        extra.extend(check_action_refs(
+            &t.success,
+            &t.failure,
+            agent_dir,
+            &mut report,
+        ));
+        let scripts = crate::format::audio_feature_srcs(&t.pages);
+        extra.extend(check_v2_refs(&scripts, &[], agent_dir, &mut report));
+    }
+
+    let mut reports = vec![report];
+    reports.extend(extra);
+    reports
+}
+
+/// `store/*.json` (always v2).
+fn validate_store_entry(rel_path: &str, content: &str, agent_dir: &Path) -> Vec<FileReport> {
+    let mut report = FileReport::new(rel_path);
+    if !rel_path.to_ascii_lowercase().ends_with(".json") {
+        report.push(err("store entries must use the .json extension"));
+        return vec![report];
+    }
+
+    let (entry, diags) = crate::format::parse_store_entry(content);
+    for d in diags {
+        report.push(diag_problem(d));
+    }
+
+    let mut extra = Vec::new();
+    if let Some(e) = &entry {
+        extra.extend(check_action_refs(&e.actions, &[], agent_dir, &mut report));
+    }
+
+    let mut reports = vec![report];
+    reports.extend(extra);
+    reports
 }
 
 // ============================================================================
@@ -1077,10 +818,7 @@ fn list_dir_files_recursive(dir_rel: &str, agent_dir: &Path) -> Vec<(String, Pat
 /// `.xml` (e.g. `"hypnos/foo.xml"`) lints that script standalone. When `path`
 /// is `None`, every known feature file is validated as before.
 #[tauri::command]
-pub fn validate_data_files(
-    path: Option<String>,
-    state: State<'_, AppState>,
-) -> ValidateReport {
+pub fn validate_data_files(path: Option<String>, state: State<'_, AppState>) -> ValidateReport {
     let agent_dir = state.agent_dir.clone();
     let mut files: Vec<FileReport> = Vec::new();
     let mut errors = 0usize;
@@ -1100,7 +838,9 @@ pub fn validate_data_files(
         }
         files.push(r);
     }
-    let collect = |files: &mut Vec<FileReport>, errors: &mut usize, warnings: &mut usize,
+    let collect = |files: &mut Vec<FileReport>,
+                   errors: &mut usize,
+                   warnings: &mut usize,
                    r: FileReport| push_one(files, errors, warnings, r);
 
     // Resolve + validate the scope itself: a malformed/escaping scope yields a
@@ -1109,22 +849,20 @@ pub fn validate_data_files(
     // is *not* required (e.g. `path="routines"` when that dir exists is fine,
     // but `path="conditioning/missing.json"` just lints nothing under it).
     let scope: Option<String> = match &path {
-        Some(p) if !p.trim().is_empty() => {
-            match crate::bash::resolve_under(&agent_dir, p) {
-                Ok(_) => Some(norm_rel(p)),
-                Err(msg) => {
-                    let mut r = FileReport::new(norm_rel(p));
-                    r.push(err(msg));
-                    collect(&mut files, &mut errors, &mut warnings, r);
-                    return ValidateReport {
-                        checked: files.len(),
-                        errors,
-                        warnings,
-                        files,
-                    };
-                }
+        Some(p) if !p.trim().is_empty() => match crate::bash::resolve_under(&agent_dir, p) {
+            Ok(_) => Some(norm_rel(p)),
+            Err(msg) => {
+                let mut r = FileReport::new(norm_rel(p));
+                r.push(err(msg));
+                collect(&mut files, &mut errors, &mut warnings, r);
+                return ValidateReport {
+                    checked: files.len(),
+                    errors,
+                    warnings,
+                    files,
+                };
             }
-        }
+        },
         _ => None,
     };
     let in_scope_of = |rel: &str| match &scope {
@@ -1132,38 +870,18 @@ pub fn validate_data_files(
         None => true,
     };
 
-    // routines/*.md
+    // XML scripts reached by any in-scope entry (conditioning JSONs and
+    // v2 audio features / script actions) — the unreferenced-XML pass
+    // below uses this to tell standalone scripts apart from reachable ones.
+    let mut reachable_xml: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // routines/*.md (parsed + validated by format.rs)
     for (rel, full) in list_dir_files("routines", &agent_dir) {
         if !rel.to_ascii_lowercase().ends_with(".md") || !in_scope_of(&rel) {
             continue;
         }
         let content = std::fs::read_to_string(&full).unwrap_or_default();
-        let r = validate_routine(&rel, &content, &agent_dir);
-        collect(&mut files, &mut errors, &mut warnings, r);
-    }
-
-    // rules/*.md
-    for (rel, full) in list_dir_files("rules", &agent_dir) {
-        if !rel.to_ascii_lowercase().ends_with(".md") || !in_scope_of(&rel) {
-            continue;
-        }
-        let content = std::fs::read_to_string(&full).unwrap_or_default();
-        let r = validate_rule(&rel, &content, &agent_dir);
-        collect(&mut files, &mut errors, &mut warnings, r);
-    }
-
-    // conditioning/*.json (+ referenced XML trees). We track every .xml the
-    // in-scope conditioning entries reach, so the unreferenced-XML pass below
-    // can tell standalone scripts apart from reachable ones.
-    let mut reachable_xml: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (rel, full) in list_dir_files("conditioning", &agent_dir) {
-        if !rel.to_ascii_lowercase().ends_with(".json") || !in_scope_of(&rel) {
-            continue;
-        }
-        let content = std::fs::read_to_string(&full).unwrap_or_default();
-        for r in validate_conditioning(&rel, &content, &agent_dir) {
-            // Record any XML file this entry reached (status ok/warning/error
-            // all mean it exists on disk and is part of a tree).
+        for r in validate_routine_v2(&rel, &content, &agent_dir) {
             if r.path.to_ascii_lowercase().ends_with(".xml") {
                 reachable_xml.insert(r.path.clone());
             }
@@ -1171,26 +889,44 @@ pub fn validate_data_files(
         }
     }
 
-    // journal/format.json
-    if in_scope_of("journal/format.json") {
-        let journal_format = crate::bash::resolve_under(&agent_dir, "journal/format.json")
-            .ok()
-            .filter(|p| p.exists());
-        if let Some(full) = journal_format {
-            let content = std::fs::read_to_string(&full).unwrap_or_default();
-            let r = validate_journal_format("journal/format.json", &content);
+    // habits/*.md (v2)
+    for (rel, full) in list_dir_files("habits", &agent_dir) {
+        if !rel.to_ascii_lowercase().ends_with(".md") || !in_scope_of(&rel) {
+            continue;
+        }
+        let content = std::fs::read_to_string(&full).unwrap_or_default();
+        for r in validate_habit(&rel, &content, &agent_dir) {
+            if r.path.to_ascii_lowercase().ends_with(".xml") {
+                reachable_xml.insert(r.path.clone());
+            }
             collect(&mut files, &mut errors, &mut warnings, r);
         }
     }
 
-    // voice/config.json
-    if in_scope_of("voice/config.json") {
-        let voice_config = crate::bash::resolve_under(&agent_dir, "voice/config.json")
-            .ok()
-            .filter(|p| p.exists());
-        if let Some(full) = voice_config {
-            let content = std::fs::read_to_string(&full).unwrap_or_default();
-            let r = validate_voice_config("voice/config.json", &content, &agent_dir);
+    // tasks/*.md (v2)
+    for (rel, full) in list_dir_files("tasks", &agent_dir) {
+        if !rel.to_ascii_lowercase().ends_with(".md") || !in_scope_of(&rel) {
+            continue;
+        }
+        let content = std::fs::read_to_string(&full).unwrap_or_default();
+        for r in validate_task(&rel, &content, &agent_dir) {
+            if r.path.to_ascii_lowercase().ends_with(".xml") {
+                reachable_xml.insert(r.path.clone());
+            }
+            collect(&mut files, &mut errors, &mut warnings, r);
+        }
+    }
+
+    // store/*.json (v2)
+    for (rel, full) in list_dir_files("store", &agent_dir) {
+        if !rel.to_ascii_lowercase().ends_with(".json") || !in_scope_of(&rel) {
+            continue;
+        }
+        let content = std::fs::read_to_string(&full).unwrap_or_default();
+        for r in validate_store_entry(&rel, &content, &agent_dir) {
+            if r.path.to_ascii_lowercase().ends_with(".xml") {
+                reachable_xml.insert(r.path.clone());
+            }
             collect(&mut files, &mut errors, &mut warnings, r);
         }
     }
@@ -1237,7 +973,7 @@ pub fn validate_data_files(
             }
             // Unreferenced is a warning, not an error (per design decision).
             r.push(warn(
-                "script is not referenced by any conditioning JSON entry".to_string(),
+                "script is not referenced by any feature file (v2 audio feature or script action)".to_string(),
             ));
             collect(&mut files, &mut errors, &mut warnings, r);
         }
@@ -1274,35 +1010,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_cron_accepts_5_and_6_field() {
-        assert!(validate_cron("30 2 * * *").is_ok());
-        assert!(validate_cron("0 30 2 * * *").is_ok());
-        assert!(validate_cron("@daily").is_ok());
-    }
-
-    #[test]
-    fn validate_cron_rejects_bad_field_count_and_ranges() {
-        assert!(validate_cron("30 2 *").is_err()); // 3 fields
-        assert!(validate_cron("* * 25 * * *").is_err()); // hour 25 out of range
-        assert!(validate_cron("* * * * 13").is_err()); // month 13 out of range
-    }
-
-    #[test]
-    fn frontmatter_splits_schedule_and_body() {
-        let content = "---\nschedule: 30 2 * * *\n---\n\nHello body.\n";
-        let (fm, body) = split_frontmatter(content);
-        assert_eq!(frontmatter_schedule(&fm).as_deref(), Some("30 2 * * *"));
-        assert!(body.trim().starts_with("Hello body."));
-    }
-
-    #[test]
-    fn frontmatter_missing_when_not_at_start() {
-        let content = "\n---\nschedule: 30 2 * * *\n---\nbody\n";
-        let (fm, _body) = split_frontmatter(content);
-        assert!(frontmatter_schedule(&fm).is_none());
-    }
-
-    #[test]
     fn extract_links_basic_and_image_skipped() {
         let body = "see [a](conditioning/foo.json) and ![img](x.png) and [b](rule/bar.md)";
         let links: Vec<String> = extract_md_links(body)
@@ -1313,20 +1020,12 @@ mod tests {
     }
 
     #[test]
-    fn in_app_link_resolves_rules_alias_and_skips_external() {
+    fn in_app_link_resolves_and_skips_external() {
         assert_eq!(
-            in_app_link_target("rules/dress.md").as_deref(),
-            Some("rules/dress.md")
+            in_app_link_target("routines/dress.md").as_deref(),
+            Some("routines/dress.md")
         );
-        // Legacy singular `rule/` prefix still resolves to the `rules/` dir.
-        assert_eq!(
-            in_app_link_target("rule/dress.md").as_deref(),
-            Some("rules/dress.md")
-        );
-        assert_eq!(
-            in_app_link_target("./conditioning/a.json").as_deref(),
-            Some("conditioning/a.json")
-        );
+        assert_eq!(in_app_link_target("rules/dress.md"), None);
         assert_eq!(in_app_link_target("https://x.com"), None);
         assert_eq!(in_app_link_target("chastity"), None);
         assert_eq!(in_app_link_target("inventory/items#42"), None);
@@ -1443,7 +1142,11 @@ mod tests {
                 .iter()
                 .any(|p| p.message.contains("circular include"))
         });
-        assert!(any_cycle, "no circular-include error reported: {:?}", reports);
+        assert!(
+            any_cycle,
+            "no circular-include error reported: {:?}",
+            reports
+        );
     }
 
     #[test]
@@ -1487,5 +1190,84 @@ mod tests {
         assert!(in_scope("./conditioning/a.json", "./conditioning"));
         // Empty scope matches everything.
         assert!(in_scope("anything", ""));
+    }
+
+    // ── v2 feature format (format.rs grammar) ───────────────────────────
+
+    #[test]
+    fn v2_routine_routes_to_format_parser() {
+        let dir = agent_dir_with(&[(
+            "routines/drill.md",
+            "---\nformat: 2\ntitle: Drill\nschedule: 0 8 * * *\n---\n\nintro\n",
+        )]);
+        let content = std::fs::read_to_string(dir.path().join("routines/drill.md")).unwrap();
+        let reports = validate_routine_v2("routines/drill.md", &content, dir.path());
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].status, "ok", "{:?}", reports[0].problems);
+    }
+
+    #[test]
+    fn routine_without_marker_reports_error() {
+        let dir = agent_dir_with(&[]);
+        let reports = validate_routine_v2(
+            "routines/x.md",
+            "---
+schedule: 0 8 * * *
+---
+```feature
+type: wait
+duration: 1m
+---
+x
+```
+",
+            dir.path(),
+        );
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].status, "error");
+        assert!(problems_for(&reports[0]).iter().any(|m| m.contains("format: 2")));
+    }
+
+    #[test]
+    fn v2_habit_dangling_task_template_is_error() {
+        let dir = agent_dir_with(&[(
+            "habits/nox.md",
+            "---\ntitle: No X\ntype: max\ncount: 0\nfailure: { \"type\": \"task\", \"template\": \"missing-one\" }\n---\ndesc\n",
+        )]);
+        let content = std::fs::read_to_string(dir.path().join("habits/nox.md")).unwrap();
+        let reports = validate_habit("habits/nox.md", &content, dir.path());
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].status, "error");
+        assert!(problems_for(&reports[0])
+            .iter()
+            .any(|m| m.contains("tasks/missing-one.md")));
+    }
+
+    #[test]
+    fn v2_routine_audio_feature_lints_script_tree() {
+        let dir = agent_dir_with(&[
+            (
+                "routines/listen.md",
+                "---\nformat: 2\ntitle: Listen\n---\n```feature\ntype: audio\nsrc: hypnos/a.xml\n---\nlisten\n```\n",
+            ),
+            ("hypnos/a.xml", "<voice speaker='female'>hi</voice>"),
+        ]);
+        let content = std::fs::read_to_string(dir.path().join("routines/listen.md")).unwrap();
+        let reports = validate_routine_v2("routines/listen.md", &content, dir.path());
+        // The routine's own report + one for the referenced script.
+        assert_eq!(reports.len(), 2, "{:?}", reports);
+        assert!(reports.iter().all(|r| r.status == "ok"), "{:?}", reports);
+    }
+
+    #[test]
+    fn v2_store_entry_notification_action_is_clean() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reports = validate_store_entry(
+            "store/pass.json",
+            "{ \"title\": \"P\", \"price\": 5, \"action\": { \"type\": \"notification\", \"text\": \"hi\" } }",
+            dir.path(),
+        );
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].status, "ok", "{:?}", reports[0].problems);
     }
 }

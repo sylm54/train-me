@@ -13,15 +13,20 @@ mod audio_renderer;
 mod audio_server;
 mod bash;
 mod chastity;
+mod economy;
 mod expression;
+mod format;
+mod framework_updater;
 mod helper;
 mod inventory;
 mod manifest;
 mod model_downloader;
+mod onboarding;
 mod package_import;
 mod package_manifest;
-mod framework_updater;
+mod prerender;
 mod render_notify;
+mod schedule;
 mod sounds;
 mod tag_parser;
 mod validators;
@@ -151,7 +156,11 @@ pub struct ExportResult {
 #[tauri::command]
 fn get_model_status(state: State<'_, AppState>) -> Result<ModelStatus, String> {
     let downloaded = model_downloader::is_model_downloaded(&state.model_dir);
-    let loaded = state.renderer.try_lock().map(|g| g.is_some()).unwrap_or(true);
+    let loaded = state
+        .renderer
+        .try_lock()
+        .map(|g| g.is_some())
+        .unwrap_or(true);
     let missing_files = model_downloader::missing_files(&state.model_dir);
     let speakers = model_downloader::available_speakers()
         .iter()
@@ -356,12 +365,9 @@ fn delete_track(path: String) -> Result<String, String> {
 /// dedup dirs are deliberately left alone — another script may reference them.
 #[tauri::command]
 fn delete_manifest(script_path: String, state: State<'_, AppState>) -> Result<(), String> {
-    let dir = state
-        .tracks_dir
-        .join(manifest::manifest_id(&script_path));
+    let dir = state.tracks_dir.join(manifest::manifest_id(&script_path));
     if dir.exists() {
-        fs::remove_dir_all(&dir)
-            .map_err(|e| format!("Failed to delete render: {}", e))?;
+        fs::remove_dir_all(&dir).map_err(|e| format!("Failed to delete render: {}", e))?;
     }
     Ok(())
 }
@@ -483,6 +489,8 @@ async fn reset_app_data(state: State<'_, AppState>) -> Result<ResetReport, Strin
     //    "no framework" onboarding state.
     wipe_dir_contents(&state.data_dir.join("prompts"))?;
     package_manifest::clear_installed_framework(&state.data_dir);
+    let _ = std::fs::remove_file(state.data_dir.join("onboarding.json"));
+    let _ = std::fs::remove_file(state.data_dir.join("onboarding_answers.json"));
     report.prompts = true;
 
     // 3. Chastity — reset to the default (unlocked, no countdown) state.
@@ -498,6 +506,26 @@ async fn reset_app_data(state: State<'_, AppState>) -> Result<ResetReport, Strin
             .map_err(|e| e.to_string())?;
     }
     report.inventory = true;
+
+    // 4b. v2 engine — wipe the economy and schedule ledgers the same way.
+    {
+        let state_dir = state.state_dir.clone();
+        let wipe = |db: &str, tables: &str| -> Result<(), String> {
+            rusqlite::Connection::open(state_dir.join(db))
+                .map_err(|e| e.to_string())?
+                .execute_batch(tables)
+                .map_err(|e| e.to_string())
+        };
+        wipe(
+            "economy.db",
+            "DELETE FROM ledger; DELETE FROM exemptions; DELETE FROM purchases; \
+             DELETE FROM stock_state; DELETE FROM pending_actions;",
+        )?;
+        wipe(
+            "schedule.db",
+            "DELETE FROM occurrences; DELETE FROM habit_days; DELETE FROM task_instances;",
+        )?;
+    }
 
     // 5. Agent feature data — wipe the writable scratch space, skipping
     //    `activity.db*` (reset in step 6). inventory.db lives in state_dir,
@@ -560,9 +588,7 @@ fn wipe_agent_data(agent_dir: &std::path::Path) -> Result<(), String> {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
         // activity.db (+ sidecars) is reset via rusqlite in reset_app_data.
-        if name_str == "activity.db"
-            || name_str.starts_with("activity.db-")
-        {
+        if name_str == "activity.db" || name_str.starts_with("activity.db-") {
             continue;
         }
         let path = entry.path();
@@ -674,7 +700,10 @@ async fn render_manifest(
 
     let notify_app_for_setup = app.clone();
     let notify_title_for_setup = display_title.clone();
-    log::info!("render_manifest: dispatching to spawn_blocking (script={})", script_path);
+    log::info!(
+        "render_manifest: dispatching to spawn_blocking (script={})",
+        script_path
+    );
     let result = tauri::async_runtime::spawn_blocking(move || {
         // First signal to the UI: the command reached the worker. If this
         // never appears, the hang is in dispatch (event-loop starvation), not
@@ -949,7 +978,12 @@ fn collect_includes(
             | tag_parser::Node::React { parts, .. } => {
                 for part in parts {
                     collect_includes(
-                        &part.children, script_dir, agent_dir, out, visited, warnings,
+                        &part.children,
+                        script_dir,
+                        agent_dir,
+                        out,
+                        visited,
+                        warnings,
                     );
                 }
             }
@@ -1007,7 +1041,9 @@ async fn export_scripts_zip(
 
     // ── 2. Persist + hand off to the user via the shared helper (handles
     //    the desktop save-path vs. Android Downloads + share-sheet split).
-    let note = persist_export_artifact(&app, out_path, &zip_bytes, "scripts.zip", "application/zip").await?;
+    let note =
+        persist_export_artifact(&app, out_path, &zip_bytes, "scripts.zip", "application/zip")
+            .await?;
 
     Ok(ExportResult {
         files: count,
@@ -1047,7 +1083,13 @@ pub async fn persist_export_artifact(
         // shareable content:// URI (no permissions needed on Android 11+).
         let uri = api
             .public_storage()
-            .write_new(None, PublicGeneralPurposeDir::Download, &rel, Some(mime), bytes)
+            .write_new(
+                None,
+                PublicGeneralPurposeDir::Download,
+                &rel,
+                Some(mime),
+                bytes,
+            )
             .await
             .map_err(|e| format!("Failed to write {} to Downloads: {}", default_name, e))?;
 
@@ -1269,10 +1311,22 @@ async fn export_all_zip(
     let tracks_dir = state.tracks_dir.clone();
 
     let roots = vec![
-        ArchiveRoot { source: prompts_dir, prefix: "prompts" },
-        ArchiveRoot { source: agent_dir, prefix: "agent_data" },
-        ArchiveRoot { source: state_dir, prefix: "state" },
-        ArchiveRoot { source: tracks_dir, prefix: "tracks" },
+        ArchiveRoot {
+            source: prompts_dir,
+            prefix: "prompts",
+        },
+        ArchiveRoot {
+            source: agent_dir,
+            prefix: "agent_data",
+        },
+        ArchiveRoot {
+            source: state_dir,
+            prefix: "state",
+        },
+        ArchiveRoot {
+            source: tracks_dir,
+            prefix: "tracks",
+        },
     ];
 
     let zip_bytes = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
@@ -1284,7 +1338,14 @@ async fn export_all_zip(
     let total_bytes = zip_bytes.len() as u64;
     let count = count_zip_entries(&zip_bytes);
 
-    let note = persist_export_artifact(&app, out_path, &zip_bytes, "train-me-backup.zip", "application/zip").await?;
+    let note = persist_export_artifact(
+        &app,
+        out_path,
+        &zip_bytes,
+        "train-me-backup.zip",
+        "application/zip",
+    )
+    .await?;
 
     Ok(ExportResult {
         files: count,
@@ -1475,34 +1536,6 @@ fn sanitize_track_name(name: &str) -> String {
 // Cron helpers
 // ============================================================================
 
-/// Compute the next `count` fire times for a cron expression.
-///
-/// Accepts the documented 5-field form (`min hour dom month dow`) as well
-/// as 6/7-field (`sec min hour dom month dow [year]`) and `@`-shorthands:
-/// a 5-field expression is normalized to 6-field by prepending a `0`
-/// seconds field before handing it to the `cron` crate (which otherwise
-/// silently rejects 5-field input and schedules nothing). See
-/// `validators::normalize_cron`.
-///
-/// Returns RFC 3339 strings. If the expression is invalid or produces
-/// fewer matches, returns a shorter (or empty) vec.
-#[tauri::command]
-fn next_cron_times(expr: &str, count: usize) -> Vec<String> {
-    use chrono::Utc;
-    use cron::Schedule as CronSchedule;
-    use std::str::FromStr;
-
-    let normalized = validators::normalize_cron(expr);
-    let Ok(schedule) = CronSchedule::from_str(&normalized) else {
-        return Vec::new();
-    };
-    schedule
-        .upcoming(Utc)
-        .take(count)
-        .map(|t| t.to_rfc3339())
-        .collect()
-}
-
 // ============================================================================
 // App entrypoint
 // ============================================================================
@@ -1591,6 +1624,14 @@ pub fn run() {
                 .expect("failed to init activity.db schema");
             inventory::ensure_schema(&state_dir.join("inventory.db"))
                 .expect("failed to init inventory.db schema");
+            economy::ensure_schema(&state_dir.join("economy.db"))
+                .expect("failed to init economy.db schema");
+            schedule::ensure_schema(&state_dir.join("schedule.db"))
+                .expect("failed to init schedule.db schema");
+            // v2 engine DBs: economy (points/exemptions/purchases) and
+            // schedule (occurrence ledger + task instances). Like
+            // inventory.db they live outside the agent sandbox.
+
 
             log::info!("Data dir: {:?}", data_dir);
             log::info!("Agent dir: {:?}", agent_dir);
@@ -1610,29 +1651,27 @@ pub fn run() {
             // `audio_server` module docs for why we serve audio over HTTP
             // rather than Tauri's `asset://` protocol.
             let audio_token = generate_audio_token();
-            let audio_base_url =
-                match tauri::async_runtime::block_on(audio_server::bind_audio_server(
-                    tracks_dir.clone(),
-                    audio_token.clone(),
-                )) {
-                    Ok((addr, _join)) => {
-                        let url = format!(
-                            "http://{}?{}={}",
-                            addr,
-                            audio_server::TOKEN_PARAM,
-                            audio_token
-                        );
-                        log::info!("Audio server listening on {}", addr);
-                        url
-                    }
-                    Err(e) => {
-                        // Non-fatal: audio playback will be broken, but the
-                        // rest of the app should still start. The frontend
-                        // falls back to a clearly-invalid URL it can surface.
-                        log::error!("Failed to start audio server: {e}");
-                        String::from("about:blank")
-                    }
-                };
+            let audio_base_url = match tauri::async_runtime::block_on(
+                audio_server::bind_audio_server(tracks_dir.clone(), audio_token.clone()),
+            ) {
+                Ok((addr, _join)) => {
+                    let url = format!(
+                        "http://{}?{}={}",
+                        addr,
+                        audio_server::TOKEN_PARAM,
+                        audio_token
+                    );
+                    log::info!("Audio server listening on {}", addr);
+                    url
+                }
+                Err(e) => {
+                    // Non-fatal: audio playback will be broken, but the
+                    // rest of the app should still start. The frontend
+                    // falls back to a clearly-invalid URL it can surface.
+                    log::error!("Failed to start audio server: {e}");
+                    String::from("about:blank")
+                }
+            };
 
             app.manage(AppState {
                 data_dir,
@@ -1645,6 +1684,16 @@ pub fn run() {
                 renderer: Arc::new(Mutex::new(None)),
                 bash: Arc::new(bash_sandbox),
             });
+
+            // First reconciliation pass in the background: materialize
+            // expected occurrences and resolve anything that lapsed while
+            // the app was closed (see schedule.rs module docs).
+            schedule::spawn_reconcile(app.handle().clone());
+
+            // First reconciliation pass in the background: materialize
+            // expected occurrences and resolve anything that lapsed while
+            // the app was closed (see schedule.rs module docs).
+
 
             Ok(())
         })
@@ -1696,7 +1745,6 @@ pub fn run() {
             // App-data reset (preserves model/ + API keys)
             reset_app_data,
             // Cron computation for routine scheduling
-            next_cron_times,
             // Feature-file validation (routines, rules, conditioning, journal, voice)
             validators::validate_data_files,
             // Inventory (SQLite-backed)
@@ -1723,6 +1771,22 @@ pub fn run() {
             chastity::chastity_auto_unlock,
             chastity::chastity_arm_countdown,
             chastity::chastity_stop_countdown,
+            // v2 engine: economy + schedule (FORMAT.md)
+            economy::economy_summary,
+            economy::economy_dismiss_pending,
+            schedule::reconcile_schedule,
+            schedule::parse_v2_file,
+            schedule::v2_summary,
+            schedule::v2_start_run,
+            schedule::v2_finish_run,
+            schedule::v2_fail_run,
+            schedule::v2_habit_log,
+            schedule::v2_purchase,
+            schedule::v2_upcoming,
+            prerender::v2_prerender,
+            onboarding::onboarding_questions,
+            onboarding::onboarding_step,
+            onboarding::save_onboarding_answers,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

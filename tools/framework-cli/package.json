@@ -1,0 +1,14 @@
+{
+  "name": "train-me-framework",
+  "version": "0.1.0",
+  "description": "Lint and package train-me frameworks (see FORMAT.md / FRAMEWORKS.md in the train-me repo).",
+  "bin": {
+    "tm-framework": "./src/cli.ts"
+  },
+  "dependencies": {
+    "adm-zip": "^0.6.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}

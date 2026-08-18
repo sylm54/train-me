@@ -61,13 +61,11 @@ interface FeatureTab {
 
 const FEATURE_TABS: FeatureTab[] = [
   { value: "all", label: "All" },
-  { value: "conditioning", label: "Conditioning" },
-  { value: "rule", label: "Rules" },
   { value: "routine", label: "Routines" },
+  { value: "habit", label: "Habits" },
+  { value: "script", label: "Scripts" },
   { value: "chastity", label: "Chastity" },
   { value: "inventory", label: "Inventory" },
-  { value: "journal", label: "Journal" },
-  { value: "voice", label: "Voice" },
 ];
 
 /** Count entries per feature, used to badge each tab. */
