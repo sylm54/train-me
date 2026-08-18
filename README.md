@@ -2,8 +2,10 @@
 
 Lint and package [train-me](https://github.com/sylm54/train-me) frameworks.
 
+Published as the repo's `framework-cli` branch (no package manager supports subpath git deps, so CI keeps a root-level copy there):
+
 ```
-bun add -d github:sylm54/train-me/tools/framework-cli
+npm i -D github:sylm54/train-me#framework-cli   # or pnpm/bun add -d
 bunx tm-framework lint      # validate everything; exit 1 on errors
 bunx tm-framework package   # build dist/<id>.zip + dist/index.json
 ```
