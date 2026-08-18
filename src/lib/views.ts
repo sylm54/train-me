@@ -4,13 +4,10 @@
 
 export type View =
   | "chat"
+  | "today"
+  | "session"
   | "settings"
   | "tts"
-  | "conditioning"
-  | "rules"
-  | "routines"
   | "inventory"
   | "chastity"
-  | "journal"
-  | "voice"
   | "activity";

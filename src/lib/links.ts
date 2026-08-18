@@ -1,15 +1,11 @@
 /**
  * In-app link resolution for markdown content.
  *
- * Markdown bodies rendered in Rules / Routines / Journal / Voice Training
- * may contain links like:
+ * Markdown bodies rendered in Rules / Routines / Today may contain
+ * links like:
  *
- *   [foo](conditioning/foo.json)
  *   [item](inventory/items#42)
- *   [rule](rule/dress_code.md)
  *   [routine](routines/morning.md)
- *   [journal](journal/2025-06-05-1030.md)
- *   [voice](voice/breathing.md)
  *   [chastity](chastity)
  *
  * This module resolves such paths to a {view, anchor?} pair so the
@@ -30,12 +26,7 @@ export interface AppLink {
  * Resolve an in-app path to an AppLink, or null if the path is external /
  * unrecognised. Recognised prefixes (relative, no leading slash):
  *
- *   conditioning/   → "conditioning"
- *   rule/           → "rules"
- *   rules/          → "rules"
- *   routines/       → "routines"
- *   journal/        → "journal"
- *   voice/          → "voice"
+ *   routines/       → "today"
  *   inventory/      → "inventory"
  *   chastity        → "chastity"
  */
@@ -57,7 +48,7 @@ export function resolveAppPath(href: string): AppLink | null {
     h = h.slice(0, hashIdx);
   }
   // Strip a trailing filename — we route by directory, not by file.
-  // (e.g. "conditioning/foo.json" → view "conditioning", anchor "foo".)
+  // (e.g. "rules/foo.md" → view "rules", anchor "foo".)
   h = h.trim();
 
   // Bare feature name → that view.
@@ -67,17 +58,10 @@ export function resolveAppPath(href: string): AppLink | null {
     case "inventory":
     case "inventory/items":
       return { view: "inventory", anchor };
-    case "conditioning":
-      return { view: "conditioning", anchor };
-    case "rules":
-    case "rule":
-      return { view: "rules", anchor };
     case "routines":
-      return { view: "routines", anchor };
-    case "journal":
-      return { view: "journal", anchor };
-    case "voice":
-      return { view: "voice", anchor };
+    case "rules":
+    case "today":
+      return { view: "today", anchor };
   }
 
   // Directory-prefixed path. Use the first segment to pick the view;
@@ -88,22 +72,11 @@ export function resolveAppPath(href: string): AppLink | null {
   const head = segs[0].toLowerCase();
   let view: View | null = null;
   switch (head) {
-    case "conditioning":
-      view = "conditioning";
-      break;
-    case "rule":
-    case "rules":
-      view = "rules";
-      break;
     case "routines":
     case "routine":
-      view = "routines";
-      break;
-    case "journal":
-      view = "journal";
-      break;
-    case "voice":
-      view = "voice";
+    case "rules":
+    case "rule":
+      view = "today";
       break;
     case "inventory":
       view = "inventory";

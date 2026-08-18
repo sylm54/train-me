@@ -1,0 +1,8 @@
+{
+  "title": "Lazy day pass",
+  "description": "24h off habits.",
+  "price": 25,
+  "stock": 3,
+  "restock": "0 0 * * 1",
+  "action": { "type": "exemption", "duration": "24h", "scope": "habits" }
+}

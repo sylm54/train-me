@@ -10,12 +10,6 @@ export type {
   TrackerComponentProps,
   VoiceTracker,
 } from "./types";
-export { parseVoiceConfig, resolveTrackers, specToConfig } from "./config";
-export type {
-  TrackerSpec,
-  LessonConfig,
-  VoiceConfig,
-} from "./config";
 export { FrameBus, useVoiceSession } from "./audio";
 export type { VoiceSession, VoiceSessionState } from "./audio";
 export { TRACKERS, TRACKER_LIST, getTracker } from "./registry";

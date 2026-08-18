@@ -206,6 +206,16 @@ pub(crate) fn install_framework(
 
     // Record the installed framework (with source url + choices for later
     // update checks and re-installs).
+    // Root-level onboarding.json: install (or, on update without one,
+    // remove) the framework's deterministic first-run questions.
+    let staged_onboarding = staged_root.join("onboarding.json");
+    if staged_onboarding.is_file() {
+        std::fs::copy(&staged_onboarding, data_dir.join("onboarding.json"))
+            .map_err(|e| format!("Failed to copy onboarding.json: {e}"))?;
+    } else if is_update {
+        let _ = std::fs::remove_file(data_dir.join("onboarding.json"));
+    }
+
     let record = installed_from_manifest(manifest, source_url, choices);
     write_installed_framework(data_dir, &record)?;
 
@@ -622,6 +632,7 @@ fn stage_to_persistent<R: Read + Seek + Send + 'static>(
         ));
     }
     let config = Config::from_pkg_root(&pkg_root)?;
+    crate::onboarding::from_pkg_root(&pkg_root)?; // validates when present
 
     // Reset the persistent staging dir and copy the framework into it.
     let _ = fs::remove_dir_all(staging_dir);

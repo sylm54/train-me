@@ -3,24 +3,24 @@
  * then routes between feature views.
  */
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import { AppShell } from "@/components/AppShell";
 import { ChatView } from "@/views/ChatView";
 import { SettingsView } from "@/views/SettingsView";
 import { TtsView } from "@/views/TtsView";
-import { ConditioningView } from "@/views/ConditioningView";
-import { RulesView } from "@/views/RulesView";
-import { RoutinesView } from "@/views/RoutinesView";
 import { InventoryView } from "@/views/InventoryView";
 import { ChastityView } from "@/views/ChastityView";
-import { JournalView } from "@/views/JournalView";
-import { VoiceTrainingView } from "@/views/VoiceTrainingView";
 import { ActivityView } from "@/views/ActivityView";
+import { TodayView } from "@/views/TodayView";
+import { SessionView } from "@/views/SessionView";
 import { OnboardingView } from "@/views/OnboardingView";
 import { useSettings } from "@/lib/settings";
-import { useFeatureVisibility } from "@/lib/features";
 import { useGlobalAppLinkNavigation } from "@/lib/links";
 import { useRoutineNotifier } from "@/lib/use-routine-notifier";
+import { notify } from "@/lib/notifications";
+import type { SessionRequest } from "@/lib/v2";
 import { createChat, ensureActiveChat } from "@/lib/chatStore";
 import { useIdleChatSweeper } from "@/hooks/useIdleChatSweeper";
 import type { View } from "@/lib/views";
@@ -41,6 +41,34 @@ export default function App() {
   // (Declared before the onboarding early-return so hooks always run in
   // the same order — see React's Rules of Hooks.)
   const navigate = useCallback((next: View) => setView(next), []);
+
+  // The pending v2 session (routine/task run) handed to SessionView.
+  const [sessionRequest, setSessionRequest] = useState<SessionRequest | null>(null);
+  const openSession = useCallback((request: SessionRequest) => {
+    setSessionRequest(request);
+    setView("session");
+  }, []);
+
+  // Background pre-render: warm every v2-referenced script shortly after
+  // startup (hash-keyed — edited scripts re-render, orphans are GC'd).
+  useEffect(() => {
+    const t = window.setTimeout(() => {
+      void invoke("v2_prerender").catch(() => undefined);
+    }, 15_000);
+    return () => window.clearTimeout(t);
+  }, []);
+
+  // Engine notifications arrive as events (the Rust side must not touch
+  // the notification plugin beyond render_notify — see schedule.rs) and
+  // are delivered here through the JS notification wrapper.
+  useEffect(() => {
+    const un = listen<{ title: string; body: string }>("v2-notify", (e) => {
+      void notify(e.payload.title, e.payload.body);
+    });
+    return () => {
+      void un.then((f) => f());
+    };
+  }, []);
 
   // Keep routine notifications alive for the lifetime of the app.
   useRoutineNotifier();
@@ -63,11 +91,6 @@ export default function App() {
   // regardless of which renderer produced the `<a>`.
   useGlobalAppLinkNavigation(navigate);
 
-  // Provisional features (journal, voice) are hidden until the agent has
-  // created their config file. Also declared before the early-return so
-  // hooks stay stable.
-  const features = useFeatureVisibility();
-
   // First run: walk the user through models + framework import before
   // revealing the main app. The flag is persisted, so this only shows
   // again after a data reset (which clears it).
@@ -80,20 +103,17 @@ export default function App() {
   // on the wrapper div.
   let body: React.ReactNode = null;
   switch (view) {
+    case "today":
+      body = <TodayView onRequestSession={openSession} />;
+      break;
+    case "session":
+      body = <SessionView request={sessionRequest} navigate={navigate} />;
+      break;
     case "settings":
       body = <SettingsView />;
       break;
     case "tts":
       body = <TtsView />;
-      break;
-    case "conditioning":
-      body = <ConditioningView />;
-      break;
-    case "rules":
-      body = <RulesView />;
-      break;
-    case "routines":
-      body = <RoutinesView />;
       break;
     case "inventory":
       body = <InventoryView />;
@@ -101,28 +121,13 @@ export default function App() {
     case "chastity":
       body = <ChastityView />;
       break;
-    case "journal":
-      body = <JournalView />;
-      break;
-    case "voice":
-      body = <VoiceTrainingView />;
-      break;
     case "activity":
       body = <ActivityView />;
       break;
   }
 
-  // Hide provisional features whose config file hasn't been provisioned.
-  const hiddenViews = new Set<View>();
-  if (!features.journal) hiddenViews.add("journal");
-  if (!features.voice) hiddenViews.add("voice");
-
   return (
-    <AppShell
-      currentView={view}
-      onChangeView={setView}
-      hiddenViews={hiddenViews}
-    >
+    <AppShell currentView={view} onChangeView={setView}>
       {/* ChatView is kept mounted across view switches so its session
           (messages, in-flight generation, token totals) persists when the
           user navigates away and back. It's hidden via CSS rather than

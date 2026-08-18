@@ -7,14 +7,10 @@
 import {
   MessageSquare,
   Settings as SettingsIcon,
-  BookOpen,
-  ListChecks,
   PackageOpen,
   Lock,
-  MicVocal,
-  PenLine,
-  Sparkles,
   Activity as ActivityIcon,
+  CalendarCheck,
   type LucideIcon,
 } from "lucide-react";
 import type { View } from "@/lib/views";
@@ -28,12 +24,8 @@ interface NavItem {
 
 const NAV_ITEMS: NavItem[] = [
   { view: "chat", label: "Agent", icon: MessageSquare },
-  { view: "rules", label: "Rules", icon: BookOpen },
-  { view: "routines", label: "Routines", icon: ListChecks },
-  { view: "conditioning", label: "Conditioning", icon: Sparkles },
-  { view: "voice", label: "Voice", icon: MicVocal },
+  { view: "today", label: "Today", icon: CalendarCheck },
   { view: "chastity", label: "Chastity", icon: Lock },
-  { view: "journal", label: "Journal", icon: PenLine },
   { view: "inventory", label: "Inventory", icon: PackageOpen },
   { view: "activity", label: "Activity", icon: ActivityIcon },
   { view: "settings", label: "Settings", icon: SettingsIcon },

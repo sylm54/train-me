@@ -132,8 +132,7 @@ pub fn create_bash_sandbox(agent_dir: &Path, state_dir: &Path) -> anyhow::Result
             // `..` or symlinks), so the agent stays scoped to `agent_dir`.
             let realfs = bashkit::RealFs::new(&mount_path, bashkit::RealFsMode::ReadWrite)
                 .expect("failed to mount agent dir as RealFs");
-            let agent_fs: Arc<dyn bashkit::FileSystem> =
-                Arc::new(bashkit::PosixFs::new(realfs));
+            let agent_fs: Arc<dyn bashkit::FileSystem> = Arc::new(bashkit::PosixFs::new(realfs));
 
             let builder = bashkit::Bash::builder()
                 .fs(agent_fs)
@@ -163,6 +162,10 @@ pub fn create_bash_sandbox(agent_dir: &Path, state_dir: &Path) -> anyhow::Result
             let builder = crate::inventory::InventoryBuiltin::register(
                 builder,
                 state_dir_owned.join("inventory.db"),
+            );
+            let builder = crate::economy::PointsBuiltin::register(
+                builder,
+                state_dir_owned.join("economy.db"),
             );
             let mut bash = builder.build();
 
@@ -440,15 +443,9 @@ pub fn ensure_agent_dir(data_dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(&agent)?;
     // Conventional subdirs the agent is expected to populate. We pre-create
     // them so the layout is discoverable on first run; the agent is free to
-    // create others.
-    for sub in [
-        "special",
-        "conditioning",
-        "rules",
-        "routines",
-        "journal",
-        "voice",
-    ] {
+    // create others. (`habits`, `tasks`, `store` are v2-format dirs —
+    // see FORMAT.md.)
+    for sub in ["special", "routines", "habits", "tasks", "store", "hypnos"] {
         std::fs::create_dir_all(agent.join(sub))?;
     }
     seed_examples(&agent)?;
@@ -472,20 +469,20 @@ fn seed_examples(agent_dir: &Path) -> std::io::Result<()> {
     }
     const EXAMPLES: &[BundledExample] = &[
         BundledExample {
-            rel: "examples/rule.md",
-            contents: include_str!("../../examples/rule.md"),
+            rel: "examples/routine-v2.md",
+            contents: include_str!("../../examples/routine-v2.md"),
         },
         BundledExample {
-            rel: "examples/routine.md",
-            contents: include_str!("../../examples/routine.md"),
+            rel: "examples/habit.md",
+            contents: include_str!("../../examples/habit.md"),
         },
         BundledExample {
-            rel: "examples/format.json",
-            contents: include_str!("../../examples/format.json"),
+            rel: "examples/task.md",
+            contents: include_str!("../../examples/task.md"),
         },
         BundledExample {
-            rel: "examples/voice-config.json",
-            contents: include_str!("../../examples/voice-config.json"),
+            rel: "examples/store.json",
+            contents: include_str!("../../examples/store.json"),
         },
     ];
 
@@ -583,7 +580,9 @@ mod tests {
         let fs: Arc<dyn FileSystem> = Arc::new(PosixFs::new(backend));
 
         // Write via the sandbox's filesystem (as `echo > /rules/daily.md` would).
-        fs.mkdir(std::path::Path::new("/rules"), true).await.unwrap();
+        fs.mkdir(std::path::Path::new("/rules"), true)
+            .await
+            .unwrap();
         fs.write_file(std::path::Path::new("/rules/daily.md"), b"hello")
             .await
             .unwrap();
