@@ -13,7 +13,13 @@ import { createHash } from "crypto";
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync } from "fs";
 import { join, resolve } from "path";
 
-const EXCLUDE = new Set(["dist", ".git", ".dev", ".github", "node_modules", "README.md", "AGENTS.md"]);
+const EXCLUDE = new Set([
+  "dist", ".git", ".dev", ".github", ".agents", "tools", "node_modules",
+  "README.md", "AGENTS.md", "skills-lock.json",
+  // Repo tooling manifests/lockfiles — never framework content.
+  "package.json", "package-lock.json", "bun.lock", "bun.lockb",
+  "pnpm-lock.yaml", "yarn.lock",
+]);
 
 export function pack(rootArg: string, outDirArg?: string): number {
   const root = resolve(rootArg);
