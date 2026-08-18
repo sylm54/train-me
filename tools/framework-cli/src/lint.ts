@@ -15,6 +15,7 @@ import {
   validateTask,
 } from "./validate";
 import { validateOnboarding } from "./onboarding";
+import { validateXml } from "./xml";
 
 interface Report {
   errors: number;
@@ -221,6 +222,18 @@ export function lint(rootArg: string): number {
           parsed.templates.forEach((t) => allTemplates.add(t));
         }
       }
+    }
+
+    // XML scripts: parse + semantic validation (port of tag_parser.rs).
+    for (const f of walk(agentDir).sort()) {
+      if (!f.toLowerCase().endsWith(".xml")) continue;
+      const diags: Diag[] = [];
+      try {
+        diags.push(...validateXml(readFileSync(f, "utf-8")));
+      } catch (e) {
+        diags.push({ severity: "error", message: `unexpected error: ${e}` });
+      }
+      reportFile(relative(root, f).replaceAll("\\", "/"), diags, out);
     }
 
     // Prompts: embeds + .md links + token estimate.
