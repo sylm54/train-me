@@ -549,6 +549,7 @@ pub fn get_staged_framework(state: State<'_, AppState>) -> Option<StagedFramewor
 /// record. Clears staging on success.
 #[tauri::command]
 pub async fn install_staged_framework(
+    app: AppHandle,
     choices: JsonValue,
     state: State<'_, AppState>,
 ) -> Result<ImportResult, String> {
@@ -557,7 +558,7 @@ pub async fn install_staged_framework(
     let agent_root = state.agent_dir.clone();
     let prompts_root = state.data_dir.join("prompts");
 
-    tauri::async_runtime::spawn_blocking(move || -> Result<ImportResult, String> {
+    let result = tauri::async_runtime::spawn_blocking(move || -> Result<ImportResult, String> {
         let meta = read_staged_meta(&staging_dir)?;
         let result = install_framework(
             &meta.root,
@@ -576,7 +577,12 @@ pub async fn install_staged_framework(
         result
     })
     .await
-    .map_err(|e| format!("Install task failed: {}", e))?
+    .map_err(|e| format!("Install task failed: {}", e))??;
+    // The prompt store and `{{include}}` targets (e.g. USER.md) were just
+    // rewritten — the frontend rebuilds its cached system prompt so the
+    // agent doesn't keep running the previous framework's prompts.
+    let _ = app.emit(crate::PROMPT_INPUTS_CHANGED, ());
+    Ok(result)
 }
 
 /// Tauri command: discard anything currently staged.

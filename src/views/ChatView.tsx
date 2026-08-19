@@ -2,8 +2,10 @@
  * Chat view: the main agent interface.
  *
  * Loads the system prompt on mount (from `prompts/main_agent.md`),
- * wires the custom OpenRouter transport to `useChat`, and renders a
- * streaming message list.
+ * reloads it whenever the backend reports that prompt inputs changed
+ * (onboarding answers → `agent_data/USER.md`, framework installs → the
+ * prompt store), wires the custom OpenRouter transport to `useChat`, and
+ * renders a streaming message list.
  *
  * Multi-chat: the app owns the active chat id. Switching it spins up a fresh
  * `useChat` instance (the SDK keys off `id`), whose messages we rehydrate from
@@ -56,6 +58,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type React from "react";
 import { useChat } from "@ai-sdk/react";
 import type { UIMessage } from "ai";
+import { listen } from "@tauri-apps/api/event";
 import {
   AlertCircle,
   Archive,
@@ -181,7 +184,9 @@ export function ChatView({
   const [promptLoading, setPromptLoading] = useState(true);
   const [promptError, setPromptError] = useState<string | null>(null);
 
-  const refreshPrompt = async () => {
+  // Stable identity: run on mount and re-run whenever the backend reports
+  // that prompt inputs changed (see the listener effect below).
+  const refreshPrompt = useCallback(async () => {
     setPromptLoading(true);
     setPromptError(null);
     // Start a fresh include snapshot window for this session: any
@@ -197,11 +202,27 @@ export function ChatView({
     } finally {
       setPromptLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
-    refreshPrompt();
-  }, []);
+    void refreshPrompt();
+  }, [refreshPrompt]);
+
+  // Rebuild the system prompt when its inputs change on disk. The prompt
+  // and its `{{include}}` snapshots are cached for the session and this
+  // component never remounts, so without this the agent would keep a
+  // stale prompt after onboarding answers rewrite `agent_data/USER.md` (or
+  // after a framework update rewrites the prompt store) until a restart.
+  // Mid-generation sends are unaffected: the transport reads the prompt
+  // per send, so the fresh one applies from the next turn on.
+  useEffect(() => {
+    const un = listen("prompt-inputs-changed", () => {
+      void refreshPrompt();
+    });
+    return () => {
+      void un.then((f) => f());
+    };
+  }, [refreshPrompt]);
 
   // Keep the latest settings + system prompt in refs so the transport's
   // getters can read them on every call. This lets us build the transport

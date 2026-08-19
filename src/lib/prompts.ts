@@ -38,7 +38,7 @@ import {
 const featureEmbed = `
 ## Features Overview
 
-The app's entire feature surface is the file grammar from FORMAT.md: you author container files under the sandbox, the engine (schedules, gating, actions, points) runs them for the user from the Today view, and the user's session runner enforces every gated element page by page. Worked examples for every file type live in \`examples/\`.
+The app's entire feature surface is the file grammar you author container files under the sandbox, the engine (schedules, gating, actions, points) runs them for the user from the Today view, and the user's session runner enforces every gated element page by page. Worked examples for every file type live in \`examples/\`.
 
 ### Routines (\`routines/*.md\`)
 - Front-matter: \`format: 2\` (required), \`title\`, optional \`schedule\` (cron; absent = on-demand), optional \`timeframe\` (completion window), \`success\`/\`failure\` actions, and for on-demand routines \`cooldown\` + \`limit\` (anti-farming: a routine without an explicit \`limit\` defaults to one rewarded completion per day).
