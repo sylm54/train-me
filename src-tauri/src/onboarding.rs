@@ -31,7 +31,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 
 use crate::AppState;
 
@@ -566,6 +566,7 @@ pub fn onboarding_step(
 
 #[tauri::command]
 pub fn save_onboarding_answers(
+    app: AppHandle,
     session: Answers,
     state: State<'_, AppState>,
 ) -> Result<OnboardingState, String> {
@@ -575,6 +576,10 @@ pub fn save_onboarding_answers(
     std::fs::write(state.data_dir.join(ANSWERS_FILE), json)
         .map_err(|e| format!("write answers: {e}"))?;
     write_user_md(&state.agent_dir, &state.data_dir)?;
+    // USER.md is the canonical `{{include}}` target: prompts that inline it
+    // must be rebuilt, else the agent keeps a stale system prompt until an
+    // app restart (ChatView is mounted for the whole session).
+    let _ = app.emit(crate::PROMPT_INPUTS_CHANGED, ());
     crate::schedule::log_activity(
         &state.agent_dir,
         "onboarding",

@@ -31,6 +31,13 @@ mod sounds;
 mod tag_parser;
 mod validators;
 
+/// Emitted whenever files that feed the system prompt change on disk
+/// (framework install rewriting the prompt store, onboarding answers
+/// rewriting `agent_data/USER.md`). The frontend rebuilds its cached
+/// system prompt — the `{{include}}` snapshot cache would otherwise serve
+/// stale content until an app restart.
+pub(crate) const PROMPT_INPUTS_CHANGED: &str = "prompt-inputs-changed";
+
 // ============================================================================
 // Application State
 // ============================================================================
