@@ -28,6 +28,8 @@ export interface QuestionItem {
   min?: number;
   max?: number;
   hint?: string | null;
+  /** `true`: the question may be skipped (stored as `null`). */
+  optional?: boolean;
 }
 
 /** One screen of the flow. `question: null` means the flow is complete. */
@@ -41,7 +43,8 @@ export interface OnboardingStep {
   total: number;
 }
 
-export type AnswerValue = string | number | string[];
+/** `null` marks an optional question the user skipped. */
+export type AnswerValue = string | number | string[] | null;
 export type AnswerMap = Record<string, AnswerValue>;
 
 export interface OnboardingState {

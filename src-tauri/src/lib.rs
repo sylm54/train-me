@@ -1788,6 +1788,7 @@ pub fn run() {
             schedule::v2_finish_run,
             schedule::v2_fail_run,
             schedule::v2_habit_log,
+            schedule::v2_habit_history,
             schedule::v2_purchase,
             schedule::v2_upcoming,
             prerender::v2_prerender,

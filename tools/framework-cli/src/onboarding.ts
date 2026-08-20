@@ -106,6 +106,9 @@ export function validateOnboarding(raw: Json, diags: Diag[]): void {
           diags.push({ severity: "error", message: `${label}: min must be below max` });
         }
       }
+      if (item.optional !== undefined && typeof item.optional !== "boolean") {
+        diags.push({ severity: "error", message: `${label}: \`optional\` must be a boolean` });
+      }
     }
     if (item.showIf !== undefined) {
       validateCondition(item.showIf, `${label} showIf`, diags);

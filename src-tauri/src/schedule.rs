@@ -77,6 +77,11 @@ CREATE TABLE IF NOT EXISTS task_instances (
     status TEXT NOT NULL DEFAULT 'assigned',
     fired_timeouts TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS containers (
+    container TEXT PRIMARY KEY,
+    hash TEXT NOT NULL,
+    first_seen TEXT NOT NULL
+);
 ";
 
 pub fn ensure_schema(path: &Path) -> Result<(), String> {
@@ -328,6 +333,39 @@ pub struct ReconcileReport {
     pub lines: Vec<String>,
 }
 
+/// When `rel`'s content was first seen. A routine the agent just wrote (or
+/// edited) must not be punished for windows that closed before the content
+/// existed, so reconcile only materializes fires from `first_seen` onward.
+/// Re-seeing unchanged content (app restarts) keeps the original timestamp,
+/// so genuinely missed windows still lapse. The content hash makes an edit
+/// count as "new" — a rewritten schedule gets a fresh start too.
+fn touch_container(
+    sched: &Connection,
+    rel: &str,
+    content: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
+    let hash = crate::manifest::hash_bytes(content.as_bytes());
+    let known: Option<String> = sched
+        .query_row("SELECT hash FROM containers WHERE container = ?1", [rel], |r| r.get(0))
+        .ok();
+    if known.as_deref() != Some(hash.as_str()) {
+        let _ = sched.execute(
+            "INSERT INTO containers (container, hash, first_seen) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(container) DO UPDATE SET hash = ?2, first_seen = ?3",
+            rusqlite::params![rel, hash, ts(now)],
+        );
+        return now;
+    }
+    sched
+        .query_row("SELECT first_seen FROM containers WHERE container = ?1", [rel], |r| {
+            r.get(0)
+        })
+        .ok()
+        .and_then(|s: String| economy::parse_ts(&s))
+        .unwrap_or(now)
+}
+
 pub fn reconcile_blocking(
     agent_dir: &Path,
     state_dir: &Path,
@@ -353,13 +391,14 @@ pub fn reconcile_blocking(
             continue;
         };
 
-        // Materialize fires in [now - lookback, now + horizon]. The
-        // success window is the routine's `timeframe` (or the default).
+        // Materialize fires in [max(lookback, first_seen), now + horizon].
+        // The success window is the routine's `timeframe` (or the default).
         let window_secs = routine
             .timeframe_secs
             .map_or(DEFAULT_WINDOW_SECS, |s| s as i64);
         {
-            let from = now - chrono::Duration::seconds(LOOKBACK_SECS);
+            let first_seen = touch_container(&sched, &rel, &content, now);
+            let from = std::cmp::max(now - chrono::Duration::seconds(LOOKBACK_SECS), first_seen);
             let to = now + chrono::Duration::seconds(HORIZON_SECS);
             if let Ok(fires) = cron_fires_between(&schedule_expr, from, to) {
                 for due in fires {
@@ -1143,6 +1182,62 @@ pub struct PurchaseResult {
     pub balance: i64,
 }
 
+// ============================================================================
+// Habit detail (drives the habit inspector in the Today view)
+// ============================================================================
+
+#[derive(Serialize)]
+pub struct HabitDay {
+    pub day: String,
+    pub count: i64,
+    pub status: String,
+}
+
+#[derive(Serialize)]
+pub struct HabitDetail {
+    pub habit: format::Habit,
+    /// Recorded days, newest first (capped at 60).
+    pub history: Vec<HabitDay>,
+}
+
+#[tauri::command]
+pub async fn v2_habit_history(
+    habit_ref: String,
+    state: State<'_, AppState>,
+) -> Result<HabitDetail, String> {
+    let agent_dir = state.agent_dir.clone();
+    let state_dir = state.state_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let sched = open(&state_dir.join("schedule.db"))?;
+        let full = crate::bash::resolve_under(&agent_dir, &habit_ref)?;
+        let content = std::fs::read_to_string(&full).map_err(|e| e.to_string())?;
+        let (habit, diags) = format::parse_habit(&content);
+        if let Some(e) = parse_errors(&diags) {
+            return Err(format!("habit invalid: {e}"));
+        }
+        let habit = habit.ok_or("habit parse failed")?;
+        let history: Vec<HabitDay> = sched
+            .prepare(
+                "SELECT day, count, status FROM habit_days \
+                 WHERE habit = ?1 ORDER BY day DESC LIMIT 60",
+            )
+            .and_then(|mut stmt| {
+                let rows = stmt.query_map([&habit_ref], |r| {
+                    Ok(HabitDay {
+                        day: r.get(0)?,
+                        count: r.get(1)?,
+                        status: r.get(2)?,
+                    })
+                })?;
+                Ok(rows.filter_map(Result::ok).collect())
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(HabitDetail { habit, history })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 pub async fn v2_purchase(
     entry: String,
@@ -1212,6 +1307,9 @@ pub struct RoutineCard {
     pub current: Option<DueInfo>,
     pub next: Option<DueInfo>,
     pub in_progress: Option<String>,
+    /// Audio scripts referenced by this routine (pages + actions) — drives
+    /// the per-item prerender affordance.
+    pub audio: Vec<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -1222,6 +1320,8 @@ pub struct HabitCard {
     pub limit: i64,
     pub today_count: i64,
     pub status: String,
+    /// Audio scripts referenced by this habit's actions.
+    pub audio: Vec<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -1231,6 +1331,8 @@ pub struct TaskCard {
     pub template: String,
     pub deadline: Option<String>,
     pub status: String,
+    /// Audio scripts referenced by the template (pages + actions).
+    pub audio: Vec<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -1240,6 +1342,23 @@ pub struct StoreCard {
     pub description: Option<String>,
     pub price: i64,
     pub stock: Option<i64>,
+    /// Audio scripts referenced by this entry's action.
+    pub audio: Vec<String>,
+}
+
+/// Script paths referenced by a container's pages and action lists,
+/// deduped — the summary cards expose them so the UI can offer prerender
+/// without starting anything.
+fn container_audio(pages: &[format::Page], action_lists: &[&[format::Action]]) -> Vec<String> {
+    let mut srcs = format::audio_feature_srcs(pages);
+    for actions in action_lists {
+        let mut arefs = format::ActionRefs::default();
+        format::collect_action_refs(actions, &mut arefs);
+        srcs.extend(arefs.scripts);
+    }
+    srcs.sort();
+    srcs.dedup();
+    srcs
 }
 
 #[derive(Serialize)]
@@ -1341,6 +1460,7 @@ pub async fn v2_summary(state: State<'_, AppState>) -> Result<V2Summary, String>
                 current,
                 next,
                 in_progress,
+                audio: container_audio(&routine.pages, &[&routine.success, &routine.failure]),
             });
         }
 
@@ -1369,20 +1489,39 @@ pub async fn v2_summary(state: State<'_, AppState>) -> Result<V2Summary, String>
                 limit: habit.count as i64,
                 today_count,
                 status,
+                audio: container_audio(&[], &[&habit.success, &habit.failure]),
             });
         }
 
-        // Tasks.
+        // Tasks. Open instances only; template audio refs are parsed once
+        // per template file so each card can offer prerender. Keyed by the
+        // resolved template path (templates may be bare names or full
+        // `tasks/…md` paths — see `template_to_path`).
+        let mut template_audio: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for (rel, content) in list_v2_files(&agent_dir, "tasks", ".md") {
+            if let Some(t) = format::parse_task(&content).0 {
+                template_audio.insert(
+                    rel,
+                    container_audio(&t.pages, &[&t.success, &t.failure]),
+                );
+            }
+        }
         let tasks = {
             let mut stmt = sched.prepare(
                 "SELECT iid, title, template, deadline, status FROM task_instances \
                  WHERE status IN ('assigned', 'in_progress') ORDER BY assigned",
             ).map_err(|e| e.to_string())?;
             let rows = stmt.query_map([], |r| {
+                let template: String = r.get(2)?;
                 Ok(TaskCard {
                     iid: r.get(0)?,
                     title: r.get(1)?,
-                    template: r.get(2)?,
+                    audio: template_audio
+                        .get(&format::template_to_path(&template))
+                        .cloned()
+                        .unwrap_or_default(),
+                    template,
                     deadline: r.get(3)?,
                     status: r.get(4)?,
                 })
@@ -1407,6 +1546,7 @@ pub async fn v2_summary(state: State<'_, AppState>) -> Result<V2Summary, String>
                 description: entry.description,
                 price: entry.price,
                 stock,
+                audio: container_audio(&[], &[&entry.actions]),
             });
         }
 
@@ -1643,6 +1783,21 @@ mod tests {
                        success: { \"type\": \"points\", \"delta\": 15 }\n\
                        failure: { \"type\": \"points\", \"delta\": -5 }\n---\nintro\n";
         let (tmp, agent, state) = env(&[("routines/drill.md", routine)]);
+        // Pretend the routine has existed for two days (same content hash),
+        // so the lookback materializes the missed fires of the past day.
+        {
+            let sched = open(&state.join("schedule.db")).unwrap();
+            sched
+                .execute(
+                    "INSERT INTO containers (container, hash, first_seen) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![
+                        "routines/drill.md",
+                        crate::manifest::hash_bytes(routine.as_bytes()),
+                        ts(utc_now() - chrono::Duration::days(2))
+                    ],
+                )
+                .unwrap();
+        }
         let report = reconcile_blocking(&agent, &state, None);
         assert!(report.materialized > 0, "materialized: {:?}", report);
         assert!(report.lapsed > 0, "lapsed: {:?}", report);
@@ -1669,6 +1824,39 @@ mod tests {
         let report2 = reconcile_blocking(&agent, &state, None);
         let econ = open(&state.join("economy.db")).unwrap();
         assert_eq!(economy::balance(&econ).unwrap(), bal_after_first, "second reconcile changed balance: {report2:?}");
+        let _ = tmp;
+    }
+
+    #[test]
+    fn new_routine_is_not_failed_retroactively() {
+        // A routine the agent just wrote must not be punished for windows
+        // that closed before the file existed — its first occurrence is
+        // the next scheduled fire, not the missed past ones.
+        let routine = "---\nformat: 2\ntitle: Drill\nschedule: * * * * *\ntimeframe: 1m\n\
+                       failure: { \"type\": \"points\", \"delta\": -5 }\n---\nintro\n";
+        let (tmp, agent, state) = env(&[("routines/drill.md", routine)]);
+        let report = reconcile_blocking(&agent, &state, None);
+        assert!(report.materialized > 0, "future fires materialized: {report:?}");
+        assert_eq!(report.lapsed, 0, "no retro-failures for a new routine: {report:?}");
+        let econ = open(&state.join("economy.db")).unwrap();
+        assert_eq!(economy::balance(&econ).unwrap(), 0, "no failure points fired");
+        let _ = tmp;
+    }
+
+    #[test]
+    fn edited_routine_reschedules_without_retro_failures() {
+        // Re-writing a routine (here: tightening the schedule) counts as
+        // new content — the past of the NEW schedule is not punished either.
+        let v1 = "---\nformat: 2\ntitle: Drill\nschedule: 0 6 * * *\n---\nintro\n";
+        let (tmp, agent, state) = env(&[("routines/drill.md", v1)]);
+        reconcile_blocking(&agent, &state, None);
+        let v2 = "---\nformat: 2\ntitle: Drill\nschedule: * * * * *\ntimeframe: 1m\n\
+                  failure: { \"type\": \"points\", \"delta\": -5 }\n---\nintro\n";
+        std::fs::write(agent.join("routines/drill.md"), v2).unwrap();
+        let report = reconcile_blocking(&agent, &state, None);
+        assert_eq!(report.lapsed, 0, "edit must not retro-fail: {report:?}");
+        let econ = open(&state.join("economy.db")).unwrap();
+        assert_eq!(economy::balance(&econ).unwrap(), 0);
         let _ = tmp;
     }
 

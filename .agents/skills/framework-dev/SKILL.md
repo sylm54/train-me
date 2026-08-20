@@ -61,7 +61,7 @@ Full spec: FORMAT.md in the train-me repo. Worked examples: `examples/` seeded i
 
 **TTS XML scripts** — the full tag reference (all tags, attributes, sound/tone/effect values, the `@` expression language, and a worked example) lives in [tts-tags.md](tts-tags.md) next to this file. Read it when authoring or editing `.xml` audio scripts.
 
-**onboarding.json** — ordered items: `{kind: "text", text, showIf?}` and `{kind: "question", id, answer: open|choice|rating, prompt, choices?, multiple?, min?/max?, hint?, showIf?}`. `showIf` conditions reference answers of questions *above*: `{id, equals/notEquals/includes/min/max/answered}` plus `all`/`any`/`not`.
+**onboarding.json** — ordered items: `{kind: "text", text, showIf?}` and `{kind: "question", id, answer: open|choice|rating, prompt, choices?, multiple?, min?/max?, hint?, optional?, showIf?}`. `showIf` conditions reference answers of questions *above*: `{id, equals/notEquals/includes/min/max/answered}` plus `all`/`any`/`not`. The questionnaire runs once, as the final wizard step after install (never re-asked later); `optional: true` questions may be skipped (skips render nothing in `USER.md`).
 
 Always run the linter after editing — it catches dangling refs, invalid durations/cron/actions, missing `format: 2`, broken `<include>` trees, and showIf forward references.
 

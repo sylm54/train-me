@@ -106,6 +106,8 @@ export interface RoutineCard {
   current: DueInfo | null;
   next: DueInfo | null;
   in_progress: string | null;
+  /** Audio scripts referenced by the routine (pages + actions). */
+  audio: string[];
 }
 
 export interface HabitCard {
@@ -115,6 +117,8 @@ export interface HabitCard {
   limit: number;
   today_count: number;
   status: string;
+  /** Audio scripts referenced by the habit's actions. */
+  audio: string[];
 }
 
 export interface TaskCard {
@@ -123,6 +127,8 @@ export interface TaskCard {
   template: string;
   deadline: string | null;
   status: string;
+  /** Audio scripts referenced by the task's template. */
+  audio: string[];
 }
 
 export interface StoreCard {
@@ -131,6 +137,8 @@ export interface StoreCard {
   description: string | null;
   price: number;
   stock: number | null;
+  /** Audio scripts referenced by the entry's action. */
+  audio: string[];
 }
 
 export interface V2Summary {
@@ -151,6 +159,39 @@ export interface ReconcileReport {
   tasks_failed: number;
   actions_fired: number;
   lines: string[];
+}
+
+// ── Habit detail (v2_habit_history) ────────────────────────────────────────
+
+export interface Habit {
+  title: string;
+  htype: "max" | "min";
+  count: number;
+  success: Action[];
+  failure: Action[];
+}
+
+export interface HabitDay {
+  day: string;
+  count: number;
+  status: string;
+}
+
+export interface HabitDetail {
+  habit: Habit;
+  /** Recorded days, newest first. */
+  history: HabitDay[];
+}
+
+// ── Prerender (v2_prerender) ───────────────────────────────────────────────
+
+export interface PrerenderReport {
+  referenced: number;
+  rendered: string[];
+  fresh: number;
+  gc_removed: string[];
+  model_missing: boolean;
+  errors: string[];
 }
 
 // ── Invoke wrappers ────────────────────────────────────────────────────────
@@ -189,6 +230,54 @@ export function reconcile(): Promise<ReconcileReport> {
 
 export function dismissPending(id: number): Promise<void> {
   return invoke("economy_dismiss_pending", { id });
+}
+
+/** Habit detail: parsed habit + per-day history (drives the inspector). */
+export function fetchHabitDetail(habitRef: string): Promise<HabitDetail> {
+  return invoke("v2_habit_history", { habitRef });
+}
+
+/**
+ * Run a prerender pass. Without `paths`, every referenced script is
+ * (re)rendered; with `paths`, only the scripts referenced by those
+ * container files (per-item prerender, without starting anything).
+ */
+export function prerender(paths?: string[]): Promise<PrerenderReport> {
+  return invoke("v2_prerender", { paths: paths ?? null });
+}
+
+// ── Display helpers ────────────────────────────────────────────────────────
+
+/** Mirror of the backend's `template_to_path` (bare name → tasks/<n>.md). */
+export function templateToPath(template: string): string {
+  return template.endsWith(".md") ? template : `tasks/${template}.md`;
+}
+
+export function humanDuration(secs: number): string {
+  if (secs % 86400 === 0) return `${secs / 86400}d`;
+  if (secs >= 3600) return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
+  if (secs >= 60) return `${Math.floor(secs / 60)}m`;
+  return `${secs}s`;
+}
+
+/** One-line human-readable summary of an action (detail views). */
+export function describeAction(a: Action): string {
+  switch (a.type) {
+    case "points":
+      return `${a.delta >= 0 ? "+" : ""}${a.delta} points`;
+    case "task":
+      return `assigns task “${a.template}”`;
+    case "script":
+      return `plays ${a.src}`;
+    case "notification":
+      return `notifies: ${a.text}`;
+    case "exemption":
+      return `exemption (${a.scope}) for ${humanDuration(a.duration_secs)}`;
+    case "roulette":
+      return `roulette: ${a.outcomes
+        .map((o) => `${describeAction(o.action)} (${o.weight || "off"})`)
+        .join(" / ")}`;
+  }
 }
 
 // ── Session launcher contract (App-level state → SessionView) ─────────────

@@ -71,23 +71,30 @@ fn next_fire_secs(expr: &str, now: chrono::DateTime<chrono::Utc>) -> i64 {
 
 /// Scan every v2 container for referenced scripts. Reads files under
 /// `agent_dir`; `econ` (open economy DB) contributes the pending-script
-/// queue at top priority.
+/// queue at top priority. `only` restricts the container scan to those
+/// file paths (a user-initiated per-item prerender — the pending queue is
+/// skipped); `None` scans everything.
 pub fn collect_script_refs(
     agent_dir: &Path,
     econ: Option<&Connection>,
     now: chrono::DateTime<chrono::Utc>,
+    only: Option<&[String]>,
 ) -> Vec<ScriptRef> {
     let mut refs: Vec<ScriptRef> = Vec::new();
     let mut push = |src: String, priority: i64| {
         refs.push(ScriptRef { src, priority })
     };
+    let wanted = |rel: &str| only.map_or(true, |set| set.contains(&rel.to_string()));
 
-    // Queued scripts the user is waiting for — top priority.
-    if let Some(conn) = econ {
-        if let Ok(pending) = economy::list_pending(conn) {
-            for p in pending {
-                if p.kind == "script" {
-                    push(p.payload, 0);
+    // Queued scripts the user is waiting for — top priority (full passes
+    // only; a per-item prerender targets exactly what the user picked).
+    if only.is_none() {
+        if let Some(conn) = econ {
+            if let Ok(pending) = economy::list_pending(conn) {
+                for p in pending {
+                    if p.kind == "script" {
+                        push(p.payload, 0);
+                    }
                 }
             }
         }
@@ -97,7 +104,10 @@ pub fn collect_script_refs(
 
     // Routines: audio features/links + script actions, prioritized by the
     // routine's next fire (on-demand routines sort mid-pack).
-    for (_, content) in list("routines", ".md") {
+    for (rel, content) in list("routines", ".md") {
+        if !wanted(&rel) {
+            continue;
+        }
         if let Some(r) = format::parse_routine(&content).0 {
             let priority = match &r.schedule {
                 Some(expr) => next_fire_secs(expr, now),
@@ -116,7 +126,10 @@ pub fn collect_script_refs(
     }
 
     // Task templates: same model, no cron — mid-pack.
-    for (_, content) in list("tasks", ".md") {
+    for (rel, content) in list("tasks", ".md") {
+        if !wanted(&rel) {
+            continue;
+        }
         if let Some(t) = format::parse_task(&content).0 {
             let priority = now.timestamp() + 3600;
             for src in format::audio_feature_srcs(&t.pages) {
@@ -134,7 +147,10 @@ pub fn collect_script_refs(
     // Habits + store: script actions only, lowest priority.
     let low = now.timestamp() + 86_400;
     for (dir, ext) in [("habits", ".md"), ("store", ".json")] {
-        for (_, content) in list(dir, ext) {
+        for (rel, content) in list(dir, ext) {
+            if !wanted(&rel) {
+                continue;
+            }
             let actions = if dir == "habits" {
                 format::parse_habit(&content).0.map(|h| (h.success, h.failure))
             } else {
@@ -233,21 +249,28 @@ pub fn prerender_blocking(
     tracks_dir: &Path,
     model_dir: &Path,
     renderer_arc: &parking_lot::Mutex<Option<crate::audio_renderer::AudioRenderer>>,
+    only: Option<&[String]>,
 ) -> PrerenderReport {
     let mut report = PrerenderReport::default();
     let now = chrono::Utc::now();
 
     let econ = economy::open_ro(&state_dir.join("economy.db"));
-    let refs = collect_script_refs(agent_dir, econ.as_ref(), now);
+    let refs = collect_script_refs(agent_dir, econ.as_ref(), now, only);
     report.referenced = refs.len();
 
     // GC targets computed up front, executed after rendering (so a script
-    // we just re-rendered keeps its dir).
-    let gc = gc_targets(
-        tracks_dir,
-        &refs,
-        std::time::Duration::from_secs(600),
-    );
+    // we just re-rendered keeps its dir). Full passes only — a filtered
+    // pass sees just the picked item's refs and would collect every other
+    // track.
+    let gc = if only.is_none() {
+        gc_targets(
+            tracks_dir,
+            &refs,
+            std::time::Duration::from_secs(600),
+        )
+    } else {
+        Vec::new()
+    };
 
     let stale: Vec<&ScriptRef> = refs.iter().filter(|r| !is_fresh(tracks_dir, agent_dir, &r.src)).collect();
     report.fresh = refs.len() - stale.len();
@@ -289,8 +312,13 @@ pub fn prerender_blocking(
 // Command
 // ============================================================================
 
+/// Run a prerender pass. Without `paths`, every referenced script is
+/// (re)rendered and unreferenced tracks are GC'd; with `paths`, only the
+/// scripts referenced by those container files (a per-item prerender from
+/// the Today view, without starting anything).
 #[tauri::command]
 pub async fn v2_prerender(
+    paths: Option<Vec<String>>,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<PrerenderReport, String> {
@@ -300,7 +328,14 @@ pub async fn v2_prerender(
     let model_dir = state.model_dir.clone();
     let renderer_arc = state.renderer.clone();
     let report = tauri::async_runtime::spawn_blocking(move || {
-        prerender_blocking(&agent_dir, &state_dir, &tracks_dir, &model_dir, &renderer_arc)
+        prerender_blocking(
+            &agent_dir,
+            &state_dir,
+            &tracks_dir,
+            &model_dir,
+            &renderer_arc,
+            paths.as_deref(),
+        )
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -342,7 +377,7 @@ mod tests {
             ("hypnos/c.xml", "<voice>c</voice>"),
             // hypnos/missing.xml referenced nowhere on disk — filter target.
         ]);
-        let refs = collect_script_refs(&agent, None, chrono::Utc::now());
+        let refs = collect_script_refs(&agent, None, chrono::Utc::now(), None);
         let srcs: Vec<&str> = refs.iter().map(|r| r.src.as_str()).collect();
         assert!(srcs.contains(&"hypnos/a.xml"));
         assert!(srcs.contains(&"hypnos/b.xml"));
@@ -351,6 +386,28 @@ mod tests {
         let habit_ref = refs.iter().find(|r| r.src == "hypnos/c.xml").unwrap();
         let routine_ref = refs.iter().find(|r| r.src == "hypnos/a.xml").unwrap();
         assert!(habit_ref.priority > routine_ref.priority);
+        let _ = tmp;
+    }
+
+    #[test]
+    fn collect_refs_honors_the_only_filter() {
+        let routine = "---\nformat: 2\ntitle: R\nschedule: 0 8 * * *\n---\n```feature\ntype: audio\nsrc: hypnos/a.xml\n---\nx\n```\n";
+        let habit = "---\ntitle: H\ntype: min\ncount: 1\nfailure: { \"type\": \"script\", \"src\": \"hypnos/c.xml\" }\n---\n";
+        let (tmp, agent, _tracks) = env(&[
+            ("routines/r.md", routine),
+            ("habits/h.md", habit),
+            ("hypnos/a.xml", "<voice>a</voice>"),
+            ("hypnos/c.xml", "<voice>c</voice>"),
+        ]);
+        // Per-item pass: only the habit's scripts, nothing else.
+        let refs = collect_script_refs(
+            &agent,
+            None,
+            chrono::Utc::now(),
+            Some(&["habits/h.md".to_string()]),
+        );
+        let srcs: Vec<&str> = refs.iter().map(|r| r.src.as_str()).collect();
+        assert_eq!(srcs, vec!["hypnos/c.xml"]);
         let _ = tmp;
     }
 
@@ -371,7 +428,7 @@ x
             ("routines/r.md", routine),
             ("hypnos/a.xml", "<voice>a</voice>"),
         ]);
-        let refs = collect_script_refs(&agent, None, chrono::Utc::now());
+        let refs = collect_script_refs(&agent, None, chrono::Utc::now(), None);
         // Owned by the referenced script; imports dir; fresh dir → all kept.
         std::fs::create_dir_all(tracks.join(crate::manifest::manifest_id("hypnos/a.xml"))).unwrap();
         std::fs::create_dir_all(tracks.join("imports")).unwrap();
