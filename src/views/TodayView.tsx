@@ -4,25 +4,39 @@
  * pending script actions, and the points/economy overview.
  *
  * Reconciles on mount (and on every `v2-reconciled` engine event) so the
- * ledger state shown here is always post-reconciliation.
+ * ledger state shown here is always post-reconciliation. Habits open an
+ * inspector (actions + per-day history); anything referencing audio can
+ * be pre-rendered right here without starting it.
  */
 
 import { useCallback, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { CalendarClock, Coins, Play, Shield, ShoppingCart } from "lucide-react";
+import {
+  CalendarClock,
+  ChevronRight,
+  Coins,
+  Loader2,
+  Play,
+  Shield,
+  ShoppingCart,
+  Volume2,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { AudioPlayerOverlay } from "@/components/AudioPlayerOverlay";
 import {
+  describeAction,
   dismissPending,
+  fetchHabitDetail,
   fetchSummary,
   habitLog,
+  prerender,
   purchase,
   reconcile,
   startRun,
+  templateToPath,
+  type HabitDetail,
   type V2Summary,
 } from "@/lib/v2";
-import { fetchOnboardingState, type OnboardingState } from "@/lib/onboarding";
-import { OnboardingFlow } from "@/components/OnboardingFlow";
 
 interface Props {
   onRequestSession: (request: {
@@ -42,17 +56,17 @@ export function TodayView({ onRequestSession }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [flash, setFlash] = useState<string[]>([]);
   const [playing, setPlaying] = useState<string | null>(null);
-  // Framework onboarding questions that gained new ids after an update.
-  const [onboarding, setOnboarding] = useState<OnboardingState | null>(null);
-  const [showQuestions, setShowQuestions] = useState(false);
+  // Habit inspector (path null = closed).
+  const [habitDetail, setHabitDetail] = useState<HabitDetail | null>(null);
+  const [habitPath, setHabitPath] = useState<string | null>(null);
+  const [habitBusy, setHabitBusy] = useState(false);
+  // Prerender target in flight ("all" or a container path).
+  const [prerendering, setPrerendering] = useState<string | null>(null);
 
   const refresh = useCallback(() => {
     fetchSummary()
       .then(setSummary)
       .catch((e) => setError(String(e)));
-    fetchOnboardingState()
-      .then(setOnboarding)
-      .catch(() => setOnboarding(null));
   }, []);
 
   useEffect(() => {
@@ -90,6 +104,79 @@ export function TodayView({ onRequestSession }: Props) {
     }
   };
 
+  // ── Habit inspector ──────────────────────────────────────────────────
+
+  const openHabit = async (path: string) => {
+    setHabitBusy(true);
+    setHabitDetail(null);
+    setHabitPath(path);
+    try {
+      setHabitDetail(await fetchHabitDetail(path));
+    } catch (e) {
+      showLines([String(e)]);
+      setHabitPath(null);
+    } finally {
+      setHabitBusy(false);
+    }
+  };
+
+  const closeHabit = () => {
+    setHabitDetail(null);
+    setHabitPath(null);
+  };
+
+  // ── Prerender (per-item + everything currently needed) ───────────────
+
+  const runPrerender = async (key: string, paths?: string[]) => {
+    if (prerendering) return;
+    setPrerendering(key);
+    try {
+      const r = await prerender(paths);
+      if (r.model_missing) {
+        showLines([
+          "TTS model not downloaded yet — download it (TTS Studio) and pre-render will run in the background.",
+        ]);
+      } else if (r.rendered.length === 0 && r.errors.length === 0) {
+        showLines([
+          r.referenced === 0
+            ? "No audio scripts are referenced by anything right now."
+            : `Audio already rendered — ${r.fresh} script${r.fresh === 1 ? "" : "s"} up to date.`,
+        ]);
+      } else {
+        showLines([
+          `Rendered ${r.rendered.length} script${r.rendered.length === 1 ? "" : "s"}${
+            r.fresh > 0 ? ` (${r.fresh} already up to date)` : ""
+          }.`,
+          ...r.errors.slice(0, 3).map((e) => `error: ${e}`),
+        ]);
+      }
+    } catch (e) {
+      showLines([String(e)]);
+    } finally {
+      setPrerendering(null);
+    }
+  };
+
+  const prerenderButton = (key: string, paths?: string[], label?: string) => {
+    const busy = prerendering === key;
+    const anyBusy = prerendering !== null;
+    return (
+      <Button
+        size="sm"
+        variant="outline"
+        disabled={anyBusy}
+        title={label ?? "Pre-render referenced audio"}
+        onClick={(e) => {
+          e.stopPropagation();
+          void runPrerender(key, paths);
+        }}
+      >
+        {busy ? <Loader2 className="size-3.5 animate-spin" /> : <Volume2 className="size-3.5" />}
+        {label}
+      </Button>
+    );
+  };
+
   if (error) {
     return (
       <div className="flex-1 grid place-items-center p-6 text-sm text-[var(--color-danger)]">
@@ -108,6 +195,12 @@ export function TodayView({ onRequestSession }: Props) {
       summary.store.length +
       summary.pending.length >
     0;
+
+  const anyAudio =
+    summary.routines.some((r) => r.audio.length > 0) ||
+    summary.habits.some((h) => h.audio.length > 0) ||
+    summary.tasks.some((t) => t.audio.length > 0) ||
+    summary.store.some((s) => s.audio.length > 0);
 
   return (
     <div className="flex-1 overflow-y-auto">
@@ -128,6 +221,9 @@ export function TodayView({ onRequestSession }: Props) {
               {ex.scope} until {formatDue(ex.until)}
             </div>
           ))}
+          <div className="ml-auto">
+            {anyAudio && prerenderButton("all", undefined, "Pre-render audio")}
+          </div>
         </div>
 
         {flash.length > 0 && (
@@ -136,17 +232,6 @@ export function TodayView({ onRequestSession }: Props) {
               <div key={i}>{line}</div>
             ))}
           </div>
-        )}
-
-        {onboarding && onboarding.pending_count > 0 && !showQuestions && (
-          <button
-            onClick={() => setShowQuestions(true)}
-            className="w-full rounded-lg border border-[var(--color-pink-400)] bg-[var(--color-pink-50)] p-3 text-left text-sm"
-          >
-            The framework has {onboarding.pending_count} new question
-            {onboarding.pending_count === 1 ? "" : "s"} for you — answer them so
-            the agent can customize your training.
-          </button>
         )}
 
         {!hasContent && (
@@ -206,6 +291,7 @@ export function TodayView({ onRequestSession }: Props) {
                     {r.locked && ` · ${r.locked}`}
                   </div>
                 </div>
+                {r.audio.length > 0 && prerenderButton(r.path, [r.path])}
                 {r.in_progress ? (
                   <Button
                     size="sm"
@@ -233,7 +319,8 @@ export function TodayView({ onRequestSession }: Props) {
             {summary.habits.map((h) => (
               <div
                 key={h.path}
-                className="flex items-center gap-3 rounded-lg border border-[var(--color-border)] p-3"
+                onClick={() => void openHabit(h.path)}
+                className="flex items-center gap-3 rounded-lg border border-[var(--color-border)] p-3 cursor-pointer hover:bg-[var(--color-surface-muted)]"
               >
                 <div className="flex-1 min-w-0">
                   <div className="text-sm font-medium truncate">{h.title}</div>
@@ -243,13 +330,16 @@ export function TodayView({ onRequestSession }: Props) {
                     {h.status === "success" && " · reached"}
                   </div>
                 </div>
+                {h.audio.length > 0 && prerenderButton(h.path, [h.path])}
+                <ChevronRight className="size-4 text-muted-foreground shrink-0" />
                 <Button
                   size="sm"
                   variant="outline"
                   disabled={h.status !== "open"}
-                  onClick={() =>
-                    void habitLog(h.path).then((res) => showLines(res.lines))
-                  }
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void habitLog(h.path).then((res) => showLines(res.lines));
+                  }}
                 >
                   Log
                 </Button>
@@ -273,6 +363,7 @@ export function TodayView({ onRequestSession }: Props) {
                     {t.status === "in_progress" && " · in progress"}
                   </div>
                 </div>
+                {t.audio.length > 0 && prerenderButton(t.iid, [templateToPath(t.template)])}
                 <Button size="sm" onClick={() => void startTask(t.iid)}>
                   Start
                 </Button>
@@ -297,6 +388,7 @@ export function TodayView({ onRequestSession }: Props) {
                     {s.stock !== null ? ` · stock ${s.stock}` : ""}
                   </div>
                 </div>
+                {s.audio.length > 0 && prerenderButton(s.path, [s.path])}
                 <Button
                   size="sm"
                   variant="outline"
@@ -333,21 +425,117 @@ export function TodayView({ onRequestSession }: Props) {
         )}
       </div>
 
-      {showQuestions && (
+      {/* Habit inspector */}
+      {(habitDetail || habitBusy) && (
         <div className="fixed inset-0 z-50 bg-[var(--color-background)] overflow-y-auto">
-          <div className="max-w-2xl mx-auto px-4 py-6 space-y-5">
-            <div className="flex items-center justify-between">
-              <h2 className="text-lg font-bold">New framework questions</h2>
-              <Button variant="ghost" size="sm" onClick={() => setShowQuestions(false)}>
-                Later
+          <div className="max-w-2xl mx-auto px-4 py-6 space-y-6">
+            <div className="flex items-center justify-between gap-3">
+              <h2 className="text-lg font-bold truncate">
+                {habitDetail?.habit.title ?? "Habit"}
+              </h2>
+              <Button variant="ghost" size="sm" onClick={closeHabit}>
+                Close
               </Button>
             </div>
-            <OnboardingFlow
-              onFinish={() => {
-                setShowQuestions(false);
-                refresh();
-              }}
-            />
+
+            {habitBusy && !habitDetail && (
+              <div className="grid place-items-center py-10">
+                <Loader2 className="size-6 animate-spin" />
+              </div>
+            )}
+
+            {habitDetail && (
+              <>
+                <div className="rounded-lg border border-[var(--color-border)] p-4 space-y-3 text-sm">
+                  <div className="flex flex-wrap gap-2 text-xs">
+                    <span className="rounded-full border border-[var(--color-border)] px-3 py-1">
+                      {habitDetail.habit.htype === "max" ? "stay under" : "reach"}{" "}
+                      {habitDetail.habit.count}
+                    </span>
+                    {(() => {
+                      const card = summary.habits.find((h) => h.path === habitPath);
+                      return card ? (
+                        <span className="rounded-full border border-[var(--color-border)] px-3 py-1">
+                          today {card.today_count} ·{" "}
+                          {card.status === "open"
+                            ? "in progress"
+                            : card.status === "success"
+                              ? "reached"
+                              : "broke"}
+                        </span>
+                      ) : null;
+                    })()}
+                  </div>
+
+                  <div className="space-y-1">
+                    <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      On success
+                    </div>
+                    {habitDetail.habit.success.length === 0 ? (
+                      <div className="text-xs text-muted-foreground">nothing</div>
+                    ) : (
+                      habitDetail.habit.success.map((a, i) => (
+                        <div key={i} className="text-sm">{describeAction(a)}</div>
+                      ))
+                    )}
+                  </div>
+
+                  <div className="space-y-1">
+                    <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      On failure
+                    </div>
+                    {habitDetail.habit.failure.length === 0 ? (
+                      <div className="text-xs text-muted-foreground">nothing</div>
+                    ) : (
+                      habitDetail.habit.failure.map((a, i) => (
+                        <div key={i} className="text-sm">{describeAction(a)}</div>
+                      ))
+                    )}
+                  </div>
+
+                  {(() => {
+                    const card = summary.habits.find((h) => h.path === habitPath);
+                    return card && card.audio.length > 0 ? (
+                      <div>{prerenderButton(card.path, [card.path], "Pre-render audio")}</div>
+                    ) : null;
+                  })()}
+                </div>
+
+                <Section title="History">
+                  {habitDetail.history.length === 0 ? (
+                    <div className="text-xs text-muted-foreground">
+                      No recorded days yet.
+                    </div>
+                  ) : (
+                    <div className="rounded-lg border border-[var(--color-border)] divide-y divide-[var(--color-border)] text-sm">
+                      {habitDetail.history.map((d) => (
+                        <div key={d.day} className="flex items-center gap-3 px-3 py-2">
+                          <span className="flex-1 tabular-nums">{d.day}</span>
+                          <span className="text-muted-foreground tabular-nums">
+                            {d.count}×
+                          </span>
+                          <span
+                            className={`text-xs w-16 text-right ${
+                              d.status === "failed"
+                                ? "text-[var(--color-danger)]"
+                                : d.status === "success"
+                                  ? "text-[var(--color-pink-500)]"
+                                  : "text-muted-foreground"
+                            }`}
+                          >
+                            {d.status === "failed"
+                              ? "broke"
+                              : d.status === "success"
+                                ? "reached"
+                                : "open"}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </Section>
+              </>
+            )}
           </div>
         </div>
       )}

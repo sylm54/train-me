@@ -15,8 +15,9 @@
 //! ]
 //! ```
 //!
-//! — the user answers them right after install (wizard) or as they
-//! become pending after an update (Today banner). Answers are stored at
+//! — the user answers them right after install, as the final step of the
+//! setup wizard. The questionnaire is purely an init mechanism: once
+//! onboarding is done it is never asked again. Answers are stored at
 //! `<data_dir>/onboarding_answers.json` and rendered into the agent
 //! sandbox as `agent_data/USER.md`. Nothing is added to the system
 //! prompt: the framework decides how the agent consumes the profile
@@ -110,6 +111,12 @@ pub struct QuestionItem {
     pub max: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    /// `true`: the question may be left unanswered (the UI offers a Skip).
+    /// A skip is stored as an explicit `null` answer — it counts as
+    /// resolved for flow progress, is not rendered into `USER.md`, and
+    /// evaluates as unanswered in `showIf` conditions.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub optional: bool,
     #[serde(default, rename = "showIf", skip_serializing_if = "Option::is_none")]
     pub show_if: Option<Condition>,
 }
@@ -363,6 +370,15 @@ fn is_answered(answer: Option<&serde_json::Value>) -> bool {
         .unwrap_or(false)
 }
 
+/// A question the flow can move past: answered, or explicitly skipped
+/// (`null` — only possible for `optional` questions).
+fn is_resolved(answer: Option<&serde_json::Value>) -> bool {
+    match answer {
+        Some(serde_json::Value::Null) => true,
+        other => is_answered(other),
+    }
+}
+
 // ============================================================================
 // Storage
 // ============================================================================
@@ -425,7 +441,7 @@ fn state_for(data_dir: &Path) -> OnboardingState {
     let pending_count = visible_items(&flow, &answered)
         .iter()
         .filter(|item| match item {
-            OnboardingItem::Question(q) => !is_answered(answered.get(&q.id)),
+            OnboardingItem::Question(q) => !is_resolved(answered.get(&q.id)),
             _ => false,
         })
         .count();
@@ -454,8 +470,10 @@ fn write_user_md(agent_dir: &Path, data_dir: &Path) -> Result<(), String> {
         let OnboardingItem::Question(q) = item else {
             continue;
         };
-        let Some(answer) = answered.get(&q.id) else {
-            continue;
+        // Skipped (`null`) answers render nothing — there is no data.
+        let answer = match answered.get(&q.id) {
+            Some(serde_json::Value::Null) | None => continue,
+            Some(answer) => answer,
         };
         let rendered = match answer {
             serde_json::Value::Array(items) => items
@@ -485,18 +503,18 @@ fn write_user_md(agent_dir: &Path, data_dir: &Path) -> Result<(), String> {
 pub struct OnboardingStep {
     /// Consecutive visible text blocks leading up to the question.
     pub texts: Vec<String>,
-    /// The next visible, unanswered question (`None` = flow complete).
+    /// The next visible, unresolved question (`None` = flow complete).
     pub question: Option<QuestionItem>,
-    /// Unanswered visible questions, including the current one.
+    /// Unresolved visible questions, including the current one.
     pub remaining: usize,
     /// Total visible questions.
     pub total: usize,
 }
 
 /// Compute the next screen: walk visible items, accumulating text blocks;
-/// the first unanswered question ends the screen. Text blocks after the
-/// last answered question with no question left arrive on a final,
-/// question-less screen.
+/// the first unresolved question ends the screen (answered or skipped —
+/// `null` — both count as resolved). Text blocks after the last resolved
+/// question with no question left arrive on a final, question-less screen.
 fn step_for(flow: &[OnboardingItem], answers: &Answers) -> OnboardingStep {
     let visible = visible_items(flow, answers);
     let questions: Vec<&QuestionItem> = visible
@@ -511,7 +529,7 @@ fn step_for(flow: &[OnboardingItem], answers: &Answers) -> OnboardingStep {
         .collect();
     let remaining_total = questions
         .iter()
-        .filter(|q| !is_answered(answers.get(&q.id)))
+        .filter(|q| !is_resolved(answers.get(&q.id)))
         .count();
 
     let mut texts: Vec<String> = Vec::new();
@@ -519,7 +537,7 @@ fn step_for(flow: &[OnboardingItem], answers: &Answers) -> OnboardingStep {
         match item {
             OnboardingItem::Text(t) => texts.push(t.text.clone()),
             OnboardingItem::Question(q) => {
-                if !is_answered(answers.get(&q.id)) {
+                if !is_resolved(answers.get(&q.id)) {
                     return OnboardingStep {
                         texts,
                         question: Some((*q).clone()),
@@ -699,6 +717,46 @@ mod tests {
         let step = step_for(&f, &a);
         assert!(step.question.is_none());
         assert_eq!(step.remaining, 0);
+    }
+
+    #[test]
+    fn optional_questions_can_be_skipped() {
+        let flow = parse_flow(
+            r###"[
+            { "kind": "question", "id": "name", "answer": "open",
+              "prompt": "Name?", "optional": true },
+            { "kind": "question", "id": "why", "answer": "open",
+              "prompt": "Why?", "showIf": { "id": "name", "answered": true } }
+        ]"###,
+        )
+        .unwrap();
+
+        // Unanswered: the optional question is the next screen.
+        let step = step_for(&flow, &Answers::new());
+        assert_eq!(step.question.as_ref().unwrap().id, "name");
+        assert_eq!(step.remaining, 1);
+
+        // Skipped (`null`): counts as resolved for progress…
+        let mut a = Answers::new();
+        a.insert("name".into(), serde_json::Value::Null);
+        let step = step_for(&flow, &a);
+        assert!(step.question.is_none(), "skipped optional completes the flow");
+        assert_eq!(step.remaining, 0);
+        // …but evaluates as unanswered for `showIf` (the `why` question
+        // stayed hidden above).
+
+        // USER.md renders nothing for a skipped question.
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        let agent = data.join("agent_data");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(data.join(QUESTIONS_FILE), serde_json::to_string(&flow).unwrap()).unwrap();
+        std::fs::write(data.join(ANSWERS_FILE), serde_json::to_string(&a).unwrap()).unwrap();
+        write_user_md(&agent, data).unwrap();
+        let md = std::fs::read_to_string(agent.join(USER_MD)).unwrap();
+        assert!(md.contains("(No answers yet.)"));
+        assert!(!md.contains("Name?"));
+        let _ = tmp;
     }
 
     #[test]

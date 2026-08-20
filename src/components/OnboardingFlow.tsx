@@ -1,12 +1,12 @@
 /**
- * Stepper for the framework onboarding flow (wizard step + Today modal).
+ * Stepper for the framework onboarding flow (setup-wizard step).
  *
  * Renders one screen at a time — the leading text blocks plus the next
- * visible unanswered question — asking the backend for the next screen
+ * visible unresolved question — asking the backend for the next screen
  * after every answer, so `showIf` conditionals hide/show live without
- * any duplicated logic on this side. When the flow completes it saves
- * the session (which regenerates `agent_data/USER.md`) and calls
- * `onFinish`.
+ * any duplicated logic on this side. Optional questions may be skipped
+ * (stored as `null`). When the flow completes it saves the session
+ * (which regenerates `agent_data/USER.md`) and calls `onFinish`.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -28,7 +28,7 @@ interface Props {
 }
 
 function isAnswered(answer: AnswerValue | undefined): boolean {
-  if (answer === undefined) return false;
+  if (answer === undefined || answer === null) return false;
   if (typeof answer === "string") return answer.trim().length > 0;
   if (Array.isArray(answer)) return answer.length > 0;
   return true;
@@ -71,8 +71,9 @@ export function OnboardingFlow({ onFinish }: Props) {
     const q = step?.question;
     if (!q) return;
     const next = { ...sessionRef.current };
-    if (answer === undefined) delete next[q.id];
-    else next[q.id] = answer;
+    // `undefined` = the user skipped an optional question — store the
+    // explicit `null` so the backend counts it as resolved (not answered).
+    next[q.id] = answer === undefined ? null : answer;
     setSession(next);
     setHistory((h) => [...h.filter((id) => id !== q.id), q.id]);
     setBusy(true);
@@ -144,7 +145,12 @@ export function OnboardingFlow({ onFinish }: Props) {
 
       {q ? (
         <div className="rounded-lg border border-[var(--color-border)] p-4 space-y-3">
-          <div className="text-sm font-medium">{q.prompt}</div>
+          <div className="text-sm font-medium">
+            {q.prompt}
+            {q.optional && (
+              <span className="ml-2 text-xs font-normal text-muted-foreground">(optional)</span>
+            )}
+          </div>
           {q.hint && <div className="text-xs text-muted-foreground">{q.hint}</div>}
 
           {q.answer === "open" && (
@@ -223,10 +229,11 @@ export function OnboardingFlow({ onFinish }: Props) {
             )}
             <Button
               size="sm"
-              disabled={!isAnswered(draft)}
-              onClick={() => void advance(draft)}
+              disabled={!isAnswered(draft) && !q.optional}
+              onClick={() => void advance(isAnswered(draft) ? draft : undefined)}
             >
-              Continue <ArrowRight className="size-3.5" />
+              {isAnswered(draft) ? "Continue" : "Skip"}
+              <ArrowRight className="size-3.5" />
             </Button>
           </div>
         </div>

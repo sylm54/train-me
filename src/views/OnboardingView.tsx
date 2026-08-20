@@ -124,12 +124,27 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
   // relevant (mounted with an installed framework, or after install).
   useEffect(() => {
     if (step !== "framework" && step !== "questions") return;
-    fetchOnboardingState()
-      .then((state) => setOnboardingPending(state.pending_count > 0))
-      .catch(() => setOnboardingPending(false));
+    void refreshOnboardingPending();
   }, [step]);
 
   // ── Staging actions ──────────────────────────────────────────────────
+
+  // Re-check whether the (newly) installed framework has unanswered
+  // onboarding questions. Returns the pending count so install handlers
+  // can route to the questions step in the same tick — the `onboardingPending`
+  // state alone is stale right after a setState.
+  const refreshOnboardingPending = async (): Promise<boolean> => {
+    try {
+      const state = await fetchOnboardingState();
+      const pending = state.pending_count > 0;
+      setOnboardingPending(pending);
+      return pending;
+    } catch {
+      setOnboardingPending(false);
+      return false;
+    }
+  };
+
   const handleStageUrl = async (url: string) => {
     const trimmed = url.trim();
     if (!trimmed) return;
@@ -172,7 +187,10 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
     }
   };
 
-  const runInstall = async (fw: StagedFramework, chosen: FrameworkChoices) => {
+  const runInstall = async (
+    fw: StagedFramework,
+    chosen: FrameworkChoices,
+  ): Promise<boolean> => {
     setError(null);
     setBusy(true);
     try {
@@ -180,19 +198,34 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
       setResult(res);
       setStaged(null);
       setPhase("installed");
+      // The just-installed framework may ship onboarding questions — the
+      // questions step gate must reflect the NEW state, not the pre-install
+      // snapshot taken when this step mounted.
+      await refreshOnboardingPending();
+      return true;
     } catch (e) {
       setError(String(e));
       // Stay in the config phase so the user can retry.
       setStaged(fw);
       setPhase(fw.config.options.length > 0 ? "config" : "browse");
+      return false;
     } finally {
       setBusy(false);
     }
   };
 
   const handleApplyAndFinish = async () => {
-    if (staged) await runInstall(staged, choices);
-    onComplete();
+    let ok = true;
+    if (staged) ok = await runInstall(staged, choices);
+    if (!ok) return; // install failed — stay here, the error is shown
+    // The questionnaire is the final onboarding step — offer it right
+    // after the install instead of deferring to Today.
+    const pending = await refreshOnboardingPending();
+    if (pending) {
+      setStep("questions");
+    } else {
+      onComplete();
+    }
   };
 
   const handleBackToBrowse = async () => {
@@ -224,7 +257,7 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
   // Footer-Next behaviour depends on the framework phase.
   const frameworkNextLabel = () => {
     if (phase === "config") return "Apply & finish";
-    if (phase === "installed") return "Finish";
+    if (phase === "installed") return onboardingPending ? "Next" : "Finish";
     return "Next";
   };
   const frameworkNextDisabled =
