@@ -58,7 +58,9 @@ The app's entire feature surface is the file grammar you author container files 
 - \`title\`, \`price\` (points), optional \`stock\` + \`restock\` cron, and \`action\` (or an array). The user buys entries from Today; stock restocks lazily from the cron.
 
 ### Actions (used by success/failure/timeouts/store)
-- \`points\` (delta), \`task\` (template name → assigns an instance), \`script\` (xml path → queued for the user to play), \`notification\` (text), \`exemption\` (duration + scope habits|routines|tasks|all — suspends failure actions AND protects streaks; \`all\` is the blanket pause), \`roulette\` (weighted outcomes, \`weight: 0\` disables an outcome).
+- \`points\` (delta), \`task\` (template name → assigns an instance), \`exemption\` (duration + scope habits|routines|tasks|all — suspends failure actions AND protects streaks; \`all\` is the blanket pause), \`roulette\` (weighted outcomes, \`weight: 0\` disables an outcome).
+- \`script\` (xml path) — IMMEDIATE audio feedback. When the user is in the app it auto-plays right away as a background jingle — a clicker/confirmation sting scoring the event (think "cha-ching", not a session). Author script-action scripts as NON-interactive (no \`<until>\`/\`<choice>\`/\`<rating>\`/\`<react>\`) and SHORT — under ~10 seconds. Scripts with interactive tags or longer than 60 s will not auto-play; they land in the "Queued for you" list on Today for manual listening. Long or interactive audio belongs inside routine/task pages (\`audio\` feature blocks or links), not in \`script\` actions.
+- \`notification\` (text) — IMMEDIATE visual feedback. While the app is open the text pops up as an in-app overlay; when it isn't, it becomes an OS notification. Use \`notification\` + \`script\` together to give an event both a message and a jingle (e.g. a success sting + "+10, well done").
 
 ### Points (\`points\` bash builtin)
 - Append-only ledger; the balance is never rewritten. \`points info\` shows balance + recent entries; \`points grant <n> "reason"\` / \`points deduct <n> "reason"\` append visible, reasoned deltas. Negative balances are just a number.

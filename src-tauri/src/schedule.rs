@@ -223,8 +223,21 @@ fn execute_action(
             Err(e) => format!("task assignment failed: {e}"),
         },
         Action::Script { src } => {
-            let _ = economy::queue_pending(econ, "script", src);
-            notify(app, "Script queued", src);
+            // Queue the script (Today's "Queued for you" list + top prerender
+            // priority) and tell the frontend to auto-play it as a jingle when
+            // the user is in the app — the audio companion to the notification.
+            // The frontend gates on focus/interactivity and dismisses the
+            // pending row itself once playback completes.
+            match economy::queue_pending(econ, "script", src) {
+                Ok(id) => {
+                    notify(app, "Script queued", src);
+                    if let Some(app) = app {
+                        use tauri::Emitter;
+                        let _ = app.emit("v2-autoplay", serde_json::json!({ "src": src, "id": id }));
+                    }
+                }
+                Err(_) => notify(app, "Script queued", src),
+            }
             format!("script queued: {src}")
         }
         Action::Notification { text } => {

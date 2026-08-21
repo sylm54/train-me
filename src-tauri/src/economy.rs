@@ -291,13 +291,15 @@ pub struct PendingRow {
     pub payload: String,
 }
 
-pub fn queue_pending(conn: &Connection, kind: &str, payload: &str) -> Result<(), String> {
+/// Queue a pending action row; returns the new row's id (the script
+/// autoplay path uses it to dismiss the row once playback completes).
+pub fn queue_pending(conn: &Connection, kind: &str, payload: &str) -> Result<i64, String> {
     conn.execute(
         "INSERT INTO pending_actions (ts, kind, payload) VALUES (?1, ?2, ?3)",
         rusqlite::params![now_ts(), kind, payload],
     )
     .map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(conn.last_insert_rowid())
 }
 
 pub fn list_pending(conn: &Connection) -> Result<Vec<PendingRow>, String> {

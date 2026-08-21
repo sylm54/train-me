@@ -4,7 +4,6 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { AppShell } from "@/components/AppShell";
 import { ChatView } from "@/views/ChatView";
@@ -16,10 +15,12 @@ import { ActivityView } from "@/views/ActivityView";
 import { TodayView } from "@/views/TodayView";
 import { SessionView } from "@/views/SessionView";
 import { OnboardingView } from "@/views/OnboardingView";
+import { NoticeToasts } from "@/components/NoticeToasts";
 import { useSettings } from "@/lib/settings";
 import { useGlobalAppLinkNavigation } from "@/lib/links";
 import { useRoutineNotifier } from "@/lib/use-routine-notifier";
-import { notify } from "@/lib/notifications";
+import { useAppForeground } from "@/lib/appFocus";
+import { useJinglePlayer } from "@/lib/jinglePlayer";
 import type { SessionRequest } from "@/lib/v2";
 import { createChat, ensureActiveChat } from "@/lib/chatStore";
 import { useIdleChatSweeper } from "@/hooks/useIdleChatSweeper";
@@ -58,17 +59,14 @@ export default function App() {
     return () => window.clearTimeout(t);
   }, []);
 
+  // Foreground getter shared by the notice overlay and the jingle player.
   // Engine notifications arrive as events (the Rust side must not touch
   // the notification plugin beyond render_notify — see schedule.rs) and
-  // are delivered here through the JS notification wrapper.
-  useEffect(() => {
-    const un = listen<{ title: string; body: string }>("v2-notify", (e) => {
-      void notify(e.payload.title, e.payload.body);
-    });
-    return () => {
-      void un.then((f) => f());
-    };
-  }, []);
+  // are delivered by NoticeToasts: an in-app overlay while the user is in
+  // the app, an OS notification otherwise. `script` actions auto-play as
+  // jingles through the same foreground signal (see jinglePlayer.ts).
+  const isForeground = useAppForeground();
+  useJinglePlayer(isForeground);
 
   // Keep routine notifications alive for the lifetime of the app.
   useRoutineNotifier();
@@ -142,6 +140,7 @@ export default function App() {
         />
       </div>
       {view !== "chat" && body}
+      <NoticeToasts isForeground={isForeground} />
     </AppShell>
   );
 }
