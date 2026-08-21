@@ -15,6 +15,7 @@ import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { ManifestPlayer, type ActivePrompt, type Segment } from "@/lib/manifestPlayer";
 import { logActivity } from "@/lib/activity";
+import { setAudioBusy } from "@/lib/audioBus";
 
 interface ManifestStatus {
   rendered: boolean;
@@ -52,6 +53,13 @@ export function AudioPlayerOverlay({ src, onClose, onEnded }: Props) {
   const fail = useCallback((msg: string) => {
     setError(msg);
     setPhase("error");
+  }, []);
+
+  // Claim the audio output for the overlay's lifetime so background
+  // jingles don't play over a session the user deliberately opened.
+  useEffect(() => {
+    setAudioBusy(true);
+    return () => setAudioBusy(false);
   }, []);
 
   // Render (if needed) and load the manifest.
