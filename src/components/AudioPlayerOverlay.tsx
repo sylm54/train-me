@@ -16,6 +16,12 @@ import { Spinner } from "@/components/ui/spinner";
 import { ManifestPlayer, type ActivePrompt, type Segment } from "@/lib/manifestPlayer";
 import { logActivity } from "@/lib/activity";
 import { setAudioBusy } from "@/lib/audioBus";
+import {
+  ensureGlobalListener,
+  markDone,
+  markError,
+  markStart,
+} from "@/lib/renderRegistry";
 
 interface ManifestStatus {
   rendered: boolean;
@@ -71,6 +77,10 @@ export function AudioPlayerOverlay({ src, onClose, onEnded }: Props) {
         let manifestPath: string;
         if (!status.rendered || status.stale) {
           setPhase("rendering");
+          // Track the render app-wide too: if the user closes this overlay
+          // mid-render, the global progress pill keeps it visible.
+          ensureGlobalListener();
+          markStart(src);
           const un = await import("@tauri-apps/api/event").then((m) =>
             m.listen<{ label?: string }>("render-manifest-progress", (e) => {
               setRenderLabel(e.payload.label ?? "rendering…");
@@ -82,6 +92,7 @@ export function AudioPlayerOverlay({ src, onClose, onEnded }: Props) {
           } finally {
             un();
           }
+          markDone(src);
         } else {
           const m = await invoke<RenderedManifest>("render_manifest", { scriptPath: src });
           manifestPath = m.manifest_path;
@@ -91,6 +102,7 @@ export function AudioPlayerOverlay({ src, onClose, onEnded }: Props) {
         rootRef.current = read.root;
         setPhase("ready");
       } catch (e) {
+        markError(src, String(e));
         if (!cancelled) fail(String(e));
       }
     })();

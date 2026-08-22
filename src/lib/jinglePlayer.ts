@@ -29,6 +29,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { ManifestPlayer, type Segment } from "@/lib/manifestPlayer";
 import { isAudioBusy } from "@/lib/audioBus";
 import { logActivity } from "@/lib/activity";
+import { ensureGlobalListener, markDone, markError, markStart } from "@/lib/renderRegistry";
 
 /** Hard cap for auto-play — longer scripts stay queued for manual play. */
 const MAX_JINGLE_SECS = 60;
@@ -62,9 +63,14 @@ async function playJingle(item: QueueItem): Promise<void> {
     // The full-screen player owns the audio output — leave this queued.
     if (isAudioBusy()) return;
 
+    // Register the render in the app-wide registry so the progress pill
+    // covers it (jingles render headless, with no view of their own).
+    ensureGlobalListener();
+    markStart(item.src);
     const rendered = await invoke<RenderedManifest>("render_manifest", {
       scriptPath: item.src,
     });
+    markDone(item.src);
     const read = await invoke<{ root: Segment }>("read_manifest", {
       manifestPath: rendered.manifest_path,
     });
@@ -96,6 +102,7 @@ async function playJingle(item: QueueItem): Promise<void> {
     void logActivity("script", "play", item.src);
     await invoke("economy_dismiss_pending", { id: item.id }).catch(() => {});
   } catch (e) {
+    markError(item.src, String(e));
     console.warn(`[jingle] ${item.src} not auto-played:`, e);
   }
 }

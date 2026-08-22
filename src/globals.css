@@ -164,3 +164,38 @@ body {
 .notice-toast {
     animation: notice-in 0.18s ease-out;
 }
+
+/* Entrance for the app-wide render-progress pill (RenderProgressOverlay). */
+@keyframes pill-in {
+    from {
+        opacity: 0;
+        transform: translateY(8px);
+    }
+    to {
+        opacity: 1;
+        transform: none;
+    }
+}
+.render-pill {
+    animation: pill-in 0.18s ease-out;
+}
+
+/* Fullscreen alert popup for `notification` actions delivered in-app
+   (NoticeToasts). The backdrop dims the whole screen; the card scales up
+   from slightly smaller to land prominently. */
+@keyframes alert-in {
+    from {
+        opacity: 0;
+        transform: scale(0.96);
+    }
+    to {
+        opacity: 1;
+        transform: none;
+    }
+}
+.alert-backdrop {
+    animation: notice-in 0.15s ease-out;
+}
+.alert-card {
+    animation: alert-in 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}

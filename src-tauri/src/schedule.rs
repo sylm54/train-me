@@ -130,11 +130,19 @@ fn local_day(d: chrono::DateTime<chrono::Utc>) -> String {
 /// this emits an event and the frontend delivers the OS notification via
 /// its existing `notifications.ts` wrapper.
 fn notify(app: Option<&tauri::AppHandle>, title: &str, body: &str) {
+    notify_kind(app, title, body, "notice")
+}
+
+/// Like [`notify`], but with an explicit `kind`. `alert` marks messages
+/// that originate from a `notification` action — the frontend shows those
+/// as a prominent fullscreen popup while the user is in the app (the
+/// screen dims around the message) instead of a transient toast.
+fn notify_kind(app: Option<&tauri::AppHandle>, title: &str, body: &str, kind: &str) {
     use tauri::Emitter;
     if let Some(app) = app {
         let _ = app.emit(
             "v2-notify",
-            serde_json::json!({ "title": title, "body": body }),
+            serde_json::json!({ "title": title, "body": body, "kind": kind }),
         );
     }
 }
@@ -241,7 +249,7 @@ fn execute_action(
             format!("script queued: {src}")
         }
         Action::Notification { text } => {
-            notify(app, "Notice", text);
+            notify_kind(app, "Notice", text, "alert");
             format!("notified: {text}")
         }
         Action::Exemption {

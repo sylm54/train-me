@@ -16,6 +16,7 @@ import { TodayView } from "@/views/TodayView";
 import { SessionView } from "@/views/SessionView";
 import { OnboardingView } from "@/views/OnboardingView";
 import { NoticeToasts } from "@/components/NoticeToasts";
+import { RenderProgressOverlay } from "@/components/RenderProgressOverlay";
 import { useSettings } from "@/lib/settings";
 import { useGlobalAppLinkNavigation } from "@/lib/links";
 import { useRoutineNotifier } from "@/lib/use-routine-notifier";
@@ -141,6 +142,9 @@ export default function App() {
       </div>
       {view !== "chat" && body}
       <NoticeToasts isForeground={isForeground} />
+      {/* Render progress must survive navigation → mounted once here, and
+          z-40 keeps it under full-screen overlays (player, dialogs). */}
+      <RenderProgressOverlay />
     </AppShell>
   );
 }

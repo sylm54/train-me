@@ -169,6 +169,8 @@ export interface Habit {
   count: number;
   success: Action[];
   failure: Action[];
+  /** Markdown body below the front-matter (rendered in the inspector). */
+  body: string;
 }
 
 export interface HabitDay {
