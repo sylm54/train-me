@@ -243,6 +243,31 @@ fn is_fresh(tracks_dir: &Path, agent_dir: &Path, src: &str) -> bool {
 // The pass itself
 // ============================================================================
 
+/// Emit one `render-manifest-progress` event (same payload as the UI
+/// `render_manifest` command) so the frontend's app-wide render registry —
+/// and its progress pill — covers background prerenders too.
+fn emit_progress(app: &tauri::AppHandle, script: &str, step: usize, total: usize, label: &str) {
+    use tauri::Emitter;
+    let _ = app.emit(
+        "render-manifest-progress",
+        serde_json::json!({
+            "script": script,
+            "step": step,
+            "total": total,
+            "label": label,
+        }),
+    );
+}
+
+/// Emit the terminal `render-manifest-done` event for one script render.
+fn emit_done(app: &tauri::AppHandle, script: &str, error: Option<&str>) {
+    use tauri::Emitter;
+    let _ = app.emit(
+        "render-manifest-done",
+        serde_json::json!({ "script": script, "ok": error.is_none(), "error": error }),
+    );
+}
+
 pub fn prerender_blocking(
     agent_dir: &Path,
     state_dir: &Path,
@@ -250,6 +275,7 @@ pub fn prerender_blocking(
     model_dir: &Path,
     renderer_arc: &parking_lot::Mutex<Option<crate::audio_renderer::AudioRenderer>>,
     only: Option<&[String]>,
+    app: Option<&tauri::AppHandle>,
 ) -> PrerenderReport {
     let mut report = PrerenderReport::default();
     let now = chrono::Utc::now();
@@ -291,9 +317,63 @@ pub fn prerender_blocking(
             }
             if let Some(renderer) = guard.as_mut() {
                 for r in &stale {
-                    match renderer.render_manifest(&r.src, agent_dir, tracks_dir, None) {
-                        Ok(_) => report.rendered.push(r.src.clone()),
-                        Err(e) => report.errors.push(format!("{}: {e:#}", r.src)),
+                    // Progress tracker mirroring the UI render path: a
+                    // seeded "Pre-rendering…" tick (so the frontend entry
+                    // exists before the first engine phase) plus ~2 Hz
+                    // throttled step updates, finalized by a done event.
+                    let tracker = app.map(|app| {
+                        let app = app.clone();
+                        let script = r.src.clone();
+                        let last: std::sync::Arc<parking_lot::Mutex<Option<std::time::Instant>>> =
+                            std::sync::Arc::new(parking_lot::Mutex::new(None));
+                        std::sync::Arc::new(std::sync::Mutex::new(
+                            crate::audio_renderer::ProgressTracker {
+                                step: 0,
+                                total: 0,
+                                callback: Box::new(move |step, total, label| {
+                                    let should_emit = {
+                                        let mut guard = last.lock();
+                                        let now = std::time::Instant::now();
+                                        match *guard {
+                                            None => {
+                                                *guard = Some(now);
+                                                true
+                                            }
+                                            Some(prev)
+                                                if now.duration_since(prev)
+                                                    >= std::time::Duration::from_millis(500) =>
+                                            {
+                                                *guard = Some(now);
+                                                true
+                                            }
+                                            _ => false,
+                                        }
+                                    };
+                                    if should_emit {
+                                        emit_progress(&app, &script, step, total, label);
+                                    }
+                                }),
+                            },
+                        ))
+                    });
+                    if let Some(app) = app {
+                        emit_progress(app, &r.src, 0, 0, "Pre-rendering…");
+                    }
+                    match renderer.render_manifest(&r.src, agent_dir, tracks_dir, tracker.as_ref())
+                    {
+                        Ok(_) => {
+                            if let Some(app) = app {
+                                emit_done(app, &r.src, None);
+                            }
+                            report.rendered.push(r.src.clone());
+                        }
+                        Err(e) => {
+                            let msg = format!("{e:#}");
+                            if let Some(app) = app {
+                                emit_done(app, &r.src, Some(&msg));
+                            }
+                            report.errors.push(format!("{}: {msg}", r.src));
+                        }
                     }
                 }
             }
@@ -327,6 +407,7 @@ pub async fn v2_prerender(
     let tracks_dir = state.tracks_dir.clone();
     let model_dir = state.model_dir.clone();
     let renderer_arc = state.renderer.clone();
+    let report_app = app.clone();
     let report = tauri::async_runtime::spawn_blocking(move || {
         prerender_blocking(
             &agent_dir,
@@ -335,6 +416,7 @@ pub async fn v2_prerender(
             &model_dir,
             &renderer_arc,
             paths.as_deref(),
+            Some(&report_app),
         )
     })
     .await

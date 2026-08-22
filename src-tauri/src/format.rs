@@ -1428,13 +1428,15 @@ pub struct Habit {
     pub count: u64,
     pub success: Vec<Action>,
     pub failure: Vec<Action>,
+    /// Markdown body below the front-matter (shown in the habit inspector).
+    pub body: String,
 }
 
 /// Parse a `habits/*.md` file. Habits are always v2; a `format:` key is
 /// accepted but optional (must be 2 if present).
 pub fn parse_habit(content: &str) -> (Option<Habit>, Vec<Diag>) {
     let mut diags = Vec::new();
-    let (fm, _body) = split_frontmatter(content);
+    let (fm, body) = split_frontmatter(content);
     let Some(fm) = fm else {
         diags.push(error_at(
             None,
@@ -1491,6 +1493,7 @@ pub fn parse_habit(content: &str) -> (Option<Habit>, Vec<Diag>) {
             count,
             success,
             failure,
+            body: body.trim().to_string(),
         }),
         diags,
     )

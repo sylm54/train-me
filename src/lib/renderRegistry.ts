@@ -19,6 +19,11 @@
  * device is exactly the window where the bar used to look "stuck"). Components
  * subscribe through `useRenderStore` (built on `useSyncExternalStore`).
  *
+ * Background renders that no view marks with `markStart` (pre-render passes,
+ * jingles) are adopted directly from backend progress events, and the
+ * backend's terminal `render-manifest-done` event finalizes every entry —
+ * so renders remain visible even when their initiating view unmounts.
+ *
  * State is keyed by the backend's `script` field (the script path), so
  * concurrent renders of different scripts don't cross-feed each other.
  */
@@ -74,6 +79,14 @@ const listeners = new Set<() => void>();
 // A fresh Map ref is published on every mutation so useSyncExternalStore sees
 // a changed snapshot (it compares by reference between renders).
 let store: ReadonlyMap<string, RenderEntry> = new Map();
+/**
+ * Script paths whose entries were created by the global progress listener
+ * rather than an explicit {@link markStart} — i.e. background renders with
+ * no view awaiting them (pre-render passes, jingles). The overlay may
+ * auto-clear these once terminal; owned entries are left for their owner
+ * to consume.
+ */
+const autoCreated = new Set<string>();
 
 function emit(): void {
   for (const l of listeners) l();
@@ -105,8 +118,9 @@ function getSnapshot(): ReadonlyMap<string, RenderEntry> {
 let globalListenerPromise: Promise<void> | null = null;
 
 /**
- * Ensure the global `render-manifest-progress` listener is attached. Safe to
- * call repeatedly; resolves immediately once the listener is up.
+ * Ensure the global `render-manifest-progress` / `render-manifest-done`
+ * listeners are attached. Safe to call repeatedly; resolves immediately
+ * once the listeners are up.
  *
  * IMPORTANT: callers must NOT `await` this before invoking `render_manifest`.
  * On some mobile devices the underlying `listen()` IPC never resolves (or
@@ -127,10 +141,26 @@ export function ensureGlobalListener(): Promise<void> {
         "render-manifest-progress",
         (e) => {
           const { script, step, total, label } = e.payload;
-          // Only advance a render that's actually in flight — ignore stray
-          // events for renders whose view instance already marked done/error.
-          const cur = store.get(script);
-          if (!cur || cur.status !== "rendering") return;
+          let cur = store.get(script);
+          if (!cur) {
+            // A background render nobody marked (pre-render pass, jingle):
+            // adopt it so the app-wide pill picks it up from the first tick.
+            autoCreated.add(script);
+            cur = {
+              status: "rendering",
+              step: 0,
+              total: 0,
+              label: "",
+              error: null,
+              startedAt: Date.now(),
+              countedAt: null,
+              countedStep: 0,
+            };
+          } else if (cur.status !== "rendering") {
+            // Ignore stray events for renders that already reached a
+            // terminal state — don't resurrect them.
+            return;
+          }
           // The first time the walker reports a non-zero `total`, stamp the
           // rate baseline (timestamp + step) so the UI can estimate remaining
           // time from the per-step rate. The throttle can coalesce the very
@@ -149,10 +179,25 @@ export function ensureGlobalListener(): Promise<void> {
           });
         },
       );
-      // Keep the unlisten handle so the listener could be torn down in tests /
-      // a future hot-reload path; for the app lifetime it intentionally stays
-      // attached (the registry must survive navigation).
+      const unlistenDone: UnlistenFn = await listen<{
+        script: string;
+        ok: boolean;
+        error: string | null;
+      }>("render-manifest-done", (e) => {
+        // Terminal signal from the backend (emitted for both the UI command
+        // and pre-render passes). Finalizes the entry even when the view
+        // that started the render has unmounted, so a pill never sticks on
+        // "rendering" forever.
+        const cur = store.get(e.payload.script);
+        if (!cur || cur.status !== "rendering") return;
+        if (e.payload.ok) markDone(e.payload.script);
+        else markError(e.payload.script, e.payload.error ?? "render failed");
+      });
+      // Keep the unlisten handles so the listeners could be torn down in
+      // tests / a future hot-reload path; for the app lifetime they
+      // intentionally stay attached (the registry must survive navigation).
       void unlisten;
+      void unlistenDone;
     } catch (e) {
       // Don't poison the cache: clear it so the next render can retry, and
       // swallow — the listener is cosmetic (the render result comes through
@@ -168,6 +213,7 @@ export function ensureGlobalListener(): Promise<void> {
 
 /** Mark a render as starting; clears any prior progress/error for the path. */
 export function markStart(scriptPath: string): void {
+  autoCreated.delete(scriptPath);
   setEntry(scriptPath, {
     status: "rendering",
     step: 0,
@@ -223,11 +269,17 @@ export function markError(scriptPath: string, message: string): void {
 
 /** Remove a script's entry entirely (e.g. after the UI has consumed it). */
 export function clear(scriptPath: string): void {
+  autoCreated.delete(scriptPath);
   if (!store.has(scriptPath)) return;
   const next = new Map(store);
   next.delete(scriptPath);
   store = next;
   emit();
+}
+
+/** True when the entry was adopted from backend events, not `markStart`. */
+export function isAutoCreated(scriptPath: string): boolean {
+  return autoCreated.has(scriptPath);
 }
 
 // ── React binding ──────────────────────────────────────────────────────────

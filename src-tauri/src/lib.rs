@@ -643,6 +643,9 @@ async fn render_manifest(
         .filter(|s| !s.is_empty())
         .unwrap_or(&script_path)
         .to_string();
+    // Kept out of the spawn_blocking closure for the terminal
+    // `render-manifest-done` event emitted below.
+    let done_script = script_path.clone();
 
     // Progress tracker: each tick emits a Tauri push event for the in-app
     // progress bar, throttled to 2 Hz (a render can emit hundreds of ticks —
@@ -755,6 +758,23 @@ async fn render_manifest(
     // Whether the render succeeded or failed, tear down the notification so
     // it doesn't linger forever.
     render_notify::clear_render_progress(&app);
+
+    // Terminal signal for the frontend's render registry. The registry
+    // tracks renders app-wide (its progress pill survives navigation), so
+    // it needs this event to finalize an entry even when the view that
+    // started the render has since unmounted and nobody is awaiting the
+    // invoke result anymore.
+    {
+        let done = match &result {
+            Ok(Ok(_)) => serde_json::json!({ "script": done_script, "ok": true }),
+            Ok(Err(e)) => {
+                serde_json::json!({ "script": done_script, "ok": false, "error": e })
+            }
+            Err(e) => serde_json::json!({ "script": done_script, "ok": false, "error": e.to_string() }),
+        };
+        let _ = app.emit("render-manifest-done", done);
+    }
+
     result.map_err(|e| e.to_string())?
 }
 

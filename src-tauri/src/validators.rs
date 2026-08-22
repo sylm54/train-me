@@ -106,23 +106,130 @@ fn warn(message: impl Into<String>) -> Problem {
 
 /// Normalize a cron expression to the form the `cron` crate accepts.
 ///
-/// The `cron` 0.16 crate requires 6 or 7 fields
-/// (`sec min hour dom month dow [year]`), but the documented + example
-/// form in this app is classic 5-field (`min hour dom month dow`). To keep
-/// 5-field cron both *valid* (per the user's chosen contract) and
-/// *functional* (so notifications actually fire), we prepend a `0` seconds
-/// field to any 5-field expression. `@`-shorthands and 6/7-field
-/// expressions are passed through unchanged.
+/// Two conversions happen:
+///
+/// 1. The `cron` 0.16 crate requires 6 or 7 fields
+///    (`sec min hour dom month dow [year]`), but the documented + example
+///    form in this app is classic 5-field (`min hour dom month dow`). To
+///    keep 5-field cron both *valid* (per the user's chosen contract) and
+///    *functional* (so notifications actually fire), we prepend a `0`
+///    seconds field to any 5-field expression.
+///
+/// 2. The crate numbers days of week 1–7 with **Sunday = 1**, while
+///    classic cron (and FORMAT.md, and the frontend humanizer in
+///    `cron.ts`) uses **0–7 with Sunday = 0 and 7**. A numeric DOW field
+///    is rewritten from the classic to the crate convention — e.g. `7`
+///    (classic Sunday) becomes `1`, `1-5` (Mon–Fri) becomes `2-6` — so an
+///    expression like `0 20 * * 7` fires on Sunday as documented instead
+///    of the crate's Saturday. Named days (`sun`, `fri`, …) already mean
+///    the same thing in both conventions and pass through untouched.
+///
+/// `@`-shorthands are passed through unchanged.
 pub fn normalize_cron(expr: &str) -> String {
     let trimmed = expr.trim();
     if trimmed.starts_with('@') {
         return trimmed.to_string();
     }
     let fields: Vec<&str> = trimmed.split_whitespace().collect();
-    match fields.len() {
-        5 => format!("0 {}", trimmed),
-        _ => trimmed.to_string(),
+    let (prepend_seconds, dow_idx) = match fields.len() {
+        5 => (true, 4),
+        6 => (false, 5),
+        7 => (false, 5),
+        _ => return trimmed.to_string(),
+    };
+    let mapped_dow = map_dow_classic_to_crate(fields[dow_idx]);
+    let mut out: Vec<String> = Vec::with_capacity(fields.len() + usize::from(prepend_seconds));
+    if prepend_seconds {
+        out.push("0".to_string());
     }
+    for (i, f) in fields.iter().enumerate() {
+        out.push(if i == dow_idx {
+            mapped_dow.clone()
+        } else {
+            (*f).to_string()
+        });
+    }
+    out.join(" ")
+}
+
+/// Rewrite one DOW field from classic numbering (0 = Sunday, 7 = Sunday)
+/// to the `cron` crate's (1 = Sunday … 7 = Saturday).
+///
+/// The field is expanded to its set of classic day numbers (handling
+/// `*`, comma lists, ranges, and steps), each day is mapped between the
+/// conventions, and the result is re-serialized (`*` when all seven days
+/// match, else an explicit list — a wrapped classic range like `5-7`
+/// (Fri–Sun) has no contiguous crate equivalent). Fields containing
+/// day names, or anything unparseable, are returned unchanged so the
+/// crate's own validation reports the error.
+fn map_dow_classic_to_crate(field: &str) -> String {
+    if field == "*" {
+        return "*".to_string();
+    }
+
+    // Parse the field into (range, step) parts and expand to classic days.
+    let mut classic_days: Vec<u8> = Vec::new();
+    for part in field.split(',') {
+        let (range_part, step) = match part.split_once('/') {
+            Some((r, s)) => match s.parse::<u8>() {
+                Ok(n) if n >= 1 => (r, n),
+                _ => return field.to_string(),
+            },
+            None => (part, 1u8),
+        };
+        let (lo, hi) = if range_part == "*" {
+            (0u8, 6u8)
+        } else if let Some((a, b)) = range_part.split_once('-') {
+            match (a.parse::<u8>(), b.parse::<u8>()) {
+                (Ok(a), Ok(b)) => (a, b),
+                _ => return field.to_string(),
+            }
+        } else {
+            match range_part.parse::<u8>() {
+                // A bare number with a step (`5/2`) means "from 5 to the
+                // end" in classic cron; the DOW end is 7 (= Sunday too).
+                Ok(v) => (v, if step > 1 { 7 } else { v }),
+                _ => return field.to_string(),
+            }
+        };
+        if lo > hi || hi > 7 {
+            return field.to_string();
+        }
+        let mut d = lo;
+        while d <= hi {
+            classic_days.push(d);
+            d += step;
+        }
+    }
+
+    // Classic day 0 and 7 are both Sunday; the crate's Sunday is 1.
+    let mut crate_days: Vec<u8> = classic_days
+        .iter()
+        .map(|&d| if d % 7 == 0 { 1 } else { d + 1 })
+        .collect();
+    crate_days.sort_unstable();
+    crate_days.dedup();
+    if crate_days.len() == 7 {
+        return "*".to_string();
+    }
+    // Re-serialize, collapsing contiguous runs back into ranges (`2-6`
+    // rather than `2,3,4,5,6`); wrapped day sets (e.g. Fri–Sun → 1,6,7)
+    // stay as lists.
+    let mut parts: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < crate_days.len() {
+        let start = i;
+        while i + 1 < crate_days.len() && crate_days[i + 1] == crate_days[i] + 1 {
+            i += 1;
+        }
+        if start == i {
+            parts.push(crate_days[i].to_string());
+        } else {
+            parts.push(format!("{}-{}", crate_days[start], crate_days[i]));
+        }
+        i += 1;
+    }
+    parts.join(",")
 }
 
 // ============================================================================
@@ -1007,6 +1114,42 @@ mod tests {
         assert_eq!(normalize_cron("@daily"), "@daily");
         // 7-field (with year) unchanged
         assert_eq!(normalize_cron("0 0 0 1 1 * 2025"), "0 0 0 1 1 * 2025");
+    }
+
+    #[test]
+    fn normalize_cron_maps_classic_dow() {
+        // Classic 0 and 7 are both Sunday; the crate's Sunday is 1.
+        assert_eq!(normalize_cron("0 20 * * 7"), "0 0 20 * * 1");
+        assert_eq!(normalize_cron("0 20 * * 0"), "0 0 20 * * 1");
+        // Classic 1-5 = Mon–Fri → crate 2-6.
+        assert_eq!(normalize_cron("30 2 * * 2-4"), "0 30 2 * * 3-5");
+        assert_eq!(normalize_cron("0 8 * * 1-5"), "0 0 8 * * 2-6");
+        // Scattered list, mapped and re-sorted.
+        assert_eq!(normalize_cron("0 8 * * 6,0"), "0 0 8 * * 1,7");
+        // Full week collapses to *.
+        assert_eq!(normalize_cron("0 8 * * 0-6"), "0 0 8 * * *");
+        // Wrapped range Fri–Sun (no contiguous crate range; Sat–Sun collapses).
+        assert_eq!(normalize_cron("0 8 * * 5-7"), "0 0 8 * * 1,6-7");
+        // Step over the week: */2 = Sun,Tue,Thu,Sat.
+        assert_eq!(normalize_cron("0 8 * * */2"), "0 0 8 * * 1,3,5,7");
+        // 6-field expression: DOW mapped in place.
+        assert_eq!(normalize_cron("0 0 20 * * 7"), "0 0 20 * * 1");
+        // Named days pass through untouched (same meaning in both).
+        assert_eq!(normalize_cron("0 8 * * mon-fri"), "0 0 8 * * mon-fri");
+    }
+
+    #[test]
+    fn normalize_cron_dow_map_matches_crate_semantics() {
+        // The mapped expression must parse AND fire on the expected
+        // weekday: classic `0 20 * * 7` means Sunday 20:00.
+        use std::str::FromStr;
+        let schedule = cron::Schedule::from_str(&normalize_cron("0 20 * * 7")).unwrap();
+        let fire = schedule
+            .after(&chrono::DateTime::parse_from_rfc3339("2026-08-21T00:00:00Z").unwrap())
+            .next()
+            .unwrap();
+        // 2026-08-21 is a Friday → next Sunday 20:00 UTC is the 23rd.
+        assert_eq!(fire.to_rfc3339(), "2026-08-23T20:00:00+00:00");
     }
 
     #[test]

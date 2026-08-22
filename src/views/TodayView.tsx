@@ -23,6 +23,8 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { AudioPlayerOverlay } from "@/components/AudioPlayerOverlay";
+import { MarkdownBody } from "@/components/MarkdownBody";
+import { parseSchedule } from "@/lib/cron";
 import {
   describeAction,
   dismissPending,
@@ -281,11 +283,19 @@ export function TodayView({ onRequestSession }: Props) {
                     ) : (
                       <>
                         <CalendarClock className="size-3" />
-                        {r.current
-                          ? `due now (until ${formatDue(r.current.window_end)})`
-                          : r.next
-                            ? `next ${formatDue(r.next.due)}`
-                            : r.schedule}
+                        {[
+                          // Humanized schedule (e.g. "Sunday at 8:00 PM") so
+                          // raw cron never surfaces on the card; due info
+                          // follows when an occurrence exists.
+                          parseSchedule(r.schedule)?.human ?? r.schedule ?? "",
+                          r.current
+                            ? `due now (until ${formatDue(r.current.window_end)})`
+                            : r.next
+                              ? `next ${formatDue(r.next.due)}`
+                              : null,
+                        ]
+                          .filter(Boolean)
+                          .join(" · ")}
                       </>
                     )}
                     {r.locked && ` · ${r.locked}`}
@@ -375,30 +385,58 @@ export function TodayView({ onRequestSession }: Props) {
         {/* Store */}
         {summary.store.length > 0 && (
           <Section title="Store">
-            {summary.store.map((s) => (
-              <div
-                key={s.path}
-                className="flex items-center gap-3 rounded-lg border border-[var(--color-border)] p-3"
-              >
-                <div className="flex-1 min-w-0">
-                  <div className="text-sm font-medium truncate">{s.title}</div>
-                  <div className="text-xs text-muted-foreground truncate">
-                    {s.description ? `${s.description} · ` : ""}
-                    {s.price} points
-                    {s.stock !== null ? ` · stock ${s.stock}` : ""}
-                  </div>
-                </div>
-                {s.audio.length > 0 && prerenderButton(s.path, [s.path])}
-                <Button
-                  size="sm"
-                  variant="outline"
-                  disabled={summary.balance < s.price || (s.stock !== null && s.stock <= 0)}
-                  onClick={() => void purchase(s.path).then((res) => showLines(res.lines))}
+            {summary.store.map((s) => {
+              const affordable = summary.balance >= s.price;
+              const outOfStock = s.stock !== null && s.stock <= 0;
+              return (
+                <div
+                  key={s.path}
+                  className="flex items-center gap-3 rounded-lg border border-[var(--color-border)] p-3"
                 >
-                  <ShoppingCart className="size-3.5" /> Buy
-                </Button>
-              </div>
-            ))}
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium truncate">{s.title}</div>
+                    <div className="text-xs text-muted-foreground truncate">
+                      {s.description}
+                      {s.stock !== null && ` · stock ${s.stock}`}
+                    </div>
+                  </div>
+                  {s.audio.length > 0 && prerenderButton(s.path, [s.path])}
+                  {/* Explicit price tag — always visible next to the buy
+                      action, colored by affordability so "why can't I buy
+                      this" answers itself. */}
+                  <div
+                    className={`flex flex-col items-end shrink-0 ${
+                      affordable && !outOfStock ? "" : "text-[var(--color-danger)]"
+                    }`}
+                    title={
+                      outOfStock
+                        ? "Out of stock"
+                        : affordable
+                          ? `${s.price} points`
+                          : `You need ${s.price - summary.balance} more points`
+                    }
+                  >
+                    <span className="flex items-center gap-1 rounded-full border border-current px-2.5 py-1 text-xs font-semibold tabular-nums">
+                      <Coins className="size-3.5" />
+                      {s.price} pts
+                    </span>
+                    {!affordable && !outOfStock && (
+                      <span className="mt-1 text-[10px] tabular-nums">
+                        need {s.price - summary.balance} more
+                      </span>
+                    )}
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={!affordable || outOfStock}
+                    onClick={() => void purchase(s.path).then((res) => showLines(res.lines))}
+                  >
+                    <ShoppingCart className="size-3.5" /> Buy
+                  </Button>
+                </div>
+              );
+            })}
           </Section>
         )}
 
@@ -466,6 +504,11 @@ export function TodayView({ onRequestSession }: Props) {
                       ) : null;
                     })()}
                   </div>
+
+                  {/* Markdown body from the habit file */}
+                  {habitDetail.habit.body && (
+                    <MarkdownBody>{habitDetail.habit.body}</MarkdownBody>
+                  )}
 
                   <div className="space-y-1">
                     <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
