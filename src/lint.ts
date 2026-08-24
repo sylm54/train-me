@@ -149,10 +149,20 @@ export function lint(rootArg: string): number {
 
   // ── onboarding.json ────────────────────────────────────────────────
   const onboardingPath = join(root, "onboarding.json");
+  // The flow's output file is app-generated at runtime (onboarding
+  // answers), so its absence from the zip is legitimate — the prompt
+  // include check below exempts it.
+  let onboardingOutput: string | null = null;
   if (existsSync(onboardingPath)) {
     const diags: Diag[] = [];
     try {
-      validateOnboarding(readJson(onboardingPath), diags);
+      const res = validateOnboarding(
+        readJson(onboardingPath),
+        root,
+        selectedPartFolders(root),
+        diags,
+      );
+      onboardingOutput = res.output;
     } catch (e) {
       diags.push({ severity: "error", message: `invalid JSON: ${e}` });
     }
@@ -257,7 +267,7 @@ export function lint(rootArg: string): number {
         }
         for (const m of content.matchAll(/\{\{\s*include\s+['"]([^'"]+)['"]\s*\}\}/g)) {
           const rel = m[1]!.replace(/^\.\//, "").replace(/^\/+/, "").trim();
-          if (rel === "USER.md") continue;
+          if (rel === "USER.md" || (onboardingOutput && rel === onboardingOutput)) continue;
           if (!existsInAnyPart(rel)) {
             diags.push({
               severity: "error",
