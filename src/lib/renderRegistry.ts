@@ -28,7 +28,7 @@
  * concurrent renders of different scripts don't cross-feed each other.
  */
 
-import { useSyncExternalStore } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 /** Lifecycle of a single script's render. */
@@ -290,4 +290,59 @@ export function isAutoCreated(scriptPath: string): boolean {
  */
 export function useRenderStore(): ReadonlyMap<string, RenderEntry> {
   return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+}
+
+// ── Time estimates ──────────────────────────────────────────────────────────
+
+/**
+ * Estimate the remaining render time in ms, or `null` when no estimate is
+ * possible yet. Based on the per-step rate since the walker first seeded
+ * `total` (see {@link RenderEntry.countedAt}): steps are the leaf nodes of
+ * the script AST and render at roughly a uniform cost, so the early rate
+ * extrapolates well. Returns null until at least one step completed after
+ * the count began.
+ */
+export function estimateRemainingMs(entry: RenderEntry, now = Date.now()): number | null {
+  if (entry.countedAt == null || entry.total <= 0) return null;
+  const done = entry.step - entry.countedStep;
+  if (done <= 0) return null;
+  const elapsedSec = (now - entry.countedAt) / 1000;
+  if (elapsedSec <= 0) return null;
+  const rate = done / elapsedSec; // steps per second
+  const remainingSteps = Math.max(0, entry.total - entry.step);
+  return (remainingSteps / rate) * 1000;
+}
+
+/** Milliseconds since the render started (covers pre-walk phases too). */
+export function elapsedMs(entry: RenderEntry, now = Date.now()): number {
+  return entry.startedAt == null ? 0 : Math.max(0, now - entry.startedAt);
+}
+
+/**
+ * Format a duration compactly as m:ss (or h:mm:ss past the hour), e.g.
+ * `0:45`, `12:03`. Caller prefixes meaning ("~" for estimates, "elapsed").
+ */
+export function formatClock(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const two = (n: number) => String(n).padStart(2, "0");
+  return h > 0 ? `${h}:${two(m)}:${two(sec)}` : `${m}:${two(sec)}`;
+}
+
+/**
+ * A `Date.now()` value that re-renders the caller every second while
+ * `enabled`, so time readouts tick between the backend's throttled (~2 Hz)
+ * progress events. Returns a stable timestamp when disabled (no timers run).
+ */
+export function useRenderTick(enabled: boolean): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!enabled) return;
+    setNow(Date.now());
+    const t = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(t);
+  }, [enabled]);
+  return now;
 }

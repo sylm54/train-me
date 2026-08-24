@@ -74,10 +74,13 @@ import { FrameworkOptionsList } from "@/components/FrameworkOptions";
 import { loadPrompt } from "@/lib/prompts";
 import {
   ensureGlobalListener,
+  estimateRemainingMs,
+  formatClock,
   markDone,
   markError,
   markStart,
   useRenderStore,
+  useRenderTick,
   type RenderEntry,
 } from "@/lib/renderRegistry";
 import { pickExportPath, isAndroid } from "@/lib/export";
@@ -1799,6 +1802,8 @@ function RenderTestCard({ modelLoaded }: { modelLoaded: boolean }) {
   const renderStore = useRenderStore();
   const entry: RenderEntry | null = renderStore.get(RENDER_TEST_SCRIPT) ?? null;
   const rendering = entry?.status === "rendering";
+  const now = useRenderTick(!!rendering);
+  const eta = entry ? estimateRemainingMs(entry, now) : null;
   const renderError = entry?.status === "error" ? entry.error : null;
   const [result, setResult] = useState<RenderedManifest | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
@@ -1858,6 +1863,7 @@ function RenderTestCard({ modelLoaded }: { modelLoaded: boolean }) {
             {entry && entry.total > 0 && (
               <span className="shrink-0 ml-2 tabular-nums">
                 {entry.step}/{entry.total}
+                {eta != null ? ` · ~${formatClock(eta)} left` : ""}
               </span>
             )}
           </div>

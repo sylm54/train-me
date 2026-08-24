@@ -1,7 +1,24 @@
 //! Framework onboarding flow (deterministic first-run customization).
 //!
-//! A framework ZIP may carry a root-level `onboarding.json`: an ordered
-//! array of *items* —
+//! A framework ZIP may carry a root-level `onboarding.json`. Two forms are
+//! accepted:
+//!
+//! ```json
+//! [ …items ]
+//! ```
+//!
+//! ```json
+//! { "output": "PROFILE.md", "items": [ …items ] }
+//! ```
+//!
+//! `output` (object form only) is the sandbox-relative file answers render
+//! into — default `USER.md`.
+//!
+//! Items are `{kind: "text", text, showIf?}`, `{kind: "question", …}` (the
+//! `kind` may be omitted) and `{kind: "include", src, showIf?}` — the latter
+//! splices in the item array of a subfile (framework-root-relative `src`),
+//! with the include's `showIf` ANDed onto each spliced item's own condition.
+//! Subfiles may nest includes; cycles are rejected at parse time.
 //!
 //! ```json
 //! [
@@ -11,24 +28,29 @@
 //!   { "kind": "text", "text": "Since you're experienced…",
 //!     "showIf": { "id": "experience", "equals": "lots" } },
 //!   { "kind": "question", "id": "limits", "answer": "open",
-//!     "prompt": "Hard limits?", "showIf": { "id": "experience", "notEquals": "none" } }
+//!     "prompt": "Hard limits?", "showIf": { "id": "experience", "notEquals": "none" } },
+//!   { "kind": "include", "src": "onboarding/advanced.json",
+//!     "showIf": { "part": "journal" } }
 //! ]
 //! ```
 //!
-//! — the user answers them right after install, as the final step of the
-//! setup wizard. The questionnaire is purely an init mechanism: once
-//! onboarding is done it is never asked again. Answers are stored at
-//! `<data_dir>/onboarding_answers.json` and rendered into the agent
-//! sandbox as `agent_data/USER.md`. Nothing is added to the system
-//! prompt: the framework decides how the agent consumes the profile
-//! (typically `{{include './USER.md'}}` in its own prompts).
+//! The user answers right after install, as the final step of the setup
+//! wizard. The questionnaire is purely an init mechanism: once onboarding
+//! is done it is never asked again. Answers are stored at
+//! `<data_dir>/onboarding_answers.json` and rendered into the agent sandbox
+//! as `agent_data/USER.md` (or the flow's `output`). Nothing is added to
+//! the system prompt: the framework decides how the agent consumes the
+//! profile (typically `{{include './USER.md'}}` in its own prompts).
 //!
 //! Conditions (`showIf`) may reference answers of questions *above* the
-//! item (validated at parse time). The flow engine — visibility, step
-//! screens, save-time pruning — lives entirely here so the frontend never
-//! re-implements it.
+//! item (validated at parse time) and the framework parts that were
+//! selected at install (`{ "part": "journal" }`, optionally
+//! `installed: false` — part names are validated against `config.json` at
+//! stage time). The flow engine — visibility, step screens, save-time
+//! pruning — lives entirely here so the frontend never re-implements it.
 
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -38,17 +60,39 @@ use crate::AppState;
 
 const QUESTIONS_FILE: &str = "onboarding.json";
 const ANSWERS_FILE: &str = "onboarding_answers.json";
-const USER_MD: &str = "USER.md";
+const DEFAULT_OUTPUT: &str = "USER.md";
 
 pub type Answers = BTreeMap<String, serde_json::Value>;
+
+/// A parsed onboarding flow: the spliced item list plus the settings that
+/// ride along from the root file.
+#[derive(Clone, Debug)]
+pub struct Flow {
+    pub items: Vec<OnboardingItem>,
+    /// Sandbox-relative path the rendered answer file is written to.
+    pub output: String,
+    /// Every subfile `src` this flow (transitively) includes — the install
+    /// step copies them next to `onboarding.json` in the data dir.
+    pub includes: Vec<String>,
+}
+
+impl Default for Flow {
+    fn default() -> Self {
+        Flow {
+            items: Vec::new(),
+            output: DEFAULT_OUTPUT.to_string(),
+            includes: Vec::new(),
+        }
+    }
+}
 
 // ============================================================================
 // Schema
 // ============================================================================
 
-/// Display condition. Either a comparison against a previous answer, or
-/// a compound (`all` / `any` / `not`). Multiple comparators on one
-/// comparison are ANDed.
+/// Display condition. Either a comparison against a previous answer, a
+/// check on an installed framework part, or a compound (`all` / `any` /
+/// `not`). Multiple comparators on one comparison are ANDed.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(untagged)]
 pub enum Condition {
@@ -74,6 +118,17 @@ pub enum Condition {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         answered: Option<bool>,
     },
+    /// True when the named part folder (a `config.json` choice target) was
+    /// installed. `installed: false` inverts it.
+    Part {
+        part: String,
+        #[serde(default = "default_true")]
+        installed: bool,
+    },
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -91,6 +146,18 @@ pub enum AnswerKind {
 pub struct TextItem {
     /// Markdown shown between questions.
     pub text: String,
+    #[serde(default, rename = "showIf", skip_serializing_if = "Option::is_none")]
+    pub show_if: Option<Condition>,
+}
+
+/// `{kind: "include", src}` — splices a subfile's item array in place. The
+/// include's own `showIf` is ANDed onto every spliced item's condition, so
+/// a hidden include hides everything it pulls in. Never survives into a
+/// resolved [`Flow`].
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct IncludeItem {
+    /// Framework-root-relative path of a JSON file containing an item array.
+    pub src: String,
     #[serde(default, rename = "showIf", skip_serializing_if = "Option::is_none")]
     pub show_if: Option<Condition>,
 }
@@ -154,6 +221,19 @@ fn condition_ids(c: &Condition, out: &mut Vec<String>) {
         Condition::Any { any } => any.iter().for_each(|c| condition_ids(c, out)),
         Condition::Not { not } => condition_ids(not, out),
         Condition::Cmp { id, .. } => out.push(id.clone()),
+        Condition::Part { .. } => {}
+    }
+}
+
+/// Collect every part name referenced by a condition (for validation
+/// against the parts `config.json` can select).
+fn condition_parts(c: &Condition, out: &mut Vec<String>) {
+    match c {
+        Condition::All { all } => all.iter().for_each(|c| condition_parts(c, out)),
+        Condition::Any { any } => any.iter().for_each(|c| condition_parts(c, out)),
+        Condition::Not { not } => condition_parts(not, out),
+        Condition::Cmp { .. } => {}
+        Condition::Part { part, .. } => out.push(part.clone()),
     }
 }
 
@@ -164,6 +244,13 @@ fn validate_condition(c: &Condition, label: &str) -> Result<(), String> {
         Condition::All { all } => all.iter().try_for_each(|c| validate_condition(c, label)),
         Condition::Any { any } => any.iter().try_for_each(|c| validate_condition(c, label)),
         Condition::Not { not } => validate_condition(not, label),
+        Condition::Part { part, .. } => {
+            if part.trim().is_empty() {
+                Err(format!("{label}: `part` must be non-empty"))
+            } else {
+                Ok(())
+            }
+        }
         Condition::Cmp {
             id,
             equals,
@@ -193,12 +280,38 @@ fn validate_condition(c: &Condition, label: &str) -> Result<(), String> {
     }
 }
 
-/// Parse + validate a framework's `onboarding.json`.
+/// AND two optional conditions into one (`all` when both are present).
+fn and_conditions(a: Condition, b: Option<Condition>) -> Option<Condition> {
+    match b {
+        None => Some(a),
+        Some(b) => Some(Condition::All { all: vec![a, b] }),
+    }
+}
+
+/// A sandbox/data-dir-relative output path is safe when it is relative,
+/// has no `..` component, and has no drive/UNC prefix.
+fn safe_rel_path(p: &str) -> Result<(), String> {
+    let trimmed = p.trim();
+    if trimmed.is_empty() {
+        return Err("path must not be empty".to_string());
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() || trimmed.starts_with('/') || trimmed.starts_with('\\') {
+        return Err(format!("`{trimmed}` must be a relative path"));
+    }
+    if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err(format!("`{trimmed}` must not contain `..`"));
+    }
+    Ok(())
+}
+
+/// Parse + validate a flat item array (what a subfile contains, and what
+/// the root file becomes once includes are spliced).
 pub fn parse_flow(json: &str) -> Result<Vec<OnboardingItem>, String> {
     let items: Vec<serde_json::Value> =
-        serde_json::from_str(json).map_err(|e| format!("invalid onboarding.json: {e}"))?;
+        serde_json::from_str(json).map_err(|e| format!("invalid onboarding items: {e}"))?;
     if items.is_empty() {
-        return Err("onboarding.json must contain at least one item".to_string());
+        return Err("onboarding items must contain at least one item".to_string());
     }
 
     let mut parsed: Vec<OnboardingItem> = Vec::new();
@@ -264,6 +377,139 @@ pub fn parse_flow(json: &str) -> Result<Vec<OnboardingItem>, String> {
     Ok(parsed)
 }
 
+/// Recursively splice `include` items (raw JSON) into a flat raw array.
+/// `stack` carries the include chain for cycle detection. Returns the
+/// resolved array plus every `src` touched.
+fn resolve_includes(
+    root: &Path,
+    items: &[serde_json::Value],
+    stack: &mut Vec<String>,
+    includes_out: &mut Vec<String>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    for (i, raw) in items.iter().enumerate() {
+        let is_include = raw.get("kind").and_then(|k| k.as_str()) == Some("include");
+        if !is_include {
+            out.push(raw.clone());
+            continue;
+        }
+        let inc: IncludeItem = serde_json::from_value(raw.clone())
+            .map_err(|e| format!("include #{i}: {e}"))?;
+        let label = format!("include `{}`", inc.src);
+        safe_rel_path(&inc.src).map_err(|e| format!("{label}: {e}"))?;
+        if stack.contains(&inc.src) {
+            return Err(format!(
+                "include cycle: {} → {src}",
+                stack.join(" → "),
+                src = inc.src
+            ));
+        }
+        let path = root.join(inc.src.trim());
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("{label}: cannot read ({e})"))?;
+        let sub: Vec<serde_json::Value> = serde_json::from_str(&text)
+            .map_err(|e| format!("{label}: invalid JSON ({e})"))?;
+        includes_out.push(inc.src.trim().to_string());
+        stack.push(inc.src.trim().to_string());
+        let spliced = resolve_includes(root, &sub, stack, includes_out);
+        stack.pop();
+
+        // Hoist the include's showIf onto each spliced item so a hidden
+        // include hides everything it pulls in. (Non-object entries pass
+        // through untouched — parse_flow rejects them later.)
+        for mut item in spliced? {
+            if let Some(cond) = &inc.show_if {
+                if let Some(obj) = item.as_object_mut() {
+                    let own = obj
+                        .get("showIf")
+                        .cloned()
+                        .and_then(|v| serde_json::from_value::<Condition>(v).ok());
+                    let merged = and_conditions(cond.clone(), own);
+                    if let Some(merged) = merged {
+                        obj.insert(
+                            "showIf".to_string(),
+                            serde_json::to_value(merged).unwrap(),
+                        );
+                    }
+                }
+            }
+            out.push(item);
+        }
+    }
+    Ok(out)
+}
+
+/// Read + resolve the onboarding flow under `root` (a staged framework root
+/// or the installed data dir). `Ok(None)` when no `onboarding.json` exists.
+/// `known_parts` — the part names `config.json` can select — enables part
+/// reference validation (only available at stage time; `None` skips it).
+pub fn resolve_flow(
+    root: &Path,
+    known_parts: Option<&[String]>,
+) -> Result<Option<Flow>, String> {
+    let path = root.join(QUESTIONS_FILE);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("{QUESTIONS_FILE}: {e}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("invalid {QUESTIONS_FILE}: {e}"))?;
+
+    // Root form: bare item array, or `{ output, items }`.
+    let (output, raw_items): (String, Vec<serde_json::Value>) = match &value {
+        serde_json::Value::Array(items) => (DEFAULT_OUTPUT.to_string(), items.clone()),
+        serde_json::Value::Object(obj) => {
+            let items = obj
+                .get("items")
+                .cloned()
+                .ok_or_else(|| format!("{QUESTIONS_FILE}: object form needs an `items` array"))?;
+            let items: Vec<serde_json::Value> = serde_json::from_value(items)
+                .map_err(|e| format!("{QUESTIONS_FILE}: `items` must be an array ({e})"))?;
+            let output = obj
+                .get("output")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| DEFAULT_OUTPUT.to_string());
+            (output, items)
+        }
+        _ => {
+            return Err(format!(
+                "{QUESTIONS_FILE}: must be an item array or an object with `items`"
+            ))
+        }
+    };
+    safe_rel_path(&output).map_err(|e| format!("{QUESTIONS_FILE}: `output` {e}"))?;
+
+    let mut includes = Vec::new();
+    let flat = resolve_includes(root, &raw_items, &mut Vec::new(), &mut includes)?;
+    let flat_json = serde_json::to_string(&flat)
+        .map_err(|e| format!("{QUESTIONS_FILE}: re-encode failed ({e})"))?;
+    let items = parse_flow(&flat_json)?;
+
+    if let Some(known) = known_parts {
+        let mut refs = Vec::new();
+        for item in &items {
+            if let Some(cond) = item.show_if() {
+                condition_parts(cond, &mut refs);
+            }
+        }
+        for r in refs {
+            if !known.contains(&r) {
+                return Err(format!(
+                    "{QUESTIONS_FILE}: showIf references part `{r}`, which no config.json \
+                     choice selects"
+                ));
+            }
+        }
+    }
+
+    Ok(Some(Flow {
+        items,
+        output,
+        includes,
+    }))
+}
+
 impl OnboardingItem {
     fn show_if(&self) -> Option<&Condition> {
         match self {
@@ -285,11 +531,12 @@ fn value_matches(answer: &serde_json::Value, expected: &serde_json::Value) -> bo
     answer == expected
 }
 
-fn eval_condition(c: &Condition, answers: &Answers) -> bool {
+fn eval_condition(c: &Condition, answers: &Answers, parts: &HashSet<String>) -> bool {
     match c {
-        Condition::All { all } => all.iter().all(|c| eval_condition(c, answers)),
-        Condition::Any { any } => any.iter().any(|c| eval_condition(c, answers)),
-        Condition::Not { not } => !eval_condition(not, answers),
+        Condition::All { all } => all.iter().all(|c| eval_condition(c, answers, parts)),
+        Condition::Any { any } => any.iter().any(|c| eval_condition(c, answers, parts)),
+        Condition::Not { not } => !eval_condition(not, answers, parts),
+        Condition::Part { part, installed } => parts.contains(part) == *installed,
         Condition::Cmp {
             id,
             equals,
@@ -336,21 +583,30 @@ fn eval_condition(c: &Condition, answers: &Answers) -> bool {
     }
 }
 
-/// Items visible given the current answers (evaluated top to bottom).
-pub fn visible_items<'a>(items: &'a [OnboardingItem], answers: &Answers) -> Vec<&'a OnboardingItem> {
+/// Items visible given the current answers and installed parts
+/// (evaluated top to bottom).
+pub fn visible_items<'a>(
+    items: &'a [OnboardingItem],
+    answers: &Answers,
+    parts: &HashSet<String>,
+) -> Vec<&'a OnboardingItem> {
     items
         .iter()
         .filter(|item| {
             item.show_if()
-                .map(|c| eval_condition(c, answers))
+                .map(|c| eval_condition(c, answers, parts))
                 .unwrap_or(true)
         })
         .collect()
 }
 
 /// Question ids that are visible (not hidden by the answer set).
-fn visible_question_ids(items: &[OnboardingItem], answers: &Answers) -> Vec<String> {
-    visible_items(items, answers)
+fn visible_question_ids(
+    items: &[OnboardingItem],
+    answers: &Answers,
+    parts: &HashSet<String>,
+) -> Vec<String> {
+    visible_items(items, answers, parts)
         .iter()
         .filter_map(|item| match item {
             OnboardingItem::Question(q) => Some(q.id.clone()),
@@ -383,21 +639,44 @@ fn is_resolved(answer: Option<&serde_json::Value>) -> bool {
 // Storage
 // ============================================================================
 
-/// Read the framework's onboarding flow from a staged/extracted package
-/// root. `Ok(None)` when the framework ships none.
-pub fn from_pkg_root(pkg_root: &Path) -> Result<Option<Vec<OnboardingItem>>, String> {
-    let path = pkg_root.join(QUESTIONS_FILE);
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let raw = std::fs::read_to_string(&path).map_err(|e| format!("{QUESTIONS_FILE}: {e}"))?;
-    parse_flow(&raw).map(Some)
+/// Every part name a `config.json` under `root` could select (used to
+/// validate `part` conditions at stage time).
+fn config_parts(pkg_root: &Path) -> Vec<String> {
+    crate::package_manifest::Config::from_pkg_root(pkg_root)
+        .map(|c| {
+            let mut parts: Vec<String> = Vec::new();
+            for group in &c.options {
+                for choice in group.choices() {
+                    if !parts.contains(&choice.part) {
+                        parts.push(choice.part.clone());
+                    }
+                }
+            }
+            parts
+        })
+        .unwrap_or_default()
 }
 
-fn load_installed_flow(data_dir: &Path) -> Vec<OnboardingItem> {
-    std::fs::read_to_string(data_dir.join(QUESTIONS_FILE))
+/// Read + validate the framework's onboarding flow from a staged/extracted
+/// package root. `Ok(None)` when the framework ships none.
+pub fn from_pkg_root(pkg_root: &Path) -> Result<Option<Flow>, String> {
+    let parts = config_parts(pkg_root);
+    resolve_flow(pkg_root, Some(&parts))
+}
+
+/// The installed flow under the data dir (include files were copied there
+/// at install). Tolerant: a broken/missing flow yields an empty default.
+fn load_installed_flow(data_dir: &Path) -> Flow {
+    resolve_flow(data_dir, None)
         .ok()
-        .and_then(|raw| parse_flow(&raw).ok())
+        .flatten()
+        .unwrap_or_default()
+}
+
+/// Part folders that were installed (from the installed-framework record).
+fn installed_parts(data_dir: &Path) -> HashSet<String> {
+    crate::package_manifest::read_installed_framework(data_dir)
+        .map(|rec| rec.parts.into_iter().collect())
         .unwrap_or_default()
 }
 
@@ -412,10 +691,11 @@ fn load_answers(data_dir: &Path) -> Answers {
 /// answers for questions the final answer set has hidden.
 fn merged_answers(data_dir: &Path, session: &Answers) -> Answers {
     let flow = load_installed_flow(data_dir);
+    let parts = installed_parts(data_dir);
     let mut merged = load_answers(data_dir);
     merged.extend(session.iter().map(|(k, v)| (k.clone(), v.clone())));
-    let visible = visible_question_ids(&flow, &merged);
-    for q in flow.iter().filter_map(|i| match i {
+    let visible = visible_question_ids(&flow.items, &merged, &parts);
+    for q in flow.items.iter().filter_map(|i| match i {
         OnboardingItem::Question(q) => Some(q),
         _ => None,
     }) {
@@ -437,8 +717,9 @@ pub struct OnboardingState {
 
 fn state_for(data_dir: &Path) -> OnboardingState {
     let flow = load_installed_flow(data_dir);
+    let parts = installed_parts(data_dir);
     let answered = merged_answers(data_dir, &Answers::default());
-    let pending_count = visible_items(&flow, &answered)
+    let pending_count = visible_items(&flow.items, &answered, &parts)
         .iter()
         .filter(|item| match item {
             OnboardingItem::Question(q) => !is_resolved(answered.get(&q.id)),
@@ -446,27 +727,30 @@ fn state_for(data_dir: &Path) -> OnboardingState {
         })
         .count();
     OnboardingState {
-        items: flow,
+        items: flow.items,
         answered,
         pending_count,
     }
 }
 
-/// Render `agent_data/USER.md` from the answer set. Only visible
-/// questions appear; ids ride along as HTML comments so the file stays
-/// readable markdown while remaining machine-parseable.
-fn write_user_md(agent_dir: &Path, data_dir: &Path) -> Result<(), String> {
+/// Render the answer file (`USER.md` or the flow's `output`) into the agent
+/// sandbox. One line per visible, answered question — the prompt as a bold
+/// key followed by the answer — kept deliberately terse since the file is
+/// typically inlined into prompts. Choice questions also list the options
+/// the user did NOT pick (and flag multi-select) so the agent knows the
+/// full option set, not just the selection. Skipped (`null`) and
+/// still-unanswered questions render nothing.
+pub(crate) fn write_user_md(agent_dir: &Path, data_dir: &Path) -> Result<(), String> {
     let flow = load_installed_flow(data_dir);
+    let parts = installed_parts(data_dir);
     let answered = merged_answers(data_dir, &Answers::default());
     let mut md = String::from(
         "# User profile\n\n\
-         Answers given during framework onboarding. This file is plain data on\n\
-         the agent filesystem — nothing here is loaded into the system prompt\n\
-         automatically; the framework decides how the agent consumes it\n\
-         (e.g. `{{include './USER.md'}}` in its own prompts).\n\n",
+         Onboarding answers. Plain sandbox data — the framework's prompts decide how the\n\
+         agent consumes this file.\n\n",
     );
     let mut wrote = 0;
-    for item in visible_items(&flow, &answered) {
+    for item in visible_items(&flow.items, &answered, &parts) {
         let OnboardingItem::Question(q) = item else {
             continue;
         };
@@ -475,24 +759,79 @@ fn write_user_md(agent_dir: &Path, data_dir: &Path) -> Result<(), String> {
             Some(serde_json::Value::Null) | None => continue,
             Some(answer) => answer,
         };
-        let rendered = match answer {
-            serde_json::Value::Array(items) => items
-                .iter()
-                .map(|v| v.as_str().unwrap_or(&v.to_string()).to_string())
-                .collect::<Vec<_>>()
-                .join(", "),
-            other => other.as_str().unwrap_or(&other.to_string()).to_string(),
-        };
-        md.push_str(&format!(
-            "<!-- onboarding:{} -->\n**{}**\n\n{}\n\n",
-            q.id, q.prompt, rendered
-        ));
+        match (&q.answer, answer) {
+            // Choices: the picked option(s) plus the declined ones, so the
+            // agent sees the whole menu. Multi-select is flagged.
+            (
+                AnswerKind::Choice,
+                serde_json::Value::Array(selected),
+            ) => {
+                let chosen: Vec<&str> = selected
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .collect();
+                let declined: Vec<&str> = q
+                    .choices
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|c| !chosen.contains(c))
+                    .collect();
+                let list = chosen.join(", ");
+                let mut line = format!("**{}** (multiple choice) {}", q.prompt, list);
+                if !declined.is_empty() {
+                    line.push_str(&format!(" (not chosen: {})", declined.join(", ")));
+                }
+                md.push_str(&line);
+                md.push_str("\n\n");
+            }
+            (AnswerKind::Choice, single) => {
+                let chosen = single
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| single.to_string());
+                let declined: Vec<&str> = q
+                    .choices
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|c| *c != chosen)
+                    .collect();
+                let mut line = format!("**{}** {}", q.prompt, chosen);
+                if !declined.is_empty() {
+                    line.push_str(&format!(" (not chosen: {})", declined.join(", ")));
+                }
+                md.push_str(&line);
+                md.push_str("\n\n");
+            }
+            // Ratings carry their scale — a bare "7" is meaningless without
+            // the range it came from.
+            (AnswerKind::Rating, value) => {
+                md.push_str(&format!(
+                    "**{}** {} (scale {}–{})\n\n",
+                    q.prompt,
+                    value.as_str().unwrap_or(&value.to_string()),
+                    q.min,
+                    q.max
+                ));
+            }
+            (_, other) => {
+                md.push_str(&format!(
+                    "**{}** {}\n\n",
+                    q.prompt,
+                    other.as_str().unwrap_or(&other.to_string())
+                ));
+            }
+        }
         wrote += 1;
     }
     if wrote == 0 {
         md.push_str("_(No answers yet.)_\n");
     }
-    std::fs::write(agent_dir.join(USER_MD), md).map_err(|e| format!("USER.md: {e}"))
+    let target = agent_dir.join(flow.output.trim());
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("{}: {e}", flow.output))?;
+    }
+    std::fs::write(&target, md).map_err(|e| format!("{}: {e}", flow.output))
 }
 
 // ============================================================================
@@ -515,8 +854,12 @@ pub struct OnboardingStep {
 /// the first unresolved question ends the screen (answered or skipped —
 /// `null` — both count as resolved). Text blocks after the last resolved
 /// question with no question left arrive on a final, question-less screen.
-fn step_for(flow: &[OnboardingItem], answers: &Answers) -> OnboardingStep {
-    let visible = visible_items(flow, answers);
+fn step_for(
+    flow: &[OnboardingItem],
+    answers: &Answers,
+    parts: &HashSet<String>,
+) -> OnboardingStep {
+    let visible = visible_items(flow, answers, parts);
     let questions: Vec<&QuestionItem> = visible
         .iter()
         .filter_map(|i| {
@@ -575,11 +918,12 @@ pub fn onboarding_step(
     state: State<'_, AppState>,
 ) -> Result<OnboardingStep, String> {
     let flow = load_installed_flow(&state.data_dir);
+    let parts = installed_parts(&state.data_dir);
     let mut answers = load_answers(&state.data_dir);
     if let Some(session) = session {
         answers.extend(session);
     }
-    Ok(step_for(&flow, &answers))
+    Ok(step_for(&flow.items, &answers, &parts))
 }
 
 #[tauri::command]
@@ -615,6 +959,14 @@ pub fn save_onboarding_answers(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn no_parts() -> HashSet<String> {
+        HashSet::new()
+    }
+
+    fn parts(list: &[&str]) -> HashSet<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
 
     fn flow() -> Vec<OnboardingItem> {
         parse_flow(
@@ -673,7 +1025,7 @@ mod tests {
 
         let eval = |c: &str, a: &Answers| {
             let cond: Condition = serde_json::from_str(c).unwrap();
-            eval_condition(&cond, a)
+            eval_condition(&cond, a, &no_parts())
         };
         assert!(eval(r#"{ "id": "exp", "equals": "lots" }"#, &answers));
         assert!(eval(r#"{ "id": "exp", "notEquals": "none" }"#, &answers));
@@ -690,21 +1042,39 @@ mod tests {
     }
 
     #[test]
+    fn part_conditions() {
+        let installed = parts(&["journal", "fitness"]);
+        let eval = |c: &str, p: &HashSet<String>| {
+            let cond: Condition = serde_json::from_str(c).unwrap();
+            eval_condition(&cond, &Answers::default(), p)
+        };
+        assert!(eval(r#"{ "part": "journal" }"#, &installed));
+        assert!(!eval(r#"{ "part": "voice" }"#, &installed));
+        assert!(eval(r#"{ "part": "voice", "installed": false }"#, &installed));
+        assert!(!eval(r#"{ "part": "journal", "installed": false }"#, &installed));
+        // Combines with other conditions.
+        assert!(eval(
+            r#"{ "all": [ { "part": "journal" }, { "not": { "part": "voice" } } ] }"#,
+            &installed
+        ));
+    }
+
+    #[test]
     fn visibility_hides_downstream_questions() {
         let f = flow();
         // "none": advanced questions hidden.
         let mut a = Answers::new();
         a.insert("exp".into(), json!("none"));
-        let ids = visible_question_ids(&f, &a);
+        let ids = visible_question_ids(&f, &a, &no_parts());
         assert_eq!(ids, vec!["exp".to_string()]);
 
         // "lots": everything visible.
         a.insert("exp".into(), json!("lots"));
-        assert_eq!(visible_question_ids(&f, &a).len(), 4);
+        assert_eq!(visible_question_ids(&f, &a, &no_parts()).len(), 4);
 
         // Step: after answering exp, the next screen is the conditional
         // text + the focus question.
-        let step = step_for(&f, &a);
+        let step = step_for(&f, &a, &no_parts());
         assert_eq!(step.question.as_ref().unwrap().id, "focus");
         assert_eq!(step.texts.len(), 1);
         assert_eq!(step.remaining, 3);
@@ -714,7 +1084,7 @@ mod tests {
         a.insert("focus".into(), json!("voice"));
         a.insert("intensity".into(), json!(8));
         a.insert("contact".into(), json!("no"));
-        let step = step_for(&f, &a);
+        let step = step_for(&f, &a, &no_parts());
         assert!(step.question.is_none());
         assert_eq!(step.remaining, 0);
     }
@@ -732,14 +1102,14 @@ mod tests {
         .unwrap();
 
         // Unanswered: the optional question is the next screen.
-        let step = step_for(&flow, &Answers::new());
+        let step = step_for(&flow, &Answers::new(), &no_parts());
         assert_eq!(step.question.as_ref().unwrap().id, "name");
         assert_eq!(step.remaining, 1);
 
         // Skipped (`null`): counts as resolved for progress…
         let mut a = Answers::new();
         a.insert("name".into(), serde_json::Value::Null);
-        let step = step_for(&flow, &a);
+        let step = step_for(&flow, &a, &no_parts());
         assert!(step.question.is_none(), "skipped optional completes the flow");
         assert_eq!(step.remaining, 0);
         // …but evaluates as unanswered for `showIf` (the `why` question
@@ -753,7 +1123,7 @@ mod tests {
         std::fs::write(data.join(QUESTIONS_FILE), serde_json::to_string(&flow).unwrap()).unwrap();
         std::fs::write(data.join(ANSWERS_FILE), serde_json::to_string(&a).unwrap()).unwrap();
         write_user_md(&agent, data).unwrap();
-        let md = std::fs::read_to_string(agent.join(USER_MD)).unwrap();
+        let md = std::fs::read_to_string(agent.join("USER.md")).unwrap();
         assert!(md.contains("(No answers yet.)"));
         assert!(!md.contains("Name?"));
         let _ = tmp;
@@ -783,9 +1153,220 @@ mod tests {
         )
         .unwrap();
         write_user_md(&agent, data).unwrap();
-        let md = std::fs::read_to_string(agent.join(USER_MD)).unwrap();
-        assert!(md.contains("<!-- onboarding:exp -->"));
-        assert!(md.contains("none"));
+        let md = std::fs::read_to_string(agent.join("USER.md")).unwrap();
+        assert!(md.contains("**Experience?** none"));
+        assert!(md.contains("not chosen: some, lots"));
         assert!(!md.contains("focus"));
+        assert!(!md.contains("<!--"), "no id comment headers");
+        let _ = tmp;
+    }
+
+    #[test]
+    fn user_md_marks_multi_choice_and_declined_options() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        let agent = data.join("agent_data");
+        std::fs::create_dir_all(&agent).unwrap();
+        let flow = parse_flow(
+            r###"[
+            { "kind": "question", "id": "topics", "answer": "choice", "multiple": true,
+              "prompt": "Topics?", "choices": ["voice", "posture", "fitness"] },
+            { "kind": "question", "id": "style", "answer": "choice",
+              "prompt": "Style?", "choices": ["strict", "gentle"] },
+            { "kind": "question", "id": "heat", "answer": "rating", "min": 1, "max": 5,
+              "prompt": "Heat?" }
+        ]"###,
+        )
+        .unwrap();
+        std::fs::write(data.join(QUESTIONS_FILE), serde_json::to_string(&flow).unwrap()).unwrap();
+        let mut answers = Answers::new();
+        answers.insert("topics".into(), json!(["voice", "fitness"]));
+        answers.insert("style".into(), json!("strict"));
+        answers.insert("heat".into(), json!(4));
+        std::fs::write(data.join(ANSWERS_FILE), serde_json::to_string(&answers).unwrap()).unwrap();
+        write_user_md(&agent, data).unwrap();
+        let md = std::fs::read_to_string(agent.join("USER.md")).unwrap();
+        assert!(md.contains("**Topics?** (multiple choice) voice, fitness (not chosen: posture)"));
+        assert!(md.contains("**Style?** strict (not chosen: gentle)"));
+        assert!(md.contains("**Heat?** 4 (scale 1–5)"));
+        let _ = tmp;
+    }
+
+    #[test]
+    fn object_form_sets_output_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join(QUESTIONS_FILE),
+            r#"{ "output": "profile/PROFILE.md", "items": [
+                { "kind": "question", "id": "nick", "answer": "open",
+                  "prompt": "Nickname?" } ] }"#,
+        )
+        .unwrap();
+        let flow = resolve_flow(root, None).unwrap().expect("flow present");
+        assert_eq!(flow.output, "profile/PROFILE.md");
+        assert_eq!(flow.items.len(), 1);
+
+        // The answer file lands at the custom path (dirs created).
+        let agent = root.join("agent_data");
+        std::fs::create_dir_all(&agent).unwrap();
+        let mut answers = Answers::new();
+        answers.insert("nick".into(), json!("spark"));
+        std::fs::write(root.join(ANSWERS_FILE), serde_json::to_string(&answers).unwrap()).unwrap();
+        write_user_md(&agent, root).unwrap();
+        let md = std::fs::read_to_string(agent.join("profile").join("PROFILE.md")).unwrap();
+        assert!(md.contains("**Nickname?** spark"));
+        assert!(!agent.join("USER.md").exists());
+
+        // Unsafe output paths are rejected.
+        std::fs::write(
+            root.join(QUESTIONS_FILE),
+            r#"{ "output": "../escape.md", "items": [ { "kind": "text", "text": "x" } ] }"#,
+        )
+        .unwrap();
+        assert!(resolve_flow(root, None).is_err());
+        let _ = tmp;
+    }
+
+    #[test]
+    fn includes_splice_and_hoist_conditions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("onboarding")).unwrap();
+        std::fs::write(
+            root.join(QUESTIONS_FILE),
+            r#"{ "items": [
+                { "kind": "question", "id": "exp", "answer": "choice",
+                  "prompt": "Experience?", "choices": ["none", "lots"] },
+                { "kind": "include", "src": "onboarding/advanced.json",
+                  "showIf": { "id": "exp", "equals": "lots" } },
+                { "kind": "include", "src": "onboarding/journal.json",
+                  "showIf": { "part": "journal" } } ] }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("onboarding").join("advanced.json"),
+            r#"[
+                { "kind": "text", "text": "Advanced section" },
+                { "kind": "question", "id": "deep", "answer": "open", "prompt": "Deep?",
+                  "showIf": { "id": "exp", "answered": true } } ]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("onboarding").join("journal.json"),
+            r#"[ { "kind": "question", "id": "jrn", "answer": "open", "prompt": "Journaling?" } ]"#,
+        )
+        .unwrap();
+
+        // Part validation: journal is a config-selectable part.
+        let flow = resolve_flow(root, Some(&["journal".to_string()]))
+            .unwrap()
+            .expect("flow present");
+        assert_eq!(flow.items.len(), 4, "includes spliced in place");
+        assert_eq!(
+            flow.includes,
+            vec!["onboarding/advanced.json", "onboarding/journal.json"]
+        );
+
+        // Include showIf is ANDed onto each spliced item's own condition:
+        // with exp="none" the advanced block (incl. its text) hides; the
+        // journal block shows because the part is installed.
+        let mut a = Answers::new();
+        a.insert("exp".into(), json!("none"));
+        let with_part = parts(&["journal"]);
+        let ids = visible_question_ids(&flow.items, &a, &with_part);
+        assert_eq!(ids, vec!["exp".to_string(), "jrn".to_string()]);
+
+        // Without the part installed, only exp is visible.
+        let ids = visible_question_ids(&flow.items, &a, &no_parts());
+        assert_eq!(ids, vec!["exp".to_string()]);
+
+        // exp="lots": the nested per-item showIf (answered: true) also
+        // gates `deep`.
+        a.insert("exp".into(), json!("lots"));
+        let ids = visible_question_ids(&flow.items, &a, &with_part);
+        assert!(ids.contains(&"deep".to_string()));
+
+        // Unknown part reference fails validation when parts are known.
+        std::fs::write(
+            root.join(QUESTIONS_FILE),
+            r#"[ { "kind": "text", "text": "x", "showIf": { "part": "nope" } } ]"#,
+        )
+        .unwrap();
+        assert!(resolve_flow(root, Some(&["journal".to_string()])).is_err());
+        // …but passes without known parts (runtime re-read has no config).
+        assert!(resolve_flow(root, None).is_ok());
+        let _ = tmp;
+    }
+
+    #[test]
+    fn include_errors_missing_file_and_cycles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Missing subfile.
+        std::fs::write(
+            root.join(QUESTIONS_FILE),
+            r#"[ { "kind": "include", "src": "onboarding/gone.json" } ]"#,
+        )
+        .unwrap();
+        assert!(resolve_flow(root, None).is_err());
+
+        // Include cycle.
+        std::fs::create_dir_all(root.join("onboarding")).unwrap();
+        std::fs::write(
+            root.join(QUESTIONS_FILE),
+            r#"[ { "kind": "include", "src": "onboarding/a.json" } ]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("onboarding").join("a.json"),
+            r#"[ { "kind": "include", "src": "onboarding/b.json" } ]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("onboarding").join("b.json"),
+            r#"[ { "kind": "include", "src": "onboarding/a.json" } ]"#,
+        )
+        .unwrap();
+        let err = resolve_flow(root, None).unwrap_err();
+        assert!(err.contains("cycle"), "got: {err}");
+
+        // Escaping paths are rejected.
+        std::fs::write(
+            root.join(QUESTIONS_FILE),
+            r#"[ { "kind": "include", "src": "../secrets.json" } ]"#,
+        )
+        .unwrap();
+        assert!(resolve_flow(root, None).is_err());
+        let _ = tmp;
+    }
+
+    #[test]
+    fn from_pkg_root_validates_against_config_parts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("base")).unwrap();
+        std::fs::write(
+            root.join("config.json"),
+            r#"{ "options": [ { "type": "multiple", "id": "extras", "title": "Extras",
+                "choices": [ { "id": "j", "label": "J", "part": "journal" } ] } ] }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(QUESTIONS_FILE),
+            r#"[ { "kind": "question", "id": "q", "answer": "open", "prompt": "Q?",
+                 "showIf": { "part": "journal" } } ]"#,
+        )
+        .unwrap();
+        assert!(from_pkg_root(root).unwrap().is_some());
+
+        std::fs::write(
+            root.join(QUESTIONS_FILE),
+            r#"[ { "kind": "question", "id": "q", "answer": "open", "prompt": "Q?",
+                 "showIf": { "part": "ghost" } } ]"#,
+        )
+        .unwrap();
+        assert!(from_pkg_root(root).is_err());
+        let _ = tmp;
     }
 }

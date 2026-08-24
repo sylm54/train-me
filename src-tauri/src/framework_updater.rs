@@ -353,6 +353,7 @@ mod tests {
             installed_at: "2026-01-01T00:00:00+00:00".into(),
             source_url: String::new(),
             choices: serde_json::Value::Null,
+            parts: Vec::new(),
         };
         // Same version → no update. (We can't hit the network in a unit test,
         // so we exercise the comparison helper directly via the public fn's

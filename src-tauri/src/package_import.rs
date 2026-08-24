@@ -206,18 +206,60 @@ pub(crate) fn install_framework(
 
     // Record the installed framework (with source url + choices for later
     // update checks and re-installs).
-    // Root-level onboarding.json: install (or, on update without one,
-    // remove) the framework's deterministic first-run questions.
+    // Root-level onboarding.json (+ the subfiles its includes reference):
+    // install, or on update without one, remove. Include files the new flow
+    // no longer references are pruned so renamed/deleted subfiles don't
+    // linger. The old flow is resolved BEFORE the copy overwrites it.
+    let old_includes: Vec<String> = crate::onboarding::resolve_flow(data_dir, None)
+        .ok()
+        .flatten()
+        .map(|f| f.includes)
+        .unwrap_or_default();
+    let staged_flow = crate::onboarding::resolve_flow(staged_root, None)
+        .map_err(|e| format!("Failed to resolve onboarding: {e}"))?;
     let staged_onboarding = staged_root.join("onboarding.json");
-    if staged_onboarding.is_file() {
+    if let Some(flow) = &staged_flow {
         std::fs::copy(&staged_onboarding, data_dir.join("onboarding.json"))
             .map_err(|e| format!("Failed to copy onboarding.json: {e}"))?;
+        for rel in &flow.includes {
+            let dst = data_dir.join(rel);
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to copy onboarding include {rel}: {e}"))?;
+            }
+            fs::copy(staged_root.join(rel), &dst)
+                .map_err(|e| format!("Failed to copy onboarding include {rel}: {e}"))?;
+        }
     } else if is_update {
         let _ = std::fs::remove_file(data_dir.join("onboarding.json"));
     }
+    for rel in old_includes {
+        let still_used = staged_flow
+            .as_ref()
+            .map(|f| f.includes.contains(&rel))
+            .unwrap_or(false);
+        if !still_used {
+            let _ = std::fs::remove_file(data_dir.join(&rel));
+        }
+    }
 
-    let record = installed_from_manifest(manifest, source_url, choices);
+    let installed_part_folders: Vec<String> = part_names
+        .iter()
+        .filter(|p| p.as_str() != "base")
+        .cloned()
+        .collect();
+    let record = installed_from_manifest(manifest, source_url, choices, &installed_part_folders);
     write_installed_framework(data_dir, &record)?;
+
+    // The record now carries the installed parts. When answers already
+    // exist (an update over a previously-onboarded install), regenerate the
+    // answer file so a changed flow — new output path, edited questions —
+    // takes effect without re-running the questionnaire.
+    if staged_flow.is_some() && data_dir.join("onboarding_answers.json").is_file() {
+        if let Err(e) = crate::onboarding::write_user_md(agent_root, data_dir) {
+            log::warn!("[install] onboarding answer file regen failed: {e}");
+        }
+    }
 
     Ok(ImportResult {
         kind: "framework".to_string(),
@@ -932,5 +974,107 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("base/"));
+    }
+
+    #[test]
+    fn test_install_copies_onboarding_includes_and_records_parts() {
+        let root = tempdir().unwrap();
+        build_framework_root(root.path());
+        write_manifest(root.path());
+        write_config(root.path());
+        // Onboarding with a custom output + a conditional include.
+        fs::create_dir_all(root.path().join("onboarding")).unwrap();
+        fs::write(
+            root.path().join("onboarding.json"),
+            r#"{ "output": "PROFILE.md", "items": [
+                { "kind": "question", "id": "exp", "answer": "open", "prompt": "Exp?" },
+                { "kind": "include", "src": "onboarding/adv.json",
+                  "showIf": { "part": "part_hard" } } ] }"#,
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("onboarding").join("adv.json"),
+            r#"[ { "kind": "question", "id": "deep", "answer": "open", "prompt": "Deep?" } ]"#,
+        )
+        .unwrap();
+
+        let data = tempdir().unwrap();
+        let prompts = data.path().join("prompts");
+        let agent = data.path().join("agent_data");
+        fs::create_dir_all(&prompts).unwrap();
+        fs::create_dir_all(&agent).unwrap();
+        // Pre-existing answers: the install must regenerate the answer
+        // file at the NEW output path.
+        fs::write(
+            data.path().join("onboarding_answers.json"),
+            r#"{ "exp": "lots", "deep": "yes" }"#,
+        )
+        .unwrap();
+
+        let manifest = Manifest::from_pkg_root(root.path()).unwrap();
+        let config = Config::from_pkg_root(root.path()).unwrap();
+        let choices = serde_json::json!({ "intensity": "hard" });
+        install_framework(
+            root.path(),
+            "",
+            &choices,
+            &manifest,
+            &config,
+            data.path(),
+            &agent,
+            &prompts,
+        )
+        .unwrap();
+
+        // onboarding.json + its subfile landed in the data dir.
+        assert!(data.path().join("onboarding.json").is_file());
+        assert!(data.path().join("onboarding").join("adv.json").is_file());
+        // The record carries the selected part (drives showIf part checks).
+        let rec = package_manifest::read_installed_framework(data.path()).unwrap();
+        assert_eq!(rec.parts, vec!["part_hard".to_string()]);
+        // Answers were regenerated at the custom output path, with the
+        // part-gated include visible (part_hard IS installed).
+        let md = fs::read_to_string(agent.join("PROFILE.md")).unwrap();
+        assert!(md.contains("**Exp?** lots"));
+        assert!(md.contains("**Deep?** yes"));
+
+        // Re-install with the light part: adv.json is still referenced by
+        // the flow, so it stays; the profile regenerates without `deep`
+        // (its include is hidden for a part that isn't installed).
+        let choices = serde_json::json!({ "intensity": "light" });
+        install_framework(
+            root.path(),
+            "",
+            &choices,
+            &manifest,
+            &config,
+            data.path(),
+            &agent,
+            &prompts,
+        )
+        .unwrap();
+        assert!(data.path().join("onboarding").join("adv.json").is_file());
+        let rec = package_manifest::read_installed_framework(data.path()).unwrap();
+        assert_eq!(rec.parts, vec!["part_light".to_string()]);
+        let md = fs::read_to_string(agent.join("PROFILE.md")).unwrap();
+        assert!(md.contains("**Exp?** lots"));
+        assert!(!md.contains("Deep?"));
+
+        // An update that drops onboarding entirely removes the flow AND
+        // its subfiles.
+        fs::remove_file(root.path().join("onboarding.json")).unwrap();
+        install_framework(
+            root.path(),
+            "",
+            &choices,
+            &manifest,
+            &config,
+            data.path(),
+            &agent,
+            &prompts,
+        )
+        .unwrap();
+        assert!(!data.path().join("onboarding.json").exists());
+        assert!(!data.path().join("onboarding").join("adv.json").exists());
     }
 }

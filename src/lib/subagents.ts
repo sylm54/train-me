@@ -293,7 +293,7 @@ async function runSubagent(opts: {
     // the full rationale (OpenRouter doesn't support the Responses API).
     result = streamText({
       model: cfg.provider.chat(cfg.model, cfg.modelSettings),
-      system: opts.systemPrompt,
+      system: withSubagentContext(opts.agent, opts.depth, opts.systemPrompt),
       messages: modelMessages,
       tools: opts.tools,
       stopWhen: isLoopFinished(),
@@ -470,6 +470,41 @@ async function runSubagent(opts: {
     }
     emitEnd(opts.agent, opts.depth);
   }
+}
+
+// ============================================================================
+// Subagent context injection
+// ============================================================================
+
+/**
+ * Prefix prepended to every subagent's system prompt (below its file prompt).
+ *
+ * Framework prompts are written for the agent generally; nothing in them says
+ * "you are the subagent right now". Without that, a spawned planner has been
+ * observed delegating its own task back through `invoke_planner` — spawning
+ * itself to do the very work it was given, burning a recursion level and
+ * tokens for nothing. Stating the identity + depth explicitly in the prompt
+ * makes the model do the work itself and reserve spawning for genuinely
+ * separable subtasks.
+ */
+function withSubagentContext(
+  agent: SubagentName,
+  depth: number,
+  systemPrompt: string,
+): string {
+  const caller =
+    depth <= 1 ? "the main agent" : `another ${agent} subagent (depth ${depth - 1})`;
+  return (
+    `[Subagent context — injected by the app, not part of your file prompt]\n` +
+    `You ARE the "${agent}" subagent, running at recursion depth ${depth}, spawned by ${caller} ` +
+    `via a tool call. The user does not see your messages — only your final text is ` +
+    `returned to the caller as that tool's result.\n` +
+    `Because you are already this subagent, never invoke it on yourself: do NOT spawn ` +
+    `another "${agent}" to handle the task you were given — that is your job, do it ` +
+    `directly. Spawning further subagents is only for genuinely separate, decomposable ` +
+    `subtasks, never for re-doing or continuing your own assignment.\n\n` +
+    systemPrompt
+  );
 }
 
 // ============================================================================

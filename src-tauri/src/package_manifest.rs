@@ -156,6 +156,15 @@ pub struct Choice {
     pub part: String,
 }
 
+impl OptionGroup {
+    /// The choices of either group flavour.
+    pub fn choices(&self) -> &[Choice] {
+        match self {
+            OptionGroup::Single { choices, .. } | OptionGroup::Multiple { choices, .. } => choices,
+        }
+    }
+}
+
 /// Parsed `config.json`. A missing file yields an empty config (a base-only
 /// framework with no options), so the minimal framework still installs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -230,7 +239,9 @@ impl Config {
 /// `source_url` (the update-channel index URL the framework was installed
 /// from) and `choices` (the config.json selections made at install time)
 /// are saved so update checks and re-installs can happen without re-entry.
-/// Both default empty so an older `framework.json` without them still loads.
+/// `parts` records the part folders that were actually installed so later
+/// stages (e.g. onboarding part conditions) can check activity. All default
+/// empty so an older `framework.json` without them still loads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledFramework {
     pub id: String,
@@ -247,6 +258,9 @@ pub struct InstalledFramework {
     /// Shape: `{ "<option id>": "<choice id>" | ["<choice id>", ...] }`.
     #[serde(default)]
     pub choices: JsonValue,
+    /// The part folders merged at install (beyond `base/`).
+    #[serde(default)]
+    pub parts: Vec<String>,
 }
 
 const INSTALLED_FILE: &str = "framework.json";
@@ -278,11 +292,13 @@ pub fn clear_installed_framework(data_dir: &Path) {
 /// Build an [`InstalledFramework`] from a freshly installed manifest.
 /// `source_url` is the update-channel index URL the framework was installed
 /// from (empty for a local-ZIP install). `choices` is the config.json
-/// selection set the user made (kept loose as JSON).
+/// selection set the user made (kept loose). `parts` is the set of part
+/// folders that were actually merged (beyond `base/`).
 pub fn installed_from_manifest(
     mf: &Manifest,
     source_url: &str,
     choices: &JsonValue,
+    parts: &[String],
 ) -> InstalledFramework {
     InstalledFramework {
         id: mf.id.clone(),
@@ -292,6 +308,7 @@ pub fn installed_from_manifest(
         installed_at: chrono::Utc::now().to_rfc3339(),
         source_url: source_url.to_string(),
         choices: choices.clone(),
+        parts: parts.to_vec(),
     }
 }
 
@@ -677,6 +694,7 @@ mod tests {
             installed_at: "2026-08-07T12:00:00+00:00".into(),
             source_url: "https://example.com/index.json".into(),
             choices: serde_json::json!({ "intensity": "medium" }),
+            parts: vec!["part_medium".into()],
         };
         write_installed_framework(dir.path(), &rec).unwrap();
         let back = read_installed_framework(dir.path()).expect("should read back");
