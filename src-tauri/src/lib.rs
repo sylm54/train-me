@@ -14,7 +14,10 @@ mod audio_server;
 mod bash;
 mod chastity;
 mod economy;
-mod expression;
+// `expression` is public only so its doctests compile — doctests build as
+// an external crate and can't reach private modules. Not part of the app's
+// surface (main only calls `run()`).
+pub mod expression;
 mod format;
 mod framework_updater;
 mod helper;
@@ -496,6 +499,13 @@ async fn reset_app_data(state: State<'_, AppState>) -> Result<ResetReport, Strin
     //    "no framework" onboarding state.
     wipe_dir_contents(&state.data_dir.join("prompts"))?;
     package_manifest::clear_installed_framework(&state.data_dir);
+    // Resolve the flow before deleting onboarding.json — its include
+    // subfiles (e.g. an `onboarding/` dir) are listed there.
+    if let Some(flow) = onboarding::resolve_flow(&state.data_dir, None).ok().flatten() {
+        for rel in flow.includes {
+            let _ = std::fs::remove_file(state.data_dir.join(rel));
+        }
+    }
     let _ = std::fs::remove_file(state.data_dir.join("onboarding.json"));
     let _ = std::fs::remove_file(state.data_dir.join("onboarding_answers.json"));
     report.prompts = true;

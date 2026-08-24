@@ -18,8 +18,12 @@ import { AlertCircle, CheckCircle2, AudioLines } from "lucide-react";
 import {
   clear,
   ensureGlobalListener,
+  elapsedMs,
+  estimateRemainingMs,
+  formatClock,
   isAutoCreated,
   useRenderStore,
+  useRenderTick,
   type RenderEntry,
 } from "@/lib/renderRegistry";
 
@@ -29,6 +33,29 @@ const TERMINAL_MS = 3500;
 function basename(scriptPath: string): string {
   const parts = scriptPath.split(/[\\/]/);
   return parts[parts.length - 1] || scriptPath;
+}
+
+/**
+ * Time readout for an in-flight render: the estimated time left once the
+ * per-step rate exists, otherwise the elapsed time. `now` comes from a
+ * 1-second tick so both advance between the throttled progress events.
+ */
+function TimeReadout({ entry, now }: { entry: RenderEntry; now: number }) {
+  const eta = estimateRemainingMs(entry, now);
+  if (eta != null) {
+    return (
+      <span className="shrink-0 tabular-nums text-muted-foreground">
+        ~{formatClock(eta)} left
+      </span>
+    );
+  }
+  const elapsed = elapsedMs(entry, now);
+  if (elapsed <= 0) return null;
+  return (
+    <span className="shrink-0 tabular-nums text-muted-foreground">
+      {formatClock(elapsed)}
+    </span>
+  );
 }
 
 function ProgressBar({ entry }: { entry: RenderEntry }) {
@@ -53,9 +80,11 @@ function ProgressBar({ entry }: { entry: RenderEntry }) {
 function Pill({
   script,
   entry,
+  now,
 }: {
   script: string;
   entry: RenderEntry;
+  now: number;
 }) {
   // Auto-clear adopted entries once terminal (owned entries are consumed by
   // their view, which calls `clear` itself when appropriate).
@@ -87,6 +116,7 @@ function Pill({
             {entry.step}/{entry.total}
           </span>
         )}
+        {!terminal && <TimeReadout entry={entry} now={now} />}
       </div>
       {terminal ? (
         entry.status === "error" && (
@@ -117,12 +147,18 @@ export function RenderProgressOverlay() {
     ensureGlobalListener();
   }, []);
 
+  // Tick once a second while anything renders so the elapsed/ETA readouts
+  // advance between the throttled progress events.
+  const now = useRenderTick(
+    [...store.values()].some((e) => e.status === "rendering"),
+  );
+
   if (store.size === 0) return null;
 
   return (
     <div className="fixed bottom-3 left-1/2 -translate-x-1/2 z-40 flex flex-col items-center gap-2 pointer-events-none">
       {[...store.entries()].map(([script, entry]) => (
-        <Pill key={script} script={script} entry={entry} />
+        <Pill key={script} script={script} entry={entry} now={now} />
       ))}
     </div>
   );

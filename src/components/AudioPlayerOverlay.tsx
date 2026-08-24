@@ -18,9 +18,13 @@ import { logActivity } from "@/lib/activity";
 import { setAudioBusy } from "@/lib/audioBus";
 import {
   ensureGlobalListener,
+  estimateRemainingMs,
+  formatClock,
   markDone,
   markError,
   markStart,
+  useRenderStore,
+  useRenderTick,
 } from "@/lib/renderRegistry";
 
 interface ManifestStatus {
@@ -55,6 +59,12 @@ export function AudioPlayerOverlay({ src, onClose, onEnded }: Props) {
   const playerRef = useRef<ManifestPlayer | null>(null);
   const rootRef = useRef<Segment | null>(null);
   const endedFired = useRef(false);
+  // App-wide render entry for this script (seeded by markStart below) —
+  // drives the progress bar + time-remaining readout while rendering.
+  const renderEntry = useRenderStore().get(src) ?? null;
+  const rendering = phase === "rendering" && renderEntry?.status === "rendering";
+  const now = useRenderTick(rendering);
+  const eta = rendering && renderEntry ? estimateRemainingMs(renderEntry, now) : null;
 
   const fail = useCallback((msg: string) => {
     setError(msg);
@@ -169,9 +179,38 @@ export function AudioPlayerOverlay({ src, onClose, onEnded }: Props) {
       <div className="flex-1 flex flex-col items-center justify-center gap-6 px-6 text-center">
         {phase === "checking" && <Spinner className="size-6" />}
         {phase === "rendering" && (
-          <div className="flex flex-col items-center gap-3">
+          <div className="flex flex-col items-center gap-3 w-full max-w-sm px-4">
             <Spinner className="size-6" />
             <div className="text-sm text-muted-foreground">Rendering audio… {renderLabel}</div>
+            <div className="w-full space-y-1.5">
+              {renderEntry && renderEntry.total > 0 ? (
+                <div className="h-1.5 rounded-full bg-[var(--color-border)] overflow-hidden">
+                  <div
+                    className="h-full rounded-full bg-[var(--color-pink-500)] transition-all duration-200 ease-out"
+                    style={{
+                      width: `${Math.min(
+                        100,
+                        Math.round((renderEntry.step / renderEntry.total) * 100),
+                      )}%`,
+                    }}
+                  />
+                </div>
+              ) : (
+                <div className="h-1.5 rounded-full bg-[var(--color-border)] overflow-hidden">
+                  <div className="h-full w-1/3 rounded-full bg-[var(--color-pink-500)] animate-[render-indeterminate_1.1s_ease-in-out_infinite]" />
+                </div>
+              )}
+              <div className="flex items-center justify-between text-[11px] text-muted-foreground">
+                <span className="tabular-nums">
+                  {renderEntry && renderEntry.total > 0
+                    ? `${renderEntry.step}/${renderEntry.total}`
+                    : ""}
+                </span>
+                {eta != null && (
+                  <span className="tabular-nums">~{formatClock(eta)} left</span>
+                )}
+              </div>
+            </div>
           </div>
         )}
         {phase === "error" && (
