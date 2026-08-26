@@ -156,7 +156,7 @@ export function RenderProgressOverlay() {
   if (store.size === 0) return null;
 
   return (
-    <div className="fixed bottom-3 left-1/2 -translate-x-1/2 z-40 flex flex-col items-center gap-2 pointer-events-none">
+    <div className="fixed bottom-[calc(4.5rem+var(--safe-bottom,0px))] lg:bottom-3 left-1/2 -translate-x-1/2 z-40 flex flex-col items-center gap-2 pointer-events-none">
       {[...store.entries()].map(([script, entry]) => (
         <Pill key={script} script={script} entry={entry} now={now} />
       ))}
