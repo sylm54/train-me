@@ -974,6 +974,55 @@ const VALID_SPEAKERS: &[&str] = &[
     "female", "female2", "female3", "female4", "female5",
 ];
 
+// ============================================================================
+// Glob <include> helpers (pure; shared by the renderer and validators)
+// ============================================================================
+
+/// True when an `<include src>` is a glob pattern (contains `*` or `?`).
+/// A glob expands to every matching file; one match is chosen per playback.
+pub fn include_src_is_glob(src: &str) -> bool {
+    src.contains('*') || src.contains('?')
+}
+
+/// Split a glob `src` into its (directory, file-name-pattern) parts on the
+/// last separator. Returns `None` when there is no separator (bare pattern,
+/// resolved against the base directory directly).
+pub fn split_glob_src(src: &str) -> Option<(&str, &str)> {
+    let normalized = src.replace('\\', "/");
+    normalized
+        .rfind('/')
+        .map(|i| (&src[..i], &src[i + 1..]))
+}
+
+/// Case-insensitive wildcard match supporting `*` (any run of characters)
+/// and `?` (exactly one character). Classic two-pointer algorithm — no regex.
+pub fn wildcard_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.to_lowercase().chars().collect();
+    let n: Vec<char> = name.to_lowercase().chars().collect();
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let (mut star, mut mark) = (usize::MAX, 0usize);
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = pi;
+            mark = ni;
+            pi += 1;
+        } else if star != usize::MAX {
+            pi = star + 1;
+            mark += 1;
+            ni = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 /// Validate a parsed AST for semantic correctness.
 ///
 /// This catches issues the parser doesn't: unknown sound types, tone presets,
@@ -1107,8 +1156,19 @@ fn validate_nodes(
                 } else if seen_includes.contains(src) {
                     errors.push(format!(
                         "Circular or repeated <include src=\"{}\"> — each file may only be included once in a render tree",
-                        src
+                        src,
                     ));
+                } else if include_src_is_glob(src) {
+                    // Wildcards are only expanded over one directory; reject
+                    // patterns that would need recursive directory matching.
+                    if let Some((dir, _)) = split_glob_src(src) {
+                        if dir.contains('*') || dir.contains('?') {
+                            errors.push(format!(
+                                "Wildcards in <include src=\"{}\"> are only allowed in the file name, not in directories",
+                                src
+                            ));
+                        }
+                    }
                 }
                 seen_includes.insert(src.clone());
             }
@@ -1589,6 +1649,41 @@ mod tests {
             "Non-self-closing <include> should error; got {:?}",
             result,
         );
+    }
+
+    #[test]
+    fn test_wildcard_match() {
+        assert!(wildcard_match("*.xml", "a.xml"));
+        assert!(wildcard_match("*.xml", "A.XML")); // case-insensitive
+        assert!(!wildcard_match("*.xml", "a.txt"));
+        assert!(!wildcard_match("*.xml", "a.xml.bak"));
+        assert!(wildcard_match("tease-?.xml", "tease-3.xml"));
+        assert!(!wildcard_match("tease-?.xml", "tease-33.xml"));
+        assert!(wildcard_match("*", "anything"));
+        assert!(wildcard_match("a*b*c", "aXXbYYc"));
+        assert!(!wildcard_match("a*b*c", "aXXbYY"));
+        assert!(wildcard_match("", ""));
+        assert!(!wildcard_match("", "x"));
+    }
+
+    #[test]
+    fn test_split_glob_src() {
+        assert_eq!(split_glob_src("dir/*.xml"), Some(("dir", "*.xml")));
+        assert_eq!(split_glob_src("a\\b/*.xml"), Some(("a\\b", "*.xml")));
+        assert_eq!(split_glob_src("*.xml"), None);
+    }
+
+    #[test]
+    fn test_validate_glob_include_directory_wildcard_rejected() {
+        let nodes = parse(r#"<include src="hy*nos/*.xml"/>"#).unwrap();
+        let err = validate(&nodes).unwrap_err().to_string();
+        assert!(
+            err.contains("only allowed in the file name"),
+            "unexpected error: {err}"
+        );
+        // Wildcard in the file name alone is fine.
+        let ok = parse(r#"<include src="hypnos/*.xml"/>"#).unwrap();
+        assert!(validate(&ok).is_ok());
     }
 
     #[test]

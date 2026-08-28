@@ -105,6 +105,18 @@ fn open_db(db_path: &Path) -> Result<Connection, String> {
     Connection::open(db_path).map_err(|e| e.to_string())
 }
 
+/// Owned-item count (0 when the DB doesn't exist yet). The schema is
+/// ensured at app startup, so an existing file always has the table.
+/// Used by the onboarding answer file's app-setup heads-up.
+pub fn count_items(db_path: &Path) -> Result<i64, String> {
+    if !db_path.exists() {
+        return Ok(0);
+    }
+    let conn = open_db(db_path)?;
+    conn.query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+        .map_err(|e| e.to_string())
+}
+
 const ITEM_COLS: &str = "id, name, category, quantity, notes, created_at, updated_at";
 
 fn map_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<InventoryItem> {

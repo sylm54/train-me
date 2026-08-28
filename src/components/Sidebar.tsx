@@ -8,7 +8,6 @@ import {
   MessageSquare,
   Settings as SettingsIcon,
   PackageOpen,
-  Lock,
   Activity as ActivityIcon,
   CalendarCheck,
   type LucideIcon,
@@ -25,7 +24,6 @@ interface NavItem {
 const NAV_ITEMS: NavItem[] = [
   { view: "chat", label: "Agent", icon: MessageSquare },
   { view: "today", label: "Today", icon: CalendarCheck },
-  { view: "chastity", label: "Chastity", icon: Lock },
   { view: "inventory", label: "Inventory", icon: PackageOpen },
   { view: "activity", label: "Activity", icon: ActivityIcon },
   { view: "settings", label: "Settings", icon: SettingsIcon },

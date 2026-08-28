@@ -15,6 +15,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ArrowLeft, Check } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { MarkdownBody } from "@/components/MarkdownBody";
@@ -555,8 +556,23 @@ function WaitFeature({
 
 interface ChastityState {
   locked: boolean;
+  hidden_string: string | null;
+  revealed: boolean;
+  locked_at: string | null;
 }
 
+/**
+ * A lock/unlock gate. If the device is already in the required state the
+ * gate is auto-fulfilled the moment the page renders; otherwise it walks
+ * the user through the transition:
+ *
+ *   state: locked   — the user locks themselves with a secret code right
+ *                     here (only the user may lock).
+ *   state: unlocked — the lock releases and the hidden code is revealed
+ *                     (the agent sanctioned the release by embedding this
+ *                     gate). Also reveals a code left hidden by a bash
+ *                     `chastity unlock`.
+ */
 function ChastityFeature({
   feature,
   done,
@@ -568,6 +584,11 @@ function ChastityFeature({
 }) {
   const required = String(feature.config.state ?? "locked");
   const [state, setState] = useState<ChastityState | null>(null);
+  const [secret, setSecret] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  /** Code revealed by an unlock, shown so the user can open the device. */
+  const [revealedCode, setRevealedCode] = useState<string | null>(null);
 
   const load = useCallback(() => {
     invoke<ChastityState>("get_chastity_state")
@@ -576,24 +597,114 @@ function ChastityFeature({
   }, []);
   useEffect(load, [load]);
 
-  const matches = state !== null && (state.locked ? "locked" : "unlocked") === required;
+  const matches =
+    state !== null && (state.locked ? "locked" : "unlocked") === required;
+  // Already in the required state (and nothing left to reveal) → fulfilled.
+  const autoFulfilled =
+    state !== null &&
+    matches &&
+    (required === "locked" || !state.hidden_string || state.revealed);
+
+  // Auto-fulfill as soon as the loaded state satisfies the gate.
+  useEffect(() => {
+    if (autoFulfilled) onDone();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoFulfilled]);
+
+  const lock = async () => {
+    const trimmed = secret.trim();
+    if (!trimmed) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const next = await invoke<ChastityState>("chastity_lock", { secret: trimmed });
+      setState(next);
+      setSecret("");
+      await logActivity("chastity", "lock", "session gate");
+      onDone();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const unlock = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const next = await invoke<ChastityState>("chastity_unlock");
+      setState(next);
+      setRevealedCode(next.hidden_string);
+      // The code goes into the activity log too — if the reveal screen is
+      // missed, the code stays recoverable from Activity.
+      await logActivity(
+        "chastity",
+        "unlock",
+        next.hidden_string ? `session gate — code: ${next.hidden_string}` : "session gate",
+      );
+      onDone();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <FeatureShell title="chastity" done={done}>
       <div className="text-sm">{feature.body}</div>
-      {state === null ? (
+      {revealedCode !== null ? (
+        <div className="rounded-md border border-[var(--color-pink-400)] bg-[var(--color-pink-50)] p-3 text-sm">
+          Unlocked — your code:{" "}
+          <span className="font-mono font-semibold">{revealedCode}</span>
+        </div>
+      ) : state === null ? (
         <Spinner className="size-4" />
-      ) : matches ? (
-        <Button onClick={onDone}>Confirm — device is {required}</Button>
+      ) : autoFulfilled ? (
+        <div className="text-sm text-muted-foreground">
+          Device is already {required} — nothing to do.
+        </div>
+      ) : required === "locked" ? (
+        <div className="space-y-2">
+          <div className="text-xs text-muted-foreground">
+            Put the device on and set the code it will lock with. The app hides
+            the code from both of us; only an unlock releases it.
+          </div>
+          <div className="flex gap-2">
+            <Input
+              type="password"
+              value={secret}
+              onChange={(e) => setSecret(e.target.value)}
+              placeholder="Lock code"
+              autoComplete="off"
+              spellCheck={false}
+              disabled={busy}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  void lock();
+                }
+              }}
+            />
+            <Button size="sm" disabled={busy || !secret.trim()} onClick={() => void lock()}>
+              Lock
+            </Button>
+          </div>
+        </div>
       ) : (
-        <div className="text-sm text-[var(--color-danger)]">
-          The device is currently {state.locked ? "locked" : "unlocked"}, but this step requires{" "}
-          {required}.{" "}
-          <button className="underline" onClick={load}>
-            refresh
-          </button>
+        <div className="space-y-2">
+          <div className="text-xs text-muted-foreground">
+            {state.locked
+              ? "The gate releases the lock and shows you the code."
+              : "Your last lock's code hasn't been revealed yet."}
+          </div>
+          <Button size="sm" disabled={busy} onClick={() => void unlock()}>
+            {state.locked ? "Unlock" : "Show my code"}
+          </Button>
         </div>
       )}
+      {error && <div className="text-xs text-[var(--color-danger)]">{error}</div>}
     </FeatureShell>
   );
 }

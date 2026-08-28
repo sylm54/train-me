@@ -14,9 +14,10 @@ import type {
   ReasoningEffort,
   ChatSettings,
   PlaybackSettings,
+  AudioSettings,
 } from "./types";
 import { DEFAULT_MODEL_ID } from "./models";
-import { DEFAULT_PLAYBACK_SETTINGS } from "./types";
+import { DEFAULT_PLAYBACK_SETTINGS, DEFAULT_AUDIO_SETTINGS } from "./types";
 
 import { ensureNotificationPermission } from "./notifications";
 import { migrateChatSettings } from "./contextUsage";
@@ -48,6 +49,7 @@ const DEFAULT_SETTINGS: AgentSettings = {
   },
   chat: { ...DEFAULT_CHAT_SETTINGS },
   playback: { ...DEFAULT_PLAYBACK_SETTINGS },
+  audio: { ...DEFAULT_AUDIO_SETTINGS },
   onboarded: false,
 };
 
@@ -70,6 +72,10 @@ function load(): AgentSettings {
       playback: {
         ...DEFAULT_SETTINGS.playback,
         ...(parsed.playback ?? {}),
+      },
+      audio: {
+        ...DEFAULT_SETTINGS.audio,
+        ...(parsed.audio ?? {}),
       },
       onboarded: parsed.onboarded ?? false,
     };
@@ -197,12 +203,25 @@ export function useSettings() {
     });
   }, []);
 
+  /** Update the audio rendering settings (background pre-rendering). */
+  const setAudio = useCallback((patch: Partial<AudioSettings>) => {
+    setSettings((prev) => {
+      const next: AgentSettings = {
+        ...prev,
+        audio: { ...prev.audio, ...patch },
+      };
+      save(next);
+      return next;
+    });
+  }, []);
+
   return {
     settings,
     setApiKey,
     setAgent,
     setChat,
     setPlayback,
+    setAudio,
     completeOnboarding,
     resetOnboarding,
   };

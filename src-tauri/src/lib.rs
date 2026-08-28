@@ -371,8 +371,9 @@ fn delete_track(path: String) -> Result<String, String> {
 
 /// Delete a conditioning script's rendered manifest (the `tracks/<id>/`
 /// directory holding manifest.json + seg-*.wav). The script source itself is
-/// untouched, so it can be re-rendered anytime. The shared `tracks/imports/`
-/// dedup dirs are deliberately left alone — another script may reference them.
+/// untouched, so it can be re-rendered anytime. Include targets render into
+/// their own canonical directories, so deleting one script's render never
+/// invalidates another script's links.
 #[tauri::command]
 fn delete_manifest(script_path: String, state: State<'_, AppState>) -> Result<(), String> {
     let dir = state.tracks_dir.join(manifest::manifest_id(&script_path));
@@ -479,7 +480,7 @@ pub struct ResetReport {
 /// - `agent_data/` — scripts, conditioning, journal, routines, rules, …
 /// - `activity.db` — the activity log is emptied (autoincrement reset)
 /// - `inventory.db` — items + wishlist rows deleted (autoincrement left as-is)
-/// - `chastity.json` — lock + countdown reset to defaults
+/// - `chastity.json` — lock state reset to defaults
 /// - `tracks/`     — rendered TTS audio removed
 ///
 /// The TTS model directory and the frontend settings are intentionally
@@ -828,7 +829,21 @@ fn manifest_status(
 
     let source_abs = state.agent_dir.join(&script_path);
     let stale = match fs::read(&source_abs) {
-        Ok(bytes) => existing.hash != manifest::hash_bytes(&bytes),
+        Ok(bytes) => {
+            // Same freshness contract as the renderer: version + content
+            // hash + glob-include expansion digest (a globbed folder's
+            // contents changing makes the script stale).
+            let script_dir = source_abs
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf();
+            let current_glob_digest = std::str::from_utf8(&bytes).ok().and_then(|source| {
+                audio_renderer::glob_digest(source, &script_dir, &state.agent_dir)
+            });
+            existing.version != manifest::MANIFEST_VERSION
+                || existing.hash != manifest::hash_bytes(&bytes)
+                || existing.glob_digest != current_glob_digest
+        }
         // Source file missing — surface as stale so the UI re-renders.
         Err(_) => true,
     };
@@ -859,8 +874,10 @@ fn read_manifest(manifest_path: String) -> Result<serde_json::Value, String> {
     Ok(value)
 }
 
-/// List every top-level manifest under `tracks/` (one level deep, excluding
-/// the shared `imports/` subdir).
+/// List every top-level manifest under `tracks/` (one level deep). The
+/// `imports/` skip is legacy: v3 renders includes into each script's own
+/// canonical directory, and the first full prerender pass GCs the old
+/// shared store away.
 #[tauri::command]
 fn list_manifests(state: State<'_, AppState>) -> Result<Vec<RenderedManifest>, String> {
     let mut out = Vec::new();
@@ -1805,9 +1822,6 @@ pub fn run() {
             chastity::get_chastity_state,
             chastity::chastity_lock,
             chastity::chastity_unlock,
-            chastity::chastity_auto_unlock,
-            chastity::chastity_arm_countdown,
-            chastity::chastity_stop_countdown,
             // v2 engine: economy + schedule (FORMAT.md)
             economy::economy_summary,
             economy::economy_dismiss_pending,

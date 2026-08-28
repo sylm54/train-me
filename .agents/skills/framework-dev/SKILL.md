@@ -13,7 +13,7 @@ A **framework** is a ZIP that supplies everything user-facing in train-me: the a
 - Everything interactive is expressed as **feature files** the agent authors and the **engine** runs: routines (scheduled or on-demand sessions), habits (daily count goals/limits), task templates (assignable one-offs), and store entries (point-priced rewards). The user plays everything from the **Today** view in a gated, page-by-page session runner.
 - The engine owns correctness: an append-only **points ledger**, scheduled **occurrences** reconciled lazily (missed windows fire failure actions), **exemptions** that suspend failures and protect streaks, and **idempotent actions** (`points`, `task`, `script`, `notification`, `exemption`, `roulette`).
 - **Onboarding flow**: your framework may ship `onboarding.json`; the user answers it right after install (deterministic, conditional questions). Answers land in `agent_data/USER.md` — or the sandbox-relative `output` path your flow declares — plain data the framework consumes via `{{include}}` in its own prompts. Nothing is auto-added to any system prompt.
-- **Audio**: TTS XML scripts (spoken word, sound effects, loops, interactive `<choice>`/`<until>` prompts) render to audio and play in a full player. Referenced scripts pre-render automatically in the background; playbacks and decisions log under feature `script`.
+- **Audio**: TTS XML scripts (spoken word, sound effects, loops, interactive `<choice>`/`<until>` prompts) render to audio and play in a full player. Every script in the sandbox pre-renders in the background after startup (toggleable in Settings; referenced scripts render first); `<include>` targets render as linked sub-manifests — a shared subscript is synthesized once — and a glob include (`dir/*.xml`) picks a random match per playback. Playbacks and decisions log under feature `script`.
 - The agent inspects state through bash builtins (`points`, `chastity`, `inventory`) and the `activity.db` SQLite log it can query read-only.
 
 ## Framework layout
@@ -45,7 +45,7 @@ Full spec: FORMAT.md in the train-me repo. Worked examples: `examples/` seeded i
 
 - `voice` — live mic analysis: `analyzers` (pitch, resonance, intonation, weight, loudness, genderspace), `minHz`/`maxHz`/`targetHz`, `targetCentroid`, `targetDb`, `requiredScore` (0–1), `holdRatio`, `duration`.
 - `wait` — `duration` enforced timer.
-- `chastity` — `state: locked|unlocked`, confirmed against app-tracked device state.
+- `chastity` — `state: locked|unlocked` gate: auto-fulfilled when the device is already in that state; otherwise `locked` has the user lock themselves with a hidden code on the page, `unlocked` releases the lock and reveals the code.
 - `input` — `field` (id for the stored answer).
 - `choice` — `options` (`A|B|C` or array).
 - `slider` — `min`, `max`, `label`.

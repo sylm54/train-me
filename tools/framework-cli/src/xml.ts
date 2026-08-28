@@ -53,6 +53,41 @@ const VALID_SPEAKERS = [
   "female", "female2", "female3", "female4", "female5",
 ];
 
+// ── glob <include> helpers (mirror tag_parser.rs) ─────────────────────────
+
+/** True when an `<include src>` is a glob pattern (contains `*` or `?`). */
+export function includeSrcIsGlob(src: string): boolean {
+  return src.includes("*") || src.includes("?");
+}
+
+/** Case-insensitive wildcard match: `*` = any run, `?` = one character. */
+export function wildcardMatch(pattern: string, name: string): boolean {
+  const p = pattern.toLowerCase();
+  const n = name.toLowerCase();
+  let pi = 0;
+  let ni = 0;
+  let star = -1;
+  let mark = 0;
+  while (ni < n.length) {
+    if (pi < p.length && (p[pi] === "?" || p[pi] === n[ni])) {
+      pi++;
+      ni++;
+    } else if (pi < p.length && p[pi] === "*") {
+      star = pi;
+      mark = ni;
+      pi++;
+    } else if (star !== -1) {
+      pi = star + 1;
+      mark++;
+      ni = mark;
+    } else {
+      return false;
+    }
+  }
+  while (pi < p.length && p[pi] === "*") pi++;
+  return pi === p.length;
+}
+
 // Container tags that require children and a matching closing tag.
 const CONTAINER_TAGS = new Set([
   "voice", "speed", "volume", "effect", "overlay", "loop", "background",
@@ -422,6 +457,15 @@ function validateNodes(nodes: Node[], errors: string[], seenIncludes: Set<string
         if (!node.src) errors.push(`<include> has an empty 'src' attribute`);
         else if (seenIncludes.has(node.src)) {
           errors.push(`circular or repeated <include src="${node.src}"> — each file may only be included once in a render tree`);
+        } else if (includeSrcIsGlob(node.src)) {
+          // Wildcards expand over one directory; reject patterns that would
+          // need recursive directory matching (mirrors the Rust validator).
+          const sep = Math.max(node.src.lastIndexOf("/"), node.src.lastIndexOf("\\"));
+          if (sep >= 0 && /[*?]/.test(node.src.slice(0, sep))) {
+            errors.push(
+              `Wildcards in <include src="${node.src}"> are only allowed in the file name, not in directories`,
+            );
+          }
         }
         seenIncludes.add(node.src);
         break;

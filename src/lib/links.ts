@@ -6,7 +6,6 @@
  *
  *   [item](inventory/items#42)
  *   [routine](routines/morning.md)
- *   [chastity](chastity)
  *
  * This module resolves such paths to a {view, anchor?} pair so the
  * renderer can call `setView(view)` and (optionally) scroll to a fragment.
@@ -28,7 +27,6 @@ export interface AppLink {
  *
  *   routines/       → "today"
  *   inventory/      → "inventory"
- *   chastity        → "chastity"
  */
 export function resolveAppPath(href: string): AppLink | null {
   // Strip whitespace and a leading "./".
@@ -53,8 +51,6 @@ export function resolveAppPath(href: string): AppLink | null {
 
   // Bare feature name → that view.
   switch (h) {
-    case "chastity":
-      return { view: "chastity", anchor };
     case "inventory":
     case "inventory/items":
       return { view: "inventory", anchor };

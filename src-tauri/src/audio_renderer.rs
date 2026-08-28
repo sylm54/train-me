@@ -13,12 +13,12 @@ use std::sync::{Arc, Mutex};
 use crate::expression::{self, Expr};
 use crate::helper::{load_text_to_speech, load_voice_style, write_wav_file, Style, TextToSpeech};
 use crate::manifest::{
-    self, nominal_duration, relative_path, sha8_of_path, BeatMark, BeatmeterMeta, ChoiceOption,
-    Manifest, OverlayPartSegment, Segment, WalkCtx,
+    self, nominal_duration, relative_path, BeatMark, BeatmeterMeta, ChoiceOption, Manifest,
+    OverlayPartSegment, Segment, WalkCtx,
 };
 use crate::model_downloader;
 use crate::sounds::SoundType;
-use crate::tag_parser::{self, Node, OverlayPart};
+use crate::tag_parser::{self, include_src_is_glob, split_glob_src, wildcard_match, Node, OverlayPart};
 use crate::RenderedManifest;
 
 use rand::seq::SliceRandom;
@@ -1416,10 +1416,14 @@ impl AudioRenderer {
 
     /// Render (or reuse) a single manifest for `source_abs` into `out_dir`.
     ///
-    /// Freshness: if `out_dir/manifest.json` already exists and its stored
-    /// hash matches the SHA-256 of the current source bytes (and at least one
-    /// `.wav` is present), the existing manifest is reused as-is. This is what
-    /// deduplicates `<include>` targets under `tracks/imports/<sha8>/`.
+    /// Freshness: if `out_dir/manifest.json` already exists, its stored hash
+    /// matches the SHA-256 of the current source bytes, its format version is
+    /// current, and at least one `.wav` is present, the existing manifest is
+    /// reused as-is. This is what deduplicates `<include>` targets: every
+    /// include renders into its target's canonical track directory (the same
+    /// place a top-level render of that script uses), so a subscript shared
+    /// by many parents — or also played on its own — is synthesized once and
+    /// merely linked to by everyone else.
     fn render_manifest_file(
         &mut self,
         source_abs: &Path,
@@ -1444,6 +1448,13 @@ impl AudioRenderer {
         let bytes = fs::read(source_abs)
             .with_context(|| format!("read script {}", source_abs.display()))?;
         let hash = manifest::hash_bytes(&bytes);
+        // Glob includes bake their match set into the manifest, so freshness
+        // compares the CURRENT expansion digest too (cheap: parse + readdir,
+        // no synthesis) — adding/removing a matching file re-renders this
+        // script even though its own bytes didn't change.
+        let glob_digest = std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|source| glob_digest(source, script_dir, agent_dir));
         let manifest_path = out_dir.join("manifest.json");
 
         // Freshness shortcut.
@@ -1455,7 +1466,11 @@ impl AudioRenderer {
         if manifest_path.exists() {
             if let Ok(existing_str) = fs::read_to_string(&manifest_path) {
                 if let Ok(existing) = serde_json::from_str::<Manifest>(&existing_str) {
-                    if existing.hash == hash && has_any_wav(out_dir) {
+                    if existing.version == manifest::MANIFEST_VERSION
+                        && existing.hash == hash
+                        && existing.glob_digest == glob_digest
+                        && has_any_wav(out_dir)
+                    {
                         let duration = nominal_duration(&existing.root);
                         return Ok(RenderedManifest {
                             id: manifest::manifest_id(script_rel),
@@ -1506,8 +1521,9 @@ impl AudioRenderer {
             progress,
         )?;
         let manifest = Manifest {
-            version: 2,
+            version: manifest::MANIFEST_VERSION,
             hash: hash.clone(),
+            glob_digest: glob_digest.clone(),
             script: script_rel.to_string(),
             root,
         };
@@ -1989,18 +2005,27 @@ impl AudioRenderer {
         )
     }
 
-    /// Resolve a `<include src>` to a deduplicated `Import` segment.
+    /// Resolve a `<include src>` to a linked `Import` segment — or, when
+    /// `src` is a glob (`sounds/tease/*.xml`), a `Random` over one `Import`
+    /// per matching file so the choice happens per playback.
     ///
-    /// Resolution order:
-    /// 1. Try resolving `src` relative to the current script's directory.
-    /// 2. If that file does not exist, try resolving `src` relative to the
-    ///    agent directory root.
+    /// Every target renders (or is reused) in its OWN canonical track
+    /// directory — the same `tracks/<manifest_id(script)>/` location a
+    /// top-level render of that script would use. That is the dedup: a
+    /// subscript included by ten parents (and/or played on its own) is
+    /// synthesized once and merely linked to (`Segment::Import`); freshness
+    /// is keyed by the target's own content hash, so editing it re-renders
+    /// just that sub-manifest and every link picks the new audio up.
     ///
-    /// The target is rendered (or reused) under
-    /// `tracks/imports/<sha8(abs_path)>/`. Cycle protection: if the target is
-    /// already on the active recursion stack, we emit the reference without
-    /// descending — the manifest file will exist on disk by the time the
-    /// top-level render finishes writing.
+    /// Resolution order for `src` (plain path or glob directory):
+    /// 1. relative to the current script's directory
+    /// 2. relative to the agent directory root
+    ///
+    /// Cycle protection: plain targets on the active recursion stack are a
+    /// true cycle and fail the render (matching the linter — linking back to
+    /// an ancestor's manifest would loop at playback); glob matches on the
+    /// stack are silently filtered out, so expansion can never build a cycle.
+    #[allow(clippy::too_many_arguments)]
     fn emit_include(
         &mut self,
         src: &str,
@@ -2011,25 +2036,31 @@ impl AudioRenderer {
         visited: &mut HashSet<PathBuf>,
         progress: Option<&Arc<Mutex<ProgressTracker>>>,
     ) -> Result<Segment> {
-        let relative = normalize_path(&script_dir.join(src));
-        let included_abs = if relative.exists() {
-            relative
-        } else {
-            normalize_path(&agent_dir.join(src))
-        };
-        if !included_abs.exists() {
-            bail!("Include not found: {}", included_abs.display());
+        let is_glob = include_src_is_glob(src);
+        let mut targets = resolve_include_targets(src, script_dir, agent_dir)?;
+        if is_glob {
+            // A glob must never expand to a file on the active recursion
+            // stack — linking back to an ancestor would loop at playback.
+            targets.retain(|t| !visited.contains(t));
         }
-        let sha8 = sha8_of_path(&included_abs);
-        let import_dir = tracks_dir.join("imports").join(&sha8);
-        let manifest_abs = import_dir.join("manifest.json");
-
-        if !visited.contains(&included_abs) {
-            visited.insert(included_abs.clone());
-            fs::create_dir_all(&import_dir)?;
-            // Store the import's `script` field relative to agent_dir when
-            // possible (nicer for display), else as an absolute path.
+        let mut imports: Vec<Segment> = Vec::new();
+        for included_abs in targets {
+            if visited.contains(&included_abs) {
+                // Only reachable for plain srcs (glob matches on the stack
+                // were filtered above): a true cycle. The linter rejects it;
+                // rendering must too — linking back to an ancestor's
+                // canonical manifest would loop forever at playback.
+                bail!(
+                    "Circular include: `{}` → `{}`",
+                    src,
+                    script_relative_to(&included_abs, agent_dir)
+                );
+            }
             let included_script_rel = script_relative_to(&included_abs, agent_dir);
+            let target_out_dir = tracks_dir.join(manifest::manifest_id(&included_script_rel));
+            let manifest_abs = target_out_dir.join("manifest.json");
+
+            visited.insert(included_abs.clone());
             let included_dir = included_abs
                 .parent()
                 .unwrap_or_else(|| Path::new("."))
@@ -2037,7 +2068,7 @@ impl AudioRenderer {
             self.render_manifest_file(
                 &included_abs,
                 &included_script_rel,
-                &import_dir,
+                &target_out_dir,
                 agent_dir,
                 tracks_dir,
                 &included_dir,
@@ -2045,12 +2076,21 @@ impl AudioRenderer {
                 progress,
             )?;
             visited.remove(&included_abs);
+
+            let rel = relative_path(out_dir, &manifest_abs);
+            imports.push(Segment::Import {
+                manifest: rel.to_string_lossy().to_string(),
+            });
         }
 
-        let rel = relative_path(out_dir, &manifest_abs);
-        Ok(Segment::Import {
-            manifest: rel.to_string_lossy().to_string(),
-        })
+        match imports.len() {
+            0 => bail!(
+                "Include matched no files (or only files already being rendered): {}",
+                src
+            ),
+            1 => Ok(imports.pop().expect("len checked above")),
+            _ => Ok(Segment::Random { options: imports }),
+        }
     }
 
     /// Write a WAV named `seg-NNN.wav` to `out_dir`, incrementing `counter`.
@@ -2160,6 +2200,148 @@ fn script_relative_to(abs: &Path, base: &Path) -> String {
         Err(_) => abs.to_string_lossy().to_string(),
     };
     raw.replace('\\', "/")
+}
+
+/// Resolve an `<include src>` (plain path or glob) the way the renderer
+/// plays it: against `script_dir` first, then against `agent_dir`. Returns
+/// the absolute target list, sorted for globs (plain srcs are a one-element
+/// vec).
+///
+/// - Plain src: the first candidate that exists wins; neither existing is
+///   an error.
+/// - Glob src (`dir/*.xml`): wildcards may only appear in the file-name
+///   component (the parser/validator enforce the same rule). The directory
+///   resolves like a plain src; matches are the files in it whose name
+///   wildcard-matches (case-insensitive). Zero matches across both bases
+///   is an error.
+pub fn resolve_include_targets(src: &str, script_dir: &Path, agent_dir: &Path) -> Result<Vec<PathBuf>> {
+    if !include_src_is_glob(src) {
+        let relative = normalize_path(&script_dir.join(src));
+        let included_abs = if relative.exists() {
+            relative
+        } else {
+            normalize_path(&agent_dir.join(src))
+        };
+        if !included_abs.exists() {
+            bail!("Include not found: {}", included_abs.display());
+        }
+        return Ok(vec![included_abs]);
+    }
+
+    let (dir_part, file_pattern) = match split_glob_src(src) {
+        Some((d, f)) => (d.to_string(), f.to_string()),
+        None => (String::new(), src.to_string()),
+    };
+    if dir_part.contains('*') || dir_part.contains('?') {
+        bail!(
+            "Wildcards in <include src=\"{}\"> are only allowed in the file name",
+            src
+        );
+    }
+
+    for base in [script_dir, agent_dir] {
+        let dir = normalize_path(&base.join(&dir_part));
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(rd) = fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut matches: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_file()
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| wildcard_match(&file_pattern, n))
+                        .unwrap_or(false)
+            })
+            .collect();
+        if matches.is_empty() {
+            continue; // fall through to the next base before erroring
+        }
+        matches.sort();
+        return Ok(matches);
+    }
+    bail!("Include matched no files: {}", src)
+}
+
+/// Digest of a script's glob `<include>` expansions, or `None` when the
+/// script declares none.
+///
+/// A glob's match set is baked into the manifest at render time (one
+/// `Import` link per match). Freshness must therefore notice when the SET
+/// changes even though the script's own bytes didn't: this folds every
+/// declared glob src (document order) plus its current expansion (sorted,
+/// agent-relative) into one hash. Manifests store the digest computed at
+/// render time; a mismatch — file added, removed, or renamed in a globbed
+/// folder — marks the script stale and it re-renders with the new links.
+///
+/// Expansion errors (no matches, wildcard in a directory) fold into the
+/// digest as a marker so a broken glob keeps forcing re-renders (and thus
+/// surfaces its error) instead of silently pinning an old link set.
+pub fn glob_digest(source: &str, script_dir: &Path, agent_dir: &Path) -> Option<String> {
+    let nodes = tag_parser::parse(source).ok()?;
+    let mut srcs: Vec<String> = Vec::new();
+    collect_glob_include_srcs(&nodes, &mut srcs);
+    if srcs.is_empty() {
+        return None;
+    }
+    let mut acc = String::new();
+    for src in &srcs {
+        acc.push_str(src);
+        acc.push('\u{0}');
+        match resolve_include_targets(src, script_dir, agent_dir) {
+            Ok(targets) => {
+                for t in targets {
+                    acc.push_str(&script_relative_to(&t, agent_dir));
+                    acc.push('\n');
+                }
+            }
+            Err(e) => {
+                acc.push_str(&format!("!error: {e}"));
+                acc.push('\n');
+            }
+        }
+    }
+    Some(manifest::hash_bytes(acc.as_bytes()))
+}
+
+/// Gather every glob `<include src>` declared in `nodes`, in document order,
+/// recursing through containers and interactive parts.
+fn collect_glob_include_srcs(nodes: &[Node], out: &mut Vec<String>) {
+    for node in nodes {
+        match node {
+            Node::Include { src } => {
+                if include_src_is_glob(src) {
+                    out.push(src.clone());
+                }
+            }
+            Node::Voice { children, .. }
+            | Node::Speed { children, .. }
+            | Node::Volume { children, .. }
+            | Node::Effect { children, .. }
+            | Node::Loop { children, .. }
+            | Node::Background { children, .. }
+            | Node::Until { children, .. }
+            | Node::Section { children, .. }
+            | Node::Beatmeter { children, .. } => {
+                collect_glob_include_srcs(children, out);
+            }
+            Node::Overlay { parts, .. }
+            | Node::Random { parts }
+            | Node::Scramble { parts }
+            | Node::Choice { options: parts, .. }
+            | Node::React { parts, .. } => {
+                for part in parts {
+                    collect_glob_include_srcs(&part.children, out);
+                }
+            }
+            Node::Text(_) | Node::Pause { .. } | Node::Sound { .. } | Node::Tone { .. } => {}
+            Node::Rating { .. } => {}
+        }
+    }
 }
 
 // ============================================================================
@@ -2366,12 +2548,33 @@ fn resolve_overlay_parts(
         .collect()
 }
 
-/// Resolve a single `<include src="...">` reference.
+/// Resolve a single `<include src="...">` reference (v1 flat-render path).
 ///
 /// Resolution order:
 /// 1. Try resolving `src` as a relative path against `base_dir`.
 /// 2. If that file does not exist, try resolving `src` as an absolute path.
+///
+/// Glob srcs (`dir/*.xml`) expand to their matches and one is picked at
+/// random — the flat v1 renderer bakes a single waveform, so there is no
+/// playback-time decision to defer to (the manifest pipeline emits a
+/// `Random` of imports instead; see `emit_include`).
 fn resolve_one_include(src: &str, base_dir: &Path, visited: &mut HashSet<PathBuf>) -> Vec<Node> {
+    if include_src_is_glob(src) {
+        let matches = match resolve_include_targets(src, base_dir, base_dir) {
+            Ok(m) if !m.is_empty() => m,
+            _ => {
+                log::warn!("Skipping include glob with no matches: {}", src);
+                return Vec::new();
+            }
+        };
+        let pick = matches.choose(&mut rand::thread_rng()).expect("non-empty");
+        return resolve_one_include(
+            &pick.to_string_lossy(),
+            base_dir,
+            visited,
+        );
+    }
+
     // First try resolving relative to base_dir; fall back to absolute.
     let relative = normalize_path(&base_dir.join(src));
     let normalized = if relative.exists() {
@@ -3543,6 +3746,105 @@ mod tests {
     use crate::tag_parser;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn resolve_include_targets_plain_prefers_script_dir() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent_data");
+        let hypnos = agent.join("hypnos").join("sub");
+        fs::create_dir_all(&hypnos).unwrap();
+        fs::write(hypnos.join("leaf.xml"), "<voice>x</voice>").unwrap();
+        fs::create_dir_all(agent.join("leaf.xml")).unwrap(); // dir, not a file
+
+        // Relative to the script's own dir wins over the agent root.
+        let targets = resolve_include_targets("leaf.xml", &hypnos, &agent).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert!(targets[0].ends_with("leaf.xml") && targets[0].starts_with(&hypnos));
+
+        // Missing everywhere errors.
+        assert!(resolve_include_targets("nope.xml", &hypnos, &agent).is_err());
+    }
+
+    #[test]
+    fn glob_digest_tracks_match_set_not_script_bytes() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent_data");
+        let hypnos = agent.join("hypnos");
+        fs::create_dir_all(hypnos.join("parts")).unwrap();
+        fs::write(hypnos.join("parts").join("a.xml"), "<voice>a</voice>").unwrap();
+
+        let script = "<voice><include src='parts/*.xml'/></voice>";
+        let script_dir = hypnos.clone();
+
+        // No glob declared → None.
+        assert_eq!(
+            glob_digest("<voice>plain</voice>", &script_dir, &agent),
+            None
+        );
+
+        // Stable across calls with the same match set…
+        let d1 = glob_digest(script, &script_dir, &agent).unwrap();
+        let d2 = glob_digest(script, &script_dir, &agent).unwrap();
+        assert_eq!(d1, d2);
+
+        // …changes when a matching file is added (script bytes identical)…
+        fs::write(hypnos.join("parts").join("b.xml"), "<voice>b</voice>").unwrap();
+        let d3 = glob_digest(script, &script_dir, &agent).unwrap();
+        assert_ne!(d1, d3);
+
+        // …and again when one is removed.
+        fs::remove_file(hypnos.join("parts").join("a.xml")).unwrap();
+        let d4 = glob_digest(script, &script_dir, &agent).unwrap();
+        assert_ne!(d3, d4);
+
+        // A broken glob still yields a digest (freshness keeps retrying so
+        // the render surfaces the error).
+        let broken = glob_digest(
+            "<voice><include src='nowhere/*.xml'/></voice>",
+            &script_dir,
+            &agent,
+        );
+        assert!(broken.is_some());
+    }
+
+
+    #[test]
+    fn resolve_include_targets_glob_expands_sorted_matches() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent_data");
+        let parts = agent.join("hypnos").join("parts");
+        fs::create_dir_all(&parts).unwrap();
+        for name in ["c.xml", "a.xml", "b.xml", "notes.txt", "A2.xml"] {
+            fs::write(parts.join(name), "<voice>x</voice>").unwrap();
+        }
+        fs::create_dir_all(parts.join("subdir.xml")).unwrap(); // dirs never match
+
+        let targets = resolve_include_targets(
+            "hypnos/parts/*.xml",
+            &agent.join("no-such-script-dir"),
+            &agent,
+        )
+        .unwrap();
+        let names: Vec<String> = targets
+            .iter()
+            .map(|t| t.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        // Sorted (byte order: uppercase first), .xml-only, no directories,
+        // case-insensitive extension match.
+        assert_eq!(names, vec!["A2.xml", "a.xml", "b.xml", "c.xml"]);
+
+        // Question-mark wildcard matches exactly one character: a/b/c
+        // qualify, the two-character "A2.xml" does not.
+        let q = resolve_include_targets("hypnos/parts/?.xml", &agent, &agent).unwrap();
+        let qnames: Vec<String> = q
+            .iter()
+            .map(|t| t.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(qnames, vec!["a.xml", "b.xml", "c.xml"]);
+
+        // No matches anywhere is an error.
+        assert!(resolve_include_targets("hypnos/nothing/*.xml", &agent, &agent).is_err());
+    }
 
     /// Helper: collect all text nodes from a node vec, ignoring nested structure.
     fn collect_text(nodes: &[Node]) -> Vec<String> {

@@ -127,7 +127,7 @@ export function TodayView({ onRequestSession }: Props) {
     setHabitPath(null);
   };
 
-  // ── Prerender (per-item + everything currently needed) ───────────────
+  // ── Prerender (per-item + full sandbox sweep) ────────────────────────
 
   const runPrerender = async (key: string, paths?: string[]) => {
     if (prerendering) return;
@@ -141,7 +141,7 @@ export function TodayView({ onRequestSession }: Props) {
       } else if (r.rendered.length === 0 && r.errors.length === 0) {
         showLines([
           r.referenced === 0
-            ? "No audio scripts are referenced by anything right now."
+            ? "No audio scripts in the sandbox right now."
             : `Audio already rendered — ${r.fresh} script${r.fresh === 1 ? "" : "s"} up to date.`,
         ]);
       } else {
@@ -167,7 +167,7 @@ export function TodayView({ onRequestSession }: Props) {
         size="sm"
         variant="outline"
         disabled={anyBusy}
-        title={label ?? "Pre-render referenced audio"}
+        title={label ?? "Pre-render audio"}
         onClick={(e) => {
           e.stopPropagation();
           void runPrerender(key, paths);

@@ -9,5 +9,4 @@ export type View =
   | "settings"
   | "tts"
   | "inventory"
-  | "chastity"
   | "activity";

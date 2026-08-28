@@ -240,9 +240,11 @@ export function fetchHabitDetail(habitRef: string): Promise<HabitDetail> {
 }
 
 /**
- * Run a prerender pass. Without `paths`, every referenced script is
- * (re)rendered; with `paths`, only the scripts referenced by those
- * container files (per-item prerender, without starting anything).
+ * Run a prerender pass. Without `paths`, EVERY script in the agent sandbox
+ * is (re)rendered (container-referenced ones first, then everything else)
+ * and renders of deleted scripts are GC'd; with `paths`, only the scripts
+ * referenced by those container files (per-item prerender, without starting
+ * anything).
  */
 export function prerender(paths?: string[]): Promise<PrerenderReport> {
   return invoke("v2_prerender", { paths: paths ?? null });

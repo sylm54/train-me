@@ -38,7 +38,9 @@
 //! wizard. The questionnaire is purely an init mechanism: once onboarding
 //! is done it is never asked again. Answers are stored at
 //! `<data_dir>/onboarding_answers.json` and rendered into the agent sandbox
-//! as `agent_data/USER.md` (or the flow's `output`). Nothing is added to
+//! as `agent_data/USER.md` (or the flow's `output`) — plus an auto-added
+//! "App setup" section snapshotting app-managed state (chastity, inventory)
+//! so the agent gets a heads-up about it. Nothing is added to
 //! the system prompt: the framework decides how the agent consumes the
 //! profile (typically `{{include './USER.md'}}` in its own prompts).
 //!
@@ -739,7 +741,9 @@ fn state_for(data_dir: &Path) -> OnboardingState {
 /// typically inlined into prompts. Choice questions also list the options
 /// the user did NOT pick (and flag multi-select) so the agent knows the
 /// full option set, not just the selection. Skipped (`null`) and
-/// still-unanswered questions render nothing.
+/// still-unanswered questions render nothing. A trailing "App setup"
+/// section heads the agent up about app-managed state the questionnaire
+/// never asked about (chastity, inventory).
 pub(crate) fn write_user_md(agent_dir: &Path, data_dir: &Path) -> Result<(), String> {
     let flow = load_installed_flow(data_dir);
     let parts = installed_parts(data_dir);
@@ -824,14 +828,50 @@ pub(crate) fn write_user_md(agent_dir: &Path, data_dir: &Path) -> Result<(), Str
         wrote += 1;
     }
     if wrote == 0 {
-        md.push_str("_(No answers yet.)_\n");
+        md.push_str("_(No answers yet.)_\n\n");
     }
+    md.push_str(&app_setup_section(&data_dir.join("state")));
     let target = agent_dir.join(flow.output.trim());
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("{}: {e}", flow.output))?;
     }
     std::fs::write(&target, md).map_err(|e| format!("{}: {e}", flow.output))
+}
+
+/// The app-setup heads-up appended to the answer file: a save-time
+/// snapshot of app-managed state the questionnaire didn't ask about, so
+/// the agent knows chastity and the gear inventory are in play. The
+/// builtins are the live source of truth.
+fn app_setup_section(state_dir: &Path) -> String {
+    let ch = crate::chastity::ChastityState::load(&state_dir.join("chastity.json"));
+    let chastity_line = if ch.locked {
+        format!(
+            "**Chastity** locked (since {}) — the user is locked in right now; only the \
+             agent can release them (`chastity unlock`, or a `state: unlocked` gate that \
+             also reveals their code).\n",
+            ch.locked_at.as_deref().unwrap_or("?")
+        )
+    } else if ch.locked_at.is_some() {
+        "**Chastity** currently unlocked — the user has trained with a lock before.\n"
+            .to_string()
+    } else {
+        "**Chastity** not set up.\n".to_string()
+    };
+    let items = crate::inventory::count_items(&state_dir.join("inventory.db")).unwrap_or(0);
+    let inventory_line = if items > 0 {
+        format!(
+            "**Inventory** filled — {items} items owned (list them with `inventory items`).\n"
+        )
+    } else {
+        "**Inventory** empty so far.\n".to_string()
+    };
+    format!(
+        "## App setup\n\n\
+         Auto-added by the app; live values come from the `chastity` and `inventory` \
+         builtins.\n\n{}\n{}\n",
+        chastity_line, inventory_line
+    )
 }
 
 // ============================================================================
@@ -1189,6 +1229,51 @@ mod tests {
         assert!(md.contains("**Topics?** (multiple choice) voice, fitness (not chosen: posture)"));
         assert!(md.contains("**Style?** strict (not chosen: gentle)"));
         assert!(md.contains("**Heat?** 4 (scale 1–5)"));
+        let _ = tmp;
+    }
+
+    #[test]
+    fn user_md_appends_app_setup_headsup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        let agent = data.join("agent_data");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(data.join(QUESTIONS_FILE), serde_json::to_string(&flow()).unwrap())
+            .unwrap();
+
+        // No app state at all → neutral lines.
+        write_user_md(&agent, data).unwrap();
+        let md = std::fs::read_to_string(agent.join("USER.md")).unwrap();
+        assert!(md.contains("## App setup"));
+        assert!(md.contains("**Chastity** not set up."));
+        assert!(md.contains("**Inventory** empty so far."));
+
+        // Locked + filled inventory → the agent gets a real heads-up.
+        let state = data.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        crate::chastity::ChastityState {
+            locked: true,
+            hidden_string: Some("1234".into()),
+            revealed: false,
+            locked_at: Some("2026-08-28T10:00:00+02:00".into()),
+        }
+        .save(&state.join("chastity.json"))
+        .unwrap();
+        crate::inventory::ensure_schema(&state.join("inventory.db")).unwrap();
+        rusqlite::Connection::open(state.join("inventory.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO items (name, category, quantity, notes, created_at, updated_at) \
+                 VALUES ('cage', NULL, 1, NULL, 't', 't')",
+                [],
+            )
+            .unwrap();
+        write_user_md(&agent, data).unwrap();
+        let md = std::fs::read_to_string(agent.join("USER.md")).unwrap();
+        assert!(md.contains("**Chastity** locked (since 2026-08-28T10:00:00+02:00)"));
+        assert!(md.contains("**Inventory** filled — 1 items owned"));
+        // The hidden code itself must NOT leak into the answer file.
+        assert!(!md.contains("1234"));
         let _ = tmp;
     }
 

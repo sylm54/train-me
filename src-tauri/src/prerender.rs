@@ -1,10 +1,12 @@
 //! v2 audio pre-render pipeline (FORMAT.md §6 "Audio Rendering").
 //!
-//! Every `.xml` script referenced by a v2 container (`audio` features,
-//! markdown audio links, `script` actions, queued pending scripts) is
-//! rendered in the background, keyed by the manifest's content hash —
-//! edited scripts re-render automatically, and rendered tracks that are
-//! no longer referenced are garbage-collected.
+//! Every `.xml` script in the agent sandbox is rendered in the background,
+//! keyed by the manifest's content hash — edited scripts re-render
+//! automatically, and rendered tracks whose script no longer exists are
+//! garbage-collected. Container-referenced scripts (`audio` features,
+//! markdown audio links, `script` actions, queued pending scripts) render
+//! first; scripts nothing references (pure `<include>` subscripts, works in
+//! progress, not-yet-wired ideas) render last so they're warm too.
 //!
 //! Scheduling is prioritized: scripts queued in the economy's pending
 //! list render first (the user is waiting on them), then scripts used by
@@ -12,6 +14,10 @@
 //! else. Rendering shares the single engine lock with the UI
 //! `render_manifest` command, so a background render simply queues behind
 //! (or ahead of) a user-initiated one.
+//!
+//! The automatic startup pass (App.tsx) is opt-out via the
+//! "auto pre-render" setting; the Today view's "Pre-render audio" button
+//! always runs a full pass on demand.
 //!
 //! The model gate mirrors `get_model_status`: if the ONNX model isn't
 //! downloaded yet, prerender reports and skips — the frontend re-invokes
@@ -69,11 +75,12 @@ fn next_fire_secs(expr: &str, now: chrono::DateTime<chrono::Utc>) -> i64 {
         .unwrap_or(i64::MAX / 2)
 }
 
-/// Scan every v2 container for referenced scripts. Reads files under
-/// `agent_dir`; `econ` (open economy DB) contributes the pending-script
-/// queue at top priority. `only` restricts the container scan to those
-/// file paths (a user-initiated per-item prerender — the pending queue is
-/// skipped); `None` scans everything.
+/// Scan every v2 container for referenced scripts, and — on a full pass —
+/// every `.xml` in the sandbox besides. Reads files under `agent_dir`;
+/// `econ` (open economy DB) contributes the pending-script queue at top
+/// priority. `only` restricts the container scan to those file paths (a
+/// user-initiated per-item prerender — the pending queue and the
+/// everything-else sweep are skipped); `None` scans everything.
 pub fn collect_script_refs(
     agent_dir: &Path,
     econ: Option<&Connection>,
@@ -167,6 +174,17 @@ pub fn collect_script_refs(
         }
     }
 
+    // Full pass only: sweep up every other `.xml` in the sandbox — pure
+    // `<include>` subscripts, drafts, anything not yet wired to a container.
+    // They share the lowest priority bucket (nothing is waiting on them),
+    // and the dedup below keeps a container-referenced script's better
+    // priority. This is also what keeps their tracks alive through GC.
+    if only.is_none() {
+        for src in list_all_scripts(agent_dir) {
+            push(src, low);
+        }
+    }
+
     // Dedupe (keep the smallest priority) and drop scripts that don't
     // exist on disk (the validator reports those; nothing to render).
     refs.sort_by(|a, b| a.src.cmp(&b.src).then(a.priority.cmp(&b.priority)));
@@ -176,9 +194,44 @@ pub fn collect_script_refs(
     refs
 }
 
-/// Track directories under `tracks/` that no referenced script owns.
-/// `imports/` is shared include storage — never GC'd. Directories touched
-/// recently (mid-render safety margin) are left alone.
+/// Recursively list every `.xml` under `agent_dir` as forward-slashed,
+/// agent-relative paths, sorted. Dot-directories (`.git`, `.trash`, …) are
+/// skipped; everything else is fair game — includes, drafts, whole script
+/// folders the agent manages on its own.
+pub fn list_all_scripts(agent_dir: &Path) -> Vec<String> {
+    fn walk(dir: &Path, prefix: &str, out: &mut Vec<String>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            let rel = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, &rel, out);
+            } else if name.to_ascii_lowercase().ends_with(".xml") {
+                out.push(rel);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(agent_dir, "", &mut out);
+    out.sort();
+    out
+}
+
+/// Track directories under `tracks/` that no referenced script owns. On a
+/// full pass the reference set is every `.xml` in the sandbox, so this
+/// collects the renders of scripts the agent deleted — and, after the
+/// v3 layout migration, the legacy shared `imports/` include store.
+/// Directories touched recently (mid-render safety margin) are left alone.
 pub fn gc_targets(
     tracks_dir: &Path,
     referenced_srcs: &[ScriptRef],
@@ -200,7 +253,7 @@ pub fn gc_targets(
         if !entry.metadata().map(|m| m.is_dir()).unwrap_or(false) {
             continue;
         }
-        if name == "imports" || referenced.contains(&name) {
+        if referenced.contains(&name) {
             continue;
         }
         let recent = entry
@@ -217,8 +270,11 @@ pub fn gc_targets(
     out
 }
 
-/// True when `tracks/<manifest_id(src)>/manifest.json` exists and its
-/// stored hash matches the current script bytes.
+/// True when `tracks/<manifest_id(src)>/manifest.json` exists, its format
+/// version is current, its stored hash matches the current script bytes,
+/// and — when the script declares glob includes — its stored glob digest
+/// matches the current expansion (so adding/removing a matching file makes
+/// the script stale and it re-renders with fresh links).
 fn is_fresh(tracks_dir: &Path, agent_dir: &Path, src: &str) -> bool {
     let Ok(script_bytes) = std::fs::read(agent_dir.join(src)) else {
         return false;
@@ -229,14 +285,20 @@ fn is_fresh(tracks_dir: &Path, agent_dir: &Path, src: &str) -> bool {
     let Ok(raw) = std::fs::read_to_string(&manifest_path) else {
         return false;
     };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+    let Ok(existing) = serde_json::from_str::<crate::manifest::Manifest>(&raw) else {
         return false;
     };
-    value
-        .get("hash")
-        .and_then(|h| h.as_str())
-        .map(|h| h == crate::manifest::hash_bytes(&script_bytes))
-        .unwrap_or(false)
+    let script_dir = agent_dir
+        .join(src)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    let current_glob_digest = std::str::from_utf8(&script_bytes)
+        .ok()
+        .and_then(|source| crate::audio_renderer::glob_digest(source, &script_dir, agent_dir));
+    existing.version == crate::manifest::MANIFEST_VERSION
+        && existing.hash == crate::manifest::hash_bytes(&script_bytes)
+        && existing.glob_digest == current_glob_digest
 }
 
 // ============================================================================
@@ -472,6 +534,41 @@ mod tests {
     }
 
     #[test]
+    fn collect_refs_full_pass_sweeps_unreferenced_scripts() {
+        let routine = "---\nformat: 2\ntitle: R\n---\n```feature\ntype: audio\nsrc: hypnos/a.xml\n---\nx\n```\n";
+        let (tmp, agent, _tracks) = env(&[
+            ("routines/r.md", routine),
+            ("hypnos/a.xml", "<voice>a</voice>"),
+            // Referenced by nothing: a pure <include> subscript + a draft.
+            ("hypnos/sub/only_included.xml", "<voice>sub</voice>"),
+            ("drafts/idea.xml", "<voice>draft</voice>"),
+            // Not a script — ignored.
+            ("drafts/notes.txt", "not a script"),
+        ]);
+        // Full pass: everything on disk is included.
+        let refs = collect_script_refs(&agent, None, chrono::Utc::now(), None);
+        let srcs: Vec<&str> = refs.iter().map(|r| r.src.as_str()).collect();
+        assert!(srcs.contains(&"hypnos/sub/only_included.xml"));
+        assert!(srcs.contains(&"drafts/idea.xml"));
+        assert!(!srcs.iter().any(|s| s.ends_with(".txt")));
+        // Unreferenced scripts land in the lowest (unscheduled-habit) bucket;
+        // the container-referenced routine script sorts strictly earlier.
+        let draft = refs.iter().find(|r| r.src == "drafts/idea.xml").unwrap();
+        let audio = refs.iter().find(|r| r.src == "hypnos/a.xml").unwrap();
+        assert!(draft.priority > audio.priority);
+        // Per-item pass: no sweep — only the picked container's scripts.
+        let only = collect_script_refs(
+            &agent,
+            None,
+            chrono::Utc::now(),
+            Some(&["routines/r.md".to_string()]),
+        );
+        let osrcs: Vec<&str> = only.iter().map(|r| r.src.as_str()).collect();
+        assert_eq!(osrcs, vec!["hypnos/a.xml"]);
+        let _ = tmp;
+    }
+
+    #[test]
     fn collect_refs_honors_the_only_filter() {
         let routine = "---\nformat: 2\ntitle: R\nschedule: 0 8 * * *\n---\n```feature\ntype: audio\nsrc: hypnos/a.xml\n---\nx\n```\n";
         let habit = "---\ntitle: H\ntype: min\ncount: 1\nfailure: { \"type\": \"script\", \"src\": \"hypnos/c.xml\" }\n---\n";
@@ -494,7 +591,7 @@ mod tests {
     }
 
     #[test]
-    fn gc_targets_skips_referenced_imports_and_recent() {
+    fn gc_targets_skips_referenced_and_recent() {
         let routine = "---
 format: 2
 title: R
@@ -511,15 +608,89 @@ x
             ("hypnos/a.xml", "<voice>a</voice>"),
         ]);
         let refs = collect_script_refs(&agent, None, chrono::Utc::now(), None);
-        // Owned by the referenced script; imports dir; fresh dir → all kept.
+        // Owned by the referenced script; fresh dir → all kept.
         std::fs::create_dir_all(tracks.join(crate::manifest::manifest_id("hypnos/a.xml"))).unwrap();
+        // The legacy v2 include store: nothing references it anymore, so a
+        // full pass collects it like any other orphan.
         std::fs::create_dir_all(tracks.join("imports")).unwrap();
         std::fs::create_dir_all(tracks.join("orphan")).unwrap();
         // min_age 0: everything older than "now" is collectable, so the
         // freshly-created orphan is eligible (the 10-minute grace only
         // protects dirs from *concurrent* renders in production).
         let targets = gc_targets(&tracks, &refs, std::time::Duration::ZERO);
-        assert_eq!(targets, vec!["orphan".to_string()]);
+        assert_eq!(targets, vec!["imports".to_string(), "orphan".to_string()]);
+        let _ = tmp;
+    }
+
+    #[test]
+    fn is_fresh_requires_current_manifest_version() {
+        let (tmp, agent, tracks) = env(&[("hypnos/a.xml", "<voice>a</voice>")]);
+        let bytes = std::fs::read(agent.join("hypnos/a.xml")).unwrap();
+        let hash = crate::manifest::hash_bytes(&bytes);
+        let dir = tracks.join(crate::manifest::manifest_id("hypnos/a.xml"));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Old-format manifest with a matching hash → stale (version gate).
+        let v2 = serde_json::json!({
+            "version": 2,
+            "hash": hash,
+            "script": "hypnos/a.xml",
+            "root": { "type": "sequence", "children": [] },
+        });
+        std::fs::write(dir.join("manifest.json"), v2.to_string()).unwrap();
+        assert!(!is_fresh(&tracks, &agent, "hypnos/a.xml"));
+
+        // Current version + matching hash → fresh.
+        let v3 = serde_json::json!({
+            "version": crate::manifest::MANIFEST_VERSION,
+            "hash": hash,
+            "script": "hypnos/a.xml",
+            "root": { "type": "sequence", "children": [] },
+        });
+        std::fs::write(dir.join("manifest.json"), v3.to_string()).unwrap();
+        assert!(is_fresh(&tracks, &agent, "hypnos/a.xml"));
+        let _ = tmp;
+    }
+
+    #[test]
+    fn is_fresh_notices_glob_match_set_changes() {
+        // A script with a glob include: its manifest is fresh while the
+        // expansion digest matches, stale the moment a matching file is
+        // added — even though the script's own bytes never changed.
+        let (tmp, agent, tracks) = env(&[
+            (
+                "hypnos/main.xml",
+                "<voice><include src='parts/*.xml'/></voice>",
+            ),
+            ("hypnos/parts/a.xml", "<voice>a</voice>"),
+        ]);
+        let bytes = std::fs::read(agent.join("hypnos/main.xml")).unwrap();
+        let hash = crate::manifest::hash_bytes(&bytes);
+        let digest = crate::audio_renderer::glob_digest(
+            std::str::from_utf8(&bytes).unwrap(),
+            &agent.join("hypnos"),
+            &agent,
+        )
+        .unwrap();
+        let dir = tracks.join(crate::manifest::manifest_id("hypnos/main.xml"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::json!({
+                "version": crate::manifest::MANIFEST_VERSION,
+                "hash": hash,
+                "glob_digest": digest,
+                "script": "hypnos/main.xml",
+                "root": { "type": "sequence", "children": [] },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(is_fresh(&tracks, &agent, "hypnos/main.xml"));
+
+        // Drop a new variant in the folder → same script bytes, new digest.
+        std::fs::write(agent.join("hypnos/parts/b.xml"), "<voice>b</voice>").unwrap();
+        assert!(!is_fresh(&tracks, &agent, "hypnos/main.xml"));
         let _ = tmp;
     }
 }

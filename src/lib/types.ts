@@ -80,6 +80,24 @@ export const DEFAULT_PLAYBACK_SETTINGS: PlaybackSettings = {
   beatOffsetMs: 0,
 };
 
+/**
+ * Audio rendering settings (pre-rendering of TTS scripts).
+ */
+export interface AudioSettings {
+  /**
+   * Automatically pre-render every script in the agent sandbox shortly after
+   * startup (hash-keyed, so a pass only renders what changed). When false,
+   * rendering happens on demand: playing a script renders it, and the Today
+   * view's "Pre-render audio" button runs a full pass manually.
+   */
+  autoPrerender: boolean;
+}
+
+/** Default audio rendering settings. */
+export const DEFAULT_AUDIO_SETTINGS: AudioSettings = {
+  autoPrerender: true,
+};
+
 /** Complete settings persisted to localStorage. */
 export interface AgentSettings {
   apiKeys: ApiKeys;
@@ -88,6 +106,8 @@ export interface AgentSettings {
   chat: ChatSettings;
   /** Conditioning playback settings (beat offset, etc.). */
   playback: PlaybackSettings;
+  /** Audio rendering settings (background pre-rendering). */
+  audio: AudioSettings;
   /** Whether the user has completed the onboarding wizard. */
   onboarded: boolean;
 }

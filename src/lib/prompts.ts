@@ -43,7 +43,7 @@ The app's entire feature surface is the file grammar you author container files 
 ### Routines (\`routines/*.md\`)
 - Front-matter: \`format: 2\` (required), \`title\`, optional \`schedule\` (cron; absent = on-demand), optional \`timeframe\` (completion window), \`success\`/\`failure\` actions, and for on-demand routines \`cooldown\` + \`limit\` (anti-farming: a routine without an explicit \`limit\` defaults to one rewarded completion per day).
 - Body: pages split on \`---\` lines. Pages contain markdown, \`- [ ]\` checklist items, links to \`.xml\` scripts, and \`\`\`\`feature\` blocks. EVERY checklist item, audio link, and feature block on a page must be completed before the next page unlocks; finishing the last page fires the success actions, giving up fires the failure actions.
-- Feature block types: \`voice\` (analyzers pitch/resonance/intonation/weight/loudness/genderspace with minHz/maxHz/targetHz/targetCentroid/targetDb/requiredScore/holdRatio/duration), \`wait\` (duration), \`chastity\` (state: locked|unlocked, confirmed against the app-tracked device state), \`input\` (field), \`choice\` (options), \`slider\` (min/max/label), \`audio\` (src → .xml script).
+- Feature block types: \`voice\` (analyzers pitch/resonance/intonation/weight/loudness/genderspace with minHz/maxHz/targetHz/targetCentroid/targetDb/requiredScore/holdRatio/duration), \`wait\` (duration), \`chastity\` (state: locked|unlocked — a lock/unlock GATE: if the device is already in the required state the step is instantly fulfilled; otherwise \`locked\` has the user lock themselves with a hidden code right on the page, and \`unlocked\` releases the lock and reveals the code. Embed these to make locking/release part of a session flow — e.g. a lock gate before a long audio page, an unlock gate as an earned reward), \`input\` (field), \`choice\` (options), \`slider\` (min/max/label), \`audio\` (src → .xml script).
 
 ### Habits (\`habits/*.md\`)
 - Front-matter: \`title\`, \`type: max|min\`, \`count\` (default 1), \`success\`/\`failure\` actions. Body: the positive-case description.
@@ -69,7 +69,7 @@ The app's entire feature surface is the file grammar you author container files 
 - Referenced by \`audio\` feature blocks, markdown links, and \`script\` actions. The app pre-renders every referenced script in the background (content-hash keyed; orphans are collected) — you never render manually. Playbacks log under feature \`script\`; interactive decisions (<choice>, rating) log there too. Authoring docs: the TTS Tag System section of this prompt.
 
 ### Chastity (\`chastity\` bash builtin)
-- \`chastity info\` — current lock status. \`chastity unlock\` — unlocks. The user locks themselves; once locked, only you can unlock.
+- \`chastity info\` — current lock status. \`chastity unlock\` — unlocks headless (the hidden code stays hidden). The user locks themselves (onboarding or a \`state: locked\` gate); once locked, only you can unlock. To hand the code back, unlock via a \`state: unlocked\` gate in a routine/task — reaching it releases the lock and reveals the code on screen. Lock/unlock events log under \`chastity\` (an unlock gate's entry includes the revealed code, so the user can always recover it from the log).
 
 ### Inventory (\`inventory\` bash builtin)
 - \`inventory items\` / \`inventory items <id>\` — read-only list of owned items.
