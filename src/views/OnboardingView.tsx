@@ -1,17 +1,21 @@
 /**
  * First-run onboarding wizard.
  *
- * Walks the user through the two things the app needs before it's useful:
+ * Walks the user through the things the app needs before it's useful:
  *   1. Configuring an LLM provider (API key + per-agent model selection).
  *   2. Installing a framework (a ZIP that supplies the agent's prompts and
  *      sandbox content — the app ships none by default).
+ *   3. Setting up their profile: an optional chastity lock and a first
+ *      pass at their gear inventory.
  *
  * The framework step is a small flow: pick from the gallery (or a URL / local
  * ZIP) → stage → configure the framework's options → install. On finish,
  * `onComplete` is called so the app can swap to the main shell.
  */
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   AlertCircle,
   ArrowLeft,
@@ -24,9 +28,11 @@ import {
   EyeOff,
   Link,
   Loader2,
+  Lock,
   PackageOpen,
   Rocket,
   Sparkles,
+  X,
 } from "lucide-react";
 import { useSettings } from "@/lib/settings";
 import type { AgentName, ProviderName } from "@/lib/types";
@@ -52,10 +58,11 @@ import {
 } from "@/lib/frameworks";
 import { fetchOnboardingState } from "@/lib/onboarding";
 import { OnboardingFlow } from "@/components/OnboardingFlow";
+import { logActivity } from "@/lib/activity";
 
-type Step = "welcome" | "models" | "framework" | "questions";
+type Step = "welcome" | "models" | "framework" | "profile" | "questions";
 
-const STEP_ORDER: Step[] = ["welcome", "models", "framework", "questions"];
+const STEP_ORDER: Step[] = ["welcome", "models", "framework", "profile", "questions"];
 
 /** Sub-state of the framework step. */
 type FrameworkPhase = "browse" | "config" | "installed";
@@ -121,9 +128,10 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
   }, []);
 
   // Load the framework's onboarding questions once the framework step is
-  // relevant (mounted with an installed framework, or after install).
+  // relevant (mounted with an installed framework, or after install). The
+  // profile step needs the same gate to decide where its Next goes.
   useEffect(() => {
-    if (step !== "framework" && step !== "questions") return;
+    if (step !== "framework" && step !== "profile" && step !== "questions") return;
     void refreshOnboardingPending();
   }, [step]);
 
@@ -218,14 +226,10 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
     let ok = true;
     if (staged) ok = await runInstall(staged, choices);
     if (!ok) return; // install failed — stay here, the error is shown
-    // The questionnaire is the final onboarding step — offer it right
-    // after the install instead of deferring to Today.
-    const pending = await refreshOnboardingPending();
-    if (pending) {
-      setStep("questions");
-    } else {
-      onComplete();
-    }
+    // Refresh the questions gate, then continue to the profile step (the
+    // questionnaire itself runs after it as the final onboarding step).
+    await refreshOnboardingPending();
+    setStep("profile");
   };
 
   const handleBackToBrowse = async () => {
@@ -254,24 +258,27 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
     if (prev) setStep(prev);
   };
 
-  // Footer-Next behaviour depends on the framework phase.
-  const frameworkNextLabel = () => {
-    if (phase === "config") return "Apply & finish";
-    if (phase === "installed") return onboardingPending ? "Next" : "Finish";
-    return "Next";
+  // The profile step is the last interactive one — its Next either runs the
+  // framework questionnaire (when pending) or finishes the wizard.
+  const profileNextAction = () => {
+    if (onboardingPending) {
+      goNext();
+    } else {
+      onComplete();
+    }
   };
+
+  // Footer-Next behaviour depends on the framework phase.
+  const frameworkNextLabel = () => (phase === "config" ? "Apply & finish" : "Next");
   const frameworkNextDisabled =
     step === "framework" && phase === "browse" && !staged;
   const frameworkNextAction = () => {
     if (phase === "config") {
       void handleApplyAndFinish();
     } else if (phase === "installed") {
-      // Framework questions come between install and finishing.
-      if (onboardingPending) {
-        goNext();
-      } else {
-        onComplete();
-      }
+      // The profile step (chastity + inventory) comes between the framework
+      // and its questionnaire.
+      goNext();
     } else {
       goNext();
     }
@@ -345,6 +352,7 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
               onBackToBrowse={handleBackToBrowse}
             />
           )}
+          {step === "profile" && <ProfileStep />}
           {step === "questions" && (
             <div className="space-y-4">
               <div>
@@ -392,7 +400,7 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
             )}
             {step !== "questions" && (
               <button
-                onClick={frameworkNextAction}
+                onClick={step === "profile" ? profileNextAction : frameworkNextAction}
                 disabled={
                   (step === "models" && !mainKeyPresent) ||
                   frameworkNextDisabled ||
@@ -448,6 +456,11 @@ function WelcomeStep() {
           icon={<PackageOpen size={16} />}
           title="Install a framework"
           body="A framework is a ZIP with the agent's prompts and sandbox content, organised into a base plus optional parts you can toggle."
+        />
+        <FeatureCard
+          icon={<Lock size={16} />}
+          title="Set up your profile"
+          body="Optionally lock a chastity device with a hidden code, and list the gear you own so the agent knows what to work with."
         />
       </div>
     </div>
@@ -872,5 +885,323 @@ function FrameworkInstalledStep({ result }: { result: ImportResult | null }) {
         </p>
       )}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Profile step (chastity lock + inventory first pass) — both optional
+// ---------------------------------------------------------------------------
+
+interface SetupItem {
+  id: number;
+  name: string;
+  category: string | null;
+  quantity: number;
+}
+
+/** Mirrors the backend `inventory_import_csv` result. */
+interface CsvImportResult {
+  items_added: number;
+  items_updated: number;
+  wishlist_added: number;
+  wishlist_updated: number;
+  note: string | null;
+}
+
+function ProfileStep() {
+  return (
+    <div className="space-y-6">
+      <div>
+        <h2 className="text-xl font-semibold tracking-tight">
+          Your setup
+        </h2>
+        <p className="text-sm text-[var(--color-muted-foreground)] mt-1">
+          Both of these are optional — you can skip ahead and change everything
+          later.
+        </p>
+      </div>
+      <ChastitySetup />
+      <InventorySetup />
+    </div>
+  );
+}
+
+function ChastitySetup() {
+  const [secret, setSecret] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [locked, setLocked] = useState(false);
+
+  // Locking is always available — re-locking simply sets a fresh code.
+  const lock = async () => {
+    const trimmed = secret.trim();
+    if (!trimmed) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await invoke("chastity_lock", { secret: trimmed });
+      setSecret("");
+      setLocked(true);
+      await logActivity("chastity", "lock", "onboarding setup");
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="border border-[var(--color-border)] rounded-lg bg-[var(--color-surface)] p-4 space-y-3">
+      <div className="flex items-start gap-3">
+        <div className="size-8 rounded-md bg-[var(--color-pink-100)] text-[var(--color-pink-700)] grid place-items-center shrink-0">
+          <Lock size={16} />
+        </div>
+        <div className="min-w-0">
+          <h3 className="text-sm font-medium">Chastity lock</h3>
+          <p className="text-xs text-[var(--color-muted-foreground)] mt-0.5">
+            Lock a real device (a lockbox, a cage…) with a secret code. The app
+            hides the code — once locked, only the agent can release you, and it
+            decides when through your training.
+          </p>
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <input
+          type="password"
+          value={secret}
+          onChange={(e) => setSecret(e.target.value)}
+          placeholder="Code the device locks with"
+          autoComplete="off"
+          spellCheck={false}
+          disabled={busy}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              void lock();
+            }
+          }}
+          className="flex-1 min-w-[200px] font-mono text-sm border border-[var(--color-border)] rounded-md px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-[var(--color-pink-300)]"
+        />
+        <button
+          onClick={() => void lock()}
+          disabled={busy || !secret.trim()}
+          className="px-3 py-2 text-sm rounded-md bg-[var(--color-pink-400)] text-[var(--color-primary-foreground)] hover:bg-[var(--color-pink-500)] disabled:opacity-50 inline-flex items-center gap-2"
+        >
+          {busy ? <Loader2 size={14} className="animate-spin" /> : <Lock size={14} />}
+          Lock
+        </button>
+      </div>
+      {locked && (
+        <p className="text-xs text-[var(--color-success)] flex items-start gap-1.5">
+          <CheckCircle2 size={14} className="mt-0.5 shrink-0" />
+          <span>Locked — only the agent can release you now.</span>
+        </p>
+      )}
+      {error && (
+        <p className="text-xs text-[var(--color-danger)] flex items-start gap-1.5">
+          <AlertCircle size={14} className="mt-0.5 shrink-0" />
+          <span className="break-words">{error}</span>
+        </p>
+      )}
+    </section>
+  );
+}
+
+function InventorySetup() {
+  const [items, setItems] = useState<SetupItem[] | null>(null);
+  const [categories, setCategories] = useState<string[]>([]);
+  const [name, setName] = useState("");
+  const [category, setCategory] = useState("");
+  const [quantity, setQuantity] = useState("1");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [csvBusy, setCsvBusy] = useState(false);
+  const [importNote, setImportNote] = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    Promise.all([
+      invoke<SetupItem[]>("inventory_list_items"),
+      invoke<string[]>("inventory_list_categories"),
+    ])
+      .then(([it, cats]) => {
+        setItems(it);
+        setCategories(cats);
+      })
+      .catch(() => setItems([]));
+  }, []);
+  useEffect(load, [load]);
+
+  const add = async () => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const item = await invoke<SetupItem>("inventory_add_item", {
+        name: trimmed,
+        category: category.trim() || null,
+        quantity: quantity ? parseInt(quantity, 10) || 1 : null,
+        notes: null,
+      });
+      await logActivity("inventory", "add_item", `#${item.id} ${item.name}`);
+      setName("");
+      setQuantity("1");
+      load();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = async (id: number) => {
+    try {
+      await invoke("inventory_remove_item", { id });
+      await logActivity("inventory", "remove_item", `#${id}`);
+      load();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  /** Merge a CSV previously exported from the Inventory tab (same format). */
+  const importCsv = async () => {
+    setCsvBusy(true);
+    setError(null);
+    setImportNote(null);
+    try {
+      const selected = await openDialog({
+        multiple: false,
+        filters: [{ name: "CSV", extensions: ["csv"] }],
+      });
+      if (!selected) return;
+      const path = typeof selected === "string" ? selected : selected[0];
+      const res = await invoke<CsvImportResult>("inventory_import_csv", {
+        path,
+      });
+      const added = res.items_added + res.wishlist_added;
+      const updated = res.items_updated + res.wishlist_updated;
+      await logActivity("inventory", "import_csv", `+${added} new, ${updated} updated`);
+      setImportNote(`Imported ${added} new, updated ${updated}.`);
+      load();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setCsvBusy(false);
+    }
+  };
+
+  return (
+    <section className="border border-[var(--color-border)] rounded-lg bg-[var(--color-surface)] p-4 space-y-3">
+      <div className="flex items-start gap-3">
+        <div className="size-8 rounded-md bg-[var(--color-pink-100)] text-[var(--color-pink-700)] grid place-items-center shrink-0">
+          <PackageOpen size={16} />
+        </div>
+        <div className="min-w-0">
+          <h3 className="text-sm font-medium">Your gear</h3>
+          <p className="text-xs text-[var(--color-muted-foreground)] mt-0.5">
+            List what you own — the agent reads your inventory to tailor
+            training to your toys. You can edit the full list any time from the
+            Inventory tab.
+          </p>
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <input
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="e.g. Silicone dildo"
+          disabled={busy}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              void add();
+            }
+          }}
+          className="flex-1 min-w-[160px] text-sm border border-[var(--color-border)] rounded-md px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-[var(--color-pink-300)]"
+        />
+        <input
+          list="onboarding-categories"
+          value={category}
+          onChange={(e) => setCategory(e.target.value)}
+          placeholder="Category (optional)"
+          disabled={busy}
+          className="w-40 text-sm border border-[var(--color-border)] rounded-md px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-[var(--color-pink-300)]"
+        />
+        <datalist id="onboarding-categories">
+          {categories.map((c) => (
+            <option key={c} value={c} />
+          ))}
+        </datalist>
+        <input
+          type="number"
+          min={1}
+          value={quantity}
+          onChange={(e) => setQuantity(e.target.value)}
+          disabled={busy}
+          className="w-16 text-sm border border-[var(--color-border)] rounded-md px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-[var(--color-pink-300)]"
+        />
+        <button
+          onClick={() => void add()}
+          disabled={busy || !name.trim()}
+          className="px-3 py-2 text-sm rounded-md bg-[var(--color-pink-400)] text-[var(--color-primary-foreground)] hover:bg-[var(--color-pink-500)] disabled:opacity-50"
+        >
+          Add
+        </button>
+        <button
+          onClick={() => void importCsv()}
+          disabled={csvBusy}
+          className="px-3 py-2 text-sm rounded-md border border-[var(--color-border)] hover:bg-[var(--color-pink-50)] disabled:opacity-50 inline-flex items-center gap-2"
+        >
+          {csvBusy && <Loader2 size={14} className="animate-spin" />}
+          Import CSV
+        </button>
+      </div>
+
+      {importNote && (
+        <p className="text-xs text-[var(--color-success)]">{importNote}</p>
+      )}
+
+      {items === null ? (
+        <Loader2 size={14} className="animate-spin text-[var(--color-muted-foreground)]" />
+      ) : items.length > 0 ? (
+        <ul className="flex flex-wrap gap-2">
+          {items.map((it) => (
+            <li
+              key={it.id}
+              className="inline-flex items-center gap-1.5 pl-2.5 pr-1 py-1 rounded-full border border-[var(--color-border)] text-xs"
+            >
+              <span>
+                {it.name}
+                {it.quantity > 1 && <span className="opacity-60"> ×{it.quantity}</span>}
+                {it.category && (
+                  <span className="opacity-60"> · {it.category}</span>
+                )}
+              </span>
+              <button
+                onClick={() => void remove(it.id)}
+                className="size-4 grid place-items-center rounded-full text-[var(--color-muted-foreground)] hover:bg-[var(--color-pink-100)] hover:text-[var(--color-danger)]"
+                aria-label={`Remove ${it.name}`}
+              >
+                <X size={12} />
+              </button>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="text-xs text-[var(--color-muted-foreground)]">
+          Nothing added yet.
+        </p>
+      )}
+
+      {error && (
+        <p className="text-xs text-[var(--color-danger)] flex items-start gap-1.5">
+          <AlertCircle size={14} className="mt-0.5 shrink-0" />
+          <span className="break-words">{error}</span>
+        </p>
+      )}
+    </section>
   );
 }

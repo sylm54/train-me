@@ -2,15 +2,21 @@
 //!
 //! State lives at `<state_dir>/chastity.json` and is read/written by:
 //!   - the `chastity` bash builtin (agent-facing; supports `info` and
-//!     `unlock` only — the agent may NOT lock the user or manage countdowns)
-//!   - dedicated Tauri commands (UI-facing; the user locks, arms/stops
-//!     countdowns, and the auto-unlock fires when a countdown expires)
+//!     `unlock` only — the agent may NOT lock the user)
+//!   - dedicated Tauri commands (UI-facing: the user locks via the UI —
+//!     onboarding or a `chastity` feature block's lock gate — and the
+//!     feature-block unlock gate releases the lock and reveals the code)
 //!
 //! The agent never sees the file directly — the bash sandbox is mounted
 //! over `agent_data/`, and `state_dir` is a sibling directory.
+//!
+//! The hidden code outlives the lock: both unlock paths preserve it so a
+//! later unlock gate can reveal it to the user (they need it to open the
+//! physical device). `revealed` tracks whether the UI has already shown
+//! it; it resets when a new lock is set.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use bashkit::{async_trait, Builtin, BuiltinContext, ExecResult};
 use serde::{Deserialize, Serialize};
@@ -27,30 +33,29 @@ pub struct ChastityState {
     /// Whether the user is currently locked.
     #[serde(default)]
     pub locked: bool,
-    /// A hidden/secret string the user picks at lock time. The agent never
-    /// sees this in cleartext; `chastity unlock` requires the exact string.
+    /// A hidden/secret string the user picks at lock time — the code that
+    /// opens the physical device. The agent never sees this in cleartext;
+    /// only the UI reveals it to the user. Preserved across unlocks.
     #[serde(default)]
     pub hidden_string: Option<String>,
+    /// Whether the UI has already shown `hidden_string` to the user since
+    /// the lock was set. A fresh lock resets this.
+    #[serde(default)]
+    pub revealed: bool,
     /// RFC3339 timestamp the user locked at.
     #[serde(default)]
     pub locked_at: Option<String>,
-    /// RFC3339 timestamp at which a countdown ends (if any).
-    #[serde(default)]
-    pub countdown_end: Option<String>,
-    /// Whether the countdown is currently active.
-    #[serde(default)]
-    pub countdown_active: bool,
 }
 
 impl ChastityState {
-    pub fn load(path: &Path) -> Self {
+    pub fn load(path: &std::path::Path) -> Self {
         match fs::read_to_string(path) {
             Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
             Err(_) => ChastityState::default(),
         }
     }
 
-    pub fn save(&self, path: &Path) -> Result<(), String> {
+    pub fn save(&self, path: &std::path::Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
@@ -67,30 +72,6 @@ fn now_rfc3339() -> String {
     chrono::Local::now().to_rfc3339()
 }
 
-/// Parse a shorthand duration into seconds.
-/// Supports: `30s`, `30m`, `2h`, `3d`, `1w`. Plain numbers are treated as
-/// seconds.
-pub(crate) fn parse_duration(s: &str) -> Option<u64> {
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-    let (num_part, unit) = match s.find(|c: char| !c.is_ascii_digit()) {
-        Some(idx) => (&s[..idx], &s[idx..]),
-        None => (s, ""),
-    };
-    let n: u64 = num_part.parse().ok()?;
-    let secs = match unit {
-        "" | "s" => n,
-        "m" => n.checked_mul(60)?,
-        "h" => n.checked_mul(60 * 60)?,
-        "d" => n.checked_mul(60 * 60 * 24)?,
-        "w" => n.checked_mul(60 * 60 * 24 * 7)?,
-        _ => return None,
-    };
-    Some(secs)
-}
-
 // ============================================================================
 // Builtin (agent-facing)
 // ============================================================================
@@ -102,10 +83,11 @@ pub(crate) fn parse_duration(s: &str) -> Option<u64> {
 ///   chastity unlock                     — unlock (no secret required; only
 ///                                         the agent may call this)
 ///
-/// The agent may NOT lock the user — locking is a user-only action via
-/// the UI. The agent also has no access to the countdown (the user arms
-/// and stops countdowns via the UI). The bash builtin intentionally does
-/// not expose `lock`, `countdown`, or any write access beyond unlocking.
+/// The agent may NOT lock the user — locking is a user-only action (the
+/// onboarding setup or a `chastity` feature block's lock gate). Note that
+/// a bash unlock does NOT reveal the hidden code; only an unlocked-gate
+/// feature block shows it to the user, so pair `chastity unlock` with one
+/// when the user needs their code back.
 pub struct ChastityBuiltin {
     state_path: PathBuf,
 }
@@ -147,27 +129,31 @@ impl Builtin for ChastityBuiltin {
                             "-"
                         }
                     ),
-                    format!("countdown_active: {}", st.countdown_active),
-                    format!("countdown_end: {}", st.countdown_end.unwrap_or_default()),
+                    format!("code_revealed: {}", st.revealed),
                 ];
                 Ok(ExecResult::ok(lines.join("\n") + "\n"))
             }
             "unlock" => {
                 // The agent does not need the secret. Only the user knows
                 // the secret (set via the UI when locking); the agent may
-                // release the lock at its own discretion.
+                // release the lock at its own discretion. The code is kept
+                // hidden — the unlock gate in a routine reveals it.
                 let st = ChastityState::load(&self.state_path);
                 if !st.locked {
                     return Ok(ExecResult::ok("not locked\n".to_string()));
                 }
                 let cleared = ChastityState {
                     locked: false,
-                    locked_at: st.locked_at.clone(),
-                    countdown_active: false,
-                    ..Default::default()
+                    hidden_string: st.hidden_string,
+                    revealed: false,
+                    locked_at: st.locked_at,
                 };
                 match cleared.save(&self.state_path) {
-                    Ok(()) => Ok(ExecResult::ok("unlocked\n".to_string())),
+                    Ok(()) => Ok(ExecResult::ok(
+                        "unlocked (the code stays hidden until an unlock gate \
+                         reveals it)\n"
+                            .to_string(),
+                    )),
                     Err(e) => Ok(ExecResult::err(format!("save: {}\n", e), 1)),
                 }
             }
@@ -181,8 +167,10 @@ impl Builtin for ChastityBuiltin {
     fn llm_hint(&self) -> Option<&'static str> {
         Some(
             "chastity: Read lock state or unlock the user. Subcommands: info, unlock. \
-             The agent cannot lock the user or manage countdowns — only the user \
-             can do that via the UI.",
+             The agent cannot lock the user — only the user can lock themselves \
+             (onboarding or a chastity lock gate). A bash unlock does not reveal \
+             the hidden code; embed a chastity feature block with state: unlocked \
+             in a routine/task when the user should get their code back.",
         )
     }
 }
@@ -203,7 +191,8 @@ pub fn get_chastity_state(state: State<'_, crate::AppState>) -> Result<ChastityS
     Ok(ChastityState::load(&state_path(&state)))
 }
 
-/// Lock with a new secret. UI-initiated.
+/// Lock with a new secret. UI-initiated (onboarding setup or a session's
+/// lock gate). Resets the reveal flag for the fresh code.
 #[tauri::command]
 pub fn chastity_lock(
     secret: String,
@@ -212,73 +201,30 @@ pub fn chastity_lock(
     let mut st = ChastityState::load(&state_path(&state));
     st.locked = true;
     st.hidden_string = Some(secret);
+    st.revealed = false;
     st.locked_at = Some(now_rfc3339());
     st.save(&state_path(&state))?;
     Ok(st)
 }
 
-/// Unlock — UI version bypasses the secret check. The user is at the
-/// keyboard; this is the "force unlock" path.
+/// Release the lock and reveal the hidden code to the user. Called by a
+/// session's unlock gate — the agent sanctions the release by embedding
+/// the gate (it can also unlock headless via the bash builtin, which keeps
+/// the code hidden until the next unlock gate). The code and `locked_at`
+/// are preserved so the UI can display them; `revealed` is set so later
+/// unlock gates while already unlocked auto-fulfill instead of re-showing
+/// it. Idempotent: calling it while unlocked just (re-)reveals the code.
 #[tauri::command]
 pub fn chastity_unlock(state: State<'_, crate::AppState>) -> Result<ChastityState, String> {
-    let st = ChastityState::load(&state_path(&state));
-    let cleared = ChastityState {
-        locked: false,
-        locked_at: st.locked_at.clone(),
-        countdown_active: false,
-        ..Default::default()
-    };
-    cleared.save(&state_path(&state))?;
-    Ok(cleared)
-}
-
-/// Clear the lock + countdown, preserving locked_at and hidden_string
-/// for the UI to display the previous secret. Used by the auto-unlock
-/// when the countdown expires.
-#[tauri::command]
-pub fn chastity_auto_unlock(state: State<'_, crate::AppState>) -> Result<ChastityState, String> {
     let st = ChastityState::load(&state_path(&state));
     let next = ChastityState {
         locked: false,
         hidden_string: st.hidden_string,
+        revealed: true,
         locked_at: st.locked_at,
-        countdown_active: false,
-        countdown_end: None,
     };
     next.save(&state_path(&state))?;
     Ok(next)
-}
-
-/// Arm a countdown. `duration` accepts the same shorthand the bash
-/// builtin uses: `30m`, `2h`, `3d`, `1w`. Returns the new state.
-#[tauri::command]
-pub fn chastity_arm_countdown(
-    duration: String,
-    state: State<'_, crate::AppState>,
-) -> Result<ChastityState, String> {
-    let secs = parse_duration(&duration)
-        .ok_or_else(|| format!("invalid duration '{}'. Examples: 30m, 2h, 3d, 1w", duration))?;
-    let mut st = ChastityState::load(&state_path(&state));
-    if !st.locked {
-        return Err("Lock first before arming a countdown.".into());
-    }
-    let end = chrono::Local::now()
-        .checked_add_signed(chrono::Duration::seconds(secs as i64))
-        .map(|t| t.to_rfc3339());
-    st.countdown_active = true;
-    st.countdown_end = end;
-    st.save(&state_path(&state))?;
-    Ok(st)
-}
-
-/// Cancel the active countdown.
-#[tauri::command]
-pub fn chastity_stop_countdown(state: State<'_, crate::AppState>) -> Result<ChastityState, String> {
-    let mut st = ChastityState::load(&state_path(&state));
-    st.countdown_active = false;
-    st.countdown_end = None;
-    st.save(&state_path(&state))?;
-    Ok(st)
 }
 
 #[cfg(test)]
@@ -286,14 +232,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_durations() {
-        assert_eq!(parse_duration("30"), Some(30));
-        assert_eq!(parse_duration("30s"), Some(30));
-        assert_eq!(parse_duration("5m"), Some(5 * 60));
-        assert_eq!(parse_duration("2h"), Some(2 * 3600));
-        assert_eq!(parse_duration("3d"), Some(3 * 86400));
-        assert_eq!(parse_duration("1w"), Some(7 * 86400));
-        assert_eq!(parse_duration("abc"), None);
-        assert_eq!(parse_duration("3x"), None);
+    fn unlock_preserves_the_hidden_code() {
+        let dir = std::env::temp_dir().join(format!(
+            "tm-chastity-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("chastity.json");
+
+        let mut st = ChastityState::default();
+        st.locked = true;
+        st.hidden_string = Some("1234".into());
+        st.locked_at = Some("2026-01-01T00:00:00+00:00".into());
+        st.save(&path).unwrap();
+
+        let loaded = ChastityState::load(&path);
+        assert!(loaded.locked);
+        assert!(!loaded.revealed);
+
+        let cleared = ChastityState {
+            locked: false,
+            hidden_string: loaded.hidden_string.clone(),
+            revealed: true,
+            locked_at: loaded.locked_at.clone(),
+        };
+        cleared.save(&path).unwrap();
+
+        let after = ChastityState::load(&path);
+        assert!(!after.locked);
+        assert_eq!(after.hidden_string.as_deref(), Some("1234"));
+        assert!(after.revealed);
+        assert_eq!(after.locked_at.as_deref(), Some("2026-01-01T00:00:00+00:00"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_state_file_without_revealed_loads() {
+        let dir = std::env::temp_dir().join(format!(
+            "tm-chastity-legacy-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("chastity.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A pre-`revealed` file with countdown fields still parses: serde
+        // defaults the missing field and ignores the unknown ones.
+        std::fs::write(
+            &path,
+            "{\"locked\":true,\"hidden_string\":\"x\",\"locked_at\":\"t\",\"countdown_active\":true}",
+        )
+        .unwrap();
+        let st = ChastityState::load(&path);
+        assert!(st.locked);
+        assert!(!st.revealed);
+        let _ = std::fs::remove_file(&path);
     }
 }

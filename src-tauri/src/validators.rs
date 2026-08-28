@@ -296,7 +296,7 @@ fn find_unescaped(bytes: &[u8], from: usize, needle: u8) -> Option<usize> {
 
 /// Returns `Some(relative_path)` if `href` is an in-app link to a file we
 /// should existence-check, or `None` if it's external / has no file target
-/// (e.g. bare `chastity`, `inventory/…`). Port of `resolveAppPath` from
+/// (e.g. bare `inventory/…`). Port of `resolveAppPath` from
 /// `links.ts`, restricted to file-bearing targets.
 fn in_app_link_target(href: &str) -> Option<String> {
     let mut h = href.trim();
@@ -324,7 +324,7 @@ fn in_app_link_target(href: &str) -> Option<String> {
 
     // Bare feature names route to a view but have no file target.
     match h {
-        "chastity" | "inventory" | "inventory/items" | "routines" | "today" => return None,
+        "inventory" | "inventory/items" | "routines" | "today" => return None,
         _ => {}
     }
 
@@ -358,15 +358,17 @@ fn in_app_link_target(href: &str) -> Option<String> {
 // from a conditioning entry, run `tag_parser`'s syntax + semantic checks on
 // each, and chase `<include>`s transitively to catch:
 //
-//   - dangling includes  (target doesn't exist / escapes agent_dir)
+//   - dangling includes  (target doesn't exist / escapes agent_dir / a glob
+//     that matches nothing)
 //   - circular includes  (a file (transitively) includes an ancestor on the
 //     current path — distinct from "already fully visited = share, fine")
 //   - unparseable included files
 //
 // The include-resolution rule mirrors the renderer
-// (`audio_renderer::AudioRenderer::emit_include`): relative to the including
-// script's directory first, then relative to `agent_dir`. Keeping the rule
-// identical means the linter's verdict matches what actually renders.
+// (`audio_renderer::resolve_include_targets`): relative to the including
+// script's directory first, then relative to `agent_dir`; a glob (wildcards
+// in the file-name component) expands to every matching file. Keeping the
+// rule identical means the linter's verdict matches what actually renders.
 
 /// Lexically collapse `.`/`..` without requiring the path to exist, then
 /// verify the result stays under `root`. Mirrors `bash::resolve_under` but
@@ -389,10 +391,69 @@ fn normalize_under(root: &Path, joined: &Path) -> Result<PathBuf, String> {
     Ok(normalized)
 }
 
-/// Resolve a `<include src>` to an absolute path the same way the renderer
-/// does: relative to the including script's directory first, then relative to
-/// `agent_dir`. Returns `Err` with a message if neither exists or the resolved
-/// path escapes `agent_dir` — the caller turns that into a diagnostic.
+/// Resolve an `<include src>` (plain or glob) the same way the renderer
+/// does: relative to the including script's directory first, then relative
+/// to `agent_dir`, with every target contained under `agent_dir`. A glob
+/// (wildcards confined to the file name) expands to its sorted match list.
+/// Returns `Err` with a message when nothing resolves — the caller turns
+/// that into a diagnostic.
+fn resolve_include_targets(
+    src: &str,
+    script_dir: &Path,
+    agent_dir: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    if !crate::tag_parser::include_src_is_glob(src) {
+        return resolve_include(src, script_dir, agent_dir).map(|p| vec![p]);
+    }
+
+    let (dir_part, file_pattern) = match crate::tag_parser::split_glob_src(src) {
+        Some((d, f)) => (d.to_string(), f.to_string()),
+        None => (String::new(), src.to_string()),
+    };
+    if dir_part.contains('*') || dir_part.contains('?') {
+        return Err(format!(
+            "wildcards in include `{src}` are only allowed in the file name"
+        ));
+    }
+
+    for base in [script_dir, agent_dir] {
+        let joined = base.join(&dir_part);
+        if !joined.is_dir() {
+            continue;
+        }
+        let Ok(dir) = normalize_under(agent_dir, &joined) else {
+            continue;
+        };
+        let mut matches: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.is_file()
+                            && p.file_name()
+                                .and_then(|n| n.to_str())
+                                .map(|n| {
+                                    crate::tag_parser::wildcard_match(&file_pattern, n)
+                                })
+                                .unwrap_or(false)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if matches.is_empty() {
+            continue; // fall through to the next base before erroring
+        }
+        matches.sort();
+        return Ok(matches);
+    }
+    Err(format!("include matched no files: {src}"))
+}
+
+/// Resolve a plain `<include src>` to an absolute path the same way the
+/// renderer does: relative to the including script's directory first, then
+/// relative to `agent_dir`. Returns `Err` with a message if neither exists or
+/// the resolved path escapes `agent_dir` — the caller turns that into a
+/// diagnostic.
 fn resolve_include(src: &str, script_dir: &Path, agent_dir: &Path) -> Result<PathBuf, String> {
     let rel = script_dir.join(src);
     if rel.exists() {
@@ -512,8 +573,9 @@ fn walk_script(
         report.push(err(format!("invalid TTS markup: {e}")));
     }
 
-    // Resolve every <include> declared in this file, attach diagnostics here,
-    // and recurse into the resolvable, non-cyclic targets.
+    // Resolve every <include> declared in this file (globs expand to their
+    // match list), attach diagnostics here, and recurse into the resolvable,
+    // non-cyclic targets.
     let script_dir = abs
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
@@ -521,20 +583,29 @@ fn walk_script(
     let declared = collect_include_srcs(&nodes);
 
     for src in declared {
-        match resolve_include(&src, &script_dir, agent_dir) {
-            Err(msg) => report.push(err(msg)), // dangling / escapes agent_dir
-            Ok(target) => {
-                if on_stack.contains(&target) {
-                    // Back-edge to an ancestor on the current path → real cycle.
-                    report.push(err(format!(
-                        "circular include: `{src}` (→ `{}`)",
-                        rel_under(agent_dir, &target)
-                    )));
-                } else {
-                    // Recurse; the child's own report (if any) is inserted by
-                    // the recursive call. If the child fails to parse, that's
-                    // reported on the child — no extra error needed here.
-                    walk_script(&target, agent_dir, reports, visited, on_stack);
+        match resolve_include_targets(&src, &script_dir, agent_dir) {
+            Err(msg) => report.push(err(msg)), // dangling / escapes / no matches
+            Ok(targets) => {
+                let is_glob = crate::tag_parser::include_src_is_glob(&src);
+                for target in targets {
+                    if on_stack.contains(&target) {
+                        if is_glob {
+                            // Globs silently never include the declaring
+                            // script or any of its ancestors — the renderer
+                            // filters the same way, so no cycle is possible.
+                            continue;
+                        }
+                        // Back-edge to an ancestor on the current path → real cycle.
+                        report.push(err(format!(
+                            "circular include: `{src}` (→ `{}`)",
+                            rel_under(agent_dir, &target)
+                        )));
+                    } else {
+                        // Recurse; the child's own report (if any) is inserted by
+                        // the recursive call. If the child fails to parse, that's
+                        // reported on the child — no extra error needed here.
+                        walk_script(&target, agent_dir, reports, visited, on_stack);
+                    }
                 }
             }
         }
@@ -1074,13 +1145,13 @@ pub fn validate_data_files(path: Option<String>, state: State<'_, AppState>) -> 
                 .unwrap_or_else(|| std::path::Path::new("."))
                 .to_path_buf();
             for src in collect_include_srcs(&nodes) {
-                if let Err(msg) = resolve_include(&src, &script_dir, &agent_dir) {
+                if let Err(msg) = resolve_include_targets(&src, &script_dir, &agent_dir) {
                     r.push(err(msg));
                 }
             }
             // Unreferenced is a warning, not an error (per design decision).
             r.push(warn(
-                "script is not referenced by any feature file (v2 audio feature or script action)".to_string(),
+                "script is not referenced by any feature file (audio feature or script action) or explicit <include>".to_string(),
             ));
             collect(&mut files, &mut errors, &mut warnings, r);
         }
@@ -1170,7 +1241,6 @@ mod tests {
         );
         assert_eq!(in_app_link_target("rules/dress.md"), None);
         assert_eq!(in_app_link_target("https://x.com"), None);
-        assert_eq!(in_app_link_target("chastity"), None);
         assert_eq!(in_app_link_target("inventory/items#42"), None);
     }
 
@@ -1263,6 +1333,68 @@ mod tests {
         let paths: Vec<_> = reports.iter().map(|r| r.path.as_str()).collect();
         assert!(paths.contains(&"hypnos/sub/root.xml"));
         assert!(paths.contains(&"hypnos/sub/leaf.xml"));
+    }
+
+    #[test]
+    fn script_tree_glob_include_walks_every_match() {
+        // A glob include expands to every matching file; each is linted as
+        // part of the tree.
+        let dir = agent_dir_with(&[
+            (
+                "hypnos/root.xml",
+                "<voice><include src='hypnos/parts/*.xml'/></voice>",
+            ),
+            ("hypnos/parts/a.xml", "<voice>a</voice>"),
+            ("hypnos/parts/b.xml", "<voice>b</voice>"),
+            ("hypnos/parts/notes.txt", "not a script"),
+        ]);
+        let reports = validate_script_tree("hypnos/root.xml", dir.path());
+        let paths: Vec<_> = reports.iter().map(|r| r.path.as_str()).collect();
+        assert!(paths.contains(&"hypnos/root.xml"));
+        assert!(paths.contains(&"hypnos/parts/a.xml"));
+        assert!(paths.contains(&"hypnos/parts/b.xml"));
+        assert!(!paths.contains(&"hypnos/parts/notes.txt"));
+        assert!(reports.iter().all(|r| r.status == "ok"), "{:?}", reports);
+    }
+
+    #[test]
+    fn script_tree_glob_include_with_no_matches_is_an_error() {
+        let dir = agent_dir_with(&[
+            (
+                "hypnos/root.xml",
+                "<voice><include src='hypnos/nothing/*.xml'/></voice>",
+            ),
+        ]);
+        let reports = validate_script_tree("hypnos/root.xml", dir.path());
+        assert!(
+            problems_for(&reports[0])
+                .iter()
+                .any(|m| m.contains("matched no files")),
+            "{:?}",
+            reports[0].problems
+        );
+    }
+
+    #[test]
+    fn script_tree_glob_include_never_cycles_on_itself() {
+        // The glob in a.xml matches a.xml itself (and b.xml) — the
+        // self-match is silently dropped (the renderer filters the same
+        // way), the sibling is linted, and the tree is clean.
+        let dir = agent_dir_with(&[
+            (
+                "hypnos/a.xml",
+                "<voice><include src='hypnos/*.xml'/></voice>",
+            ),
+            ("hypnos/b.xml", "<voice>b</voice>"),
+        ]);
+        let reports = validate_script_tree("hypnos/a.xml", dir.path());
+        assert!(
+            reports.iter().all(|r| r.status == "ok"),
+            "{:?}",
+            reports
+        );
+        let paths: Vec<_> = reports.iter().map(|r| r.path.as_str()).collect();
+        assert!(paths.contains(&"hypnos/b.xml"));
     }
 
     #[test]

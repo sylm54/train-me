@@ -15,7 +15,7 @@ import {
   validateTask,
 } from "./validate";
 import { validateOnboarding } from "./onboarding";
-import { validateXml } from "./xml";
+import { includeSrcIsGlob, validateXml, wildcardMatch } from "./xml";
 
 interface Report {
   errors: number;
@@ -307,12 +307,38 @@ export function lint(rootArg: string): number {
       refDiags.push({ severity: "error", message: `referenced script \`${script}\` does not exist` });
       continue;
     }
-    // <include> walk for dangling/circular includes.
+    // <include> walk for dangling/circular includes (globs expand to their
+    // match list, mirroring the app's validators).
     for (const agentRoot of agentRoots) {
       const abs = join(agentRoot, script);
       if (!existsSync(abs)) continue;
       const visited = new Set<string>();
       const stack: string[] = [];
+      /** Resolve one include src (plain or glob) from `containingPath`. */
+      const expandInclude = (containingPath: string, src: string): string[] => {
+        if (!includeSrcIsGlob(src)) {
+          const rel = resolve(join(containingPath, ".."), src);
+          const target = existsSync(rel) ? rel : join(agentRoot, src);
+          return existsSync(target) ? [target] : [];
+        }
+        const sep = Math.max(src.lastIndexOf("/"), src.lastIndexOf("\\"));
+        const dirPart = sep >= 0 ? src.slice(0, sep) : "";
+        const pattern = sep >= 0 ? src.slice(sep + 1) : src;
+        if (/[*?]/.test(dirPart)) {
+          throw new Error(`wildcards in include \`${src}\` are only allowed in the file name`);
+        }
+        for (const base of [join(containingPath, ".."), agentRoot]) {
+          const dir = resolve(base, dirPart);
+          if (!existsSync(dir) || !statSync(dir).isDirectory()) continue;
+          const matches = readdirSync(dir)
+            .filter((n) => wildcardMatch(pattern, n))
+            .map((n) => join(dir, n))
+            .filter((p) => statSync(p).isFile())
+            .sort();
+          if (matches.length > 0) return matches;
+        }
+        return [];
+      };
       const walkIncludes = (path: string) => {
         const norm = path.replaceAll("\\", "/");
         if (stack.includes(norm)) {
@@ -325,12 +351,29 @@ export function lint(rootArg: string): number {
         const content = readFileSync(path, "utf-8");
         for (const m of content.matchAll(/<include\s+src\s*=\s*["']([^"']+)["']/g)) {
           const src = m[1]!;
-          const rel = resolve(join(path, ".."), src);
-          const abs2 = existsSync(rel) ? rel : join(agentRoot, src);
-          if (!existsSync(abs2)) {
-            refDiags.push({ severity: "error", message: `\`${script}\`: include not found: ${src}` });
-          } else {
-            walkIncludes(abs2);
+          let targets: string[];
+          try {
+            targets = expandInclude(path, src);
+          } catch (e) {
+            refDiags.push({ severity: "error", message: `\`${script}\`: ${(e as Error).message}` });
+            continue;
+          }
+          if (targets.length === 0) {
+            refDiags.push({
+              severity: "error",
+              message: includeSrcIsGlob(src)
+                ? `\`${script}\`: include matched no files: ${src}`
+                : `\`${script}\`: include not found: ${src}`,
+            });
+            continue;
+          }
+          const isGlob = includeSrcIsGlob(src);
+          for (const target of targets) {
+            // A glob never includes the declaring script or an ancestor —
+            // the app's renderer filters the same way, so no cycle is
+            // possible through glob matches.
+            if (isGlob && stack.includes(target.replaceAll("\\", "/"))) continue;
+            walkIncludes(target);
           }
         }
         stack.pop();

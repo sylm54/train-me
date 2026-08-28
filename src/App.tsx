@@ -10,7 +10,6 @@ import { ChatView } from "@/views/ChatView";
 import { SettingsView } from "@/views/SettingsView";
 import { TtsView } from "@/views/TtsView";
 import { InventoryView } from "@/views/InventoryView";
-import { ChastityView } from "@/views/ChastityView";
 import { ActivityView } from "@/views/ActivityView";
 import { TodayView } from "@/views/TodayView";
 import { SessionView } from "@/views/SessionView";
@@ -51,14 +50,18 @@ export default function App() {
     setView("session");
   }, []);
 
-  // Background pre-render: warm every v2-referenced script shortly after
-  // startup (hash-keyed — edited scripts re-render, orphans are GC'd).
+  // Background pre-render: warm every script in the agent sandbox shortly
+  // after startup (hash-keyed — edited scripts re-render, renders of deleted
+  // scripts are GC'd). Opt-out via Settings; when off, scripts still render
+  // on demand when played, or via the Today view's manual pass.
+  const autoPrerender = settings.audio.autoPrerender;
   useEffect(() => {
+    if (!autoPrerender) return;
     const t = window.setTimeout(() => {
       void invoke("v2_prerender").catch(() => undefined);
     }, 15_000);
     return () => window.clearTimeout(t);
-  }, []);
+  }, [autoPrerender]);
 
   // Foreground getter shared by the notice overlay and the jingle player.
   // Engine notifications arrive as events (the Rust side must not touch
@@ -116,9 +119,6 @@ export default function App() {
       break;
     case "inventory":
       body = <InventoryView />;
-      break;
-    case "chastity":
-      body = <ChastityView />;
       break;
     case "activity":
       body = <ActivityView />;

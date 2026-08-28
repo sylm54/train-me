@@ -18,6 +18,9 @@ use std::path::{Component, Path, PathBuf};
 use crate::audio_renderer::resolve_scalar;
 use crate::tag_parser::{Node, SectionRole};
 
+/// Current on-disk manifest format version (see [`Manifest::version`]).
+pub const MANIFEST_VERSION: u32 = 3;
+
 // ============================================================================
 // Segment tree
 // ============================================================================
@@ -178,10 +181,23 @@ pub struct BeatMark {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
-    /// Manifest format version (currently `2`).
+    /// Manifest format version. Bumped when the on-disk layout of the
+    /// segment tree changes in a way that requires re-rendering existing
+    /// scripts (e.g. v3: `<include>` targets moved from the shared
+    /// `tracks/imports/` side directory to each script's canonical track
+    /// directory). Freshness checks compare against [`MANIFEST_VERSION`] so
+    /// stale-format manifests rebuild once after an app update.
     pub version: u32,
     /// Hex SHA-256 of the source script bytes; used for staleness checks.
     pub hash: String,
+    /// Digest of the script's glob `<include>` expansions (see
+    /// `audio_renderer::glob_digest`); `None` when the script declares no
+    /// glob include. A glob's match set is baked into the manifest at render
+    /// time, so freshness must also compare the CURRENT expansion against
+    /// this digest — adding/removing a matching file re-renders the script
+    /// even though its own bytes didn't change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub glob_digest: Option<String>,
     /// Script path relative to `agent_dir` (forward-slash normalised), or an
     /// absolute path if the script lives outside the agent dir.
     pub script: String,
@@ -263,15 +279,6 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
 /// SHA-256 (hex) of a byte slice — used for `Manifest::hash`.
 pub(crate) fn hash_bytes(bytes: &[u8]) -> String {
     hex_encode(&Sha256::digest(bytes))
-}
-
-/// First 8 hex chars of SHA-256 of an absolute path's string form. Two
-/// includes pointing at the same absolute file collapse to the same import
-/// directory regardless of how their `src` was written.
-pub(crate) fn sha8_of_path(abs_path: &Path) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(abs_path.to_string_lossy().as_bytes());
-    hex_encode(&hasher.finalize()[..4])
 }
 
 /// Derive the on-disk manifest id from a script path relative to `agent_dir`.
@@ -618,21 +625,13 @@ mod tests {
     }
 
     #[test]
-    fn test_sha8_of_path_stable_and_short() {
-        let p = Path::new("/tmp/foo.xml");
-        assert_eq!(sha8_of_path(p), sha8_of_path(p));
-        assert_eq!(sha8_of_path(p).len(), 8);
-        assert_ne!(sha8_of_path(p), sha8_of_path(Path::new("/tmp/bar.xml")));
-    }
-
-    #[test]
     fn test_relative_path() {
         let from = Path::new("/app/tracks/top1");
-        let to = Path::new("/app/tracks/imports/abcd/manifest.json");
+        let to = Path::new("/app/tracks/hypnos_sub/manifest.json");
         let rel = relative_path(from, to);
         assert_eq!(
             rel.to_string_lossy().replace('\\', "/"),
-            "../imports/abcd/manifest.json"
+            "../hypnos_sub/manifest.json"
         );
 
         // Same directory.
@@ -642,12 +641,12 @@ mod tests {
         assert_eq!(rel2.to_string_lossy().replace('\\', "/"), "seg-000.wav");
 
         // Sibling of ancestor.
-        let from3 = Path::new("/app/tracks/imports/abcd");
+        let from3 = Path::new("/app/tracks/hypnos_sub");
         let to3 = Path::new("/app/tracks/top1/manifest.json");
         let rel3 = relative_path(from3, to3);
         assert_eq!(
             rel3.to_string_lossy().replace('\\', "/"),
-            "../../top1/manifest.json"
+            "../top1/manifest.json"
         );
     }
 
@@ -730,6 +729,7 @@ mod tests {
         let manifest = Manifest {
             version: 2,
             hash: h1.clone(),
+            glob_digest: None,
             script: "s.xml".into(),
             root: Segment::Sequence { children: vec![] },
         };

@@ -101,8 +101,15 @@ const AGENT_PROMPTS: { agent: AgentName; file: string; label: string }[] = [
 type PromptMode = "rendered" | "raw";
 
 export function SettingsView() {
-  const { settings, setApiKey, setAgent, setChat, setPlayback, resetOnboarding } =
-    useSettings();
+  const {
+    settings,
+    setApiKey,
+    setAgent,
+    setChat,
+    setPlayback,
+    setAudio,
+    resetOnboarding,
+  } = useSettings();
   // Resolved context window for the main model (live catalog / preset /
   // manual override) — shown next to the auto-summarize threshold.
   const contextWindow = useContextWindow(
@@ -574,12 +581,22 @@ export function SettingsView() {
           </h2>
           <div className="border border-[var(--color-border)] rounded-lg p-4 bg-[var(--color-surface)] space-y-4">
             <p className="text-xs text-[var(--color-muted-foreground)]">
-              Settings for the conditioning player. Scripts that use a{" "}
-              <code className="font-mono">&lt;beatmeter&gt;</code> play an audible
-              click on each beat; this offset nudges that click earlier (−) or
-              later (+) to line it up with the speech if the two audio paths lag
-              differently on your device.
+              Settings for the conditioning player and audio rendering. Scripts
+              that use a <code className="font-mono">&lt;beatmeter&gt;</code>{" "}
+              play an audible click on each beat; the offset below nudges that
+              click earlier (−) or later (+) to line it up with the speech if
+              the two audio paths lag differently on your device.
             </p>
+
+            <ToggleField
+              label="Auto pre-render after startup"
+              value={settings.audio.autoPrerender}
+              hint="When on, every script in the agent sandbox is rendered in the background shortly after startup (and re-rendered when edited). When off, scripts render on demand when played; the Today view's “Pre-render audio” button runs a full pass manually."
+              onChange={(v) => {
+                setAudio({ autoPrerender: v });
+                flashSave();
+              }}
+            />
 
             <ChatNumberField
               label="Beat click offset (ms)"
@@ -951,6 +968,40 @@ function ChatNumberField({
         </p>
       )}
     </div>
+  );
+}
+
+/** Labelled boolean switch (checkbox row) used by the settings sections. */
+function ToggleField({
+  label,
+  value,
+  hint,
+  onChange,
+}: {
+  label: string;
+  value: boolean;
+  hint?: string;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <label className="flex items-start gap-3 cursor-pointer select-none">
+      <input
+        type="checkbox"
+        checked={value}
+        onChange={(e) => onChange(e.target.checked)}
+        // Accent the native checkbox with the app's pink; sized to match the
+        // number inputs' visual weight.
+        className="mt-0.5 h-4 w-4 accent-[var(--color-pink-400)]"
+      />
+      <span>
+        <span className="block text-sm font-medium">{label}</span>
+        {hint && (
+          <span className="block text-[11px] text-[var(--color-muted-foreground)] mt-0.5">
+            {hint}
+          </span>
+        )}
+      </span>
+    </label>
   );
 }
 
