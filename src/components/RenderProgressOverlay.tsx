@@ -95,9 +95,12 @@ function Pill({
   }, [script, entry.status]);
 
   const terminal = entry.status !== "rendering";
+  // Defensive clamp: the backend clamps what it emits, but the counter must
+  // never read above the total (e.g. "70/62") whatever the source.
+  const shownStep = Math.min(entry.step, entry.total);
 
   return (
-    <div className="render-pill pointer-events-auto w-[min(92vw,24rem)] rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] px-4 py-2.5 shadow-lg space-y-1.5">
+    <div className="render-pill w-[min(92vw,24rem)] rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] px-4 py-2.5 shadow-lg space-y-1.5">
       <div className="flex items-center gap-2 text-xs">
         {terminal ? (
           entry.status === "done" ? (
@@ -113,7 +116,7 @@ function Pill({
         </span>
         {!terminal && entry.total > 0 && (
           <span className="shrink-0 tabular-nums text-muted-foreground">
-            {entry.step}/{entry.total}
+            {shownStep}/{entry.total}
           </span>
         )}
         {!terminal && <TimeReadout entry={entry} now={now} />}
@@ -138,7 +141,7 @@ function Pill({
   );
 }
 
-export function RenderProgressOverlay() {
+export function RenderProgressOverlay({ composer }: { composer?: boolean }) {
   const store = useRenderStore();
 
   // The registry attaches its listeners on first subscription; make sure
@@ -155,8 +158,19 @@ export function RenderProgressOverlay() {
 
   if (store.size === 0) return null;
 
+  // The pill is informational only — the whole overlay is click-through, so
+  // it can never swallow taps on whatever it floats above. On views with a
+  // bottom composer (the agent chat) it additionally floats clear above the
+  // message box + send button: composer + context footer ≈ 9rem on desktop,
+  // plus the mobile bottom nav's 4rem below `lg`.
+  const position = composer
+    ? "bottom-[calc(13.5rem+var(--safe-bottom,0px))] lg:bottom-44"
+    : "bottom-[calc(4.5rem+var(--safe-bottom,0px))] lg:bottom-3";
+
   return (
-    <div className="fixed bottom-[calc(4.5rem+var(--safe-bottom,0px))] lg:bottom-3 left-1/2 -translate-x-1/2 z-40 flex flex-col items-center gap-2 pointer-events-none">
+    <div
+      className={`fixed ${position} left-1/2 -translate-x-1/2 z-40 flex flex-col items-center gap-2 pointer-events-none`}
+    >
       {[...store.entries()].map(([script, entry]) => (
         <Pill key={script} script={script} entry={entry} now={now} />
       ))}

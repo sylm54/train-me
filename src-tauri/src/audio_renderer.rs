@@ -123,7 +123,15 @@ pub struct ProgressTracker {
 
 impl ProgressTracker {
     pub(crate) fn emit(&mut self, label: &str) {
-        (self.callback)(self.step, self.total, label);
+        // Never report more steps than the announced total: the total is an
+        // estimate (see `count_speakable_nodes`), so a construct the estimate
+        // under-counts must not push the bar past 100% (e.g. "70/62").
+        let step = if self.total > 0 {
+            self.step.min(self.total)
+        } else {
+            self.step
+        };
+        (self.callback)(step, self.total, label);
     }
 
     /// Emit a "phase" event: relabel the progress bar WITHOUT advancing the
@@ -1076,7 +1084,7 @@ impl AudioRenderer {
                         )?;
                         foreground.extend_from_slice(&samples);
                         _total_duration += dur;
-                        self.emit_progress(tracker, "Random branch");
+                        self.emit_label(tracker, "Random branch");
                     }
                 }
 
@@ -1098,7 +1106,7 @@ impl AudioRenderer {
                         )?;
                         foreground.extend_from_slice(&samples);
                         _total_duration += dur;
-                        self.emit_progress(tracker, "Scramble part");
+                        self.emit_label(tracker, "Scramble part");
                     }
                 }
 
@@ -1118,7 +1126,7 @@ impl AudioRenderer {
                         )?;
                         foreground.extend_from_slice(&samples);
                         _total_duration += dur;
-                        self.emit_progress(tracker, "Choice option");
+                        self.emit_label(tracker, "Choice option");
                     }
                 }
 
@@ -1371,6 +1379,16 @@ impl AudioRenderer {
         }
     }
 
+    /// Emit a progress label WITHOUT advancing the leaf counter. The flat
+    /// path's "Random branch"/"Scramble part"/"Choice option" markers sit on
+    /// top of the branch's own leaf ticks, so counting them as steps pushed
+    /// the bar past its pre-counted total (e.g. 70/62).
+    fn emit_label(&self, tracker: &Arc<Mutex<ProgressTracker>>, label: &str) {
+        if let Ok(mut t) = tracker.lock() {
+            t.emit(label);
+        }
+    }
+
     // ============================================================
     // Recursive segment manifest walker
     // ============================================================
@@ -1402,6 +1420,20 @@ impl AudioRenderer {
         // re-render.
         let mut visited: HashSet<PathBuf> = HashSet::new();
         visited.insert(source_abs.clone());
+        // Seed the tracker's total with the exact leaf count of everything
+        // this render will synthesize (top file + stale includes) before any
+        // synthesis starts, so the bar is monotonic — growing the total as
+        // includes parse mid-walk made it jump backwards (64/64 → 65/128).
+        // Best-effort: a counting failure falls back to an indeterminate bar
+        // (total 0) and the render below surfaces the real error.
+        if let Some(tracker) = progress {
+            let mut counted = HashSet::new();
+            let total = count_render_leaves(&source_abs, agent_dir, tracks_dir, &mut counted)
+                .unwrap_or(0);
+            if let Ok(mut t) = tracker.lock() {
+                t.total = total;
+            }
+        }
         self.render_manifest_file(
             &source_abs,
             script_rel,
@@ -1457,31 +1489,21 @@ impl AudioRenderer {
             .and_then(|source| glob_digest(source, script_dir, agent_dir));
         let manifest_path = out_dir.join("manifest.json");
 
-        // Freshness shortcut.
+        // Freshness shortcut (shared with the progress pre-count).
         if let Some(tracker) = progress {
             if let Ok(mut t) = tracker.lock() {
                 t.emit_phase("Checking freshness…");
             }
         }
-        if manifest_path.exists() {
-            if let Ok(existing_str) = fs::read_to_string(&manifest_path) {
-                if let Ok(existing) = serde_json::from_str::<Manifest>(&existing_str) {
-                    if existing.version == manifest::MANIFEST_VERSION
-                        && existing.hash == hash
-                        && existing.glob_digest == glob_digest
-                        && has_any_wav(out_dir)
-                    {
-                        let duration = nominal_duration(&existing.root);
-                        return Ok(RenderedManifest {
-                            id: manifest::manifest_id(script_rel),
-                            manifest_path: manifest_path.to_string_lossy().to_string(),
-                            script: existing.script.clone(),
-                            duration,
-                            created: mtime_rfc3339(&manifest_path),
-                        });
-                    }
-                }
-            }
+        if let Some(existing) = manifest_is_fresh(&manifest_path, out_dir, &hash, glob_digest.as_deref()) {
+            let duration = nominal_duration(&existing.root);
+            return Ok(RenderedManifest {
+                id: manifest::manifest_id(script_rel),
+                manifest_path: manifest_path.to_string_lossy().to_string(),
+                script: existing.script.clone(),
+                duration,
+                created: mtime_rfc3339(&manifest_path),
+            });
         }
 
         // Stale or missing — rebuild.
@@ -1495,14 +1517,8 @@ impl AudioRenderer {
             .with_context(|| format!("script {} is not UTF-8", source_abs.display()))?;
         let nodes =
             tag_parser::parse(source).with_context(|| format!("parse {}", source_abs.display()))?;
-        // Seed the progress total with this file's speakable-leaf count. The
-        // freshness shortcut above already returned for reused includes, so we
-        // only count files we actually render — no double counting.
-        if let Some(tracker) = progress {
-            if let Ok(mut t) = tracker.lock() {
-                t.total = t.total.saturating_add(count_speakable_nodes(&nodes));
-            }
-        }
+        // The tracker's total was seeded once, exactly, before synthesis
+        // began (see `render_manifest`); nothing to add per file.
         let mut counter = 0usize;
         if let Some(tracker) = progress {
             if let Ok(mut t) = tracker.lock() {
@@ -1528,6 +1544,17 @@ impl AudioRenderer {
             root,
         };
         fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+        // Land the bar exactly on 100%: the leaf total is an estimate that can
+        // over-count (a loop containing splits renders its child once but is
+        // counted per iteration; a flat-path <random> renders one branch but
+        // is counted with all of them), and the ~2 Hz emit throttle can drop
+        // the very last leaf ticks.
+        if let Some(tracker) = progress {
+            if let Ok(mut t) = tracker.lock() {
+                t.step = t.total;
+                t.emit("Writing manifest…");
+            }
+        }
         let duration = nominal_duration(&manifest.root);
         Ok(RenderedManifest {
             id: manifest::manifest_id(script_rel),
@@ -2161,6 +2188,128 @@ fn has_any_wav(dir: &Path) -> bool {
             .map(|x| x.eq_ignore_ascii_case("wav"))
             .unwrap_or(false)
     })
+}
+
+/// Freshness test shared by the render path and the progress pre-count
+/// ([`count_render_leaves`]): a manifest is reusable when its stored format
+/// version, script hash and glob-include digest match the current script and
+/// at least one `.wav` survives in its directory. Returns the parsed
+/// `Some(existing)` manifest when reusable (the caller links to it instead
+/// of re-synthesizing).
+fn manifest_is_fresh(
+    manifest_path: &Path,
+    out_dir: &Path,
+    hash: &str,
+    glob_digest: Option<&str>,
+) -> Option<Manifest> {
+    let existing = fs::read_to_string(manifest_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Manifest>(&s).ok())?;
+    let fresh = existing.version == manifest::MANIFEST_VERSION
+        && existing.hash == hash
+        && existing.glob_digest.as_deref() == glob_digest
+        && has_any_wav(out_dir);
+    if fresh {
+        Some(existing)
+    } else {
+        None
+    }
+}
+
+/// Collect every `<include src>` in an AST, at any depth — the pre-count's
+/// counterpart of the walker reaching includes through `emit_split`.
+fn collect_include_srcs(nodes: &[Node], out: &mut Vec<String>) {
+    for node in nodes {
+        match node {
+            Node::Include { src } => out.push(src.clone()),
+            Node::Voice { children, .. }
+            | Node::Speed { children, .. }
+            | Node::Volume { children, .. }
+            | Node::Effect { children, .. }
+            | Node::Background { children, .. }
+            | Node::Until { children, .. }
+            | Node::Section { children, .. }
+            | Node::Beatmeter { children, .. }
+            | Node::Loop { children, .. } => collect_include_srcs(children, out),
+            Node::Overlay { parts, .. }
+            | Node::Random { parts }
+            | Node::Scramble { parts }
+            | Node::React { parts, .. } => {
+                for part in parts {
+                    collect_include_srcs(&part.children, out);
+                }
+            }
+            Node::Choice { options, .. } => {
+                for part in options {
+                    collect_include_srcs(&part.children, out);
+                }
+            }
+            Node::Text(_) | Node::Pause { .. } | Node::Sound { .. } | Node::Tone { .. } => {}
+            Node::Rating { .. } => {}
+        }
+    }
+}
+
+/// Exact pre-count of the speakable leaves a render of `source_abs` will
+/// synthesize, so the progress bar's total is seeded once, before synthesis
+/// begins. Seeding per file as `<include>` targets parse mid-walk made the
+/// total (and the bar) jump backwards — e.g. 64/64 → 65/128 when the walker
+/// reached an include after finishing the top file's own leaves.
+///
+/// Mirrors `render_manifest_file`'s traversal: a fresh manifest contributes
+/// nothing (it's reused, not synthesized); a stale file contributes its own
+/// leaf count plus whatever its includes will render. `counted` is a
+/// persistent set (not a recursion stack) so a diamond — the same subscript
+/// included via two parents — counts once, matching the walker, where the
+/// first encounter renders the file and every later one reuses the fresh
+/// result. Includes are resolved with the same `resolve_include_targets`
+/// rules the walker applies; glob matches already counted (or on the
+/// recursion stack, which `counted` subsumes) are skipped, matching the
+/// walker's cycle filtering.
+fn count_render_leaves(
+    source_abs: &Path,
+    agent_dir: &Path,
+    tracks_dir: &Path,
+    counted: &mut HashSet<PathBuf>,
+) -> Result<usize> {
+    if !counted.insert(source_abs.to_path_buf()) {
+        return Ok(0);
+    }
+    let script_dir = source_abs
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let bytes = fs::read(source_abs)
+        .with_context(|| format!("read script {}", source_abs.display()))?;
+    let hash = manifest::hash_bytes(&bytes);
+    let glob_digest = std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|source| glob_digest(source, &script_dir, agent_dir));
+    let script_rel = script_relative_to(source_abs, agent_dir);
+    let out_dir = tracks_dir.join(manifest::manifest_id(&script_rel));
+    if manifest_is_fresh(
+        &out_dir.join("manifest.json"),
+        &out_dir,
+        &hash,
+        glob_digest.as_deref(),
+    )
+    .is_some()
+    {
+        return Ok(0);
+    }
+    let source = std::str::from_utf8(&bytes)
+        .with_context(|| format!("script {} is not UTF-8", source_abs.display()))?;
+    let nodes =
+        tag_parser::parse(source).with_context(|| format!("parse {}", source_abs.display()))?;
+    let mut count = count_speakable_nodes(&nodes);
+    let mut includes = Vec::new();
+    collect_include_srcs(&nodes, &mut includes);
+    for src in includes {
+        for target in resolve_include_targets(&src, &script_dir, agent_dir)? {
+            count += count_render_leaves(&target, agent_dir, tracks_dir, counted)?;
+        }
+    }
+    Ok(count)
 }
 
 /// Remove old `manifest.json` + `seg-*.wav` files from a manifest dir before
@@ -4058,5 +4207,78 @@ mod tests {
             "'shared' should appear in BOTH sibling branches, got {}: {:?}",
             shared_count, texts,
         );
+    }
+
+    /// Write a valid, fresh manifest (matching hash + a surviving wav) for
+    /// `script_rel`, as a previous successful render would have left behind.
+    fn write_fresh_manifest(agent_dir: &Path, tracks_dir: &Path, script_rel: &str) {
+        let bytes = fs::read(agent_dir.join(script_rel)).expect("read script");
+        let dir = tracks_dir.join(manifest::manifest_id(script_rel));
+        fs::create_dir_all(&dir).expect("create track dir");
+        fs::write(
+            dir.join("manifest.json"),
+            serde_json::json!({
+                "version": manifest::MANIFEST_VERSION,
+                "hash": manifest::hash_bytes(&bytes),
+                "script": script_rel,
+                "root": { "type": "sequence", "children": [] },
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+        fs::write(dir.join("seg-000.wav"), b"RIFF").expect("write wav");
+    }
+
+    #[test]
+    fn count_render_leaves_seeds_exact_total_across_includes() {
+        let tmp = tempdir().expect("tempdir");
+        let agent = tmp.path().join("agent");
+        let tracks = tmp.path().join("tracks");
+        fs::create_dir_all(agent.join("hypnos")).expect("mkdir");
+        fs::create_dir_all(&tracks).expect("mkdir");
+        // Top file: 2 speakable leaves (text + pause) + a nested include
+        // (found through the <voice> container) whose target adds 3 more.
+        fs::write(
+            agent.join("hypnos/main.xml"),
+            r#"<voice speaker="a">hello <pause duration="1"/> <include src="sub.xml"/></voice>"#,
+        )
+        .expect("write main");
+        fs::write(
+            agent.join("hypnos/sub.xml"),
+            r#"a <pause duration="1"/> b"#,
+        )
+        .expect("write sub");
+
+        let mut counted = std::collections::HashSet::new();
+        let total =
+            count_render_leaves(&agent.join("hypnos/main.xml"), &agent, &tracks, &mut counted)
+                .expect("count");
+        assert_eq!(total, 5, "2 own leaves + 3 from the include");
+    }
+
+    #[test]
+    fn count_render_leaves_skips_fresh_and_counts_diamonds_once() {
+        let tmp = tempdir().expect("tempdir");
+        let agent = tmp.path().join("agent");
+        let tracks = tmp.path().join("tracks");
+        fs::create_dir_all(&agent).expect("mkdir");
+        fs::create_dir_all(&tracks).expect("mkdir");
+        // main → a and b; both a and b → shared (diamond). shared is already
+        // rendered fresh, so it contributes 0; a and b render (1 leaf each).
+        fs::write(
+            agent.join("main.xml"),
+            r#"<include src="a.xml"/><include src="b.xml"/>"#,
+        )
+        .expect("write main");
+        fs::write(agent.join("a.xml"), r#"a <include src="shared.xml"/>"#).expect("write a");
+        fs::write(agent.join("b.xml"), r#"b <include src="shared.xml"/>"#).expect("write b");
+        fs::write(agent.join("shared.xml"), "s1 s2").expect("write shared");
+        write_fresh_manifest(&agent, &tracks, "shared.xml");
+
+        let mut counted = std::collections::HashSet::new();
+        let total =
+            count_render_leaves(&agent.join("main.xml"), &agent, &tracks, &mut counted)
+                .expect("count");
+        assert_eq!(total, 2, "1 leaf each from a and b; shared is fresh");
     }
 }

@@ -662,8 +662,8 @@ async fn render_manifest(
     // progress bar, throttled to 2 Hz (a render can emit hundreds of ticks —
     // we don't need them all, and dropping is fine for a purely cosmetic bar).
     // The native "Rendering…" notification is throttled independently. The
-    // total is seeded lazily inside the walker as it parses each file (see
-    // render_manifest_file).
+    // total is seeded exactly, up front, inside `render_manifest` (see
+    // `count_render_leaves`).
     let progress_app = app.clone();
     let progress_script = script_path.clone();
     let notify_throttle = Arc::new(render_notify::RenderNotifyThrottle::new());
