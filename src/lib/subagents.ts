@@ -51,7 +51,7 @@ import {
   validateFilesTool,
 } from "./tools";
 import type { AgentSettings } from "./types";
-import { emitAgentEvent, type AgentRole } from "./agent-events";
+import { emitAgentEvent, normalizeUsage, type AgentRole } from "./agent-events";
 
 // ============================================================================
 // Console logging helpers
@@ -216,21 +216,14 @@ function emitEnd(agent: SubagentName, depth: number) {
   emitAgentEvent({ type: "subagent-end", agent, depth, ts: Date.now() });
 }
 
-/** Report normalized token usage for a subagent run to the UI bus. */
-function reportUsage(agent: SubagentName, usage: unknown) {
+/** Report normalized token usage for a subagent step to the UI bus. */
+function reportUsage(agent: SubagentName, usage: unknown, providerMetadata?: unknown) {
   try {
-    const u = (usage ?? {}) as Record<string, number | undefined>;
-    const promptTokens = u.promptTokens ?? u.inputTokens ?? 0;
-    const completionTokens = u.completionTokens ?? u.outputTokens ?? 0;
     emitAgentEvent({
       type: "usage",
       role: agent as AgentRole,
       ts: Date.now(),
-      usage: {
-        promptTokens,
-        completionTokens,
-        totalTokens: u.totalTokens ?? promptTokens + completionTokens,
-      },
+      usage: normalizeUsage(usage, providerMetadata),
     });
   } catch {
     // Usage is informational; never let it break a run.
@@ -283,10 +276,12 @@ async function runSubagent(opts: {
   );
   emitStart(opts.agent, opts.depth);
 
-  // Declared outside the try so the `finally` block can read its usage.
-  // `streamText` runs synchronously, but the awaited message conversion
-  // happens before assignment — so it may stay undefined if that throws.
+  // `result` is declared outside the try so the `finally` block can read
+  // its (fallback) usage; `streamText` runs synchronously, but the awaited
+  // message conversion happens before assignment — so it may stay undefined
+  // if that throws.
   let result: ReturnType<typeof streamText> | undefined;
+  const reportedUsage = { done: false };
   try {
     const modelMessages = await convertToModelMessages(opts.messages);
     // Use `.chat()` to force the Chat Completions API — see agent.ts for
@@ -301,6 +296,14 @@ async function runSubagent(opts: {
         opts.settings,
         opts.agent,
       ) as Parameters<typeof streamText>[0]["providerOptions"],
+      // Report usage per step (LLM call) rather than only the cumulative
+      // `totalUsage` at the end — same rationale as agent.ts, and the
+      // per-step events are where cache-hit counts and the OpenRouter
+      // charge surface.
+      onStepFinish: ({ usage, providerMetadata }) => {
+        reportedUsage.done = true;
+        reportUsage(opts.agent, usage, providerMetadata);
+      },
     });
 
     // Track per-step text so we can flush it when a tool call or finish
@@ -457,10 +460,11 @@ async function runSubagent(opts: {
 
     return finalText;
   } finally {
-    // Report cumulative token usage for this run, then pop the activity
-    // from the UI progress feed. Done in `finally` so an error still
-    // clears the spinner.
-    if (result) {
+    // If the stream broke before any step finished (e.g. a connection error
+    // on the first call), still try to surface whatever usage the SDK
+    // accumulated, then pop the activity from the UI progress feed. Done in
+    // `finally` so an error still clears the spinner.
+    if (result && !reportedUsage.done) {
       try {
         const usage = await Promise.resolve(result.totalUsage);
         reportUsage(opts.agent, usage);

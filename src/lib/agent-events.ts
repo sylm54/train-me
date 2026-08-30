@@ -11,7 +11,8 @@
  *  - `usage`     — token usage per agent role, emitted when each `streamText`
  *                  step finishes (the main agent's tool loop emits one per
  *                  step, so the context meter advances during long turns).
- *                  The UI accumulates these to show a running token total and
+ *                  The UI accumulates these to show a running token total,
+ *                  a cache-hit rate, and (on OpenRouter) the money spent, and
  *                  anchors its live context-size estimate on the latest one.
  *  - `subagent*` — lifecycle + step events for the planner, so the
  *                  UI can show high-level progress ("Planning…",
@@ -28,7 +29,7 @@
  * Events are best-effort: a listener that throws never breaks a producer.
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 
 export type AgentRole = "main" | "planner";
 
@@ -37,6 +38,17 @@ export interface Usage {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  /**
+   * Prompt tokens served from the provider's cache (cache reads), when the
+   * provider reports them. Undefined = not reported (don't count as 0 in
+   * the cache-rate denominator).
+   */
+  cachedTokens?: number;
+  /**
+   * What the provider charged for this call, in USD, when it reports a cost
+   * (OpenRouter does; OpenAI's API does not). Undefined = not reported.
+   */
+  cost?: number;
 }
 
 export type AgentEvent =
@@ -108,8 +120,78 @@ type Listener = (e: AgentEvent) => void;
 
 const listeners = new Set<Listener>();
 
+// ── session usage totals ──────────────────────────────────────────────
+
+/**
+ * Cumulative usage since app start, across every role and chat. Kept at
+ * module level (not derived from the React-side event window) so the totals
+ * survive chat switches and keep accumulating while no chat view is mounted.
+ */
+export interface UsageTotals {
+  promptTokens: number;
+  completionTokens: number;
+  /** Cache-read prompt tokens, summed over calls that reported cache info. */
+  cachedTokens: number;
+  /**
+   * Prompt tokens of the calls that reported cache info — the honest
+   * denominator for the cache rate, so calls from providers/models that
+   * don't report caching don't dilute the percentage.
+   */
+  cacheReportedPromptTokens: number;
+  /** Sum of the per-call charges the provider reported (USD). */
+  cost: number;
+  /** True once any call reported a charge — gates the spend display. */
+  costReported: boolean;
+}
+
+const EMPTY_TOTALS: UsageTotals = {
+  promptTokens: 0,
+  completionTokens: 0,
+  cachedTokens: 0,
+  cacheReportedPromptTokens: 0,
+  cost: 0,
+  costReported: false,
+};
+
+let sessionUsage: UsageTotals = EMPTY_TOTALS;
+const usageListeners = new Set<() => void>();
+
+/** Fold one usage event into the session totals and notify subscribers. */
+function accumulateUsage(u: Usage): void {
+  sessionUsage = {
+    promptTokens: sessionUsage.promptTokens + u.promptTokens,
+    completionTokens: sessionUsage.completionTokens + u.completionTokens,
+    cachedTokens: sessionUsage.cachedTokens + (u.cachedTokens ?? 0),
+    cacheReportedPromptTokens:
+      sessionUsage.cacheReportedPromptTokens +
+      (u.cachedTokens !== undefined ? u.promptTokens : 0),
+    cost: sessionUsage.cost + (u.cost ?? 0),
+    costReported: sessionUsage.costReported || u.cost !== undefined,
+  };
+  for (const l of usageListeners) {
+    try {
+      l();
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/** The session usage totals as a React value (re-renders on each report). */
+export function useSessionUsage(): UsageTotals {
+  return useSyncExternalStore(
+    (onChange) => {
+      usageListeners.add(onChange);
+      return () => usageListeners.delete(onChange);
+    },
+    () => sessionUsage,
+    () => sessionUsage,
+  );
+}
+
 /** Broadcast an agent event to all subscribers. Failures are swallowed. */
 export function emitAgentEvent(event: AgentEvent): void {
+  if (event.type === "usage") accumulateUsage(event.usage);
   for (const listener of listeners) {
     try {
       listener(event);
@@ -117,6 +199,55 @@ export function emitAgentEvent(event: AgentEvent): void {
       console.warn("[agent-events] listener threw:", e);
     }
   }
+}
+
+/** A finite non-negative number, or undefined when absent/invalid. */
+function num(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : undefined;
+}
+
+/**
+ * Normalize a step's usage object (plus its provider metadata) into a
+ * `Usage`. Handles both v5 and v6 SDK field names and pulls the cache/cost
+ * details from wherever the current version surfaces them:
+ *
+ *  - cached tokens: `inputTokenDetails.cacheReadTokens` (v6; the deprecated
+ *    `cachedInputTokens` alias also works)
+ *  - cost: the raw provider usage (`raw.cost` — OpenRouter reports the exact
+ *    charge per call there) or the step's provider metadata
+ *    (`openrouter.usage.cost`). OpenAI's API reports neither, so both stay
+ *    undefined there and the UI hides the spend.
+ */
+export function normalizeUsage(
+  usage: unknown,
+  providerMetadata?: unknown,
+): Usage {
+  const u = (usage ?? {}) as Record<string, unknown>;
+  const details = (u.inputTokenDetails ?? {}) as Record<string, unknown>;
+  const raw = (u.raw ?? {}) as Record<string, unknown>;
+
+  const promptTokens = num(u.promptTokens ?? u.inputTokens) ?? 0;
+  const completionTokens = num(u.completionTokens ?? u.outputTokens) ?? 0;
+
+  const cachedTokens =
+    num(details.cacheReadTokens) ?? num(u.cachedInputTokens);
+
+  let cost = num(raw.cost);
+  if (cost === undefined) {
+    const or = (
+      ((providerMetadata as Record<string, unknown> | undefined)
+        ?.openrouter ?? {}) as Record<string, unknown>
+    )["usage"];
+    if (or != null) cost = num((or as Record<string, unknown>).cost);
+  }
+
+  return {
+    promptTokens,
+    completionTokens,
+    totalTokens: num(u.totalTokens) ?? promptTokens + completionTokens,
+    ...(cachedTokens !== undefined ? { cachedTokens } : {}),
+    ...(cost !== undefined ? { cost } : {}),
+  };
 }
 
 /** Subscribe to agent events. Returns an unsubscribe function. */
