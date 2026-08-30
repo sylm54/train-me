@@ -29,8 +29,9 @@
  * shows a "Thinking…" label; only the latest tool call / thinking step
  * in a message is shown, with earlier steps collapsed behind a toggle.
  * Exact inputs/outputs are mirrored to the browser console by the agent
- * runtime. A status bar surfaces running token totals and high-level
- * subagent activity (Planning / Validating files).
+ * runtime. A status bar surfaces the context meter, a session cache-hit
+ * rate, the money spent so far (OpenRouter), and high-level subagent
+ * activity (Planning / Validating files).
  *
  * Stream liveness: the running indicator differentiates "waiting for the
  * model" (request sent, no token yet), "thinking" (reasoning streaming),
@@ -75,6 +76,7 @@ import {
   ScrollText,
   Trash2,
   Wrench,
+  Zap,
   Check,
   X,
 } from "lucide-react";
@@ -86,7 +88,7 @@ import {
 } from "@/lib/prompts";
 import { createMainAgentTransport } from "@/lib/agent";
 import type { AgentSettings } from "@/lib/types";
-import { useAgentEvents, type AgentEvent } from "@/lib/agent-events";
+import { useAgentEvents, useSessionUsage, type AgentEvent } from "@/lib/agent-events";
 import {
   archiveChat,
   createChat,
@@ -955,6 +957,16 @@ function ChatHeader({
 
 // ── Context footer (status + meter) ───────────────────────────────────
 
+/**
+ * Format a USD amount compactly, keeping enough decimals for the small
+ * per-call charges that dominate LLM billing: $1.28 / $0.042 / $0.0004.
+ */
+function formatCost(usd: number): string {
+  if (usd >= 1) return `$${usd.toFixed(2)}`;
+  if (usd >= 0.01) return `$${usd.toFixed(3)}`;
+  return `$${usd.toFixed(4)}`;
+}
+
 function ContextFooter({
   isGenerating,
   phase,
@@ -994,6 +1006,13 @@ function ContextFooter({
       : pct >= thresholdPct - 10
         ? "var(--color-warning)"
         : "var(--color-pink-400)";
+
+  // Session usage stats (survive chat switches; see `useSessionUsage`).
+  const usage = useSessionUsage();
+  const cachePct =
+    usage.cacheReportedPromptTokens > 0
+      ? (usage.cachedTokens / usage.cacheReportedPromptTokens) * 100
+      : null;
 
   return (
     <div className="px-3 py-1.5 text-[11px] text-[var(--color-muted-foreground)] border-t border-[var(--color-border)] bg-[var(--color-surface-muted)] flex items-center gap-3 min-h-[28px]">
@@ -1080,6 +1099,29 @@ function ContextFooter({
           {formatTokenCount(contextTokens)} /{" "}
           {formatTokenCount(contextWindowTokens)}
         </span>
+      </div>
+
+      {/* Session usage: cache-hit rate + (OpenRouter only) money spent.
+          Hidden until the provider actually reports the numbers, so the
+          OpenAI provider (no cost field) and models without cache info
+          don't show empty/misleading stats. */}
+      <div className="flex items-center gap-2 shrink-0 tabular-nums">
+        {cachePct !== null && (
+          <span
+            className="flex items-center gap-0.5"
+            title={`Cache-hit rate: ${formatTokenCount(usage.cachedTokens)} of ${formatTokenCount(usage.cacheReportedPromptTokens)} prompt tokens were served from the provider's cache this session. Cached input is billed at a steep discount (where priced).`}
+          >
+            <Zap size={10} className="shrink-0" />
+            {Math.round(cachePct)}%
+          </span>
+        )}
+        {usage.costReported && (
+          <span
+            title={`Charged by OpenRouter this session (as reported per call). Auto-compact summary calls are not included.`}
+          >
+            {formatCost(usage.cost)}
+          </span>
+        )}
       </div>
 
       {messageCount > 0 && (
@@ -1505,15 +1547,11 @@ interface ToolHistoryEntry {
   ts: number;
 }
 
-interface Totals {
-  promptTokens: number;
-  completionTokens: number;
-}
-
 /**
- * Walk the event stream and derive (a) cumulative token + spend totals,
- * (b) the currently-active delegation stack, and (c) the full tool-call
- * history across all planner levels.
+ * Walk the event stream and derive (a) the currently-active delegation stack
+ * and (b) the full tool-call history across all planner levels. (Cumulative
+ * token/cost totals live in `useSessionUsage` — they must survive this
+ * component's per-chat remount.)
  *
  * Subagents are strictly nested (a child fully completes within its
  * parent's run), so we model activity as a push/pop stack keyed by the
@@ -1522,24 +1560,15 @@ interface Totals {
  * open at the end of the stream are the still-running delegation chain.
  */
 function deriveStats(events: AgentEvent[]): {
-  totals: Totals;
   activeSubagent: ActiveSubagent | null;
   subagentStack: ActiveSubagent[];
   toolHistory: ToolHistoryEntry[];
 } {
-  let promptTokens = 0;
-  let completionTokens = 0;
-
   const stack: ActiveSubagent[] = [];
   const toolHistory: ToolHistoryEntry[] = [];
 
   for (const e of events) {
     switch (e.type) {
-      case "usage": {
-        promptTokens += e.usage.promptTokens;
-        completionTokens += e.usage.completionTokens;
-        break;
-      }
       case "subagent-start":
         stack.push({
           agent: e.agent,
@@ -1592,7 +1621,6 @@ function deriveStats(events: AgentEvent[]): {
     stack.length > 0 ? stack[stack.length - 1] : null;
 
   return {
-    totals: { promptTokens, completionTokens },
     activeSubagent,
     subagentStack: stack,
     toolHistory,

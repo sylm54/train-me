@@ -21,7 +21,7 @@ import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import type { AgentSettings, AgentName, ProviderName } from "./types";
 import { MAIN_AGENT_TOOLS } from "./tools";
 import { buildInvokePlannerTool } from "./subagents";
-import { emitAgentEvent, type AgentRole } from "./agent-events";
+import { emitAgentEvent, normalizeUsage, type AgentRole } from "./agent-events";
 import {
   getCompaction,
   liveMessagesForModel,
@@ -33,32 +33,31 @@ import { contextCharsOf } from "./contextUsage";
  * Report token usage for an agent role to the UI event bus.
  *
  * The AI SDK exposes usage per finished step; we normalize it (handling both
- * v5 and v6 field names) and emit one event per step. For the main agent the
- * prompt tokens of a step are the *actual context size at that moment* — the
- * value the context meter is anchored on (see `contextUsage.ts`). Deliberately
- * NOT the stream's cumulative `totalUsage`: the tool loop re-sends the whole
- * context every step, so summing across steps would over-count and make the
- * meter overshoot. Failures are ignored — usage is informational, never
- * load-bearing.
+ * v5 and v6 field names, plus cache-hit counts and — on OpenRouter — the
+ * per-call charge, see `normalizeUsage`) and emit one event per step. For the
+ * main agent the prompt tokens of a step are the *actual context size at that
+ * moment* — the value the context meter is anchored on (see `contextUsage.ts`).
+ * Deliberately NOT the stream's cumulative `totalUsage`: the tool loop re-sends
+ * the whole context every step, so summing across steps would over-count and
+ * make the meter overshoot. Failures are ignored — usage is informational,
+ * never load-bearing.
  */
 function reportUsage(
   role: AgentRole,
   usage: unknown,
-  opts?: { contextChars?: number; chatId?: string },
+  opts?: {
+    contextChars?: number;
+    chatId?: string;
+    /** Step provider metadata — OpenRouter's exact charge lives here. */
+    providerMetadata?: unknown;
+  },
 ) {
   try {
-    const u = (usage ?? {}) as Record<string, number | undefined>;
-    const promptTokens = u.promptTokens ?? u.inputTokens ?? 0;
-    const completionTokens = u.completionTokens ?? u.outputTokens ?? 0;
     emitAgentEvent({
       type: "usage",
       role,
       ts: Date.now(),
-      usage: {
-        promptTokens,
-        completionTokens,
-        totalTokens: u.totalTokens ?? promptTokens + completionTokens,
-      },
+      usage: normalizeUsage(usage, opts?.providerMetadata),
       contextChars: opts?.contextChars,
       chatId: opts?.chatId,
     });
@@ -269,8 +268,12 @@ export function createMainAgentTransport(opts: {
         // Report usage per step (LLM call). A step's prompt tokens ARE the
         // current context size, so the meter advances after each tool round
         // of a long turn instead of only when the whole turn settles.
-        onStepFinish: ({ usage }) =>
-          reportUsage("main", usage, { contextChars, chatId: chatId ?? undefined }),
+        onStepFinish: ({ usage, providerMetadata }) =>
+          reportUsage("main", usage, {
+            contextChars,
+            chatId: chatId ?? undefined,
+            providerMetadata,
+          }),
       });
 
       return result.toUIMessageStream().pipeThrough(stripReasoningFromStream());
