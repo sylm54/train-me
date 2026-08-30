@@ -143,8 +143,9 @@ export default function App() {
       {view !== "chat" && body}
       <NoticeToasts isForeground={isForeground} />
       {/* Render progress must survive navigation → mounted once here, and
-          z-40 keeps it under full-screen overlays (player, dialogs). */}
-      <RenderProgressOverlay />
+          z-40 keeps it under full-screen overlays (player, dialogs). On the
+          chat view the pill floats above the composer (see the overlay). */}
+      <RenderProgressOverlay composer={view === "chat"} />
     </AppShell>
   );
 }
