@@ -450,7 +450,7 @@ function WelcomeStep() {
         <FeatureCard
           icon={<Sparkles size={16} />}
           title="Pick your models"
-          body="Connect an OpenRouter or OpenAI key and choose a model for the main and planner agents."
+          body="Connect an OpenRouter or OpenAI key and choose a model for your agent."
         />
         <FeatureCard
           icon={<PackageOpen size={16} />}

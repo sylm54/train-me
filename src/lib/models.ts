@@ -17,7 +17,6 @@ import type { AgentName, ProviderName, ReasoningEffort } from "./types";
 /** Human-readable name for each agent slot. */
 export const AGENT_LABELS: Record<AgentName, string> = {
   main: "Main agent",
-  planner: "Hypno planner",
 };
 
 /** Human-readable name for each provider. */

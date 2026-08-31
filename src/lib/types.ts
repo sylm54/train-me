@@ -2,8 +2,8 @@
  * Shared types for the Train-Me frontend.
  */
 
-/** A single agent slot. */
-export type AgentName = "main" | "planner";
+/** An agent settings slot. The spawned copy reuses the main agent's config. */
+export type AgentName = "main";
 
 /** Provider identifier (OpenAI-compatible endpoints). */
 export type ProviderName = "openrouter" | "openai";

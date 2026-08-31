@@ -26,14 +26,16 @@ my-framework/
 ├─ onboarding.json    ← optional: deterministic first-run questions
 ├─ base/              ← always installed
 │   ├─ prompts/       ← → the app's prompt store (main_agent.md is the entry point)
-│   └─ agent_files/   ← → the agent's sandbox root (routines/, habits/, tasks/,
-│                         store/, hypnos/ … plus files like USER.md)
+│   └─ agent_files/   ← → the agent's sandbox root (docs/, routines/, habits/,
+│                         tasks/, store/, hypnos/ … plus files like USER.md)
 └─ my_part/           ← optional parts, selected via config.json choices
     ├─ prompts/
     └─ agent_files/
 ```
 
-Rules: `base/` first, then each selected part; later parts win on overlap. On a same-id update, `owned_files` globs prune files the new version dropped (unless `preserve`d); `remove` globs always apply. `{{include './FILE.md'}}` in a prompt inlines sandbox files; `{{embed ...}}` inlines sibling prompts; the app also provides `{{features}}` (feature-file docs) and `{{ttsTags}}` (XML authoring docs) to prompts.
+Rules: `base/` first, then each selected part; later parts win on overlap. On a same-id update, `owned_files` globs prune files the new version dropped (unless `preserve`d); `remove` globs always apply. `{{include './FILE.md'}}` in a prompt inlines sandbox files; `{{embed ...}}` inlines sibling prompts; `{{docs}}` renders the reference-docs surface.
+
+**Docs**: every markdown file under the sandbox's `docs/` is surfaced to the agent by `{{docs}}` — a tree-structured index (path + `description` frontmatter) with bodies read on demand via `read_file`. Required frontmatter: `description` (one line, shown in the index). Optional: `inline: true` inlines the body into the system prompt (for short always-needed maps; keep under ~500 words — the linter warns above that). `docs/internal/` is app-owned (feature grammar, TTS tag reference, builtins, feedback semantics) — seeded by the app at startup; frameworks must not ship there (lint error). The app also seeds `examples/` with worked feature files.
 
 ## The feature-file grammar (FORMAT.md, abridged)
 

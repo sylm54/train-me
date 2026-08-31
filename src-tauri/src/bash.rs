@@ -436,6 +436,11 @@ pub fn ensure_prompts_dir(data_dir: &Path) -> std::io::Result<()> {
 /// Existing files are never overwritten — only missing ones are written,
 /// so user/agent edits to the examples survive.
 ///
+/// Also seeds `agent_data/docs/internal/` with the app-owned reference docs
+/// surfaced by the `{{docs}}` prompt directive. Unlike examples, these are
+/// app-managed: they are overwritten whenever their bundled content changes,
+/// so docs stay in sync with the running app.
+///
 /// Note: `inventory/` is intentionally NOT created here — inventory lives
 /// in `<state_dir>/inventory.db`, accessed via the `inventory` builtin.
 pub fn ensure_agent_dir(data_dir: &Path) -> std::io::Result<()> {
@@ -445,10 +450,11 @@ pub fn ensure_agent_dir(data_dir: &Path) -> std::io::Result<()> {
     // them so the layout is discoverable on first run; the agent is free to
     // create others. (`habits`, `tasks`, `store` are v2-format dirs —
     // see FORMAT.md.)
-    for sub in ["special", "routines", "habits", "tasks", "store", "hypnos"] {
+    for sub in ["docs", "routines", "habits", "tasks", "store", "hypnos"] {
         std::fs::create_dir_all(agent.join(sub))?;
     }
     seed_examples(&agent)?;
+    seed_internal_docs(&agent)?;
     Ok(())
 }
 
@@ -457,9 +463,9 @@ pub fn ensure_agent_dir(data_dir: &Path) -> std::io::Result<()> {
 /// `agent_data/examples/` on startup, but only when absent — existing files
 /// are left untouched so edits persist.
 ///
-/// The system prompt (`{{features}}`) references these paths as the
-/// formatting standard for rules, routines, the journal format, and voice
-/// config.
+/// The system prompt's docs (`docs/internal/feature-files.md`) reference
+/// these paths as the formatting standard for rules, routines, the journal
+/// format, and voice config.
 fn seed_examples(agent_dir: &Path) -> std::io::Result<()> {
     /// One bundled example: its relative path under `examples/` and its
     /// contents (embedded at compile time from the repo's `examples/` dir).
@@ -495,6 +501,66 @@ fn seed_examples(agent_dir: &Path) -> std::io::Result<()> {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&path, ex.contents)?;
+    }
+    Ok(())
+}
+
+/// App-owned reference docs surfaced by the `{{docs}}` prompt directive
+/// (compiled into the binary with `include_str!` from the repo's
+/// `internal-docs/` dir). Written into `agent_data/docs/internal/` on
+/// startup and OVERWRITTEN whenever their bundled content differs — these
+/// are the app's documentation, not the user's, so app updates propagate.
+/// Frameworks must not ship `docs/internal/**` (enforced by the framework
+/// CLI linter).
+fn seed_internal_docs(agent_dir: &Path) -> std::io::Result<()> {
+    /// One bundled internal doc: its path under `docs/` and its contents.
+    struct InternalDoc {
+        rel: &'static str,
+        contents: &'static str,
+    }
+    const DOCS: &[InternalDoc] = &[
+        InternalDoc {
+            rel: "docs/internal/overview.md",
+            contents: include_str!("../internal-docs/overview.md"),
+        },
+        InternalDoc {
+            rel: "docs/internal/feature-files.md",
+            contents: include_str!("../internal-docs/feature-files.md"),
+        },
+        InternalDoc {
+            rel: "docs/internal/voice-training.md",
+            contents: include_str!("../internal-docs/voice-training.md"),
+        },
+        InternalDoc {
+            rel: "docs/internal/chastity.md",
+            contents: include_str!("../internal-docs/chastity.md"),
+        },
+        InternalDoc {
+            rel: "docs/internal/feedback.md",
+            contents: include_str!("../internal-docs/feedback.md"),
+        },
+        InternalDoc {
+            rel: "docs/internal/data.md",
+            contents: include_str!("../internal-docs/data.md"),
+        },
+        InternalDoc {
+            rel: "docs/internal/tts-tags.md",
+            contents: include_str!("../internal-docs/tts-tags.md"),
+        },
+    ];
+
+    for doc in DOCS {
+        let path = agent_dir.join(doc.rel);
+        if std::fs::read(&path)
+            .map(|existing| existing == doc.contents.as_bytes())
+            .unwrap_or(false)
+        {
+            continue; // already up to date
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, doc.contents)?;
     }
     Ok(())
 }

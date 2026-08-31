@@ -20,7 +20,7 @@ import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 
 import type { AgentSettings, AgentName, ProviderName } from "./types";
 import { MAIN_AGENT_TOOLS } from "./tools";
-import { buildInvokePlannerTool } from "./subagents";
+import { buildSpawnAgentTool } from "./subagents";
 import { emitAgentEvent, normalizeUsage, type AgentRole } from "./agent-events";
 import {
   getCompaction,
@@ -129,17 +129,14 @@ export function buildProviderOptions(
 
 /**
  * Build the main agent's toolset. Includes the base tools (bash, files,
- * prompts, validate_files) plus the `invoke_planner` subagent tool. The
- * planner tool is rebuilt whenever `settings` change because it captures
- * the settings to spawn the planner LLM call.
- *
- * The planner is spawned at chain depth 1; it may recurse further up to
- * `MAX_SUBAGENT_DEPTH` (see `subagents.ts`).
+ * validate_files, ask_question) plus the `spawn_agent` subagent tool. The
+ * spawn tool is rebuilt whenever `settings` change because it captures
+ * the settings for the spawned LLM call.
  */
 export function buildMainAgentTools(settings: AgentSettings): ToolSet {
   return {
     ...MAIN_AGENT_TOOLS,
-    invoke_planner: buildInvokePlannerTool(settings, 1),
+    spawn_agent: buildSpawnAgentTool(settings),
   };
 }
 
@@ -244,7 +241,7 @@ export function createMainAgentTransport(opts: {
 
       const modelMessages = await convertToModelMessages(liveMessages);
 
-      // Rebuild tools from current settings each call (the planner tool
+      // Rebuild tools from current settings each call (the spawn_agent tool
       // captures settings).
       const tools = buildMainAgentTools(settings);
 

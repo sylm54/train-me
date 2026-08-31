@@ -1,8 +1,9 @@
 /**
  * Framework linter: validates manifest/config/onboarding, every v2
  * container in base + parts (routines, habits, tasks, store), XML script
- * reference/include trees, and prompt embeds/links. Exit code 1 when any
- * error is reported.
+ * reference/include trees, prompt embeds/links, and the docs surface
+ * (frontmatter contract, app-owned internal/ namespace). Exit code 1 when
+ * any error is reported.
  */
 
 import { readdirSync, readFileSync, statSync, existsSync } from "fs";
@@ -46,6 +47,44 @@ function walk(dir: string, out: string[] = []): string[] {
     else out.push(full);
   }
   return out;
+}
+
+/** Word budget for docs marked `inline: true` (always in the system prompt). */
+const INLINE_DOC_WORD_LIMIT = 500;
+
+/**
+ * Minimal frontmatter reader for docs files: leading `---` block with flat
+ * `key: value` lines. Mirrors the app's `parseFrontmatter` for the two keys
+ * the `{{docs}}` surface cares about (`description`, `inline`).
+ */
+function parseDocFrontmatter(content: string): {
+  description: string;
+  inline: boolean;
+  body: string;
+} {
+  const normalized = content.replaceAll("\r\n", "\n");
+  if (!normalized.startsWith("---\n")) {
+    return { description: "", inline: false, body: normalized };
+  }
+  const end = normalized.indexOf("\n---\n", 4);
+  if (end < 0) {
+    return { description: "", inline: false, body: normalized };
+  }
+  const yaml = normalized.slice(4, end);
+  const body = normalized.slice(end + 5);
+  let description = "";
+  let inline = false;
+  for (const line of yaml.split("\n")) {
+    const m = line.match(/^([A-Za-z0-9_-]+)\s*:\s*(.*)$/);
+    if (!m) continue;
+    const key = m[1];
+    let value = m[2].trim();
+    const quoted = value.match(/^['"](.*)['"]$/);
+    if (quoted) value = quoted[1];
+    if (key === "description") description = value;
+    if (key === "inline") inline = value === "true" || value === "True";
+  }
+  return { description, inline, body };
 }
 
 /** Resolve config.json parts (ported from the app's install logic). */
@@ -244,6 +283,43 @@ export function lint(rootArg: string): number {
         diags.push({ severity: "error", message: `unexpected error: ${e}` });
       }
       reportFile(relative(root, f).replaceAll("\\", "/"), diags, out);
+    }
+
+    // Docs (the `{{docs}}` surface): frontmatter contract + app-owned
+    // internal/ namespace.
+    const docsDir = join(agentDir, "docs");
+    if (statSync(docsDir, { throwIfNoEntry: false })?.isDirectory()) {
+      for (const f of walk(docsDir).sort()) {
+        if (!f.toLowerCase().endsWith(".md")) continue;
+        const diags: Diag[] = [];
+        const rel = relative(agentDir, f).replaceAll("\\", "/");
+        if (rel.startsWith("docs/internal/")) {
+          diags.push({
+            severity: "error",
+            message:
+              "frameworks must not ship docs/internal/** — that namespace is app-owned and seeded at startup",
+          });
+        }
+        const content = readFileSync(f, "utf-8");
+        const fm = parseDocFrontmatter(content);
+        if (!fm.description) {
+          diags.push({
+            severity: "error",
+            message:
+              "missing `description` frontmatter (it is shown in the {{docs}} index)",
+          });
+        }
+        if (fm.inline) {
+          const words = fm.body.trim().split(/\s+/).filter(Boolean).length;
+          if (words > INLINE_DOC_WORD_LIMIT) {
+            diags.push({
+              severity: "warning",
+              message: `\`inline: true\` body is ~${words} words — inline docs are always in the system prompt; keep them short (≤ ${INLINE_DOC_WORD_LIMIT} words)`,
+            });
+          }
+        }
+        reportFile(rel, diags, out);
+      }
     }
 
     // Prompts: embeds + .md links + token estimate.

@@ -1,32 +1,32 @@
 /**
- * Subagent orchestration: hypno planner (recursive).
+ * Subagent orchestration: self-spawn (the agent delegating to a fresh copy
+ * of itself).
  *
- * The planner is spawned from the frontend via its own `streamText` call.
- * It is *not* exposed to the user — only its parent (the main agent, or
- * another planner) sees `invoke_planner`.
+ * The copy is spawned from the frontend via its own `streamText` call. It is
+ * *not* exposed to the user — only its parent (the main agent) sees
+ * `spawn_agent`.
  *
- * Lifecycle (recursive):
- *
+ * Lifecycle:
+
  *   Main agent
- *     └─ tool: invoke_planner(task)          → planner @ depth 1
- *          └─ streamText(planner prompt, planner tools)
+ *     └─ tool: spawn_agent(task)   → copy @ depth 1
+ *          └─ streamText(main prompt, copy tools)
  *               ├─ bash / read_file / write_file / edit_file / list_files
- *               ├─ validate_files (path-aware)
- *               └─ tool: invoke_planner(task) → planner @ depth 2
- *                    └─ … (up to MAX_SUBAGENT_DEPTH)
+ *               └─ validate_files
  *
- * The planner writes XML scripts directly with `write_file`/`edit_file` and
- * validates them with `validate_files` (optionally scoped to a path). Its
- * final text becomes the `invoke_planner` tool result the parent sees.
+ * The copy runs the SAME rendered system prompt as the main agent (re-loaded
+ * from disk on every spawn, so prompt edits apply immediately) with an empty
+ * message history: the task brief is the only user message. That clean slate
+ * is the point — long authoring jobs (audio scripts, feature files) run with
+ * the docs index at the front of context instead of buried under chat
+ * history. Only the copy's final text is returned to the parent as the tool
+ * result.
  *
- * Recursion cap: a planner running at chain depth `d` is given the
- * `invoke_planner` tool (which spawns depth `d+1`) only while
- * `d < MAX_SUBAGENT_DEPTH`. The deepest level simply has no spawn tool, so
- * it authors and validates directly — exceeding the cap is structurally
- * impossible, not merely discouraged.
+ * Depth cap: the copy's toolset simply has no `spawn_agent` tool, so the
+ * recursion cap is structural, not advisory.
  *
  * All subagent activity is mirrored to the browser devtools console
- * (search for `[planner]`). Each invocation opens a collapsed
+ * (search for `[spawn]`). Each invocation opens a collapsed
  * console.group; expand it to see the full trace.
  */
 
@@ -57,26 +57,12 @@ import { emitAgentEvent, normalizeUsage, type AgentRole } from "./agent-events";
 // Console logging helpers
 // ============================================================================
 
-type SubagentName = "planner";
+type SubagentName = "spawn";
 
-/**
- * Maximum planner chain depth. Depth 1 = spawned by the main agent; each
- * nested spawn increments by one. A planner at this depth gets no
- * `invoke_planner` tool and works directly, so this is a hard, structural
- * cap on recursion. Tune to balance decomposition vs. token/latency cost.
- */
-export const MAX_SUBAGENT_DEPTH = 3;
+/** Distinct console-marker colour so it's easy to scan. */
+const LOG_STYLE = "color:#d946ef;font-weight:bold"; // pink-500
 
-/** Distinct console-marker colour for the planner so it's easy to scan. */
-const LOG_STYLES: Record<SubagentName, string> = {
-  planner: "color:#d946ef;font-weight:bold", // pink-500
-};
-
-/**
- * Console tag for a subagent at a given depth, e.g. `[planner]` for the
- * first level and `[planner·2]`, `[planner·3]` for nested ones, so the
- * recursion depth is visible when scanning flat devtools logs.
- */
+/** Console tag for a subagent at a given depth, e.g. `[spawn]`. */
 function tag(agent: SubagentName, depth: number): string {
   return depth > 1 ? `[${agent}·${depth}]` : `[${agent}]`;
 }
@@ -135,7 +121,7 @@ function log(
   message: string,
   ...args: unknown[]
 ) {
-  console.log(`%c${tag(agent, depth)}`, LOG_STYLES[agent], message, ...args);
+  console.log(`%c${tag(agent, depth)}`, LOG_STYLE, message, ...args);
 }
 
 // ── UI progress events ────────────────────────────────────────────────
@@ -146,7 +132,7 @@ function log(
 // console (via `log` above).
 
 const START_LABEL: Record<SubagentName, string> = {
-  planner: "Planning",
+  spawn: "Working on a task",
 };
 
 const STEP_LABEL: Record<string, string> = {
@@ -156,10 +142,10 @@ const STEP_LABEL: Record<string, string> = {
   edit_file: "Editing file",
   list_files: "Listing files",
   validate_files: "Validating files",
-  invoke_planner: "Planning",
+  spawn_agent: "Delegating",
 };
 
-/** Push a subagent-start event so the UI can show "Planning…" etc. */
+/** Push a subagent-start event so the UI can show progress etc. */
 function emitStart(agent: SubagentName, depth: number) {
   emitAgentEvent({
     type: "subagent-start",
@@ -249,30 +235,24 @@ function reportUsage(agent: SubagentName, usage: unknown, providerMetadata?: unk
 async function runSubagent(opts: {
   settings: AgentSettings;
   agent: SubagentName;
-  /** Chain depth of this run (1 = spawned by main, 2 = by a depth-1 planner…). */
+  /** Chain depth of this run (always 1 — copies get no spawn tool). */
   depth: number;
   systemPrompt: string;
   messages: UIMessage[];
   tools: ToolSet;
 }): Promise<string> {
-  const cfg = getProvider(opts.settings, opts.agent);
+  const cfg = getProvider(opts.settings, "main");
   if (!cfg) {
-    log(
-      opts.agent,
-      opts.depth,
-      "✗ no API key for provider",
-      opts.settings.agents[opts.agent].provider,
-    );
+    log(opts.agent, opts.depth, "✗ no API key for provider");
     throw new Error(
-      `No API key configured for the ${opts.agent} agent ` +
-        `(provider "${opts.settings.agents[opts.agent].provider}").`,
+      `No API key configured for the "${opts.settings.agents.main.provider}" provider.`,
     );
   }
 
   log(
     opts.agent,
     opts.depth,
-    `▶ starting (${opts.settings.agents[opts.agent].provider}/${cfg.model})`,
+    `▶ starting (${opts.settings.agents.main.provider}/${cfg.model})`,
   );
   emitStart(opts.agent, opts.depth);
 
@@ -294,7 +274,7 @@ async function runSubagent(opts: {
       stopWhen: isLoopFinished(),
       providerOptions: buildProviderOptions(
         opts.settings,
-        opts.agent,
+        "main",
       ) as Parameters<typeof streamText>[0]["providerOptions"],
       // Report usage per step (LLM call) rather than only the cumulative
       // `totalUsage` at the end — same rationale as agent.ts, and the
@@ -361,7 +341,7 @@ async function runSubagent(opts: {
           }
           console.groupCollapsed(
             `%c${tag(opts.agent, opts.depth)}`,
-            LOG_STYLES[opts.agent],
+            LOG_STYLE,
             "💭 reasoning",
           );
           break;
@@ -481,53 +461,42 @@ async function runSubagent(opts: {
 // ============================================================================
 
 /**
- * Prefix prepended to every subagent's system prompt (below its file prompt).
+ * Prefix prepended to the copy's system prompt (below its file prompt).
  *
  * Framework prompts are written for the agent generally; nothing in them says
- * "you are the subagent right now". Without that, a spawned planner has been
- * observed delegating its own task back through `invoke_planner` — spawning
- * itself to do the very work it was given, burning a recursion level and
- * tokens for nothing. Stating the identity + depth explicitly in the prompt
- * makes the model do the work itself and reserve spawning for genuinely
- * separable subtasks.
+ * "you are the spawned copy right now". Without that, a spawned copy has been
+ * observed trying to hand its own task back through a spawn tool — or
+ * addressing the user as if in chat. Stating the identity explicitly makes
+ * the model do the work itself and return the result as its final text.
  */
 function withSubagentContext(
   agent: SubagentName,
   depth: number,
   systemPrompt: string,
 ): string {
-  const caller =
-    depth <= 1 ? "the main agent" : `another ${agent} subagent (depth ${depth - 1})`;
   return (
     `[Subagent context — injected by the app, not part of your file prompt]\n` +
-    `You ARE the "${agent}" subagent, running at recursion depth ${depth}, spawned by ${caller} ` +
-    `via a tool call. The user does not see your messages — only your final text is ` +
-    `returned to the caller as that tool's result.\n` +
-    `Because you are already this subagent, never invoke it on yourself: do NOT spawn ` +
-    `another "${agent}" to handle the task you were given — that is your job, do it ` +
-    `directly. Spawning further subagents is only for genuinely separate, decomposable ` +
-    `subtasks, never for re-doing or continuing your own assignment.\n\n` +
+    `You ARE a fresh copy of the main agent (the "${agent}" subagent, depth ${depth}), ` +
+    `spawned by the main agent via a tool call. The user does not see your messages — ` +
+    `only your final text is returned to the caller as that tool's result.\n` +
+    `You have no tool to spawn further copies: whatever task you were given is yours ` +
+    `to complete directly.\n\n` +
     systemPrompt
   );
 }
 
 // ============================================================================
-// Planner subagent
+// spawn_agent tool
 // ============================================================================
 
 /**
- * Build the planner subagent's toolset.
- *
- * The planner authors scripts directly with `write_file`/`edit_file` and
- * validates them with `validate_files` (optionally scoped to a path).
- *
- * Recursion: a planner running at chain `depth` is handed `invoke_planner`
- * (which spawns a planner at `depth + 1`) only while `depth <
- * MAX_SUBAGENT_DEPTH`. The deepest allowed level simply has no spawn tool,
- * so it works directly — the recursion cap is structural, not advisory.
+ * Build the spawned copy's toolset: the main agent's file/inspection tools
+ * minus the user-facing `ask_question` (a background copy asking the user a
+ * question would block forever) and minus any spawn tool — copies work
+ * directly, so the recursion cap is structural.
  */
-function buildPlannerTools(settings: AgentSettings, depth: number): ToolSet {
-  const tools: ToolSet = {
+function buildSpawnedTools(): ToolSet {
+  return {
     bash: bashTool,
     read_file: readFileTool,
     write_file: writeFileTool,
@@ -535,69 +504,55 @@ function buildPlannerTools(settings: AgentSettings, depth: number): ToolSet {
     list_files: listFilesTool,
     validate_files: validateFilesTool,
   };
-  if (depth < MAX_SUBAGENT_DEPTH) {
-    tools.invoke_planner = buildInvokePlannerTool(settings, depth + 1);
-  }
-  return tools;
 }
 
 /**
- * Invoke the planner subagent with a high-level task from its parent (the
- * main agent, or another planner when recursing).
- *
- * `depth` is the chain depth of the planner to run (1 = spawned by main).
- * Loads the planner prompt from disk on every invocation so the user can
- * edit it and see changes immediately.
+ * Spawn a fresh copy of the main agent with a high-level task from its
+ * parent. Loads and renders `prompts/main_agent.md` on every invocation so
+ * the user can edit it and see changes immediately.
  */
-export async function invokePlanner(opts: {
+export async function spawnAgent(opts: {
   settings: AgentSettings;
   task: string;
-  /** Chain depth of the planner to run (1 = spawned by the main agent). */
-  depth: number;
 }): Promise<string> {
-  const plannerPrompt = await loadPrompt("hypno_planner.md");
+  const depth = 1;
+  const systemPrompt = await loadPrompt("main_agent.md");
 
-  if (!plannerPrompt) {
-    log("planner", opts.depth, "✗ prompts/hypno_planner.md missing or empty");
+  if (!systemPrompt) {
+    log("spawn", depth, "✗ prompts/main_agent.md missing or empty");
     throw new Error(
-      "prompts/hypno_planner.md is empty or missing. " +
-        "Add a system prompt for the planner before invoking it.",
+      "prompts/main_agent.md is empty or missing. " +
+        "Add a system prompt for the agent before spawning a copy.",
     );
   }
 
-  console.groupCollapsed(
-    `%c${tag("planner", opts.depth)}`,
-    LOG_STYLES.planner,
-    `▶ invoke_planner`,
-  );
-  log("planner", opts.depth, "task", preview(opts.task));
+  console.groupCollapsed(`%c${tag("spawn", depth)}`, LOG_STYLE, `▶ spawn_agent`);
+  log("spawn", depth, "task", preview(opts.task));
 
   try {
     const messages: UIMessage[] = [
       {
-        id: `planner-user-${Date.now()}-${opts.depth}`,
+        id: `spawn-user-${Date.now()}`,
         role: "user",
         parts: [{ type: "text", text: opts.task }],
       },
     ];
 
-    const tools = buildPlannerTools(opts.settings, opts.depth);
-
     const out = await runSubagent({
       settings: opts.settings,
-      agent: "planner",
-      depth: opts.depth,
-      systemPrompt: plannerPrompt,
+      agent: "spawn",
+      depth,
+      systemPrompt,
       messages,
-      tools,
+      tools: buildSpawnedTools(),
     });
-    log("planner", opts.depth, "✔ planner done");
+    log("spawn", depth, "✔ spawn done");
     return out;
   } catch (e) {
     log(
-      "planner",
-      opts.depth,
-      "✗ planner failed",
+      "spawn",
+      depth,
+      "✗ spawn failed",
       e instanceof Error ? e.message : String(e),
     );
     throw e;
@@ -607,68 +562,59 @@ export async function invokePlanner(opts: {
 }
 
 /**
- * Build the `invoke_planner` tool as exposed to a parent agent (the main
- * agent at depth 1, or a planner at deeper levels).
+ * Build the `spawn_agent` tool as exposed to the main agent.
  *
- * `depth` is the chain depth of the planner this tool will spawn. The tool
- * takes a single `task` string and returns the planner's final answer
- * (which the parent sees as the tool result).
+ * The tool takes a single self-contained `task` string and returns the
+ * copy's final answer (which the parent sees as the tool result). Rebuilt
+ * whenever `settings` change because it captures the settings for the
+ * spawned LLM call.
  */
-export function buildInvokePlannerTool(settings: AgentSettings, depth: number) {
+export function buildSpawnAgentTool(settings: AgentSettings) {
   return tool({
     description:
-      "Spawn the Hypno Planner subagent to create or update TTS audio " +
-      "scripts (and other scripted training content). The planner authors " +
-      "the JSON metadata + XML scripts directly and validates them. The " +
-      "planner may itself spawn further planners to decompose large or " +
-      "multi-part tasks, up to a fixed recursion depth; beyond that it " +
-      "does the work directly. Use this whenever the user asks to create, " +
-      "design, plan, or update audio scripts. Provide a fully " +
-      "self-contained brief — the planner does not see this chat.",
+      "Spawn a fresh copy of yourself with a clean context to complete a " +
+      "self-contained task. The copy runs your same system prompt and tools " +
+      "(except this one) with the task as its only input; only its final " +
+      "text comes back to you — it cannot see this conversation, and the " +
+      "user does not see its work. Use this for substantial, separable " +
+      "authoring jobs (e.g. writing or reworking audio scripts, building a " +
+      "set of feature files) where a clean slate with the reference docs at " +
+      "the front of context produces better work than tacking it onto this " +
+      "chat. For small fixes, do them directly. Provide a fully " +
+      "self-contained brief — include the goal, relevant paths and context, " +
+      "and any constraints; assume the copy reads no part of this chat.",
     inputSchema: z.object({
       task: z
         .string()
         .describe(
-          "A self-contained brief for the planner. Include what to " +
-            "create, target tags, desired tone/pacing, and any other " +
-            "context the planner would need to design the scripts. " +
-            "Do not assume the planner sees this chat — include all " +
-            "relevant detail.",
+          "A self-contained brief for the copy. Include what to create or " +
+            "change, the files/docs to draw on, desired tone/format, and " +
+            "any other context the copy would need. Do not assume the copy " +
+            "sees this chat — include all relevant detail.",
         ),
     }),
     execute: async ({ task }) => {
-      // Identify who is spawning the planner, for the console trace. depth
-      // here is the SPAWNED planner's level, so the caller is the main
-      // agent when depth === 1, otherwise the planner one level up.
-      const callerTag =
-        depth === 1 ? "main" : tag("planner", depth - 1);
       console.groupCollapsed(
-        `%c[${callerTag}]`,
-        depth === 1
-          ? "color:#10b981;font-weight:bold"
-          : LOG_STYLES.planner,
-        `▶ invoke_planner tool`,
+        `%c[main]`,
+        "color:#10b981;font-weight:bold",
+        `▶ spawn_agent tool`,
       );
       console.log("task", preview(task));
       try {
-        const output = await invokePlanner({ settings, task, depth });
+        const output = await spawnAgent({ settings, task });
         console.log(
-          `%c[${callerTag}]`,
-          depth === 1
-            ? "color:#10b981;font-weight:bold"
-            : LOG_STYLES.planner,
-          "✔ invoke_planner result",
+          `%c[main]`,
+          "color:#10b981;font-weight:bold",
+          "✔ spawn_agent result",
           preview(output),
         );
         return { ok: true, output };
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         console.log(
-          `%c[${callerTag}]`,
-          depth === 1
-            ? "color:#10b981;font-weight:bold"
-            : LOG_STYLES.planner,
-          "✗ invoke_planner error",
+          `%c[main]`,
+          "color:#10b981;font-weight:bold",
+          "✗ spawn_agent error",
           msg,
         );
         return { ok: false, error: msg };

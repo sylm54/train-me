@@ -95,7 +95,6 @@ interface ModelStatus {
 /** System-prompt files that back each agent, shown in the debug section. */
 const AGENT_PROMPTS: { agent: AgentName; file: string; label: string }[] = [
   { agent: "main", file: "main_agent.md", label: "Main agent" },
-  { agent: "planner", file: "hypno_planner.md", label: "Hypno planner" },
 ];
 
 type PromptMode = "rendered" | "raw";

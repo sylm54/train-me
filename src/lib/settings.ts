@@ -3,7 +3,7 @@
  *
  * Persisted values:
  *  - API keys per provider (OpenRouter, OpenAI)
- *  - Model selection per agent slot (main, planner)
+ *  - Model selection for the main agent
  */
 
 import { useEffect, useState, useCallback } from "react";
@@ -45,7 +45,6 @@ const DEFAULT_SETTINGS: AgentSettings = {
   apiKeys: {},
   agents: {
     main: { provider: "openrouter", model: DEFAULT_MODEL_ID.openrouter },
-    planner: { provider: "openrouter", model: DEFAULT_MODEL_ID.openrouter },
   },
   chat: { ...DEFAULT_CHAT_SETTINGS },
   playback: { ...DEFAULT_PLAYBACK_SETTINGS },

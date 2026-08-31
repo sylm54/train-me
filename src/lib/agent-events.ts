@@ -14,24 +14,24 @@
  *                  The UI accumulates these to show a running token total,
  *                  a cache-hit rate, and (on OpenRouter) the money spent, and
  *                  anchors its live context-size estimate on the latest one.
- *  - `subagent*` — lifecycle + step events for the planner, so the
- *                  UI can show high-level progress ("Planning…",
- *                  "Validating files…") without exposing internals. Exact
- *                  traces still go to the browser console via the
- *                  subagent logger.
+ *  - `subagent*` — lifecycle + step events for the spawned copy (see
+ *                  `subagents.ts`), so the UI can show high-level progress
+ *                  ("Working on a task…", "Validating files…") without
+ *                  exposing internals. Exact traces still go to the browser
+ *                  console via the subagent logger.
  *
- * Subagents are recursive: a planner may spawn another planner (up to a
- * fixed depth cap, enforced in `subagents.ts`). Every subagent event
- * carries a `depth` (1 = spawned directly by the main agent, 2 = spawned
- * by a depth-1 planner, …) so the UI can render the full delegation chain
- * and attribute each tool call to the level that performed it.
+ * Subagents are NOT recursive: a spawned copy gets no `spawn_agent` tool, so
+ * delegation is capped at depth 1 structurally. Events still carry a `depth`
+ * (always 1 today) so the UI's stack rendering keeps working if deeper
+ * delegation is ever introduced.
  *
  * Events are best-effort: a listener that throws never breaks a producer.
  */
 
 import { useEffect, useState, useSyncExternalStore } from "react";
 
-export type AgentRole = "main" | "planner";
+/** Which agent produced an event: the main chat loop or a spawned copy. */
+export type AgentRole = "main" | "spawn";
 
 /** Normalized token usage for one finished model call. */
 export interface Usage {
@@ -74,9 +74,8 @@ export type AgentEvent =
       type: "subagent-start";
       agent: Exclude<AgentRole, "main">;
       /**
-       * Recursion depth: 1 = spawned directly by the main agent, 2 = spawned
-       * by a depth-1 planner, etc. Uniquely identifies the frame within the
-       * current delegation stack (frames are strictly nested).
+       * Recursion depth (always 1 today — copies get no spawn tool).
+       * Identifies the frame within the current delegation stack.
        */
       depth: number;
       label: string;
