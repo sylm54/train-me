@@ -63,67 +63,31 @@ export const MODEL_CATALOG: Record<ProviderName, ProviderCatalog> = {
     label: "OpenRouter",
     models: [
       {
+        id: "z-ai/glm-5.3-flash",
+        name: "GLM 5.3 Flash",
+        description: "Great default.",
+        price: "Cheap, a bit reserved, but competent.",
+        contextWindow: 1_048_576,
+      },
+      {
         id: "~deepseek/deepseek-v4-flash-latest",
         name: "DeepSeek V4 Flash",
-        description: "Fast and cheap. Great default for most tasks.",
-        price: "~$0.10 in / $0.40 out per 1M tokens",
+        description: "Fast, but sometimes struggles a bit.",
+        price: "Cheap",
         contextWindow: 1_048_576,
       },
       {
         id: "deepseek/deepseek-v4-pro",
         name: "DeepSeek V4 Pro",
-        description: "Stronger reasoning than Flash, still affordable.",
-        price: "~$0.50 in / $2.20 out per 1M tokens",
+        description: "Stronger and Larger model than flash.",
+        price: "Expensive",
         contextWindow: 1_048_576,
-      },
-      {
-        id: "google/gemini-2.5-flash",
-        name: "Gemini 2.5 Flash",
-        description: "Google's fast multimodal model with a large context.",
-        price: "~$0.15 in / $0.60 out per 1M tokens",
-        contextWindow: 1_048_576,
-      },
-      {
-        id: "openai/gpt-4o",
-        name: "GPT-4o",
-        description: "OpenAI's flagship multimodal model.",
-        price: "~$2.50 in / $10.00 out per 1M tokens",
-        contextWindow: 128_000,
-      },
+      }
     ],
   },
   openai: {
     label: "OpenAI",
-    models: [
-      {
-        id: "gpt-4o",
-        name: "GPT-4o",
-        description: "OpenAI's flagship multimodal model.",
-        price: "~$2.50 in / $10.00 out per 1M tokens",
-        contextWindow: 128_000,
-      },
-      {
-        id: "gpt-4.1",
-        name: "GPT-4.1",
-        description: "Strong coding and instruction following.",
-        price: "~$2.00 in / $8.00 out per 1M tokens",
-        contextWindow: 1_047_576,
-      },
-      {
-        id: "gpt-4.1-mini",
-        name: "GPT-4.1 mini",
-        description: "Capable and cheaper than GPT-4.1.",
-        price: "~$0.40 in / $1.60 out per 1M tokens",
-        contextWindow: 1_047_576,
-      },
-      {
-        id: "o4-mini",
-        name: "o4-mini",
-        description: "Reasoning model, cost-efficient for hard tasks.",
-        price: "~$1.10 in / $4.40 out per 1M tokens",
-        contextWindow: 200_000,
-      },
-    ],
+    models: [],
   },
 };
 
