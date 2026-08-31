@@ -218,8 +218,8 @@ function summarizeToolPartForSummary(part: UIMessage["parts"][number]): string {
           : undefined;
       return cmd ? `ran \`${cmd.slice(0, 80)}\`` : "ran a command";
     }
-    case "invoke_planner":
-      return "planned a script";
+    case "spawn_agent":
+      return "delegated a task to a fresh copy";
     default:
       return name;
   }

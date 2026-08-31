@@ -716,7 +716,7 @@ function ChatViewInner({
           ))}
 
           {/* Persistent "agent is running" indicator with subagent
-              hierarchy. Shows the running planner with elapsed time. The
+              hierarchy. Shows the running spawned copy with elapsed time. The
               ticking seconds prove the system is alive even during long
               generations; the stream phase (connecting / thinking /
               streaming) plus the token heartbeat flag a stuck stream. */}
@@ -1520,13 +1520,13 @@ function formatRelative(ts: number): string {
 // ── Subagent / token derivation ──────────────────────────────────────
 
 /** Color dot per subagent, mirroring the console marker colours. */
-const SUBAGENT_COLOR: Record<"planner", string> = {
-  planner: "#d946ef", // pink-500
+const SUBAGENT_COLOR: Record<"spawn", string> = {
+  spawn: "#d946ef", // pink-500
 };
 
 interface ActiveSubagent {
-  agent: "planner";
-  /** Chain depth (1 = spawned by main, 2 = by a depth-1 planner, …). */
+  agent: "spawn";
+  /** Chain depth (always 1 today — copies get no spawn tool). */
   depth: number;
   label: string;
   startedAt: number;
@@ -1536,8 +1536,8 @@ interface ActiveSubagent {
 
 /** One recorded subagent tool call (for the expandable history). */
 interface ToolHistoryEntry {
-  agent: "planner";
-  /** Depth of the planner that performed this call. */
+  agent: "spawn";
+  /** Depth of the spawned copy that performed this call. */
   depth: number;
   toolName: string;
   label: string;
@@ -1549,7 +1549,7 @@ interface ToolHistoryEntry {
 
 /**
  * Walk the event stream and derive (a) the currently-active delegation stack
- * and (b) the full tool-call history across all planner levels. (Cumulative
+ * and (b) the full tool-call history across delegation levels. (Cumulative
  * token/cost totals live in `useSessionUsage` — they must survive this
  * component's per-chat remount.)
  *
@@ -1873,7 +1873,7 @@ function SubagentProgressIndicator({
 /** Collapsible list of a subagent's completed tool calls. */
 function ToolHistoryList({ entries }: { entries: ToolHistoryEntry[] }) {
   // Show the most recent few first (newest at top) and cap the rendering to
-  // avoid an unbounded list during very long planner runs.
+  // avoid an unbounded list during very long spawned-copy runs.
   const recent = [...entries].reverse().slice(0, 20);
   return (
     <Collapsible className="ml-4 mt-0.5">
@@ -2092,8 +2092,8 @@ function summarizeToolPart(part: UIMessage["parts"][number]): {
         cmd && cmd.length > 60 ? cmd.slice(0, 60) + "…" : cmd;
       return { label: "Ran command", detail };
     }
-    case "invoke_planner":
-      return { label: "Planning" };
+    case "spawn_agent":
+      return { label: "Delegating" };
     default:
       return { label: name };
   }
