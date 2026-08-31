@@ -47,6 +47,16 @@ export interface OnboardingStep {
 export type AnswerValue = string | number | string[] | null;
 export type AnswerMap = Record<string, AnswerValue>;
 
+/**
+ * Answers-map key holding a question's free-text clarification — the
+ * optional addendum the UI offers on non-open questions (`choice`,
+ * `rating`). Mirrors `NOTE_PREFIX` in src-tauri/src/onboarding.rs, which
+ * prunes the note when its question is skipped or hidden.
+ */
+export function noteKey(id: string): string {
+  return `note:${id}`;
+}
+
 export interface OnboardingState {
   pending_count: number;
 }

@@ -63,6 +63,15 @@ use crate::AppState;
 const QUESTIONS_FILE: &str = "onboarding.json";
 const ANSWERS_FILE: &str = "onboarding_answers.json";
 const DEFAULT_OUTPUT: &str = "USER.md";
+/// Answers-map key prefix under which a question's free-text clarification
+/// is stored (`note:<id>`) — the addendum the UI offers on non-`open`
+/// questions. Reserved: question ids must not start with it.
+const NOTE_PREFIX: &str = "note:";
+
+/// The answers-map key holding a question's free-text clarification.
+fn note_key(id: &str) -> String {
+    format!("{NOTE_PREFIX}{id}")
+}
 
 pub type Answers = BTreeMap<String, serde_json::Value>;
 
@@ -340,6 +349,13 @@ pub fn parse_flow(json: &str) -> Result<Vec<OnboardingItem>, String> {
             OnboardingItem::Question(q) => {
                 if q.id.trim().is_empty() || seen_ids.contains(&q.id.trim().to_string()) {
                     return Err(format!("{label}: ids must be non-empty and unique"));
+                }
+                if q.id.trim().starts_with(NOTE_PREFIX) {
+                    return Err(format!(
+                        "question `{}`: ids must not start with `{NOTE_PREFIX}` \
+                         (reserved for answer clarifications)",
+                        q.id
+                    ));
                 }
                 if q.prompt.trim().is_empty() {
                     return Err(format!("question `{}`: `prompt` must not be empty", q.id));
@@ -705,6 +721,22 @@ fn merged_answers(data_dir: &Path, session: &Answers) -> Answers {
             merged.remove(&q.id);
         }
     }
+    // Clarifications (`note:<id>`) ride along with their question: drop
+    // them when the question is hidden, skipped, or otherwise unanswered —
+    // a clarification without an answer has nothing to clarify.
+    let stale: Vec<String> = merged
+        .keys()
+        .filter(|k| k.starts_with(NOTE_PREFIX))
+        .filter(|k| {
+            k.strip_prefix(NOTE_PREFIX)
+                .map(|id| !visible.iter().any(|v| v == id) || !is_answered(merged.get(id)))
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+    for k in stale {
+        merged.remove(&k);
+    }
     merged
 }
 
@@ -740,7 +772,9 @@ fn state_for(data_dir: &Path) -> OnboardingState {
 /// key followed by the answer — kept deliberately terse since the file is
 /// typically inlined into prompts. Choice questions also list the options
 /// the user did NOT pick (and flag multi-select) so the agent knows the
-/// full option set, not just the selection. Skipped (`null`) and
+/// full option set, not just the selection. A question's free-text
+/// clarification (`note:<id>`, the addendum the UI offers on non-open
+/// questions) is appended to its line. Skipped (`null`) and
 /// still-unanswered questions render nothing. A trailing "App setup"
 /// section heads the agent up about app-managed state the questionnaire
 /// never asked about (chastity, inventory).
@@ -763,7 +797,7 @@ pub(crate) fn write_user_md(agent_dir: &Path, data_dir: &Path) -> Result<(), Str
             Some(serde_json::Value::Null) | None => continue,
             Some(answer) => answer,
         };
-        match (&q.answer, answer) {
+        let mut line = match (&q.answer, answer) {
             // Choices: the picked option(s) plus the declined ones, so the
             // agent sees the whole menu. Multi-select is flagged.
             (
@@ -785,8 +819,7 @@ pub(crate) fn write_user_md(agent_dir: &Path, data_dir: &Path) -> Result<(), Str
                 if !declined.is_empty() {
                     line.push_str(&format!(" (not chosen: {})", declined.join(", ")));
                 }
-                md.push_str(&line);
-                md.push_str("\n\n");
+                line
             }
             (AnswerKind::Choice, single) => {
                 let chosen = single
@@ -803,28 +836,35 @@ pub(crate) fn write_user_md(agent_dir: &Path, data_dir: &Path) -> Result<(), Str
                 if !declined.is_empty() {
                     line.push_str(&format!(" (not chosen: {})", declined.join(", ")));
                 }
-                md.push_str(&line);
-                md.push_str("\n\n");
+                line
             }
             // Ratings carry their scale — a bare "7" is meaningless without
             // the range it came from.
-            (AnswerKind::Rating, value) => {
-                md.push_str(&format!(
-                    "**{}** {} (scale {}–{})\n\n",
-                    q.prompt,
-                    value.as_str().unwrap_or(&value.to_string()),
-                    q.min,
-                    q.max
-                ));
-            }
-            (_, other) => {
-                md.push_str(&format!(
-                    "**{}** {}\n\n",
-                    q.prompt,
-                    other.as_str().unwrap_or(&other.to_string())
-                ));
-            }
+            (AnswerKind::Rating, value) => format!(
+                "**{}** {} (scale {}–{})",
+                q.prompt,
+                value.as_str().unwrap_or(&value.to_string()),
+                q.min,
+                q.max
+            ),
+            (_, other) => format!(
+                "**{}** {}",
+                q.prompt,
+                other.as_str().unwrap_or(&other.to_string())
+            ),
+        };
+        // The clarification the UI offers on non-open questions rides on the
+        // answer's line, in the user's own words.
+        if let Some(note) = answered
+            .get(&note_key(&q.id))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            line.push_str(&format!(" — note: \"{note}\""));
         }
+        md.push_str(&line);
+        md.push_str("\n\n");
         wrote += 1;
     }
     if wrote == 0 {
@@ -1053,6 +1093,11 @@ mod tests {
                  { "kind": "text", "text": "t", "showIf": { "id": "a" } }]"#
         )
         .is_err());
+        // `note:`-prefixed ids are reserved for answer clarifications.
+        assert!(parse_flow(
+            r#"[{ "kind": "question", "id": "note:x", "answer": "open", "prompt": "p" }]"#
+        )
+        .is_err());
         assert_eq!(flow().len(), 6);
     }
 
@@ -1229,6 +1274,45 @@ mod tests {
         assert!(md.contains("**Topics?** (multiple choice) voice, fitness (not chosen: posture)"));
         assert!(md.contains("**Style?** strict (not chosen: gentle)"));
         assert!(md.contains("**Heat?** 4 (scale 1–5)"));
+        let _ = tmp;
+    }
+
+    #[test]
+    fn clarifications_render_and_prune_with_their_question() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        let agent = data.join("agent_data");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(data.join(QUESTIONS_FILE), serde_json::to_string(&flow()).unwrap()).unwrap();
+
+        // Clarifications ride on their answers' lines…
+        let mut session = Answers::new();
+        session.insert("exp".into(), json!("lots"));
+        session.insert(note_key("exp"), json!("mostly rope, light impact"));
+        session.insert("intensity".into(), json!(8));
+        session.insert(note_key("intensity"), json!("higher on weekends"));
+        // …but one without an answer, and one for a non-question, are
+        // dropped at merge time.
+        session.insert(note_key("focus"), json!("orphan"));
+        session.insert(note_key("ghost"), json!("no such question"));
+        let merged = merged_answers(data, &session);
+        assert!(merged.contains_key(note_key("exp").as_str()));
+        assert!(merged.contains_key(note_key("intensity").as_str()));
+        assert!(!merged.contains_key(note_key("focus").as_str()));
+        assert!(!merged.contains_key(note_key("ghost").as_str()));
+
+        std::fs::write(
+            data.join(ANSWERS_FILE),
+            serde_json::to_string(&merged).unwrap(),
+        )
+        .unwrap();
+        write_user_md(&agent, data).unwrap();
+        let md = std::fs::read_to_string(agent.join("USER.md")).unwrap();
+        assert!(md.contains(
+            "**Experience?** lots (not chosen: none, some) — note: \"mostly rope, light impact\""
+        ));
+        assert!(md.contains("**Intensity 1-10?** 8 (scale 1–10) — note: \"higher on weekends\""));
+        assert!(!md.contains("orphan"));
         let _ = tmp;
     }
 
