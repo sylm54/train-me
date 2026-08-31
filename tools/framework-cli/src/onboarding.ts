@@ -169,6 +169,12 @@ function validateItems(items: Json[], knownParts: string[] | null, diags: Diag[]
       const id = item.id;
       if (typeof id !== "string" || !id.trim() || seen.has(id)) {
         diags.push({ severity: "error", message: `${label}: ids must be non-empty and unique` });
+      } else if (id.trim().startsWith("note:")) {
+        // Reserved for the app's answer clarifications (onboarding.rs).
+        diags.push({
+          severity: "error",
+          message: `${label}: ids must not start with \`note:\` (reserved for answer clarifications)`,
+        });
       } else if (typeof id === "string" && id.trim()) {
         seen.add(id);
       }

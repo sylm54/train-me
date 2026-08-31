@@ -5,8 +5,11 @@
  * visible unresolved question — asking the backend for the next screen
  * after every answer, so `showIf` conditionals hide/show live without
  * any duplicated logic on this side. Optional questions may be skipped
- * (stored as `null`). When the flow completes it saves the session
- * (which regenerates `agent_data/USER.md`) and calls `onFinish`.
+ * (stored as `null`). Non-open questions (choice, rating) also get an
+ * optional free-text clarification, stored under the `note:<id>` answer
+ * key and only kept alongside an actual answer. When the flow completes
+ * it saves the session (which regenerates `agent_data/USER.md`) and
+ * calls `onFinish`.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -17,6 +20,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { MarkdownBody } from "@/components/MarkdownBody";
 import {
   fetchOnboardingStep,
+  noteKey,
   saveOnboardingAnswers,
   type AnswerMap,
   type AnswerValue,
@@ -40,6 +44,8 @@ export function OnboardingFlow({ onFinish }: Props) {
   /** Ids answered this session, in order — powers Back. */
   const [history, setHistory] = useState<string[]>([]);
   const [draft, setDraft] = useState<AnswerValue | undefined>(undefined);
+  /** Clarification for non-open questions (stored under `note:<id>`). */
+  const [noteDraft, setNoteDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -55,6 +61,8 @@ export function OnboardingFlow({ onFinish }: Props) {
       // Pre-fill the draft when re-visiting an answered question (Back).
       const q = next.question;
       setDraft(q ? answers[q.id] : undefined);
+      const note = q && q.answer !== "open" ? answers[noteKey(q.id)] : undefined;
+      setNoteDraft(typeof note === "string" ? note : "");
     } catch (e) {
       setError(String(e));
     } finally {
@@ -74,6 +82,13 @@ export function OnboardingFlow({ onFinish }: Props) {
     // `undefined` = the user skipped an optional question — store the
     // explicit `null` so the backend counts it as resolved (not answered).
     next[q.id] = answer === undefined ? null : answer;
+    // Non-open questions carry an optional clarification under `note:<id>`;
+    // it only makes sense alongside an actual answer.
+    const key = noteKey(q.id);
+    const note =
+      q.answer !== "open" && answer !== undefined ? noteDraft.trim() : "";
+    if (note) next[key] = note;
+    else delete next[key];
     setSession(next);
     setHistory((h) => [...h.filter((id) => id !== q.id), q.id]);
     setBusy(true);
@@ -219,6 +234,15 @@ export function OnboardingFlow({ onFinish }: Props) {
                 </Button>
               ))}
             </div>
+          )}
+
+          {q.answer !== "open" && (
+            <Textarea
+              value={noteDraft}
+              onChange={(e) => setNoteDraft(e.target.value)}
+              placeholder="Anything to add or clarify? (optional)"
+              className="min-h-16"
+            />
           )}
 
           <div className="flex items-center gap-2 pt-1">
