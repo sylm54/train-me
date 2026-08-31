@@ -190,6 +190,15 @@ pub fn count_speakable_nodes(nodes: &[Node]) -> usize {
                     count += count_speakable_nodes(&part.children);
                 }
             }
+            Node::If {
+                then_branch, r#else, ..
+            } => {
+                // Upper-bound estimate: both branches are rendered.
+                count += count_speakable_nodes(then_branch);
+                if let Some(else_nodes) = r#else {
+                    count += count_speakable_nodes(else_nodes);
+                }
+            }
             Node::Include { .. } | Node::Rating { .. } => {}
         }
     }
@@ -618,6 +627,16 @@ impl AudioRenderer {
                         self.render_nodes(main_nodes, default_speaker, volume_scale, speed_scale)?;
                     foreground.extend_from_slice(&samples);
                     _total_duration += dur;
+                }
+
+                Node::If { .. } => {
+                    // Unreachable via the manifest walker (an `<if>` is always
+                    // a split point) — only a nested spot that can't hold one
+                    // (`<effect>`/`<until>` content) can land here.
+                    bail!(
+                        "<if> cannot be rendered inline — it is only allowed in playback \
+                         sequence content (not inside <effect> or <until>)"
+                    );
                 }
             }
         }
@@ -1232,6 +1251,16 @@ impl AudioRenderer {
                     )?;
                     foreground.extend_from_slice(&samples);
                     _total_duration += dur;
+                }
+
+                Node::If { .. } => {
+                    // Unreachable via the manifest walker (an `<if>` is always
+                    // a split point) — only a nested spot that can't hold one
+                    // (`<effect>`/`<until>` content) can land here.
+                    bail!(
+                        "<if> cannot be rendered inline — it is only allowed in playback \
+                         sequence content (not inside <effect> or <until>)"
+                    );
                 }
             }
         }
@@ -1889,6 +1918,34 @@ impl AudioRenderer {
                 src, out_dir, script_dir, agent_dir, tracks_dir, visited, progress,
             ),
 
+            Node::If {
+                cond,
+                then_branch,
+                r#else,
+            } => {
+                if ctx.forbid_pause {
+                    bail!("<if> is not allowed inside <background> or <overlay>");
+                }
+                // Both branches are fully rendered; the player picks one per
+                // playback against the run-context variables.
+                let then_seg = self.walk(
+                    then_branch, ctx, out_dir, script_dir, agent_dir, tracks_dir, counter,
+                    visited, progress,
+                )?;
+                let else_seg = match r#else {
+                    Some(nodes) => Some(self.walk(
+                        nodes, ctx, out_dir, script_dir, agent_dir, tracks_dir, counter, visited,
+                        progress,
+                    )?),
+                    None => None,
+                };
+                Ok(Segment::Cond {
+                    cond: cond.clone(),
+                    then: Box::new(then_seg),
+                    r#else: else_seg.map(Box::new),
+                })
+            }
+
             Node::Loop { loops, children } => {
                 let child = self.walk(
                     children, ctx, out_dir, script_dir, agent_dir, tracks_dir, counter, visited,
@@ -2244,6 +2301,14 @@ fn collect_include_srcs(nodes: &[Node], out: &mut Vec<String>) {
                     collect_include_srcs(&part.children, out);
                 }
             }
+            Node::If {
+                then_branch, r#else, ..
+            } => {
+                collect_include_srcs(then_branch, out);
+                if let Some(else_nodes) = r#else {
+                    collect_include_srcs(else_nodes, out);
+                }
+            }
             Node::Text(_) | Node::Pause { .. } | Node::Sound { .. } | Node::Tone { .. } => {}
             Node::Rating { .. } => {}
         }
@@ -2487,6 +2552,14 @@ fn collect_glob_include_srcs(nodes: &[Node], out: &mut Vec<String>) {
                     collect_glob_include_srcs(&part.children, out);
                 }
             }
+            Node::If {
+                then_branch, r#else, ..
+            } => {
+                collect_glob_include_srcs(then_branch, out);
+                if let Some(else_nodes) = r#else {
+                    collect_glob_include_srcs(else_nodes, out);
+                }
+            }
             Node::Text(_) | Node::Pause { .. } | Node::Sound { .. } | Node::Tone { .. } => {}
             Node::Rating { .. } => {}
         }
@@ -2646,6 +2719,20 @@ fn resolve_includes_in_node(
         Node::Section { role, children } => {
             let children = resolve_includes_inner(children, base_dir, visited);
             vec![Node::Section { role, children }]
+        }
+
+        Node::If {
+            cond,
+            then_branch,
+            r#else,
+        } => {
+            let then_branch = resolve_includes_inner(then_branch, base_dir, visited);
+            let r#else = r#else.map(|nodes| resolve_includes_inner(nodes, base_dir, visited));
+            vec![Node::If {
+                cond,
+                then_branch,
+                r#else,
+            }]
         }
 
         Node::Beatmeter {
@@ -4037,6 +4124,18 @@ mod tests {
             | Node::React { parts, .. } => {
                 for part in parts {
                     for child in &part.children {
+                        collect_text_recursive(child, texts);
+                    }
+                }
+            }
+            Node::If {
+                then_branch, r#else, ..
+            } => {
+                for child in then_branch {
+                    collect_text_recursive(child, texts);
+                }
+                if let Some(else_nodes) = r#else {
+                    for child in else_nodes {
                         collect_text_recursive(child, texts);
                     }
                 }

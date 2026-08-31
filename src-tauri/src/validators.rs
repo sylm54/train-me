@@ -635,6 +635,14 @@ fn collect_include_srcs(nodes: &[crate::tag_parser::Node]) -> Vec<String> {
                 | Node::Loop { children, .. }
                 | Node::Section { children, .. }
                 | Node::Beatmeter { children, .. } => rec(children, out),
+                Node::If {
+                    then_branch, r#else, ..
+                } => {
+                    rec(then_branch, out);
+                    if let Some(else_nodes) = r#else {
+                        rec(else_nodes, out);
+                    }
+                }
                 Node::Overlay { parts, .. }
                 | Node::Random { parts }
                 | Node::Scramble { parts }
@@ -765,11 +773,59 @@ fn validate_routine_v2(rel_path: &str, content: &str, agent_dir: &Path) -> Vec<F
         ));
         let scripts = crate::format::audio_feature_srcs(&r.pages);
         extra.extend(check_v2_refs(&scripts, &[], agent_dir, &mut report));
+        check_condition_idents(&r.pages, &r.title, &mut report);
     }
 
     let mut reports = vec![report];
     reports.extend(extra);
     reports
+}
+
+/// Cross-check every condition expression (`@when`, `{{#if}}`, feature
+/// `when:`) and `{{ var }}` interpolation in a file against the reserved
+/// run variables and the file's own answer `field` ids. Unknown names are
+/// silent `false`/empty at run time — exactly the mistakes worth catching
+/// at lint time.
+fn check_condition_idents(pages: &[crate::format::Page], title: &str, report: &mut FileReport) {
+    let (conds, fields, interp) = crate::format::collect_condition_refs(pages);
+    let field_list = fields.join(", ");
+    for cond in &conds {
+        let Ok(parsed) = crate::cond::parse(cond) else {
+            continue; // syntax already reported by the parser
+        };
+        for ident in &parsed.identifiers {
+            if crate::cond::RESERVED_VARS.contains(&ident.as_str()) {
+                continue;
+            }
+            if fields.iter().any(|f| f == ident) {
+                continue;
+            }
+            report.push(err(format!(
+                "`{title}`: condition `{cond}` references unknown variable `{ident}` — \
+                 use a run variable ({}) or a `field` from an input/choice/slider \
+                 feature in this file{}",
+                crate::cond::RESERVED_VARS.join(", "),
+                if field_list.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (declared here: {field_list})")
+                }
+            )));
+        }
+    }
+    for ident in &interp {
+        if crate::cond::RESERVED_VARS.contains(&ident.as_str()) {
+            continue;
+        }
+        if fields.iter().any(|f| f == ident) {
+            continue;
+        }
+        report.push(warn(format!(
+            "`{title}`: `{{{{{ident}}}}}` is not a known run variable or answer field — \
+             it renders empty (run variables: {})",
+            crate::cond::RESERVED_VARS.join(", ")
+        )));
+    }
 }
 
 /// `habits/*.md` (always v2).
@@ -829,6 +885,7 @@ fn validate_task(rel_path: &str, content: &str, agent_dir: &Path) -> Vec<FileRep
         ));
         let scripts = crate::format::audio_feature_srcs(&t.pages);
         extra.extend(check_v2_refs(&scripts, &[], agent_dir, &mut report));
+        check_condition_idents(&t.pages, &t.title, &mut report);
     }
 
     let mut reports = vec![report];

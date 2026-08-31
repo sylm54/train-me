@@ -7,6 +7,7 @@
  */
 
 import type { Diag } from "./validate";
+import { parseCondition } from "./cond";
 
 // ── AST (only what semantic validation needs) ─────────────────────────────
 
@@ -29,6 +30,7 @@ export type Node =
   | { kind: "overlay" | "random" | "scramble" | "choice"; parts: Part[] }
   | { kind: "react"; parts: Part[] }
   | { kind: "rating"; min: number; max: number }
+  | { kind: "if"; cond: string; children: Node[] }
   | { kind: "include"; src: string };
 
 // ── known values (mirror tag_parser.rs) ────────────────────────────────────
@@ -89,10 +91,12 @@ export function wildcardMatch(pattern: string, name: string): boolean {
 }
 
 // Container tags that require children and a matching closing tag.
+// `<else>` is deliberately absent — it is only consumed inside `<if>`; a
+// stray `<else>` elsewhere is an unknown-tag error (mirrors tag_parser.rs).
 const CONTAINER_TAGS = new Set([
   "voice", "speed", "volume", "effect", "overlay", "loop", "background",
   "until", "random", "scramble", "choice", "react", "beatmeter",
-  "intro", "main", "outro",
+  "intro", "main", "outro", "if",
 ]);
 
 // ── parser ─────────────────────────────────────────────────────────────────
@@ -358,10 +362,67 @@ class Parser {
         const parts = this.parsePartsContainer("react");
         return { kind: "react", parts };
       }
+      case "if": {
+        const cond = attrs.get("cond");
+        if (!cond || !cond.trim()) {
+          throw new ParseError(`<if> tag requires a cond attribute`, this.pos);
+        }
+        this.skipWs();
+        this.expectStr(">");
+        const children = this.parseIfChildren();
+        return { kind: "if", cond, children };
+      }
       default:
         // pause/sound/tone/include/rating reached here = not self-closing.
         throw new ParseError(`<${tag}> must be self-closing (ends with '/>')`, this.pos);
     }
+  }
+
+  /**
+   * Children of an `<if>`: both branches' content is collected (and thus
+   * validated) while the `<else>`/`</else>` markers are skipped. Content
+   * after `</else>` joins the else branch, mirroring the Rust parser.
+   */
+  private parseIfChildren(): Node[] {
+    const nodes: Node[] = [];
+    for (;;) {
+      if (this.pos >= this.input.length) {
+        throw new ParseError("<if> is never closed (missing </if>)", this.pos);
+      }
+      this.skipWs();
+      if (this.peekStr("</")) {
+        const save = this.pos;
+        this.pos += 2;
+        const name = this.readName("closing tag name");
+        this.skipWs();
+        this.expectStr(">");
+        if (name === "if") break;
+        if (name === "else") continue;
+        this.pos = save;
+        throw new ParseError(`unexpected closing tag </${name}> inside <if>`, this.pos);
+      }
+      if (this.peekStr("<")) {
+        const save = this.pos;
+        this.pos++;
+        const name = this.readName("tag name");
+        if (name === "else") {
+          this.readAttributes();
+          this.skipWs();
+          if (this.peekStr("/>")) this.pos += 2;
+          else this.expectStr(">");
+          continue;
+        }
+        this.pos = save;
+        nodes.push(this.parseTag());
+        continue;
+      }
+      const lt = this.input.indexOf("<", this.pos);
+      const end = lt === -1 ? this.input.length : lt;
+      const text = this.input.slice(this.pos, end);
+      this.pos = end;
+      if (text.trim()) nodes.push({ kind: "text" });
+    }
+    return nodes;
   }
 }
 
@@ -424,6 +485,11 @@ function validateNodes(nodes: Node[], errors: string[], seenIncludes: Set<string
         } else if (node.effectType === "reverb" && node.preset !== undefined && !VALID_REVERB_PRESETS.includes(node.preset)) {
           errors.push(`unknown reverb preset '${node.preset}' — valid: ${VALID_REVERB_PRESETS.join(", ")}`);
         }
+        // `<effect>` content is baked into ONE clip (no split points), so a
+        // conditional inside can never be toggled per playback.
+        if (node.children.some((c) => c.kind === "if")) {
+          errors.push(`<if> is not allowed directly inside <effect> — move it outside the effect`);
+        }
         validateNodes(node.children, errors, seenIncludes);
         break;
       case "overlay":
@@ -453,6 +519,14 @@ function validateNodes(nodes: Node[], errors: string[], seenIncludes: Set<string
       case "rating":
         if (node.min > node.max) errors.push(`<rating> min (${node.min}) must be ≤ max (${node.max})`);
         break;
+      case "if": {
+        const parsed = parseCondition(node.cond);
+        if (!parsed.ok) {
+          errors.push(`<if cond="${node.cond}">: ${parsed.error}`);
+        }
+        validateNodes(node.children, errors, seenIncludes);
+        break;
+      }
       case "include":
         if (!node.src) errors.push(`<include> has an empty 'src' attribute`);
         else if (seenIncludes.has(node.src)) {

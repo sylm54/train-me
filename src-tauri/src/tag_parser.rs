@@ -193,6 +193,20 @@ pub enum Node {
         button: String,
         parts: Vec<OverlayPart>,
     },
+
+    /// Playback-time conditional (`<if cond="…">…<else>…</else></if>`). ALL
+    /// branches are rendered to audio; the player evaluates `cond` (the
+    /// condition DSL, see `crate::cond`) against the run-context variables
+    /// when playback starts and plays exactly one branch. Like the other
+    /// interactive tags it is a split point and is rejected inside
+    /// `<background>`/`<overlay>` layers.
+    If {
+        cond: String,
+        #[serde(rename = "then")]
+        then_branch: Vec<Node>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        r#else: Option<Vec<Node>>,
+    },
 }
 
 /// A part within an overlay.
@@ -303,6 +317,8 @@ impl TagParser {
             "beatmeter" => self.parse_beatmeter_tag(),
             "rating" => self.parse_rating_tag(),
             "react" => self.parse_react_tag(),
+            "if" => self.parse_if_tag(),
+            "else" => bail!("<else> is only valid inside an <if> block"),
             other => bail!("Unknown tag: <{}>", other),
         }
     }
@@ -710,6 +726,86 @@ impl TagParser {
         Ok(Node::React { button, parts })
     }
 
+    /// Parse `<if cond="…">then…<else>other…</else></if>` (the `<else>`
+    /// branch is optional). Handled with a custom loop because `<else>` is
+    /// a sibling-aware marker, not a normal nested tag.
+    fn parse_if_tag(&mut self) -> Result<Node> {
+        let attrs = self.read_attributes();
+        let cond = match attrs.get("cond").cloned() {
+            Some(c) if !c.trim().is_empty() => c,
+            _ => bail!("<if> tag requires a cond attribute"),
+        };
+        if self.peek_str("/>") {
+            self.expect_str("/>")?;
+            bail!("<if> tag must have children");
+        }
+        self.expect_str(">")?;
+
+        let mut then_nodes: Vec<Node> = Vec::new();
+        let mut else_nodes: Option<Vec<Node>> = None;
+        let mut in_else = false;
+        loop {
+            if self.pos >= self.input.len() {
+                bail!("<if> is never closed (missing </if>)");
+            }
+            if self.peek_str("</") {
+                let save = self.pos;
+                self.pos += 2;
+                let name = self.read_tag_name()?;
+                self.skip_ws();
+                self.expect_str(">")?;
+                match name.as_str() {
+                    "if" => break,
+                    // `</else>` simply ends the else branch; `</if>` follows.
+                    "else" if in_else => continue,
+                    other => {
+                        self.pos = save;
+                        bail!("Unexpected closing tag </{}> inside <if>", other);
+                    }
+                }
+            }
+            if self.peek_str("<") {
+                let save = self.pos;
+                self.pos += 1;
+                let name = self.read_tag_name()?;
+                if name == "else" {
+                    if in_else {
+                        self.pos = save;
+                        bail!("<else> appears twice inside one <if>");
+                    }
+                    let _extra = self.read_attributes();
+                    if self.peek_str("/>") {
+                        self.expect_str("/>")?;
+                    } else {
+                        self.expect_str(">")?;
+                    }
+                    in_else = true;
+                    else_nodes = Some(Vec::new());
+                    continue;
+                }
+                self.pos = save;
+                let node = self.parse_tag()?;
+                if in_else {
+                    else_nodes.as_mut().expect("set with in_else").push(node);
+                } else {
+                    then_nodes.push(node);
+                }
+                continue;
+            }
+            let node = self.parse_text()?;
+            if in_else {
+                else_nodes.as_mut().expect("set with in_else").push(node);
+            } else {
+                then_nodes.push(node);
+            }
+        }
+        Ok(Node::If {
+            cond,
+            then_branch: filter_empty_text(then_nodes),
+            r#else: else_nodes.map(filter_empty_text),
+        })
+    }
+
     // --- Helper methods ---
 
     fn peek_str(&self, s: &str) -> bool {
@@ -930,6 +1026,18 @@ fn extract_text_recursive(node: &Node, texts: &mut Vec<String>) {
                 }
             }
         }
+        Node::If {
+            then_branch, r#else, ..
+        } => {
+            for child in then_branch {
+                extract_text_recursive(child, texts);
+            }
+            if let Some(else_nodes) = r#else {
+                for child in else_nodes {
+                    extract_text_recursive(child, texts);
+                }
+            }
+        }
         Node::Pause { .. } | Node::Sound { .. } | Node::Tone { .. } | Node::Include { .. }
         | Node::Rating { .. } => {}
     }
@@ -1145,6 +1253,14 @@ fn validate_nodes(
                         }
                     }
                 }
+                // `<effect>` content is baked into ONE clip (no split points),
+                // so a conditional inside can never be toggled per playback.
+                if children.iter().any(|c| matches!(c, Node::If { .. })) {
+                    errors.push(
+                        "<if> is not allowed directly inside <effect> — move it outside the effect"
+                            .to_string(),
+                    );
+                }
                 breadcrumb.push(format!("<effect type=\"{}\">", effect_type));
                 validate_nodes(children, errors, seen_includes, breadcrumb);
                 breadcrumb.pop();
@@ -1320,6 +1436,22 @@ fn validate_nodes(
                 }
             }
 
+            Node::If {
+                cond,
+                then_branch,
+                r#else,
+            } => {
+                if let Err(e) = crate::cond::parse(cond) {
+                    errors.push(format!("<if cond=\"{cond}\">: {e}"));
+                }
+                breadcrumb.push("<if>".to_string());
+                validate_nodes(then_branch, errors, seen_includes, breadcrumb);
+                if let Some(else_nodes) = r#else {
+                    validate_nodes(else_nodes, errors, seen_includes, breadcrumb);
+                }
+                breadcrumb.pop();
+            }
+
             Node::Pause { .. } => {}
         }
     }
@@ -1334,6 +1466,44 @@ mod tests {
         let nodes = parse("Hello world").unwrap();
         assert_eq!(nodes.len(), 1);
         assert!(matches!(&nodes[0], Node::Text(t) if t == "Hello world"));
+    }
+
+    #[test]
+    fn test_parse_if_tag() {
+        let input =
+            r#"<voice speaker="male">Hi <if cond='streak >= 7'>A<else>B</else></if></voice>"#;
+        let nodes = parse(input).unwrap();
+        let Node::Voice { children, .. } = &nodes[0] else {
+            panic!("expected Voice");
+        };
+        assert!(matches!(&children[0], Node::Text(t) if t == "Hi"));
+        let Node::If {
+            cond,
+            then_branch,
+            r#else,
+        } = &children[1]
+        else {
+            panic!("expected If");
+        };
+        assert_eq!(cond, "streak >= 7");
+        assert!(matches!(&then_branch[0], Node::Text(t) if t == "A"));
+        assert!(matches!(
+            &r#else.as_ref().expect("else branch")[0],
+            Node::Text(t) if t == "B"
+        ));
+        // Semantically valid.
+        validate(&nodes).unwrap();
+    }
+
+    #[test]
+    fn test_parse_if_requires_cond() {
+        assert!(parse("<if>x</if>").is_err());
+        assert!(parse("<else>x</else>").is_err());
+        // Unclosed if.
+        assert!(parse(r#"<if cond="a == 1">x"#).is_err());
+        // A bad condition parses structurally but fails validate.
+        let nodes = parse(r#"<if cond="a >>> 1">x</if>"#).unwrap();
+        assert!(validate(&nodes).is_err());
     }
 
     #[test]

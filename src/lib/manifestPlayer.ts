@@ -16,6 +16,7 @@
 
 import { audioUrlForPath } from "@/lib/audioUrl";
 import { BeatScheduler } from "@/lib/beatScheduler";
+import { evalCondition, type CondVars } from "@/lib/cond";
 
 // ──────────────────────────────────────────────────────────────────────────
 // Segment tree — mirrors the backend's resolved manifest tree EXACTLY.
@@ -97,6 +98,15 @@ export type Segment =
       type: "section";
       role: "intro" | "main" | "outro";
       child: Segment;
+    }
+  | {
+      /** Playback-time conditional (`<if>`): both branches are rendered; the
+       * player plays exactly one, evaluated against the run-context variables
+       * passed to the player. */
+      type: "cond";
+      cond: string;
+      then: Segment;
+      else?: Segment;
     };
 
 /** A prompt surfaced to the UI for interactive (`until` / `choice` / …) nodes. */
@@ -164,6 +174,12 @@ export interface ManifestPlayerOptions {
    * between the HTMLAudioElement path and the Web Audio path. User-tunable.
    */
   beatOffsetMs?: number;
+  /**
+   * Run-context variables for `<if>` condition segments, frozen when
+   * playback starts. Sessions pass the run context (engine vars + the
+   * user's answers); standalone playback passes environment-only vars.
+   */
+  variables?: CondVars;
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -197,6 +213,8 @@ export class ManifestPlayer {
   private reactCtl: AbortController | null = null;
   /** How many times the `<main>` section plays (clamped to ≥1). */
   private readonly mainRepeats: number;
+  /** Run-context variables for `<if>` segments (frozen at play start). */
+  private readonly variables: CondVars;
 
   // ── Progress / beatmeter tracking ────────────────────────────────────
   /** Monotonic id of the segment currently (or about to be) playing. */
@@ -215,6 +233,7 @@ export class ManifestPlayer {
   constructor(opts: ManifestPlayerOptions) {
     this.opts = opts;
     this.mainRepeats = Math.max(1, Math.floor(opts.mainRepeats ?? 1));
+    this.variables = opts.variables ?? {};
   }
 
   /**
@@ -348,6 +367,17 @@ export class ManifestPlayer {
           if (this.cancelled()) return;
           await this.play(seg.child, trackIndex);
         }
+        return;
+      }
+      case "cond": {
+        // Conditions are frozen at play start (variables never change
+        // mid-playback), so the active branch is decided here and the
+        // inactive branch's clips are simply never touched. A broken or
+        // unknown-variable condition evaluates to `false` — a broken
+        // condition must not break playback.
+        const taken = evalCondition(seg.cond, this.variables);
+        const branch = taken ? seg.then : seg.else ?? { type: "sequence", children: [] };
+        await this.play(branch, trackIndex);
         return;
       }
       default: {

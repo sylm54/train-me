@@ -104,6 +104,12 @@ impl FMap {
     pub fn has(&self, key: &str) -> bool {
         self.get(key).is_some()
     }
+    /// Take `key` out of the map (used for cross-cutting keys like `when`
+    /// that are handled before per-type validation).
+    pub fn remove(&mut self, key: &str) -> Option<FValue> {
+        let pos = self.entries.iter().position(|(k, _)| k == key)?;
+        Some(self.entries.remove(pos).1)
+    }
     /// Insert without a duplicate check (caller must have checked).
     fn insert(&mut self, key: &str, value: FValue) {
         self.entries.push((key.to_string(), value));
@@ -478,15 +484,39 @@ pub struct FeatureBlock {
     pub ftype: String,
     pub config: FMap,
     pub body: String,
+    /// Optional run-time condition (`when:` config key). When it evaluates
+    /// false, the whole feature is skipped (not rendered, not gated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
     /// Line of the opening ```feature fence.
     pub line: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub enum Element {
-    Checklist { label: String, line: usize },
-    AudioLink { src: String, line: usize },
+    Checklist {
+        label: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        when: Option<String>,
+        line: usize,
+    },
+    AudioLink {
+        src: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        when: Option<String>,
+        line: usize,
+    },
     Feature(FeatureBlock),
+}
+
+/// One conditional segment of a page's markdown. Chunks with a `when`
+/// condition render only when the condition holds against the run
+/// context; a page without conditionals is a single unconditional chunk.
+#[derive(Clone, Debug, Serialize)]
+pub struct RawChunk {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Default)]
@@ -496,11 +526,55 @@ pub struct Page {
     /// stripped — those render as dedicated components, not markdown.
     #[serde(default)]
     pub raw: String,
+    /// The same markdown split at `{{#if}}` boundaries so the runner can
+    /// filter chunks by their condition. A page without conditionals has
+    /// exactly one chunk whose `when` is absent.
+    #[serde(default)]
+    pub raw_chunks: Vec<RawChunk>,
+    /// Page-level condition: an `@when <expr>` line as the page's first
+    /// content line. A false condition skips the entire page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
+}
+
+/// One open `{{#if}}` block while scanning a page: the branch predicate
+/// text and whether we are past the `{{#else}}` marker.
+struct CondFrame {
+    pred: String,
+    in_else: bool,
+    else_seen: bool,
+    line: usize,
+}
+
+/// The effective condition for a line: the conjunction of every open
+/// frame's branch predicate (else-branches contribute `not(pred)`).
+/// `None` when no `{{#if}}` is open (unconditional text).
+fn effective_condition(stack: &[CondFrame]) -> Option<String> {
+    if stack.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = stack
+        .iter()
+        .map(|f| {
+            if f.in_else {
+                format!("not({})", f.pred)
+            } else {
+                f.pred.clone()
+            }
+        })
+        .collect();
+    Some(parts.join(" and "))
 }
 
 /// Split a body into pages on `---` lines and extract the gated elements
 /// (checklist items, `.xml` audio links, feature blocks) from each page.
 /// `first_line` is the 1-based file line of the first body line.
+///
+/// Conditional syntax (evaluated at run time against the run context):
+///   - `@when <expr>` as a page's first content line — whole-page gate.
+///   - `{{#if <expr>}}` / `{{#else}}` / `{{/if}}` on their own lines —
+///     gate the markdown text and checklist items between the markers.
+///     Nesting composes by conjunction; markers are stripped from `raw`.
 pub fn parse_pages(body: &str, first_line: usize) -> (Vec<Page>, Vec<Diag>) {
     let mut diags = Vec::new();
     let lines: Vec<&str> = body.lines().collect();
@@ -519,9 +593,28 @@ pub fn parse_pages(body: &str, first_line: usize) -> (Vec<Page>, Vec<Diag>) {
     let mut pages: Vec<Page> = vec![Page::default()];
     let mut current: Vec<Element> = Vec::new();
     let mut raw_lines: Vec<String> = Vec::new();
+    let mut raw_chunks: Vec<RawChunk> = Vec::new();
     let mut page_has_text = false;
     let mut in_plain_code = false;
     let mut skip_until = 0usize; // feature interior: skip lines < skip_until
+    let mut cond_stack: Vec<CondFrame> = Vec::new();
+
+    // Push a raw markdown line into the chunk list under the line's
+    // effective condition (merging consecutive lines with the same one).
+    let push_raw = |raw_chunks: &mut Vec<RawChunk>, raw_lines: &mut Vec<String>, line: &str, when: Option<String>| {
+        raw_lines.push(line.to_string());
+        if let Some(last) = raw_chunks.last_mut() {
+            if last.when == when {
+                last.text.push('\n');
+                last.text.push_str(line);
+                return;
+            }
+        }
+        raw_chunks.push(RawChunk {
+            text: line.to_string(),
+            when,
+        });
+    };
 
     for (i, raw) in lines.iter().enumerate() {
         if i < skip_until {
@@ -537,7 +630,8 @@ pub fn parse_pages(body: &str, first_line: usize) -> (Vec<Page>, Vec<Diag>) {
             } else if !raw.trim().is_empty() {
                 page_has_text = true;
             }
-            raw_lines.push(raw.to_string());
+            let when = effective_condition(&cond_stack);
+            push_raw(&mut raw_chunks, &mut raw_lines, raw, when);
             continue;
         }
 
@@ -545,7 +639,17 @@ pub fn parse_pages(body: &str, first_line: usize) -> (Vec<Page>, Vec<Diag>) {
             page_has_text = true;
             if info.trim() == "feature" {
                 if let Some(pos) = features.iter().position(|(open, _, _)| *open == i) {
-                    let (_, end, block) = features.remove(pos);
+                    let (_, end, mut block) = features.remove(pos);
+                    if let Some(b) = block.as_mut() {
+                        // A feature inside `{{#if}}` inherits the enclosing
+                        // condition, ANDed with its own `when:` config key.
+                        if let Some(enclosing) = effective_condition(&cond_stack) {
+                            b.when = Some(match b.when.take() {
+                                Some(w) => format!("({w}) and ({enclosing})"),
+                                None => enclosing,
+                            });
+                        }
+                    }
                     if let Some(b) = block {
                         current.push(Element::Feature(b));
                     }
@@ -557,12 +661,61 @@ pub fn parse_pages(body: &str, first_line: usize) -> (Vec<Page>, Vec<Diag>) {
             continue;
         }
 
+        // Conditional markers — recognized only as whole (trimmed) lines.
+        let trimmed = line.trim();
+        if trimmed.starts_with("{{#if ") && trimmed.ends_with("}}") {
+            let pred = trimmed["{{#if ".len()..trimmed.len() - 2].trim();
+            if pred.is_empty() {
+                diags.push(error_at(
+                    Some(line_no),
+                    "`{{#if}}` needs a condition: `{{#if <expr>}}`",
+                ));
+            } else if let Err(e) = crate::cond::parse(pred) {
+                diags.push(error_at(Some(line_no), format!("`{{{{#if}}}}` condition: {e}")));
+            }
+            cond_stack.push(CondFrame {
+                pred: pred.to_string(),
+                in_else: false,
+                else_seen: false,
+                line: line_no,
+            });
+            continue;
+        }
+        if trimmed == "{{#else}}" {
+            match cond_stack.last_mut() {
+                Some(f) if !f.else_seen => {
+                    f.in_else = true;
+                    f.else_seen = true;
+                }
+                Some(f) if f.else_seen => diags.push(error_at(
+                    Some(line_no),
+                    format!("`{{{{#else}}}}` twice for the same `{{{{#if}}}}` (opened line {})", f.line),
+                )),
+                _ => diags.push(error_at(
+                    Some(line_no),
+                    "`{{#else}}` without an open `{{#if}}`",
+                )),
+            }
+            continue;
+        }
+        if trimmed == "{{/if}}" {
+            match cond_stack.pop() {
+                Some(_) => {}
+                None => diags.push(error_at(
+                    Some(line_no),
+                    "`{{/if}}` without a matching `{{#if}}`",
+                )),
+            }
+            continue;
+        }
+
         // Page separator. A separator that would start an empty page
         // (no text, no elements) is ignored rather than creating it.
         if line.trim_end() == "---" {
             let cur = pages.last_mut().expect("always one page");
             cur.elements = std::mem::take(&mut current);
             cur.raw = std::mem::take(&mut raw_lines).join("\n");
+            cur.raw_chunks = std::mem::take(&mut raw_chunks);
             if !cur.elements.is_empty() || page_has_text {
                 pages.push(Page::default());
             }
@@ -571,16 +724,36 @@ pub fn parse_pages(body: &str, first_line: usize) -> (Vec<Page>, Vec<Diag>) {
         }
 
         if line.trim().is_empty() {
-            raw_lines.push(raw.to_string());
+            let when = effective_condition(&cond_stack);
+            push_raw(&mut raw_chunks, &mut raw_lines, raw, when);
+            continue;
+        }
+
+        // `@when <expr>` as a page's first content line gates the page.
+        if !page_has_text && trimmed.starts_with("@when ") {
+            let expr = trimmed["@when ".len()..].trim();
+            if let Err(e) = crate::cond::parse(expr) {
+                diags.push(error_at(Some(line_no), format!("`@when` condition: {e}")));
+            }
+            if pages.last_mut().expect("always one page").when.is_some() {
+                diags.push(error_at(
+                    Some(line_no),
+                    "`@when` twice on one page (it must be the first content line)",
+                ));
+            }
+            pages.last_mut().expect("always one page").when = Some(expr.to_string());
+            page_has_text = true;
             continue;
         }
         page_has_text = true;
+        let when = effective_condition(&cond_stack);
 
         // Checklist item: `- [ ] label` / `* [x] label` / `+ [ ] label`.
         // Excluded from `raw` — rendered as an interactive toggle.
         if let Some(label) = checklist_label(line) {
             current.push(Element::Checklist {
                 label: label.to_string(),
+                when: when.clone(),
                 line: line_no,
             });
             continue;
@@ -588,15 +761,27 @@ pub fn parse_pages(body: &str, first_line: usize) -> (Vec<Page>, Vec<Diag>) {
 
         // Markdown links to .xml scripts.
         for src in audio_links_in_line(line) {
-            current.push(Element::AudioLink { src, line: line_no });
+            current.push(Element::AudioLink {
+                src,
+                when: when.clone(),
+                line: line_no,
+            });
         }
-        raw_lines.push(raw.to_string());
+        push_raw(&mut raw_chunks, &mut raw_lines, raw, when);
+    }
+
+    for f in &cond_stack {
+        diags.push(error_at(
+            Some(f.line),
+            "`{{#if}}` is never closed (missing `{{/if}}`)",
+        ));
     }
 
     let last_empty = {
         let last = pages.last_mut().expect("always one page");
         last.elements = current;
         last.raw = raw_lines.join("\n");
+        last.raw_chunks = raw_chunks;
         last.elements.is_empty()
     };
     // Drop a trailing page that is entirely empty (body ended with `---`).
@@ -771,10 +956,31 @@ fn parse_feature_span(
             return (None, diags);
         }
     };
+    // `when` is cross-cutting: take it out of the config so per-type
+    // unknown-key warnings don't fire, and syntax-check the expression.
+    let mut config = config;
+    let when = match config.remove("when") {
+        None => None,
+        Some(FValue::Str(s)) if !s.trim().is_empty() => {
+            if let Err(e) = crate::cond::parse(&s) {
+                diags.push(error_at(Some(line), format!("feature `when`: {e}")));
+            }
+            Some(s.trim().to_string())
+        }
+        Some(FValue::Str(_)) => {
+            diags.push(error_at(Some(line), "feature `when` must not be empty"));
+            None
+        }
+        Some(_) => {
+            diags.push(error_at(Some(line), "feature `when` must be a condition string"));
+            None
+        }
+    };
     let block = FeatureBlock {
         ftype,
         config,
         body,
+        when,
         line,
     };
     diags.extend(validate_feature(&block));
@@ -794,6 +1000,44 @@ pub const VOICE_ANALYZERS: &[&str] = &[
 const FEATURE_TYPES: &[&str] = &[
     "voice", "wait", "chastity", "input", "choice", "slider", "audio",
 ];
+
+/// Validate a feature's `field` answer key (required on `input`, optional
+/// on `choice`/`slider`): an identifier the answer is stored under, which
+/// makes it addressable in `when:` conditions and `{{ }}` interpolation.
+/// Reserved engine variable names cannot be shadowed.
+fn check_answer_field(c: &FMap, ctx: &str, line: usize, required: bool, diags: &mut Vec<Diag>) {
+    let valid = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    };
+    match c.get("field") {
+        Some(FValue::Str(s)) if valid(s) => {
+            if crate::cond::RESERVED_VARS.contains(&s.as_str()) {
+                diags.push(error_at(
+                    Some(line),
+                    format!("{ctx}: `field: {s}` collides with a reserved run variable"),
+                ));
+            }
+        }
+        Some(FValue::Str(_)) => diags.push(error_at(
+            Some(line),
+            format!("{ctx}: `field` must be an identifier (letters, digits, `-`, `_`)"),
+        )),
+        Some(_) => diags.push(error_at(
+            Some(line),
+            format!("{ctx}: `field` must be an identifier (letters, digits, `-`, `_`)"),
+        )),
+        None => {
+            if required {
+                diags.push(error_at(
+                    Some(line),
+                    format!("{ctx}: `field` is required (identifier for the stored answer)"),
+                ));
+            }
+        }
+    }
+}
 
 /// Per-type semantic validation of a feature block's config.
 fn validate_feature(b: &FeatureBlock) -> Vec<Diag> {
@@ -928,23 +1172,11 @@ fn validate_feature(b: &FeatureBlock) -> Vec<Diag> {
         }
         "input" => {
             warn_unknown_keys(c, &["type", "field", "required"], &ctx, &mut diags);
-            match c.get("field") {
-                Some(FValue::Str(s))
-                    if !s.is_empty()
-                        && s.chars()
-                            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-') => {}
-                Some(_) => diags.push(error_at(
-                    Some(b.line),
-                    format!("{ctx}: `field` must be an identifier (letters, digits, `-`, `_`)"),
-                )),
-                None => diags.push(error_at(
-                    Some(b.line),
-                    format!("{ctx}: `field` is required (identifier for the stored answer)"),
-                )),
-            }
+            check_answer_field(c, &ctx, b.line, true, &mut diags);
         }
         "choice" => {
-            warn_unknown_keys(c, &["type", "options", "required"], &ctx, &mut diags);
+            warn_unknown_keys(c, &["type", "options", "field", "required"], &ctx, &mut diags);
+            check_answer_field(c, &ctx, b.line, false, &mut diags);
             let options = match c.get("options") {
                 Some(FValue::Str(s)) => s
                     .split('|')
@@ -971,10 +1203,11 @@ fn validate_feature(b: &FeatureBlock) -> Vec<Diag> {
         "slider" => {
             warn_unknown_keys(
                 c,
-                &["type", "min", "max", "label", "required"],
+                &["type", "min", "max", "label", "field", "required"],
                 &ctx,
                 &mut diags,
             );
+            check_answer_field(c, &ctx, b.line, false, &mut diags);
             let min = req_num(c, "min", &ctx, &mut diags);
             let max = req_num(c, "max", &ctx, &mut diags);
             if let (Some(min), Some(max)) = (min, max) {
@@ -1706,9 +1939,49 @@ pub fn parse_store_entry(content: &str) -> (Option<StoreEntry>, Vec<Diag>) {
 // Reference extraction for the validator
 // ============================================================================
 
+/// Every condition expression in a page list, every answer `field` id
+/// declared by `input`/`choice`/`slider` features, and every `{{ var }}`
+/// interpolation identifier in markdown text and checklist labels. The
+/// validator checks the conditions' and interpolations' identifiers
+/// against the reserved run variables and these fields.
+pub fn collect_condition_refs(pages: &[Page]) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut conds = Vec::new();
+    let mut fields = Vec::new();
+    let mut interp = Vec::new();
+    let mut push_cond = |c: &Option<String>| {
+        if let Some(c) = c {
+            conds.push(c.clone());
+        }
+    };
+    for page in pages {
+        push_cond(&page.when);
+        for chunk in &page.raw_chunks {
+            push_cond(&chunk.when);
+            interp.extend(crate::cond::interpolation_idents(&chunk.text));
+        }
+        for el in &page.elements {
+            match el {
+                Element::Checklist { label, when, .. } => {
+                    push_cond(when);
+                    interp.extend(crate::cond::interpolation_idents(label));
+                }
+                Element::AudioLink { when, .. } => push_cond(when),
+                Element::Feature(f) => {
+                    push_cond(&f.when);
+                    if matches!(f.ftype.as_str(), "input" | "choice" | "slider") {
+                        if let Some(FValue::Str(field)) = f.config.get("field") {
+                            fields.push(field.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (conds, fields, interp)
+}
+
 /// All `.xml` scripts referenced by `audio` features across pages.
-pub fn audio_feature_srcs(pages: &[Page]) -> Vec<String> {
-    let mut out = Vec::new();
+pub fn audio_feature_srcs(pages: &[Page]) -> Vec<String> {    let mut out = Vec::new();
     for page in pages {
         for el in &page.elements {
             if let Element::AudioLink { src, .. } = el {
@@ -2095,7 +2368,20 @@ mod tests {
         assert!(errs(&d).is_empty(), "routine-v2.md: {d:?}");
         assert!(warns(&d).is_empty(), "routine-v2.md: {d:?}");
         let r = r.expect("parses");
-        assert_eq!(r.pages.len(), 2, "intro page + settle page");
+        assert_eq!(r.pages.len(), 3, "intro page + settle page + conditional bonus page");
+
+        // Conditional syntax lands in the parsed structures: page 1 has a
+        // `{{#if}}` checklist with a condition, page 3 a page-level `@when`,
+        // and the wait features carry `when:` conditions.
+        assert!(r.pages[0].elements.iter().any(|el| matches!(
+            el,
+            Element::Checklist { when: Some(_), .. }
+        )));
+        assert!(r.pages[2].when.is_some());
+        assert!(r.pages[1].elements.iter().any(|el| matches!(
+            el,
+            Element::Feature(f) if f.when.is_some()
+        )));
 
         let habit = include_str!("../../examples/habit.md");
         let (_, hd) = parse_habit(habit);

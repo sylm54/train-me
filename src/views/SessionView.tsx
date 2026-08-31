@@ -24,10 +24,12 @@ import { FrameBus, useVoiceSession } from "@/lib/voice/audio";
 import { TRACKERS } from "@/lib/voice/registry";
 import type { TrackerConfig, TrackerSummary } from "@/lib/voice/types";
 import { logActivity } from "@/lib/activity";
+import { evalCondition, interpolate, type CondVars } from "@/lib/cond";
 import {
   failRun,
   finishRun,
   startRun,
+  type Element,
   type FValue,
   type Page,
   type Routine,
@@ -45,7 +47,15 @@ interface Props {
 type Phase =
   | { stage: "loading" }
   | { stage: "error"; message: string }
-  | { stage: "running"; runId: string; title: string; routine: Routine | null; task: TaskTemplate | null }
+  | {
+      stage: "running";
+      runId: string;
+      title: string;
+      routine: Routine | null;
+      task: TaskTemplate | null;
+      /** Engine-computed run-context variables (conditions + interpolation). */
+      context: CondVars;
+    }
   | { stage: "outcome"; outcome: RunOutcome; failed: boolean };
 
 function parseDurationSecs(raw: unknown): number {
@@ -59,28 +69,38 @@ function parseDurationSecs(raw: unknown): number {
 
 export function SessionView({ request, navigate }: Props) {
   const [phase, setPhase] = useState<Phase>({ stage: "loading" });
-  const [pageIndex, setPageIndex] = useState(0);
-  /** Completion keyed `${page}:${element index on that page}`. */
+  /** Index into the EFFECTIVE page list (conditions-false pages skipped). */
+  const [effIdx, setEffIdx] = useState(0);
+  /** Completion keyed `${originalPageIndex}:${element index on that page}`. */
   const [completed, setCompleted] = useState<Record<string, boolean>>({});
   /** Feature answers (inputs/choices/sliders) for the activity log. */
   const answersRef = useRef<Record<string, unknown>>({});
+  /**
+   * Run-context variables, mutated in place as answers arrive (stable
+   * identity so an audio player built from it isn't rebuilt mid-session).
+   * `answersTick` forces re-evaluation of conditions after each answer.
+   */
+  const varsRef = useRef<CondVars>({});
+  const [answersTick, setAnswersTick] = useState(0);
 
   useEffect(() => {
     if (!request) return;
     let cancelled = false;
     setPhase({ stage: "loading" });
-    setPageIndex(0);
+    setEffIdx(0);
     setCompleted({});
     answersRef.current = {};
     startRun(request.kind, request.ref, request.occurrence)
       .then((run) => {
         if (cancelled) return;
+        varsRef.current = { ...run.context };
         setPhase({
           stage: "running",
           runId: run.run_id,
           title: run.title,
           routine: run.routine,
           task: run.task,
+          context: run.context,
         });
       })
       .catch((e) => {
@@ -152,10 +172,33 @@ export function SessionView({ request, navigate }: Props) {
   }
 
   const pages: Page[] = phase.routine?.pages ?? phase.task?.pages ?? [];
-  const page = pages[pageIndex];
+
+  // ── Run-context conditions ────────────────────────────────────────────
+  // Conditions referencing an answer become true as the user answers (the
+  // variable map is mutated in place); pages/elements whose condition is
+  // false never render and never gate completion.
+  const evalWhen = (expr?: string): boolean => !expr || evalCondition(expr, varsRef.current);
+  void answersTick; // re-render hook only — vars are read via varsRef.
+
+  const effectivePages = pages
+    .map((p, i) => ({ p, i }))
+    .filter(({ p }) => evalWhen(p.when));
+  const effPage = effectivePages[effIdx];
+  const page = effPage?.p;
+  const pageOrigin = effPage?.i ?? 0;
+
+  const activeElements: { el: Element; idx: number }[] = page
+    ? page.elements
+        .map((el, idx) => ({ el, idx }))
+        .filter(({ el }) => {
+          if ("Feature" in el) return evalWhen(el.Feature.when);
+          if ("Checklist" in el) return evalWhen(el.Checklist.when);
+          return evalWhen(el.AudioLink.when);
+        })
+    : [];
   const pageComplete =
-    !!page && page.elements.every((_, i) => completed[`${pageIndex}:${i}`]);
-  const isLast = pageIndex >= pages.length - 1;
+    !!page && activeElements.every(({ idx }) => completed[`${pageOrigin}:${idx}`]);
+  const isLast = effIdx >= effectivePages.length - 1;
 
   const finish = async () => {
     try {
@@ -180,21 +223,32 @@ export function SessionView({ request, navigate }: Props) {
     }
   };
 
+  // The page's markdown, chunk-filtered by condition and interpolated.
+  const rawChunks = page?.raw_chunks.length
+    ? page.raw_chunks
+    : page && page.raw.trim().length > 0
+      ? [{ text: page.raw }]
+      : [];
+  const rawText = rawChunks
+    .filter((c) => evalWhen(c.when))
+    .map((c) => interpolate(c.text, varsRef.current))
+    .join("\n");
+
   return (
     <div className="flex-1 overflow-y-auto">
       <div className="max-w-2xl mx-auto px-4 py-6 space-y-6">
         <div className="flex items-center justify-between gap-4">
           <h1 className="text-lg font-bold truncate">{phase.title}</h1>
           <div className="text-xs text-muted-foreground shrink-0">
-            Page {pageIndex + 1} / {Math.max(pages.length, 1)}
+            Page {effIdx + 1} / {Math.max(effectivePages.length, 1)}
           </div>
         </div>
 
-        {page && page.raw.trim().length > 0 && <MarkdownBody>{page.raw}</MarkdownBody>}
+        {rawText.trim().length > 0 && <MarkdownBody>{rawText}</MarkdownBody>}
 
         <div className="space-y-4">
-          {page?.elements.map((el, i) => {
-            const key = `${pageIndex}:${i}`;
+          {activeElements.map(({ el, idx }) => {
+            const key = `${pageOrigin}:${idx}`;
             const done = !!completed[key];
             if ("Checklist" in el) {
               return (
@@ -208,7 +262,7 @@ export function SessionView({ request, navigate }: Props) {
                   >
                     {done && <Check className="size-3" />}
                   </span>
-                  {el.Checklist.label}
+                  {interpolate(el.Checklist.label, varsRef.current)}
                 </button>
               );
             }
@@ -217,6 +271,7 @@ export function SessionView({ request, navigate }: Props) {
                 <AudioFeatureCard
                   key={key}
                   src={el.AudioLink.src}
+                  variables={varsRef.current}
                   done={done}
                   onDone={() => markComplete(key, true)}
                   label={`Listen: ${el.AudioLink.src}`}
@@ -229,9 +284,13 @@ export function SessionView({ request, navigate }: Props) {
                 key={key}
                 feature={feature}
                 done={done}
+                variables={varsRef.current}
                 onDone={() => markComplete(key, true)}
                 onAnswer={(k, v) => {
                   answersRef.current[k] = v;
+                  // Answers become condition/interpolation variables.
+                  varsRef.current[k] = v as string | number | boolean;
+                  setAnswersTick((t) => t + 1);
                 }}
               />
             );
@@ -239,8 +298,8 @@ export function SessionView({ request, navigate }: Props) {
         </div>
 
         <div className="flex items-center gap-3 pt-2 pb-8">
-          {pageIndex > 0 && (
-            <Button variant="outline" onClick={() => setPageIndex((i) => i - 1)}>
+          {effIdx > 0 && (
+            <Button variant="outline" onClick={() => setEffIdx((i) => i - 1)}>
               <ArrowLeft className="size-4" /> Back
             </Button>
           )}
@@ -249,7 +308,7 @@ export function SessionView({ request, navigate }: Props) {
               Finish
             </Button>
           ) : (
-            <Button disabled={!pageComplete} onClick={() => setPageIndex((i) => i + 1)}>
+            <Button disabled={!pageComplete} onClick={() => setEffIdx((i) => i + 1)}>
               Next page
             </Button>
           )}
@@ -284,13 +343,16 @@ interface FeatureCardProps {
     ftype: string;
     config: { [key: string]: FValue };
     body: string;
+    when?: string;
   };
   done: boolean;
   onDone: () => void;
   onAnswer: (key: string, value: unknown) => void;
+  /** Run-context variables, forwarded to audio features (`<if>` in TTS). */
+  variables?: CondVars;
 }
 
-function FeatureCard({ feature, done, onDone, onAnswer }: FeatureCardProps) {
+function FeatureCard({ feature, done, onDone, onAnswer, variables }: FeatureCardProps) {
   switch (feature.ftype) {
     case "voice":
       return <VoiceFeature feature={feature} done={done} onDone={onDone} />;
@@ -308,6 +370,7 @@ function FeatureCard({ feature, done, onDone, onAnswer }: FeatureCardProps) {
       return (
         <AudioFeatureCard
           src={String(feature.config.src ?? "")}
+          variables={variables}
           done={done}
           onDone={onDone}
           label="Listen to the audio"
@@ -755,6 +818,9 @@ function ChoiceFeature({
       : Array.isArray(raw)
         ? raw.filter((s): s is string => typeof s === "string")
         : [];
+  // `field` makes the answer addressable in conditions/interpolation;
+  // defaults to the first option-independent fallback key.
+  const field = String(feature.config.field ?? "choice");
   return (
     <FeatureShell title="choice" done={done}>
       <div className="text-sm">{feature.body}</div>
@@ -766,7 +832,7 @@ function ChoiceFeature({
             size="sm"
             disabled={done}
             onClick={() => {
-              onAnswer("choice", opt);
+              onAnswer(field, opt);
               onDone();
             }}
           >
@@ -809,7 +875,8 @@ function SliderFeature({
           size="sm"
           disabled={done}
           onClick={() => {
-            onAnswer(label, value);
+            // `field` (explicit) → `label` (legacy key) — addressable either way.
+            onAnswer(String(feature.config.field ?? label), value);
             onDone();
           }}
         >
@@ -827,11 +894,14 @@ function AudioFeatureCard({
   done,
   onDone,
   label,
+  variables,
 }: {
   src: string;
   done: boolean;
   onDone: () => void;
   label?: string;
+  /** Run-context variables for `<if>` segments (frozen when passed). */
+  variables?: CondVars;
 }) {
   const [open, setOpen] = useState(false);
   return (
@@ -842,6 +912,7 @@ function AudioFeatureCard({
       {open && (
         <AudioPlayerOverlay
           src={src}
+          variables={variables}
           onClose={() => setOpen(false)}
           onEnded={onDone}
         />

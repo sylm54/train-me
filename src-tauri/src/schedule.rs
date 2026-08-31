@@ -13,7 +13,7 @@
 //!   - `occurrences`   — one row per expected routine run (id =
 //!                       `routine:<path>:<due>` / ad-hoc ids for on-demand
 //!                       starts), `pending → in_progress → completed |
-//!                       failed | lapsed`.
+//!                       failed | lapsed | lapsed-exempt`.
 //!   - `habit_days`    — per-habit daily counters (`open → success |
 //!                       failed`), evaluated at day boundaries.
 //!   - `task_instances`— assigned template instances with deadline,
@@ -541,13 +541,17 @@ fn resolve_lapsed_routine(
     let mut lapsed = 0;
     let mut fired = 0;
     let mut lines = Vec::new();
+    // A distinct status for exempted misses lets the run-context streak
+    // walk skip them without breaking the streak (exemptions protect
+    // streaks — FORMAT.md §6).
+    let lapse_status = if exempt { "lapsed-exempt" } else { "lapsed" };
     for (id, _window_end) in rows {
         // Mark first — structural idempotency before any side effects.
         let marked = sched
             .execute(
-                "UPDATE occurrences SET status = 'lapsed', resolved = ?2 WHERE id = ?1 \
+                "UPDATE occurrences SET status = ?2, resolved = ?3 WHERE id = ?1 \
                  AND status IN ('pending', 'in_progress')",
-                rusqlite::params![id, ts(now)],
+                rusqlite::params![id, lapse_status, ts(now)],
             )
             .unwrap_or(0);
         if marked == 0 {
@@ -759,6 +763,188 @@ fn load_task_failure(sched: &Connection, agent_dir: &Path, iid: &str) -> Option<
 // Run lifecycle commands
 // ============================================================================
 
+// ============================================================================
+// Run context (condition variables)
+// ============================================================================
+
+/// Engine-provided run-context variables, consumed by every condition in
+/// feature files (routine `@when`/`{{#if}}`/`when:`, TTS `<if cond>`) and
+/// by `{{ var }}` interpolation. Names mirror `RESERVED_VARS` in
+/// `src/lib/cond.ts`; answer fields merge on top at run time.
+///
+/// `target` names the container the context is for — `("routine", rel_path)`
+/// or `("task", template_name)` — adding its history stats (`streak`,
+/// `done`, …). `None` yields environment-only variables (standalone audio
+/// playback outside any run).
+pub fn build_run_context(
+    sched: &Connection,
+    econ: &Connection,
+    state_dir: &Path,
+    target: Option<(&str, &str)>,
+) -> serde_json::Map<String, serde_json::Value> {
+    use chrono::{Datelike, Timelike};
+
+    let mut vars = serde_json::Map::new();
+    let local = chrono::Local::now();
+    const DAYS: [&str; 7] = [
+        "sunday",
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+    ];
+    let dow = local.weekday().num_days_from_sunday() as usize;
+    vars.insert("weekday".into(), serde_json::json!(DAYS[dow]));
+    vars.insert("is_weekend".into(), serde_json::json!(dow == 0 || dow == 6));
+    vars.insert("hour".into(), serde_json::json!(local.hour() as i64));
+    vars.insert("date".into(), serde_json::json!(local.day() as i64));
+    vars.insert("month".into(), serde_json::json!(local.month() as i64));
+    vars.insert(
+        "points".into(),
+        serde_json::json!(economy::balance(econ).unwrap_or(0)),
+    );
+    vars.insert(
+        "locked".into(),
+        serde_json::json!(
+            crate::chastity::ChastityState::load(&state_dir.join("chastity.json")).locked
+        ),
+    );
+
+    match target {
+        Some(("task", template)) => collect_task_stats(sched, template, &mut vars),
+        Some(("routine", rel)) | Some((_, rel)) => {
+            collect_routine_stats(sched, rel, &local, &mut vars)
+        }
+        None => {}
+    }
+    vars
+}
+
+/// History stats for a routine, derived from the occurrence ledger.
+fn collect_routine_stats(
+    sched: &Connection,
+    rel: &str,
+    local: &chrono::DateTime<chrono::Local>,
+    vars: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let scalar = |sql: &str| -> i64 {
+        sched
+            .query_row(sql, [rel], |r| r.get::<_, i64>(0))
+            .unwrap_or(0)
+    };
+    let done = scalar(
+        "SELECT COUNT(*) FROM occurrences WHERE container = ?1 AND status = 'completed'",
+    );
+    let fails = scalar("SELECT COUNT(*) FROM occurrences WHERE container = ?1 AND status IN ('failed', 'lapsed')");
+    vars.insert("done".into(), serde_json::json!(done));
+    vars.insert("fails".into(), serde_json::json!(fails));
+
+    // Newest-first statuses; exempted misses (`lapsed-exempt`) are
+    // streak-neutral. `streak` = leading completed run; `best_streak` =
+    // longest completed run anywhere in history.
+    let statuses: Vec<String> = {
+        let mut stmt = match sched.prepare(
+            "SELECT status FROM occurrences \
+             WHERE container = ?1 AND status IN ('completed', 'failed', 'lapsed', 'lapsed-exempt') \
+             ORDER BY COALESCE(resolved, started, created) DESC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let collected: Vec<String> = match stmt.query_map([rel], |r| r.get::<_, String>(0)) {
+            Ok(rows) => rows.filter_map(Result::ok).collect(),
+            Err(_) => return,
+        };
+        collected
+    };
+    let mut streak: i64 = 0;
+    for status in &statuses {
+        match status.as_str() {
+            "completed" => streak += 1,
+            "lapsed-exempt" => {}
+            _ => break,
+        }
+    }
+    let mut best: i64 = 0;
+    let mut run: i64 = 0;
+    for status in statuses.iter().rev() {
+        match status.as_str() {
+            "completed" => {
+                run += 1;
+                best = best.max(run);
+            }
+            "lapsed-exempt" => {}
+            _ => run = 0,
+        }
+    }
+    vars.insert("streak".into(), serde_json::json!(streak));
+    vars.insert("best_streak".into(), serde_json::json!(best));
+
+    if done > 0 {
+        let last: Option<String> = sched
+            .query_row(
+                "SELECT COALESCE(resolved, started, created) FROM occurrences \
+                 WHERE container = ?1 AND status = 'completed' \
+                 ORDER BY COALESCE(resolved, started, created) DESC LIMIT 1",
+                [rel],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(last) = last.and_then(|s| economy::parse_ts(&s)) {
+            let days =
+                (local.date_naive() - last.with_timezone(&chrono::Local).date_naive()).num_days();
+            vars.insert("days_since_last".into(), serde_json::json!(days));
+        }
+    }
+}
+
+/// History stats for task instances of one template.
+fn collect_task_stats(
+    sched: &Connection,
+    template: &str,
+    vars: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let statuses: Vec<String> = {
+        let mut stmt = match sched.prepare(
+            "SELECT status FROM task_instances \
+             WHERE template = ?1 AND status IN ('completed', 'failed') ORDER BY assigned DESC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let collected: Vec<String> = match stmt.query_map([template], |r| r.get::<_, String>(0)) {
+            Ok(rows) => rows.filter_map(Result::ok).collect(),
+            Err(_) => return,
+        };
+        collected
+    };
+    let done = statuses.iter().filter(|s| s.as_str() == "completed").count() as i64;
+    let fails = statuses.iter().filter(|s| s.as_str() == "failed").count() as i64;
+    let mut streak: i64 = 0;
+    for status in &statuses {
+        match status.as_str() {
+            "completed" => streak += 1,
+            _ => break,
+        }
+    }
+    let mut best: i64 = 0;
+    let mut run: i64 = 0;
+    for status in statuses.iter().rev() {
+        if status == "completed" {
+            run += 1;
+            best = best.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    vars.insert("done".into(), serde_json::json!(done));
+    vars.insert("fails".into(), serde_json::json!(fails));
+    vars.insert("streak".into(), serde_json::json!(streak));
+    vars.insert("best_streak".into(), serde_json::json!(best));
+}
+
 #[derive(Serialize)]
 pub struct RunStart {
     pub run_id: String,
@@ -766,6 +952,8 @@ pub struct RunStart {
     pub kind: String, // "routine" | "task"
     pub routine: Option<format::Routine>,
     pub task: Option<format::TaskTemplate>,
+    /// Engine-computed run-context variables (conditions + interpolation).
+    pub context: serde_json::Map<String, serde_json::Value>,
 }
 
 fn parse_errors(diags: &[format::Diag]) -> Option<String> {
@@ -792,6 +980,7 @@ pub async fn v2_start_run(
     let state_dir = state.state_dir.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let sched = open(&state_dir.join("schedule.db"))?;
+        let econ = open(&state_dir.join("economy.db"))?;
         let now = utc_now();
 
         if kind == "task" {
@@ -812,12 +1001,19 @@ pub async fn v2_start_run(
             if let Some(e) = parse_errors(&diags) {
                 return Err(format!("task template invalid: {e}"));
             }
+            let context = build_run_context(
+                &sched,
+                &econ,
+                &state_dir,
+                Some(("task", template.as_str())),
+            );
             return Ok(RunStart {
                 run_id: ref_id.clone(),
                 title,
                 kind: "task".into(),
                 routine: None,
                 task,
+                context,
             });
         }
 
@@ -837,12 +1033,14 @@ pub async fn v2_start_run(
             [&ref_id],
             |r| Ok((r.get(0)?,)),
         ) {
+            let context = build_run_context(&sched, &econ, &state_dir, Some(("routine", &ref_id)));
             return Ok(RunStart {
                 run_id: id,
                 title: routine.title.clone(),
                 kind: "routine".into(),
                 routine: Some(routine),
                 task: None,
+                context,
             });
         }
 
@@ -943,13 +1141,46 @@ pub async fn v2_start_run(
             rusqlite::params![run_id, ref_id, ts(now), window_end],
         ).map_err(|e| e.to_string())?;
         log_activity(&agent_dir, "routine", "start", &run_id);
+        let context = build_run_context(&sched, &econ, &state_dir, Some(("routine", &ref_id)));
         Ok(RunStart {
             run_id,
             title: routine.title.clone(),
             kind: "routine".into(),
             routine: Some(routine),
             task: None,
+            context,
         })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Run-context variables for playback outside a session: `ref_id` absent
+/// (or not a recognized container path) yields environment-only variables
+/// (`weekday`, `points`, `locked`, …) — the standalone-player default.
+#[tauri::command]
+pub async fn v2_context(
+    ref_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let state_dir = state.state_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let sched = open(&state_dir.join("schedule.db"))?;
+        let econ = open(&state_dir.join("economy.db"))?;
+        let target = ref_id.as_deref().map(|r| {
+            if let Some(stem) = r.strip_prefix("tasks/").or_else(|| r.strip_prefix("tasks\\")) {
+                let stem = stem.strip_suffix(".md").unwrap_or(stem);
+                ("task", stem.to_string())
+            } else {
+                ("routine", r.to_string())
+            }
+        });
+        Ok(build_run_context(
+            &sched,
+            &econ,
+            &state_dir,
+            target.as_ref().map(|(k, r)| (*k, r.as_str())),
+        ))
     })
     .await
     .map_err(|e| e.to_string())?

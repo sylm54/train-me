@@ -195,6 +195,17 @@ A metronome over its (non-interactive) children. The renderer bakes the children
 - \`volume\` — default \`0.5\`; base click gain (0.0–1.5).
 - \`accent-gain\` — default \`1.5\`; multiplier applied to \`volume\` on accented (\`X\`) beats.
 
+#### \`<if>\` / \`<else>\` — conditional branches (playback-time)
+Plays exactly ONE branch per playback, chosen by evaluating \`cond\` against the **run-context variables** (see the condition DSL in FORMAT.md: \`weekday\`, \`streak\`, \`done\`, answer \`field\`s, …) when playback starts. Both branches are fully rendered; the skipped branch's clips are never touched, so conditionals never fork the render cache. An optional \`<else>\` container inside the \`<if>\` provides the false branch. A broken or unknown-variable condition evaluates to false. Like the other interactive tags, \`<if>\` is not allowed inside a \`<background>\` layer or an \`<overlay>\` part, not directly inside \`<effect>\`, and not inside \`<beatmeter>\` children.
+
+\`\`\`xml
+<if cond='streak >= 7'>A full week, unbroken. Impressive.
+<else>Let's build that streak back up.</else>
+</if>
+\`\`\`
+
+Conditions are frozen at play start: every \`<if>\` in the script is evaluated once against the variables in effect when the player opens (sessions pass the run context — streak, answers, etc.; standalone playback gets environment-only variables such as \`weekday\`/\`points\`). There is deliberately NO \`{{ var }}\` interpolation in TTS: interpolated values would need one synthesis per distinct value, while \`<if>\` branches are synthesized once. Use threshold branches of authored lines instead of interpolating numbers.
+
 #### \`<include>\` — self-closing (requires \`src\`)
 - \`src\` — required. Pulls in another XML file by path. Nested includes are supported with circular-include detection. In manifest mode, an include is rendered as its OWN manifest (deduped on disk by source path, so the same file included twice is stored and rendered once) and referenced by the parent; context (voice/speed/volume) is RESET at the include boundary, so an included file should declare its own \`<voice>\`. Each included file has its own content hash, so editing a sub-file re-renders only that sub-manifest.
 
