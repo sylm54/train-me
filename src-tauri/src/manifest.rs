@@ -137,6 +137,17 @@ pub enum Segment {
         role: SectionRole,
         child: Box<Segment>,
     },
+
+    /// Playback-time conditional (`<if>`). Both branches are fully rendered;
+    /// the player evaluates `cond` (the condition DSL) against the
+    /// run-context variables when playback starts and plays exactly one
+    /// branch. Duration estimates count the `then` branch only.
+    Cond {
+        cond: String,
+        then: Box<Segment>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        r#else: Option<Box<Segment>>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -349,7 +360,8 @@ pub(crate) fn contains_split(node: &Node) -> bool {
         | Node::Include { .. }
         | Node::Beatmeter { .. }
         | Node::Rating { .. }
-        | Node::React { .. } => true,
+        | Node::React { .. }
+        | Node::If { .. } => true,
 
         Node::Voice { children, .. }
         | Node::Speed { children, .. }
@@ -400,6 +412,7 @@ pub(crate) fn nominal_duration(seg: &Segment) -> f32 {
             }
         }
         Segment::Section { child, .. } => nominal_duration(child),
+        Segment::Cond { then, .. } => nominal_duration(then),
     }
 }
 
@@ -537,6 +550,14 @@ pub(crate) fn resolve_paths_recursive(value: &mut serde_json::Value, base_dir: &
                 resolve_paths_recursive(seg, base_dir);
             }
             if let Some(seg) = value.get_mut("fallback") {
+                resolve_paths_recursive(seg, base_dir);
+            }
+        }
+        Some("cond") => {
+            if let Some(seg) = value.get_mut("then") {
+                resolve_paths_recursive(seg, base_dir);
+            }
+            if let Some(seg) = value.get_mut("else") {
                 resolve_paths_recursive(seg, base_dir);
             }
         }

@@ -16,17 +16,28 @@ export interface FeatureBlock {
   ftype: string;
   config: { [key: string]: FValue };
   body: string;
+  /** Run-time condition (`when:` config key): skip the feature when false. */
+  when?: string;
   line: number;
 }
 
 export type Element =
-  | { Checklist: { label: string; line: number } }
-  | { AudioLink: { src: string; line: number } }
+  | { Checklist: { label: string; when?: string; line: number } }
+  | { AudioLink: { src: string; when?: string; line: number } }
   | { Feature: FeatureBlock };
+
+/** One conditional markdown segment of a page (`{{#if}}` split). */
+export interface RawChunk {
+  text: string;
+  when?: string;
+}
 
 export interface Page {
   elements: Element[];
   raw: string;
+  raw_chunks: RawChunk[];
+  /** Page-level condition (`@when` line): skip the whole page when false. */
+  when?: string;
 }
 
 export type Scope = "habits" | "routines" | "tasks" | "all";
@@ -74,6 +85,8 @@ export interface RunStart {
   kind: "routine" | "task";
   routine: Routine | null;
   task: TaskTemplate | null;
+  /** Engine-computed run-context variables (conditions + interpolation). */
+  context: Record<string, string | number | boolean>;
 }
 
 export interface RunOutcome {

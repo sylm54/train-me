@@ -47,15 +47,23 @@ interface Props {
   src: string;
   onClose: () => void;
   onEnded?: () => void;
+  /**
+   * Run-context variables for `<if>` condition segments. A session passes
+   * its live run context (engine vars + the user's answers so far); when
+   * omitted (Today's queued scripts, standalone playback) environment-only
+   * variables are fetched from the engine instead.
+   */
+  variables?: Record<string, string | number | boolean>;
 }
 
-export function AudioPlayerOverlay({ src, onClose, onEnded }: Props) {
+export function AudioPlayerOverlay({ src, onClose, onEnded, variables }: Props) {
   const [phase, setPhase] = useState<"checking" | "rendering" | "ready" | "error">("checking");
   const [renderLabel, setRenderLabel] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [playing, setPlaying] = useState(false);
   const [prompt, setPrompt] = useState<ActivePrompt | null>(null);
   const [finished, setFinished] = useState(false);
+  const [envVars, setEnvVars] = useState<Record<string, string | number | boolean> | null>(null);
   const playerRef = useRef<ManifestPlayer | null>(null);
   const rootRef = useRef<Segment | null>(null);
   const endedFired = useRef(false);
@@ -77,6 +85,23 @@ export function AudioPlayerOverlay({ src, onClose, onEnded }: Props) {
     setAudioBusy(true);
     return () => setAudioBusy(false);
   }, []);
+
+  // Standalone playback (no session variables passed): fall back to the
+  // engine's environment-only context. Best-effort — empty on failure.
+  useEffect(() => {
+    if (variables) return;
+    let cancelled = false;
+    invoke<Record<string, string | number | boolean>>("v2_context")
+      .then((ctx) => {
+        if (!cancelled) setEnvVars(ctx);
+      })
+      .catch(() => {
+        if (!cancelled) setEnvVars({});
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [variables]);
 
   // Render (if needed) and load the manifest.
   useEffect(() => {
@@ -121,9 +146,11 @@ export function AudioPlayerOverlay({ src, onClose, onEnded }: Props) {
     };
   }, [src, fail]);
 
-  // Build the player once the manifest is loaded.
+  // Build the player once the manifest is loaded (and the variable context
+  // — passed-in or fetched environment vars — is settled).
   useEffect(() => {
     if (phase !== "ready" || !rootRef.current) return;
+    if (!variables && !envVars) return;
     const player = new ManifestPlayer({
       onPrompt: setPrompt,
       onPlayingChange: setPlaying,
@@ -139,13 +166,14 @@ export function AudioPlayerOverlay({ src, onClose, onEnded }: Props) {
       onError: (e) => fail(e.message),
       readImport: (manifestPath) =>
         invoke<ReadManifestResult>("read_manifest", { manifestPath }).then((r) => r.root),
+      variables: variables ?? envVars ?? {},
     });
     playerRef.current = player;
     return () => {
       player.destroy();
       playerRef.current = null;
     };
-  }, [phase, src, fail, onEnded]);
+  }, [phase, src, fail, onEnded, variables, envVars]);
 
   const start = useCallback(async () => {
     const root = rootRef.current;

@@ -12,6 +12,8 @@ export interface Diag {
   line?: number;
 }
 
+import { parseCondition, RESERVED_VARS } from "./cond";
+
 // ── front-matter ───────────────────────────────────────────────────────────
 
 export function splitFrontmatter(content: string): { fm: string | null; body: string } {
@@ -318,6 +320,40 @@ export interface ParsedContainer {
   templates: string[];
 }
 
+/** `field` answer key: required on `input`, optional on `choice`/`slider`.
+ *  Reserved run variables cannot be shadowed (mirrors format.rs). */
+function checkFieldIdent(
+  config: FMap,
+  ctx: string,
+  line: number,
+  required: boolean,
+  diags: Diag[],
+): void {
+  const f = config["field"];
+  if (f === undefined) {
+    if (required) {
+      diags.push({
+        severity: "error", line,
+        message: `${ctx}: \`field\` is required (letters, digits, \`-\`, \`_\`)`,
+      });
+    }
+    return;
+  }
+  if (typeof f !== "string" || !/^[A-Za-z0-9_-]+$/.test(f)) {
+    diags.push({
+      severity: "error", line,
+      message: `${ctx}: \`field\` must be an identifier (letters, digits, \`-\`, \`_\`)`,
+    });
+    return;
+  }
+  if (RESERVED_VARS.includes(f as (typeof RESERVED_VARS)[number])) {
+    diags.push({
+      severity: "error", line,
+      message: `${ctx}: \`field: ${f}\` collides with a reserved run variable`,
+    });
+  }
+}
+
 function validateFeature(
   ftype: string,
   config: FMap,
@@ -391,16 +427,12 @@ function validateFeature(
     }
     case "input": {
       warnUnknown(config, ["type", "field", "required"], ctx, diags);
-      if (!/^[A-Za-z0-9_-]+$/.test(String(config["field"] ?? ""))) {
-        diags.push({
-          severity: "error", line,
-          message: `${ctx}: \`field\` is required (letters, digits, \`-\`, \`_\`)`,
-        });
-      }
+      checkFieldIdent(config, ctx, line, true, diags);
       break;
     }
     case "choice": {
-      warnUnknown(config, ["type", "options", "required"], ctx, diags);
+      warnUnknown(config, ["type", "options", "field", "required"], ctx, diags);
+      checkFieldIdent(config, ctx, line, false, diags);
       const o = config["options"];
       const count =
         typeof o === "string"
@@ -415,7 +447,8 @@ function validateFeature(
       break;
     }
     case "slider": {
-      warnUnknown(config, ["type", "min", "max", "label", "required"], ctx, diags);
+      warnUnknown(config, ["type", "min", "max", "label", "field", "required"], ctx, diags);
+      checkFieldIdent(config, ctx, line, false, diags);
       const min = getNum(config, "min");
       const max = getNum(config, "max");
       if (min === undefined || max === undefined) {
@@ -460,9 +493,22 @@ function parseBody(body: string, firstLine: number, diags: Diag[]): string[] {
   const lines = body.split("\n");
   let i = 0;
   let inPlainCode = false;
+  // Conditional syntax (`{{#if}}` markers, `@when` pages, feature `when:`).
+  const condStack: { line: number }[] = [];
+  const conds: { expr: string; line: number }[] = [];
+  const fields = new Set<string>();
+  const interpIdents = new Set<string>();
+  let pageHasText = false;
+  const scanInterp = (text: string): void => {
+    for (const m of text.matchAll(/\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g)) {
+      interpIdents.add(m[1]!);
+    }
+  };
   while (i < lines.length) {
     const line = lines[i]!;
     const t = line.trimStart();
+    const trimmed = t.trim();
+    const lineNo = firstLine + i;
     if (inPlainCode) {
       if (t.startsWith("```")) inPlainCode = false;
       i++;
@@ -475,6 +521,7 @@ function parseBody(body: string, firstLine: number, diags: Diag[]): string[] {
         i++;
         continue;
       }
+      pageHasText = true;
       // Feature block: config until `---`, body until closing fence.
       const openLine = firstLine + i;
       let j = i + 1;
@@ -499,6 +546,23 @@ function parseBody(body: string, firstLine: number, diags: Diag[]): string[] {
       }
       const configText = lines.slice(i + 1, sep).join("\n");
       const config = parseKv(configText, firstLine + i + 1, diags);
+      // `when` is cross-cutting: validate + remove before per-type checks
+      // so unknown-key warnings don't fire (mirrors format.rs).
+      const whenRaw = config["when"];
+      delete config["when"];
+      if (typeof whenRaw === "string") {
+        if (whenRaw.trim()) {
+          const parsed = parseCondition(whenRaw);
+          if (!parsed.ok) {
+            diags.push({ severity: "error", line: openLine, message: `feature \`when\`: ${parsed.error}` });
+          }
+          conds.push({ expr: whenRaw, line: openLine });
+        } else {
+          diags.push({ severity: "error", line: openLine, message: "feature `when` must not be empty" });
+        }
+      } else if (whenRaw !== undefined) {
+        diags.push({ severity: "error", line: openLine, message: "feature `when` must be a condition string" });
+      }
       const ftype = getStr(config, "type");
       if (!ftype) {
         diags.push({
@@ -506,13 +570,100 @@ function parseBody(body: string, firstLine: number, diags: Diag[]): string[] {
           message: "feature block is missing a `type` (first config line)",
         });
       } else {
+        // input/choice/slider field ids become addressable variables.
+        if (["input", "choice", "slider"].includes(ftype)) {
+          const f = config["field"];
+          if (typeof f === "string" && /^[A-Za-z0-9_-]+$/.test(f)) {
+            if (RESERVED_VARS.includes(f as (typeof RESERVED_VARS)[number])) {
+              diags.push({
+                severity: "error", line: openLine,
+                message: `feature \`${ftype}\`: \`field: ${f}\` collides with a reserved run variable`,
+              });
+            } else {
+              fields.add(f);
+            }
+          }
+        }
         scripts.push(...validateFeature(ftype, config, openLine, diags));
       }
       i = j + 1;
       continue;
     }
+    // Conditional markers — whole (trimmed) lines only.
+    if (trimmed.startsWith("{{#if ") && trimmed.endsWith("}}")) {
+      const expr = trimmed.slice("{{#if ".length, -2).trim();
+      const parsed = parseCondition(expr);
+      if (!expr) {
+        diags.push({ severity: "error", line: lineNo, message: "`{{#if}}` needs a condition: `{{#if <expr>}}`" });
+      } else if (!parsed.ok) {
+        diags.push({ severity: "error", line: lineNo, message: `\`{{#if}}\` condition: ${parsed.error}` });
+      }
+      condStack.push({ line: lineNo });
+      conds.push({ expr, line: lineNo });
+      i++;
+      continue;
+    }
+    if (trimmed === "{{#else}}") {
+      if (condStack.length === 0) {
+        diags.push({ severity: "error", line: lineNo, message: "`{{#else}}` without an open `{{#if}}`" });
+      }
+      i++;
+      continue;
+    }
+    if (trimmed === "{{/if}}") {
+      if (condStack.pop() === undefined) {
+        diags.push({ severity: "error", line: lineNo, message: "`{{/if}}` without a matching `{{#if}}`" });
+      }
+      i++;
+      continue;
+    }
+    if (!trimmed) {
+      i++;
+      continue;
+    }
+    // `@when <expr>` as a page's first content line gates the whole page.
+    if (!pageHasText && trimmed.startsWith("@when ")) {
+      const expr = trimmed.slice("@when ".length).trim();
+      const parsed = parseCondition(expr);
+      if (!parsed.ok) {
+        diags.push({ severity: "error", line: lineNo, message: `\`@when\` condition: ${parsed.error}` });
+      }
+      conds.push({ expr, line: lineNo });
+      pageHasText = true;
+      i++;
+      continue;
+    }
+    pageHasText = true;
+    scanInterp(trimmed, lineNo);
     scripts.push(...audioLinksInBody(t).map((s) => s));
     i++;
+  }
+  for (const f of condStack) {
+    diags.push({
+      severity: "error", line: f.line,
+      message: "`{{#if}}` is never closed (missing `{{/if}}`)",
+    });
+  }
+  // Unknown identifiers are silent `false`/empty at run time — catch them here.
+  for (const { expr } of conds) {
+    const parsed = parseCondition(expr);
+    if (!parsed.ok) continue;
+    for (const ident of parsed.cond.identifiers) {
+      if (RESERVED_VARS.includes(ident as (typeof RESERVED_VARS)[number])) continue;
+      if (fields.has(ident)) continue;
+      diags.push({
+        severity: "error",
+        message: `condition \`${expr}\` references unknown variable \`${ident}\` — use a run variable (${RESERVED_VARS.join(", ")}) or a \`field\` declared in this file`,
+      });
+    }
+  }
+  for (const ident of interpIdents) {
+    if (RESERVED_VARS.includes(ident as (typeof RESERVED_VARS)[number])) continue;
+    if (fields.has(ident)) continue;
+    diags.push({
+      severity: "warning",
+      message: `\`{{${ident}}}\` is not a known run variable or answer field — it renders empty`,
+    });
   }
   return scripts;
 }

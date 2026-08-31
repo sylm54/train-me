@@ -13,6 +13,7 @@ mod audio_renderer;
 mod audio_server;
 mod bash;
 mod chastity;
+mod cond;
 mod economy;
 // `expression` is public only so its doctests compile — doctests build as
 // an external crate and can't reach private modules. Not part of the app's
@@ -1025,6 +1026,14 @@ fn collect_includes(
             | tag_parser::Node::Beatmeter { children, .. } => {
                 collect_includes(children, script_dir, agent_dir, out, visited, warnings);
             }
+            tag_parser::Node::If {
+                then_branch, r#else, ..
+            } => {
+                collect_includes(then_branch, script_dir, agent_dir, out, visited, warnings);
+                if let Some(else_nodes) = r#else {
+                    collect_includes(else_nodes, script_dir, agent_dir, out, visited, warnings);
+                }
+            }
             tag_parser::Node::Overlay { parts, .. }
             | tag_parser::Node::Random { parts }
             | tag_parser::Node::Scramble { parts }
@@ -1829,6 +1838,7 @@ pub fn run() {
             schedule::parse_v2_file,
             schedule::v2_summary,
             schedule::v2_start_run,
+            schedule::v2_context,
             schedule::v2_finish_run,
             schedule::v2_fail_run,
             schedule::v2_habit_log,

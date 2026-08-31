@@ -77,8 +77,18 @@ async function playJingle(item: QueueItem): Promise<void> {
     if (rendered.duration > MAX_JINGLE_SECS) return;
     if (await isInteractive(read.root, new Set())) return;
 
+    // Environment-only variables for `<if>` segments (jingles fire outside
+    // any run context). Best-effort — empty on failure.
+    let variables: Record<string, string | number | boolean> = {};
+    try {
+      variables = await invoke<Record<string, string | number | boolean>>("v2_context");
+    } catch {
+      /* keep empty */
+    }
+
     await new Promise<void>((resolve) => {
       const player = new ManifestPlayer({
+        variables,
         onPrompt: () => {
           // Interactive scripts are filtered above; a prompt here would
           // have no UI — stop and leave the script queued.
@@ -179,6 +189,12 @@ async function isInteractive(seg: Segment, seen: Set<string>): Promise<boolean> 
     }
     case "section":
       return isInteractive(seg.child, seen);
+    case "cond":
+      // Both branches may carry prompts; check the ones that exist.
+      return (
+        (await isInteractive(seg.then, seen)) ||
+        (!!seg.else && (await isInteractive(seg.else, seen)))
+      );
     case "import": {
       if (seen.has(seg.manifest)) return false;
       seen.add(seg.manifest);
