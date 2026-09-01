@@ -6,11 +6,16 @@
  * interactive prompt UI (`<until>` continue, `<choice>` options, `<rating>`
  * scale). Completes (calls `onEnded` once) when the whole segment tree has
  * finished playing through any branch.
+ *
+ * While a `<visual>` slideshow is up, the player goes truly fullscreen:
+ * all chrome collapses to floating corner controls and a translucent
+ * bottom-sheet prompt panel so the visuals stay unobstructed. Without
+ * visuals the classic centered layout (header bar + controls) is used.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { X } from "lucide-react";
+import { Pause, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import {
@@ -81,6 +86,8 @@ export function AudioPlayerOverlay({ src, onClose, onEnded, variables }: Props) 
   const endedFired = useRef(false);
   /** JSON of the visual config currently loaded — dedupes loop re-entries. */
   const visualKeyRef = useRef<string | null>(null);
+  /** True once playback has begun — distinguishes Resume from Play. */
+  const startedRef = useRef(false);
   // App-wide render entry for this script (seeded by markStart below) —
   // drives the progress bar + time-remaining readout while rendering.
   const renderEntry = useRenderStore().get(src) ?? null;
@@ -222,12 +229,20 @@ export function AudioPlayerOverlay({ src, onClose, onEnded, variables }: Props) 
     const player = playerRef.current;
     if (!root || !player) return;
     setFinished(false);
+    startedRef.current = true;
     try {
       await player.start(root);
     } catch (e) {
       fail(String(e));
     }
   }, [fail]);
+
+  const resume = useCallback(() => {
+    playerRef.current?.resume();
+  }, []);
+  /** Not started: Play (from the top). Started: Resume where we paused. */
+  const playOrResume = startedRef.current ? resume : start;
+  const playLabel = startedRef.current ? "Resume" : "Play";
 
   // Esc closes.
   useEffect(() => {
@@ -238,10 +253,81 @@ export function AudioPlayerOverlay({ src, onClose, onEnded, variables }: Props) 
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
+  // The interactive prompt card. Over a slideshow it becomes a translucent
+  // dark bottom sheet; plain mode keeps the surface card.
+  const promptCard = prompt && (
+    <div
+      className={`w-full max-w-md space-y-3 rounded-lg border p-4 shadow-sm ${
+        visual
+          ? "border-white/15 bg-black/70 text-white backdrop-blur-md"
+          : "border-[var(--color-border)] bg-[var(--color-surface)]"
+      }`}
+    >
+      {prompt.prompt && (
+        <div className={`text-sm font-medium ${visual ? "text-white" : ""}`}>{prompt.prompt}</div>
+      )}
+      {prompt.text && (
+        <div className={`text-sm ${visual ? "text-white/70" : "text-muted-foreground"}`}>
+          {prompt.text}
+        </div>
+      )}
+      {prompt.kind === "until" && prompt.button && (
+        <Button onClick={() => playerRef.current?.continueUntil()}>{prompt.button}</Button>
+      )}
+      {prompt.kind === "react" && prompt.button && (
+        <Button onClick={() => playerRef.current?.react()}>{prompt.button}</Button>
+      )}
+      {prompt.kind === "choice" &&
+        prompt.options?.map((opt, i) => (
+          <Button
+            key={i}
+            variant="outline"
+            className="w-full justify-start"
+            onClick={() => {
+              void logActivity(
+                "script",
+                "choice",
+                JSON.stringify({ id: src, kind: "choice", index: i, label: opt.label }),
+              );
+              playerRef.current?.choose(i);
+            }}
+          >
+            {opt.label ?? `Option ${i + 1}`}
+          </Button>
+        ))}
+      {prompt.kind === "rating" && (
+        <div className="flex flex-wrap gap-2 justify-center">
+          {Array.from({ length: (prompt.max ?? 10) - (prompt.min ?? 1) + 1 }, (_, i) => {
+            const value = (prompt.min ?? 1) + i;
+            return (
+              <Button
+                key={value}
+                variant="outline"
+                size="sm"
+                className="h-8 w-8 p-0"
+                onClick={() => {
+                  void logActivity(
+                    "script",
+                    "choice",
+                    JSON.stringify({ id: src, kind: "rating", value }),
+                  );
+                  playerRef.current?.rate(value);
+                }}
+              >
+                {value}
+              </Button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+
   return (
     <div className="fixed inset-0 z-50 bg-[var(--color-surface)] flex flex-col">
-      {/* <visual> slideshow layer — full-bleed behind the player controls.
-          The header/content column below stays on top (z-10). */}
+      {/* <visual> slideshow layer — truly fullscreen: with a slideshow up,
+          ALL chrome collapses to floating corner controls and a bottom-sheet
+          prompt panel, leaving the visuals unobstructed. */}
       {visual && (
         <VisualStage
           config={visual.config}
@@ -250,132 +336,107 @@ export function AudioPlayerOverlay({ src, onClose, onEnded, variables }: Props) 
           playing={playing}
         />
       )}
-      <div
-        className={`relative z-10 flex items-center justify-between px-4 py-3 border-b ${
-          visual
-            ? "border-transparent bg-black/60 text-white"
-            : "border-[var(--color-border)]"
-        }`}
-      >
-        <div className="text-sm font-semibold truncate">▶ {src}</div>
-        <Button variant="ghost" size="sm" onClick={onClose} aria-label="Close player">
-          <X className="size-4" />
-        </Button>
-      </div>
-      <div
-        className={`relative z-10 flex-1 flex flex-col items-center gap-6 px-6 text-center ${
-          visual ? "justify-start pt-6" : "justify-center"
-        }`}
-      >
-        {phase === "checking" && <Spinner className="size-6" />}
-        {phase === "rendering" && (
-          <div className="flex flex-col items-center gap-3 w-full max-w-sm px-4">
-            <Spinner className="size-6" />
-            <div className="text-sm text-muted-foreground">Rendering audio… {renderLabel}</div>
-            <div className="w-full space-y-1.5">
-              {renderEntry && renderEntry.total > 0 ? (
-                <div className="h-1.5 rounded-full bg-[var(--color-border)] overflow-hidden">
-                  <div
-                    className="h-full rounded-full bg-[var(--color-pink-500)] transition-all duration-200 ease-out"
-                    style={{
-                      width: `${Math.min(
-                        100,
-                        Math.round((renderEntry.step / renderEntry.total) * 100),
-                      )}%`,
-                    }}
-                  />
-                </div>
-              ) : (
-                <div className="h-1.5 rounded-full bg-[var(--color-border)] overflow-hidden">
-                  <div className="h-full w-1/3 rounded-full bg-[var(--color-pink-500)] animate-[render-indeterminate_1.1s_ease-in-out_infinite]" />
-                </div>
-              )}
-              <div className="flex items-center justify-between text-[11px] text-muted-foreground">
-                <span className="tabular-nums">
-                  {renderEntry && renderEntry.total > 0
-                    ? `${renderEntry.step}/${renderEntry.total}`
-                    : ""}
-                </span>
-                {eta != null && (
-                  <span className="tabular-nums">~{formatClock(eta)} left</span>
-                )}
-              </div>
+
+      {visual ? (
+        <>
+          {phase === "ready" && !finished && !playing && (
+            <Button
+              size="lg"
+              onClick={playOrResume}
+              className="absolute left-1/2 top-1/2 z-10 -translate-x-1/2 -translate-y-1/2"
+            >
+              {playLabel}
+            </Button>
+          )}
+          {phase === "ready" && !finished && playing && !prompt && (
+            <button
+              onClick={() => playerRef.current?.pause()}
+              aria-label="Pause"
+              className="absolute bottom-4 right-4 z-20 grid size-10 place-items-center rounded-full bg-black/50 text-white/90 backdrop-blur-sm"
+            >
+              <Pause className="size-4" />
+            </button>
+          )}
+          {phase === "ready" && !finished && prompt && (
+            <div className="absolute inset-x-0 bottom-0 z-10 flex justify-center px-4 pb-5">
+              {promptCard}
             </div>
+          )}
+          {/* Always-available exit, clear of everything. */}
+          <button
+            onClick={onClose}
+            aria-label="Close player"
+            className="absolute right-3 top-3 z-20 grid size-9 place-items-center rounded-full bg-black/50 text-white/90 backdrop-blur-sm"
+          >
+            <X className="size-4" />
+          </button>
+        </>
+      ) : (
+        <>
+          <div className="relative z-10 flex items-center justify-between border-b border-[var(--color-border)] px-4 py-3">
+            <div className="truncate text-sm font-semibold">▶ {src}</div>
+            <Button variant="ghost" size="sm" onClick={onClose} aria-label="Close player">
+              <X className="size-4" />
+            </Button>
           </div>
-        )}
-        {phase === "error" && (
-          <div className="max-w-md text-sm text-[var(--color-danger)]">{error}</div>
-        )}
-        {phase === "ready" && (
-          <>
-            {finished ? (
-              <div className="text-base font-semibold">Finished ✓</div>
-            ) : playing ? (
-              <div className="text-sm text-muted-foreground">Playing…</div>
-            ) : (
-              <Button size="lg" onClick={start}>
-                Play
-              </Button>
+          <div className="relative z-10 flex flex-1 flex-col items-center justify-center gap-6 px-6 text-center">
+            {phase === "checking" && <Spinner className="size-6" />}
+            {phase === "rendering" && (
+              <div className="flex flex-col items-center gap-3 w-full max-w-sm px-4">
+                <Spinner className="size-6" />
+                <div className="text-sm text-muted-foreground">Rendering audio… {renderLabel}</div>
+                <div className="w-full space-y-1.5">
+                  {renderEntry && renderEntry.total > 0 ? (
+                    <div className="h-1.5 rounded-full bg-[var(--color-border)] overflow-hidden">
+                      <div
+                        className="h-full rounded-full bg-[var(--color-pink-500)] transition-all duration-200 ease-out"
+                        style={{
+                          width: `${Math.min(
+                            100,
+                            Math.round((renderEntry.step / renderEntry.total) * 100),
+                          )}%`,
+                        }}
+                      />
+                    </div>
+                  ) : (
+                    <div className="h-1.5 rounded-full bg-[var(--color-border)] overflow-hidden">
+                      <div className="h-full w-1/3 rounded-full bg-[var(--color-pink-500)] animate-[render-indeterminate_1.1s_ease-in-out_infinite]" />
+                    </div>
+                  )}
+                  <div className="flex items-center justify-between text-[11px] text-muted-foreground">
+                    <span className="tabular-nums">
+                      {renderEntry && renderEntry.total > 0
+                        ? `${renderEntry.step}/${renderEntry.total}`
+                        : ""}
+                    </span>
+                    {eta != null && (
+                      <span className="tabular-nums">~{formatClock(eta)} left</span>
+                    )}
+                  </div>
+                </div>
+              </div>
             )}
-            {playing && (
-              <Button variant="outline" size="sm" onClick={() => playerRef.current?.pause()}>
-                Pause
-              </Button>
+            {phase === "error" && (
+              <div className="max-w-md text-sm text-[var(--color-danger)]">{error}</div>
             )}
-            {prompt && (
-              <div className="w-full max-w-md rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] p-4 shadow-sm space-y-3">
-                {prompt.prompt && (
-                  <div className="text-sm font-medium">{prompt.prompt}</div>
-                )}
-                {prompt.text && <div className="text-sm text-muted-foreground">{prompt.text}</div>}
-                {prompt.kind === "until" && prompt.button && (
-                  <Button onClick={() => playerRef.current?.continueUntil()}>
-                    {prompt.button}
+            {phase === "ready" && (
+              <>
+                {finished ? (
+                  <div className="text-base font-semibold">Finished ✓</div>
+                ) : (
+                  <Button
+                    size="lg"
+                    onClick={playing ? () => playerRef.current?.pause() : playOrResume}
+                  >
+                    {playing ? "Pause" : playLabel}
                   </Button>
                 )}
-                {prompt.kind === "react" && prompt.button && (
-                  <Button onClick={() => playerRef.current?.react()}>{prompt.button}</Button>
-                )}
-                {prompt.kind === "choice" &&
-                  prompt.options?.map((opt, i) => (
-                    <Button
-                      key={i}
-                      variant="outline"
-                      className="w-full justify-start"
-                      onClick={() => {
-                        void logActivity("script", "choice", JSON.stringify({ id: src, kind: "choice", index: i, label: opt.label }));
-                        playerRef.current?.choose(i);
-                      }}
-                    >
-                      {opt.label ?? `Option ${i + 1}`}
-                    </Button>
-                  ))}
-                {prompt.kind === "rating" && (
-                  <div className="flex flex-wrap gap-2 justify-center">
-                    {Array.from({ length: (prompt.max ?? 10) - (prompt.min ?? 1) + 1 }, (_, i) => {
-                      const value = (prompt.min ?? 1) + i;
-                      return (
-                        <Button
-                          key={value}
-                          variant="outline"
-                          size="sm"
-                          className="h-8 w-8 p-0"
-                          onClick={() => {
-                            void logActivity("script", "choice", JSON.stringify({ id: src, kind: "rating", value }));
-                            playerRef.current?.rate(value);
-                          }}
-                        >
-                          {value}
-                        </Button>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
+                {promptCard}
+              </>
             )}
-          </>
-        )}
-      </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }
