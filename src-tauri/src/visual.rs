@@ -25,19 +25,28 @@
 //! `agent_data/docs/redgifs-discovery.md` so the writing agent can browse
 //! what exists.
 //!
-//! Resolution happens at PLAYBACK, not render time: the renderer only bakes
-//! the config into the manifest, and the player calls the `visual_fetch`
-//! command to resolve a fresh playlist. That keeps rendered manifests
-//! network-free and gives per-playback variety (same philosophy as
-//! `<random>`/glob includes). Downloaded media is cached on disk under
-//! `<data_dir>/visuals/` (content-addressed by gif id), served to the
-//! WebView by the audio server's `/visuals` mount.
+//! Resolution happens at PLAYBACK, not render time — but a cold fetch
+//! (search + N video downloads) takes long enough that the player would sit
+//! on "Fetching visuals…", so playlists are PREFETCHED like audio: a startup
+//! pass (`visual_prefetch`, invoked from the shell alongside audio prerender)
+//! resolves every distinct `<visual>` config in the agent sandbox into an
+//! on-disk **playlist cache** (`<data_dir>/visuals/playlists/<hash>.json`,
+//! hash of the config). `visual_fetch` serves a fresh playlist instantly from
+//! that cache and kicks a background refresh once it passes half its TTL, so
+//! playback never waits unless a config was never prefetched. Downloaded
+//! media is cached on disk under `<data_dir>/visuals/` (content-addressed by
+//! gif id), served to the WebView by the audio server's `/visuals` mount, and
+//! is shared between configs — overlapping niches dedupe to one download.
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use crate::tag_parser::Node;
 
 /// Source used when `<visual>` declares no `source` attribute.
 pub const DEFAULT_SOURCE: &str = "redgifs";
@@ -277,36 +286,150 @@ pub fn source_by_id(id: &str) -> Option<&'static dyn VisualSource> {
     SOURCES.iter().copied().find(|s| s.id() == id)
 }
 
+// ============================================================================
+// Playlist cache + prefetch (the "prerender" for visuals)
+// ============================================================================
+
+/// How long a cached playlist is served without blocking on the network.
+/// Past half of this, the next fetch also spawns a background refresh so the
+/// pool stays current without ever making playback wait.
+pub const PLAYLIST_TTL: Duration = Duration::from_secs(60 * 60 * 24);
+
+/// Wall-clock cap for ONE cold resolve's download phase. The CDN can be
+/// slow (minutes for a full playlist); rather than making playback wait it
+/// out, a resolve serves whatever landed within the budget (>= 1 slide) and
+/// later refreshes top the playlist up to `count` — already-cached media
+/// costs nothing, so each pass adds more slides.
+pub const FETCH_BUDGET: Duration = Duration::from_secs(35);
+
+/// A slide as stored in a playlist cache: the media FILE NAME (relative to
+/// the visuals cache dir - URLs are rebuilt per serve because the audio
+/// server token rotates per launch), its kind, and the source caption.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedSlide {
+    file: String,
+    kind: SlideKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    caption: Option<String>,
+}
+
+/// One resolved playlist in the cache.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PlaylistEntry {
+    /// Unix seconds of when this playlist was resolved from the source.
+    created_at: u64,
+    slides: Vec<CachedSlide>,
+}
+
+/// Stable id of a visual config: SHA-256 over its canonical JSON (all fields
+/// serialize, so an attribute change -> new hash -> new playlist).
+fn config_hash(cfg: &VisualConfig) -> String {
+    match serde_json::to_vec(cfg) {
+        Ok(bytes) => crate::manifest::hash_bytes(&bytes),
+        Err(_) => String::from("invalid"),
+    }
+}
+
+fn playlist_file(cache_dir: &Path, hash: &str) -> PathBuf {
+    cache_dir.join("playlists").join(format!("{hash}.json"))
+}
+
+fn load_playlist(cache_dir: &Path, hash: &str) -> Option<PlaylistEntry> {
+    let bytes = std::fs::read(playlist_file(cache_dir, hash)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn store_playlist(cache_dir: &Path, hash: &str, entry: &PlaylistEntry) {
+    let file = playlist_file(cache_dir, hash);
+    if let Some(parent) = file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(bytes) = serde_json::to_vec_pretty(entry) {
+        // tmp + rename: a concurrent reader (playback while prefetch runs)
+        // must never see a torn playlist JSON.
+        let tmp = file.with_extension("json.part");
+        if std::fs::write(&tmp, &bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, &file);
+        }
+    }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Resolve a config against its source and convert the result into
 /// frontend-ready slides (absolute URLs on the audio server's `/visuals`
-/// mount). The playlist order is shuffled here so every playback differs.
-/// `cache_dir` is the media cache (`<data_dir>/visuals`); `agent_dir` is
-/// where the discovery snapshot's agent-readable doc is written.
+/// mount). Serves from the playlist cache whenever possible so playback
+/// never waits on the network; cold and stale cases resolve (and refresh)
+/// as described in the module docs. `cache_dir` is the media cache
+/// (`<data_dir>/visuals`); `agent_dir` is where the discovery snapshot's
+/// agent-readable doc is written.
 pub fn fetch_playlist(
     cfg: &VisualConfig,
     cache_dir: &Path,
     agent_dir: &Path,
     base_url: &str,
 ) -> Result<Vec<VisualSlide>> {
-    let source = source_by_id(&cfg.source)
-        .ok_or_else(|| anyhow!("unknown visual source '{}'", cfg.source))?;
     std::fs::create_dir_all(cache_dir)
         .with_context(|| format!("creating visual cache dir {}", cache_dir.display()))?;
+    let hash = config_hash(cfg);
+    let now = now_secs();
+
+    if let Some(entry) = load_playlist(cache_dir, &hash) {
+        let all_exist = entry
+            .slides
+            .iter()
+            .all(|s| cache_dir.join(&s.file).is_file());
+        if all_exist {
+            let age = now.saturating_sub(entry.created_at);
+            let complete = (entry.slides.len() as u32) >= cfg.count;
+            if age < PLAYLIST_TTL.as_secs() / 2 {
+                if !complete {
+                    // A previous resolve hit the fetch budget — top the
+                    // playlist up in the background (cached media is free,
+                    // so the next pass gathers fresh slides).
+                    spawn_refresh(
+                        cfg.clone(),
+                        cache_dir.to_path_buf(),
+                        agent_dir.to_path_buf(),
+                    );
+                }
+                return Ok(serve_playlist(&entry.slides, base_url));
+            }
+            // Fresh enough to serve, old enough to refresh in the background
+            // so the NEXT playback gets a current pool.
+            spawn_refresh(
+                cfg.clone(),
+                cache_dir.to_path_buf(),
+                agent_dir.to_path_buf(),
+            );
+            return Ok(serve_playlist(&entry.slides, base_url));
+        }
+        // Media files vanished (GC'd/deleted) - fall through and re-resolve.
+    }
+
+    let slides = resolve_and_store(cfg, cache_dir, agent_dir)?;
+    Ok(serve_playlist(&slides, base_url))
+}
+
+/// Search + download for one config, then store the playlist cache.
+/// Blocking; the cold path of [`fetch_playlist`] and the whole of
+/// [`prefetch_all`] run it on worker threads.
+fn resolve_and_store(
+    cfg: &VisualConfig,
+    cache_dir: &Path,
+    agent_dir: &Path,
+) -> Result<Vec<CachedSlide>> {
+    let source = source_by_id(&cfg.source)
+        .ok_or_else(|| anyhow!("unknown visual source '{}'", cfg.source))?;
     // Best-effort discovery refresh (cached for a day): drives niche
     // validation and keeps the agent's browsing doc current.
     let discovery = refresh_discovery(cache_dir, DISCOVERY_TTL);
-    let mut assets = source.fetch(cfg, cache_dir, discovery.as_ref())?;
-    if let Some(disc) = &discovery {
-        let unknown = unknown_niches(cfg, Some(disc));
-        if !unknown.is_empty() {
-            log::warn!(
-                "<visual> niches not known to source '{}': {} (see docs/redgifs-discovery.md)",
-                cfg.source,
-                unknown.join(", ")
-            );
-        }
-    }
-    write_agent_doc(agent_dir, discovery.as_ref());
+    let assets = source.fetch(cfg, cache_dir, discovery.as_ref())?;
     if assets.is_empty() {
         bail!(
             "visual source '{}' returned no results (niches: {:?}, tags: {:?}, query: {:?})",
@@ -316,15 +439,205 @@ pub fn fetch_playlist(
             cfg.query
         );
     }
-    shuffle(&mut assets);
-    Ok(assets
-        .into_iter()
-        .map(|a| VisualSlide {
-            url: slide_url(base_url, &a.file),
+    let slides: Vec<CachedSlide> = assets
+        .iter()
+        .map(|a| CachedSlide {
+            file: a
+                .file
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default(),
             kind: a.kind,
-            caption: a.caption,
+            caption: a.caption.clone(),
         })
-        .collect())
+        .collect();
+    store_playlist(
+        cache_dir,
+        &config_hash(cfg),
+        &PlaylistEntry {
+            created_at: now_secs(),
+            slides: slides.clone(),
+        },
+    );
+    write_agent_doc(agent_dir, discovery.as_ref());
+    Ok(slides)
+}
+
+/// Turn cached slides into servable URLs. Shuffled here (not at resolve
+/// time) so even a cached pool plays in a fresh order every listen.
+fn serve_playlist(slides: &[CachedSlide], base_url: &str) -> Vec<VisualSlide> {
+    let mut slides: Vec<CachedSlide> = slides.to_vec();
+    shuffle(&mut slides);
+    slides
+        .into_iter()
+        .map(|s| VisualSlide {
+            url: slide_url(base_url, Path::new(&s.file)),
+            kind: s.kind,
+            caption: s.caption,
+        })
+        .collect()
+}
+
+/// Detached worker that re-resolves one config's playlist into the cache.
+/// Failures are logged, never surfaced - the serving copy stays valid.
+fn spawn_refresh(cfg: VisualConfig, cache_dir: PathBuf, agent_dir: PathBuf) {
+    std::thread::spawn(move || {
+        if let Err(e) = resolve_and_store(&cfg, &cache_dir, &agent_dir) {
+            log::warn!(
+                "visual playlist refresh failed ({}): {e:#}",
+                describe_config(&cfg)
+            );
+        }
+    });
+}
+
+/// Startup/on-demand prefetch: resolve every DISTINCT `<visual>` config in
+/// the agent sandbox into the playlist cache, so playback never hits the
+/// cold path. Mirrors the audio prerender pass; failures are per-config and
+/// collected, never fatal.
+pub fn prefetch_all(cache_dir: &Path, agent_dir: &Path) -> PrefetchReport {
+    let mut report = PrefetchReport::default();
+    let configs = collect_configs_in_agent_dir(agent_dir);
+    report.configs = configs.len();
+    let mut seen: HashSet<String> = HashSet::new();
+    for cfg in configs {
+        let hash = config_hash(&cfg);
+        if !seen.insert(hash.clone()) {
+            continue; // duplicate config elsewhere in the sandbox
+        }
+        // Already warm, fresh AND complete -> nothing to do.
+        if let Some(entry) = load_playlist(cache_dir, &hash) {
+            let age = now_secs().saturating_sub(entry.created_at);
+            let complete = (entry.slides.len() as u32) >= cfg.count;
+            if age < PLAYLIST_TTL.as_secs() / 2
+                && complete
+                && entry
+                    .slides
+                    .iter()
+                    .all(|s| cache_dir.join(&s.file).is_file())
+            {
+                continue;
+            }
+        }
+        match resolve_and_store(&cfg, cache_dir, agent_dir) {
+            Ok(_) => report.prefetched += 1,
+            Err(e) => {
+                report.failed += 1;
+                report
+                    .errors
+                    .push(format!("{}: {:#}", describe_config(&cfg), e));
+            }
+        }
+    }
+    report
+}
+
+/// Agent-facing summary of a prefetch pass.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct PrefetchReport {
+    /// Distinct `<visual>` configs found in the sandbox.
+    pub configs: usize,
+    /// Configs (re)resolved this pass.
+    pub prefetched: usize,
+    /// Configs whose resolution failed.
+    pub failed: usize,
+    /// Per-config failure messages.
+    pub errors: Vec<String>,
+}
+
+fn describe_config(cfg: &VisualConfig) -> String {
+    let mut parts = Vec::new();
+    if !cfg.niches.is_empty() {
+        parts.push(format!("niche={}", cfg.niches.join("+")));
+    }
+    if !cfg.tags.is_empty() {
+        parts.push(format!("tags={}", cfg.tags.join("+")));
+    }
+    if let Some(q) = &cfg.query {
+        parts.push(format!("query={q}"));
+    }
+    if parts.is_empty() {
+        parts.push("unfiltered".to_string());
+    }
+    parts.join(" ")
+}
+
+/// Collect every `<visual>` config authored in the agent sandbox (recursive
+/// `.xml` scan, cheap substring gate before parsing).
+pub fn collect_configs_in_agent_dir(agent_dir: &Path) -> Vec<VisualConfig> {
+    let mut out = Vec::new();
+    let mut stack = vec![agent_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("xml") {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if !content.contains("<visual") {
+                continue;
+            }
+            if let Ok(nodes) = crate::tag_parser::parse(&content) {
+                collect_configs(&nodes, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// Gather the `<visual>` configs of an AST, at any depth.
+pub fn collect_configs(nodes: &[Node], out: &mut Vec<VisualConfig>) {
+    for node in nodes {
+        match node {
+            Node::Visual { config, children } => {
+                out.push(config.clone());
+                collect_configs(children, out);
+            }
+            Node::Voice { children, .. }
+            | Node::Speed { children, .. }
+            | Node::Volume { children, .. }
+            | Node::Effect { children, .. }
+            | Node::Background { children, .. }
+            | Node::Until { children, .. }
+            | Node::Loop { children, .. }
+            | Node::Section { children, .. }
+            | Node::Beatmeter { children, .. } => collect_configs(children, out),
+            Node::If {
+                then_branch,
+                r#else,
+                ..
+            } => {
+                collect_configs(then_branch, out);
+                if let Some(else_nodes) = r#else {
+                    collect_configs(else_nodes, out);
+                }
+            }
+            Node::Overlay { parts, .. }
+            | Node::Random { parts }
+            | Node::Scramble { parts }
+            | Node::Choice { options: parts, .. }
+            | Node::React { parts, .. } => {
+                for part in parts {
+                    collect_configs(&part.children, out);
+                }
+            }
+            Node::Text(_)
+            | Node::Pause { .. }
+            | Node::Sound { .. }
+            | Node::Tone { .. }
+            | Node::Rating { .. }
+            | Node::Include { .. } => {}
+        }
+    }
 }
 
 fn shuffle<T>(slice: &mut [T]) {
@@ -415,6 +728,7 @@ impl VisualSource for RedgifsSource {
     ) -> Result<Vec<SlideAsset>> {
         let http = reqwest::blocking::Client::builder()
             .user_agent(REDGIFS_UA)
+            .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
             .build()
             .context("building HTTP client")?;
@@ -494,26 +808,48 @@ impl VisualSource for RedgifsSource {
             .unwrap_or_default();
 
         let block: Vec<String> = cfg.block.iter().map(|t| canonical_tag(t)).collect();
-        let mut slides = Vec::new();
-        for gif in gifs {
-            if slides.len() >= want as usize {
-                break;
+        let candidates: Vec<&GifStub> = gifs
+            .iter()
+            .filter(|g| !g.tags.iter().any(|t| block.contains(&canonical_tag(t))))
+            .collect();
+
+        // Download in parallel — sequential mp4 fetches were why a cold
+        // playlist could sit for minutes. A handful of workers pull from a
+        // shared cursor until `want` slides are in or candidates run out.
+        let results: Mutex<Vec<SlideAsset>> = Mutex::new(Vec::new());
+        let cursor = AtomicUsize::new(0);
+        let workers = candidates.len().min(4).max(1);
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| loop {
+                    let full = results
+                        .lock()
+                        .map(|r| r.len() >= want as usize)
+                        .unwrap_or(true);
+                    if full {
+                        return;
+                    }
+                    let i = cursor.fetch_add(1, Ordering::SeqCst);
+                    if i >= candidates.len() {
+                        return;
+                    }
+                    let gif = candidates[i];
+                    match download_slide(&http, &token, gif, cache_dir) {
+                        Ok(Some(slide)) => {
+                            if let Ok(mut r) = results.lock() {
+                                if r.len() < want as usize {
+                                    r.push(slide);
+                                }
+                            }
+                        }
+                        // Skipped (unsupported/failed download) — keep going.
+                        Ok(None) => {}
+                        Err(e) => log::warn!("redgifs slide {} skipped: {e:#}", gif.id),
+                    }
+                });
             }
-            let blocked = gif
-                .tags
-                .iter()
-                .any(|t| block.contains(&canonical_tag(t)));
-            if blocked {
-                continue;
-            }
-            match download_slide(&http, &token, &gif, cache_dir) {
-                Ok(Some(slide)) => slides.push(slide),
-                // Skipped (unsupported/failed download) — keep going.
-                Ok(None) => {}
-                Err(e) => log::warn!("redgifs slide {} skipped: {e:#}", gif.id),
-            }
-        }
-        Ok(slides)
+        });
+        Ok(results.into_inner().unwrap_or_default())
     }
 }
 
@@ -551,7 +887,7 @@ fn download_slide(
             .get(url.as_str())
             .bearer_auth(token)
             .header("Referer", REDGIFS_REFERER)
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_secs(60))
             .send()
             .with_context(|| format!("downloading {}", url.as_str()))?;
         if !resp.status().is_success() {
@@ -720,7 +1056,11 @@ pub fn refresh_discovery(cache_dir: &Path, max_age: Duration) -> Option<Discover
         Some(disc) => {
             if let Ok(bytes) = serde_json::to_vec_pretty(&disc) {
                 let _ = std::fs::create_dir_all(cache_dir);
-                let _ = std::fs::write(discovery_file(cache_dir), &bytes);
+                let file = discovery_file(cache_dir);
+                let tmp = file.with_extension("json.part");
+                if std::fs::write(&tmp, &bytes).is_ok() {
+                    let _ = std::fs::rename(&tmp, &file);
+                }
             }
             Some(disc)
         }
@@ -929,9 +1269,113 @@ mod tests {
         c.order = Some("recent".into());
         let mut errors = Vec::new();
         c.validate_into(&mut errors);
-        assert!(errors.iter().any(|e| e.contains("Unknown order")), "{errors:?}");
+        assert!(
+            errors.iter().any(|e| e.contains("Unknown order")),
+            "{errors:?}"
+        );
     }
 
+    #[test]
+    fn test_config_hash_stable_and_discriminating() {
+        let a = cfg();
+        let mut b = cfg();
+        assert_eq!(config_hash(&a), config_hash(&b));
+        b.count = 24;
+        assert_ne!(config_hash(&a), config_hash(&b));
+        b = cfg();
+        b.tags = vec!["other".into()];
+        assert_ne!(config_hash(&a), config_hash(&b));
+    }
+
+    #[test]
+    fn test_playlist_roundtrip_and_serve() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path();
+        let cfg = cfg();
+        let hash = config_hash(&cfg);
+        assert!(load_playlist(cache_dir, &hash).is_none());
+
+        let slides = vec![
+            CachedSlide {
+                file: "abc.mp4".into(),
+                kind: SlideKind::Video,
+                caption: Some("watch".into()),
+            },
+            CachedSlide {
+                file: "def.jpg".into(),
+                kind: SlideKind::Image,
+                caption: None,
+            },
+        ];
+        store_playlist(
+            cache_dir,
+            &hash,
+            &PlaylistEntry {
+                created_at: now_secs(),
+                slides: slides.clone(),
+            },
+        );
+        let loaded = load_playlist(cache_dir, &hash).unwrap();
+        assert_eq!(loaded.slides.len(), 2);
+        assert_eq!(loaded.slides[0].file, "abc.mp4");
+
+        // Serve rebuilds /visuals URLs (token query preserved) and shuffles;
+        // with one slide the order is trivially stable.
+        let served = serve_playlist(&slides, "http://127.0.0.1:5?t=tok");
+        assert_eq!(served.len(), 2);
+        assert!(served.iter().all(
+            |s| s.url.starts_with("http://127.0.0.1:5/visuals/") && s.url.ends_with("?t=tok"),
+        ));
+    }
+
+    /// Live smoke: one cold resolve against the real RedGIFs API, then a
+    /// serve-from-cache pass. Run manually: `cargo test --lib
+    /// prefetch_live_smoke -- --ignored` (needs network).
+    #[test]
+    #[ignore]
+    fn prefetch_live_smoke() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("visuals");
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(agent_dir.join("hypnos")).unwrap();
+        std::fs::write(
+            agent_dir.join("hypnos/vis.xml"),
+            "<visual tags=\"hypno\" count=\"4\"><voice>watch</voice></visual>",
+        )
+        .unwrap();
+
+        // The startup pass parses the sandbox and resolves the config.
+        let started = std::time::Instant::now();
+        let report = prefetch_all(&cache_dir, &agent_dir);
+        eprintln!(
+            "prefetch: {:?} in {:?}",
+            (report.configs, report.prefetched, report.failed),
+            started.elapsed()
+        );
+        assert_eq!(report.configs, 1);
+        assert_eq!(report.failed, 0, "{}", report.errors.join("; "));
+
+        // Playback then serves from the playlist cache.
+        let mut configs = collect_configs_in_agent_dir(&agent_dir);
+        assert_eq!(configs.len(), 1);
+        let slides = fetch_playlist(
+            &configs.remove(0),
+            &cache_dir,
+            &agent_dir,
+            "http://127.0.0.1:1?t=x",
+        )
+        .unwrap();
+        eprintln!("served {} slides", slides.len());
+        assert!(!slides.is_empty());
+        for s in &slides {
+            let name = s.url.rsplit('/').next().unwrap().split('?').next().unwrap();
+            assert!(cache_dir.join(name).is_file(), "missing {name}");
+        }
+
+        // A second pass finds the config warm-or-tops-up, never errors.
+        let again = prefetch_all(&cache_dir, &agent_dir);
+        assert_eq!(again.failed, 0, "{}", again.errors.join("; "));
+    }
     #[test]
     fn test_agent_doc_render() {
         let disc = Discovery {

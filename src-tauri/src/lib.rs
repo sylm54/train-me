@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -884,6 +885,28 @@ fn read_manifest(manifest_path: String) -> Result<serde_json::Value, String> {
 /// (cached a day) and mirrors it into the agent sandbox's
 /// `docs/redgifs-discovery.md`. Runs on a blocking thread (the source client
 /// is synchronous reqwest, like the model downloader).
+/// Prefetch every distinct `<visual>` config in the agent sandbox into the
+/// playlist cache (the visual analogue of audio prerender): search + media
+/// downloads happen now, so playback serves from cache instantly. Safe to
+/// call repeatedly - fresh playlists are skipped - and a pass already
+/// running short-circuits later calls.
+#[tauri::command]
+async fn visual_prefetch(state: State<'_, AppState>) -> Result<visual::PrefetchReport, String> {
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    if RUNNING.swap(true, Ordering::SeqCst) {
+        return Ok(visual::PrefetchReport::default());
+    }
+    let cache_dir = state.data_dir.join("visuals");
+    let agent_dir = state.agent_dir.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        visual::prefetch_all(&cache_dir, &agent_dir)
+    })
+    .await
+    .map_err(|e| format!("visual prefetch task failed: {e}"));
+    RUNNING.store(false, Ordering::SeqCst);
+    result
+}
+
 #[tauri::command]
 async fn visual_fetch(
     config: visual::VisualConfig,
@@ -1808,6 +1831,7 @@ pub fn run() {
             delete_manifest,
             // <visual> slideshow playlist resolution (playback-time)
             visual_fetch,
+            visual_prefetch,
             // Debug: export all conditioning scripts (+ includes) as a zip
             export_scripts_zip,
             // Full backup: export all data (except the TTS model) as a zip
