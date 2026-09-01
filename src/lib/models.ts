@@ -87,7 +87,15 @@ export const MODEL_CATALOG: Record<ProviderName, ProviderCatalog> = {
   },
   openai: {
     label: "OpenAI",
-    models: [],
+    models: [
+      {
+        id: "gpt-4",
+        name: "GPT-4",
+        description: "This is a placeholder, for a custom OpenAI endpoint you need to configure your own model.",
+        price: "$0.03 in / $0.06 out per 1K tokens",
+        contextWindow: 8_192,
+      }
+    ],
   },
 };
 
