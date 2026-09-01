@@ -186,6 +186,26 @@ export function VisualStage({ config, slides, error, playing }: VisualStageProps
         );
       })}
 
+            {/* Fetch / result states render FIRST so the caption + scrims below
+          paint above them - authored captions show even while slides load. */}
+      {slides === null && !error && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/80">
+          <Spinner className="size-6" />
+          <div className="text-sm text-white/80">Fetching visuals…</div>
+        </div>
+      )}
+      {error && (
+        <div className="absolute inset-x-0 bottom-20 flex justify-center">
+          <div className="rounded-md bg-black/70 px-3 py-1.5 text-xs text-white/80">
+            {error}
+          </div>
+        </div>
+      )}
+      {slides !== null && !error && count === 0 && (
+        <div className="absolute inset-0 flex items-center justify-center bg-black/80">
+          <div className="text-sm text-white/80">No visuals found for this script.</div>
+        </div>
+      )}
       {/* Per-switch effects (keyed by index so they restart each slide) */}
       {flash && (
         <div
@@ -227,25 +247,6 @@ export function VisualStage({ config, slides, error, playing }: VisualStageProps
         </>
       )}
 
-      {/* Fetch / result states (non-blocking overlays) */}
-      {slides === null && !error && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/80">
-          <Spinner className="size-6" />
-          <div className="text-sm text-white/80">Fetching visuals…</div>
-        </div>
-      )}
-      {error && (
-        <div className="absolute inset-x-0 bottom-20 flex justify-center">
-          <div className="rounded-md bg-black/70 px-3 py-1.5 text-xs text-white/80">
-            {error}
-          </div>
-        </div>
-      )}
-      {slides !== null && !error && count === 0 && (
-        <div className="absolute inset-0 flex items-center justify-center bg-black/80">
-          <div className="text-sm text-white/80">No visuals found for this script.</div>
-        </div>
-      )}
     </div>
   );
 }
@@ -261,13 +262,14 @@ function drawInterval(config: VisualConfig): number {
  * Resolve the caption for slide `index`: authored `<caption>` lines cycle
  * first; otherwise the slide's own caption when `captions="meta"`.
  */
-function pickCaption(
+export function pickCaption(
   config: VisualConfig,
   lines: string[],
   slides: VisualSlide[] | null,
   index: number,
 ): string | null {
-  if (config.captions === "off") return null;
+  // Authored <caption> lines always win - the author wrote them to be seen
+  // (captions="off" only suppresses the source's own captions).
   if (lines.length > 0) return lines[index % lines.length] ?? null;
   if (config.captions === "meta") {
     const slide = slides?.[index % Math.max(1, slides?.length ?? 1)];
