@@ -105,7 +105,8 @@ fn open(db_path: &Path) -> Result<Connection, String> {
 // ============================================================================
 
 fn utc_now() -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc::now()
+    // Engine clock = wall clock + debug offset (always 0 in release).
+    crate::debug_time::now()
 }
 
 fn ts(dt: chrono::DateTime<chrono::Utc>) -> String {
@@ -785,7 +786,7 @@ pub fn build_run_context(
     use chrono::{Datelike, Timelike};
 
     let mut vars = serde_json::Map::new();
-    let local = chrono::Local::now();
+    let local = crate::debug_time::now().with_timezone(&chrono::Local);
     const DAYS: [&str; 7] = [
         "sunday",
         "monday",
@@ -1598,6 +1599,22 @@ pub struct StoreCard {
     pub audio: Vec<String>,
 }
 
+/// One routine occurrence on the Today view's day timeline.
+#[derive(Serialize, Clone)]
+pub struct TimelineItem {
+    /// Routine path (back-reference to the card list).
+    pub container: String,
+    pub title: String,
+    pub occurrence: String,
+    pub due: String,
+    pub window_end: String,
+    /// `pending | in_progress | completed | failed | lapsed | lapsed-exempt`
+    pub status: String,
+    /// Ad-hoc (on-demand) start rather than a scheduled fire — rendered as
+    /// activity history, not as a timetable slot.
+    pub adhoc: bool,
+}
+
 /// Script paths referenced by a container's pages and action lists,
 /// deduped — the summary cards expose them so the UI can offer prerender
 /// without starting anything.
@@ -1623,6 +1640,8 @@ pub struct V2Summary {
     pub habits: Vec<HabitCard>,
     pub tasks: Vec<TaskCard>,
     pub store: Vec<StoreCard>,
+    /// Routine occurrences overlapping today (local day) — the timeline.
+    pub timeline: Vec<TimelineItem>,
 }
 
 #[tauri::command]
@@ -1638,10 +1657,14 @@ pub async fn v2_summary(state: State<'_, AppState>) -> Result<V2Summary, String>
 
         // Routines.
         let mut routines = Vec::new();
+        // Titles for the timeline's occurrence → routine join.
+        let mut titles: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         for (rel, content) in list_v2_files(&agent_dir, "routines", ".md") {
             let Some(routine) = format::parse_routine(&content).0 else {
                 continue;
             };
+            titles.insert(rel.clone(), routine.title.clone());
             let query = |sql: &str, params: &[&dyn rusqlite::ToSql]| -> Option<DueInfo> {
                 sched
                     .query_row(sql, params, |r| {
@@ -1802,6 +1825,63 @@ pub async fn v2_summary(state: State<'_, AppState>) -> Result<V2Summary, String>
             });
         }
 
+        // Timeline: every routine occurrence whose window overlaps today's
+        // local day (completed/lapsed history included — the timetable shows
+        // the whole day, not just what's still open). Ad-hoc on-demand starts
+        // ride along, flagged so the UI renders them as activity markers.
+        let timeline = {
+            use chrono::TimeZone;
+            let day = chrono::NaiveDate::parse_from_str(&today, "%Y-%m-%d").ok();
+            let (day_start, day_end) = day
+                .map(|d| {
+                    let s = chrono::Local
+                        .from_local_datetime(&d.and_hms_opt(0, 0, 0).unwrap())
+                        .single()
+                        .map(|s| s.with_timezone(&chrono::Utc))
+                        .unwrap_or_else(utc_now);
+                    (s, s + chrono::Duration::days(1))
+                })
+                .unwrap_or((now - chrono::Duration::hours(12), now + chrono::Duration::hours(12)));
+            let mut items: Vec<TimelineItem> = Vec::new();
+            if let Ok(mut stmt) = sched.prepare(
+                "SELECT container, due, window_end, status, id FROM occurrences \
+                 WHERE kind = 'routine' AND due < ?1 AND window_end > ?2 \
+                 ORDER BY due ASC, container ASC",
+            ) {
+                let rows = stmt.query_map(
+                    rusqlite::params![ts(day_end), ts(day_start)],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                        ))
+                    },
+                );
+                if let Ok(rows) = rows {
+                    for (container, due, window_end, status, id) in rows.flatten() {
+                        let title = titles
+                            .get(&container)
+                            .cloned()
+                            .unwrap_or_else(|| container.clone());
+                        let adhoc = id.contains(":adhoc:");
+                        items.push(TimelineItem {
+                            container,
+                            title,
+                            occurrence: id,
+                            due,
+                            window_end,
+                            status,
+                            adhoc,
+                        });
+                    }
+                }
+            }
+            items
+        };
+
         Ok(V2Summary {
             balance: economy::balance(&econ)?,
             exemptions: economy::active_exemptions(&econ)?,
@@ -1811,6 +1891,7 @@ pub async fn v2_summary(state: State<'_, AppState>) -> Result<V2Summary, String>
             habits,
             tasks,
             store,
+            timeline,
         })
     })
     .await

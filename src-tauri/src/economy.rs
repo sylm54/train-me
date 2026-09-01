@@ -89,7 +89,8 @@ pub fn open_ro(db_path: &Path) -> Option<Connection> {
 }
 
 pub fn now_ts() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    // Engine clock = wall clock + debug offset (always 0 in release).
+    crate::debug_time::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 pub fn ts_at(dt: chrono::DateTime<chrono::Utc>) -> String {
@@ -237,11 +238,11 @@ pub fn stock_for(
                         |r| r.get(0),
                     )
                     .map_err(|e| e.to_string())?;
-                let last_dt = parse_ts(&last).unwrap_or_else(chrono::Utc::now);
+                let last_dt = parse_ts(&last).unwrap_or_else(crate::debug_time::now);
                 let Some(next) = schedule.after(&last_dt).next() else {
                     break;
                 };
-                if next > chrono::Utc::now() {
+                if next > crate::debug_time::now() {
                     break;
                 }
                 conn.execute(

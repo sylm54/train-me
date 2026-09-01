@@ -32,6 +32,7 @@ import {
   Send,
   Server,
   Sparkles,
+  Timer,
 } from "lucide-react";
 import { useSettings, STORAGE_KEY } from "@/lib/settings";
 import { loadMeta, loadMessages, clearAllChats } from "@/lib/chatStore";
@@ -72,6 +73,14 @@ import {
 import { ModelPicker } from "@/components/ModelPicker";
 import { FrameworkOptionsList } from "@/components/FrameworkOptions";
 import { loadPrompt } from "@/lib/prompts";
+import {
+  debugGrantPoints,
+  debugSetTimeOffset,
+  debugTimeState,
+  debugToolsEnabled,
+  humanDuration,
+  type DebugTimeState,
+} from "@/lib/v2";
 import {
   ensureGlobalListener,
   estimateRemainingMs,
@@ -164,6 +173,9 @@ export function SettingsView() {
   const [promptBusy, setPromptBusy] = useState(false);
   const [promptError, setPromptError] = useState<string | null>(null);
 
+  // Debug tooling availability (debug builds only — time machine etc.)
+  const [debugTools, setDebugTools] = useState(false);
+
   useEffect(() => {
     invoke<ModelStatus>("get_model_status")
       .then(setModelStatus)
@@ -180,6 +192,9 @@ export function SettingsView() {
         setChoices(defaultChoices(fw.config));
       }
     });
+    debugToolsEnabled()
+      .then(setDebugTools)
+      .catch(() => {});
   }, []);
 
   const flashSave = () => {
@@ -748,6 +763,9 @@ export function SettingsView() {
 
           {debugOpen && (
             <div className="space-y-3">
+              {/* ── Time machine (debug builds only) ── */}
+              {debugTools && <DebugTimeCard />}
+
               <div className="flex items-center justify-between">
                 <p className="text-xs text-[var(--color-muted-foreground)]">
                   System prompts sent to each agent. Rendered shows the
@@ -1686,6 +1704,158 @@ function FileTreeNode({
             </p>
           )}
         </>
+      )}
+    </div>
+  );
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Debug time machine (debug builds only — see debug_time.rs)
+// ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * Shift the engine clock forward/backward to force routine due-windows,
+ * lapses, habit-day rollovers, and store restocks without waiting. Each
+ * skip runs the same `reconcile_schedule` the app performs on view open,
+ * so effects always apply through the normal engine path.
+ */
+function DebugTimeCard() {
+  const [state, setState] = useState<DebugTimeState | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [grantDelta, setGrantDelta] = useState("50");
+  const [grantBusy, setGrantBusy] = useState(false);
+
+  useEffect(() => {
+    debugTimeState()
+      .then(setState)
+      .catch(() => {});
+  }, []);
+
+  const skip = async (secs: number) => {
+    setBusy(true);
+    setError(null);
+    try {
+      setState(await debugSetTimeOffset(secs));
+      await invoke("reconcile_schedule");
+    } catch (e) {
+      setError(tauriErrorToString(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const grant = async () => {
+    const delta = parseInt(grantDelta, 10);
+    if (Number.isNaN(delta) || delta === 0) return;
+    setGrantBusy(true);
+    setError(null);
+    try {
+      await debugGrantPoints(delta);
+    } catch (e) {
+      setError(tauriErrorToString(e));
+    } finally {
+      setGrantBusy(false);
+    }
+  };
+
+  const offset = state?.offset_secs ?? 0;
+  const deltas: { label: string; secs: number }[] = [
+    { label: "−1h", secs: -3600 },
+    { label: "−15m", secs: -900 },
+    { label: "+15m", secs: 900 },
+    { label: "+1h", secs: 3600 },
+    { label: "+3h", secs: 3 * 3600 },
+    { label: "+1d", secs: 24 * 3600 },
+  ];
+
+  return (
+    <div className="rounded-lg border border-dashed border-[var(--color-pink-400)] bg-[var(--color-surface)] p-3 space-y-2.5">
+      <div className="flex items-center gap-2">
+        <Timer size={14} className="text-[var(--color-pink-700)]" />
+        <h3 className="text-xs font-semibold uppercase tracking-wider">
+          Time machine
+        </h3>
+        <span className="text-[10px] text-[var(--color-muted-foreground)]">
+          debug builds only
+        </span>
+      </div>
+
+      <p className="text-xs text-[var(--color-muted-foreground)]">
+        Shifts the engine clock (schedules, lapses, habit days) without
+        touching real wall time. Reconciles after every skip.
+      </p>
+
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+        <span>
+          Engine:{" "}
+          <span className="font-semibold tabular-nums">
+            {state
+              ? new Date(state.engine_now).toLocaleString(undefined, {
+                  weekday: "short",
+                  month: "short",
+                  day: "numeric",
+                  hour: "2-digit",
+                  minute: "2-digit",
+                })
+              : "…"}
+          </span>
+        </span>
+        <span
+          className={`tabular-nums ${
+            offset !== 0 ? "text-[var(--color-pink-700)] font-semibold" : "text-[var(--color-muted-foreground)]"
+          }`}
+        >
+          {offset === 0
+            ? "real time"
+            : `${offset > 0 ? "+" : "−"}${humanDuration(Math.abs(offset))}`}
+        </span>
+      </div>
+
+      <div className="flex flex-wrap gap-1.5">
+        {deltas.map((d) => (
+          <button
+            key={d.label}
+            disabled={busy}
+            onClick={() => void skip(offset + d.secs)}
+            className="px-2.5 py-1.5 text-xs rounded-md border border-[var(--color-border)] hover:bg-[var(--color-pink-50)] disabled:opacity-50 tabular-nums"
+          >
+            {d.label}
+          </button>
+        ))}
+        <button
+          disabled={busy || offset === 0}
+          onClick={() => void skip(0)}
+          className="px-2.5 py-1.5 text-xs rounded-md border border-[var(--color-pink-400)] text-[var(--color-pink-700)] hover:bg-[var(--color-pink-50)] disabled:opacity-50"
+        >
+          Real time
+        </button>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-1.5 pt-1 border-t border-[var(--color-border)]">
+        <span className="text-xs text-[var(--color-muted-foreground)]">
+          Points
+        </span>
+        <input
+          value={grantDelta}
+          onChange={(e) => setGrantDelta(e.target.value)}
+          inputMode="numeric"
+          className="w-20 px-2 py-1 text-xs rounded-md border border-[var(--color-input)] bg-transparent"
+        />
+        <button
+          disabled={grantBusy}
+          onClick={() => void grant()}
+          className="px-2.5 py-1.5 text-xs rounded-md border border-[var(--color-border)] hover:bg-[var(--color-pink-50)] disabled:opacity-50"
+        >
+          Grant / deduct
+        </button>
+        <span className="text-[10px] text-[var(--color-muted-foreground)]">
+          negative values deduct
+        </span>
+      </div>
+
+      {error && (
+        <p className="text-xs text-[var(--color-danger)]">{error}</p>
       )}
     </div>
   );
