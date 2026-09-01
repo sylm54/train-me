@@ -13,7 +13,14 @@ import { invoke } from "@tauri-apps/api/core";
 import { X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
-import { ManifestPlayer, type ActivePrompt, type Segment } from "@/lib/manifestPlayer";
+import {
+  ManifestPlayer,
+  type ActivePrompt,
+  type Segment,
+  type VisualConfig,
+  type VisualSlide,
+} from "@/lib/manifestPlayer";
+import { VisualStage } from "@/components/VisualStage";
 import { logActivity } from "@/lib/activity";
 import { setAudioBusy } from "@/lib/audioBus";
 import {
@@ -64,9 +71,16 @@ export function AudioPlayerOverlay({ src, onClose, onEnded, variables }: Props) 
   const [prompt, setPrompt] = useState<ActivePrompt | null>(null);
   const [finished, setFinished] = useState(false);
   const [envVars, setEnvVars] = useState<Record<string, string | number | boolean> | null>(null);
+  const [visual, setVisual] = useState<{
+    config: VisualConfig;
+    slides: VisualSlide[] | null;
+    error: string | null;
+  } | null>(null);
   const playerRef = useRef<ManifestPlayer | null>(null);
   const rootRef = useRef<Segment | null>(null);
   const endedFired = useRef(false);
+  /** JSON of the visual config currently loaded — dedupes loop re-entries. */
+  const visualKeyRef = useRef<string | null>(null);
   // App-wide render entry for this script (seeded by markStart below) —
   // drives the progress bar + time-remaining readout while rendering.
   const renderEntry = useRenderStore().get(src) ?? null;
@@ -146,6 +160,33 @@ export function AudioPlayerOverlay({ src, onClose, onEnded, variables }: Props) 
     };
   }, [src, fail]);
 
+  /**
+   * `<visual>` scope notifications from the player. The slideshow itself is
+   * resolved per playback: entering a scope fetches a fresh playlist from
+   * the visual source (network, cached on disk). Identical consecutive
+   * configs (a visual inside a looped `<main>`) reuse the running stage.
+   */
+  const handleVisual = useCallback((config: VisualConfig | null) => {
+    if (!config) {
+      visualKeyRef.current = null;
+      setVisual(null);
+      return;
+    }
+    const key = JSON.stringify(config);
+    if (visualKeyRef.current === key) return;
+    visualKeyRef.current = key;
+    setVisual({ config, slides: null, error: null });
+    invoke<VisualSlide[]>("visual_fetch", { config })
+      .then((slides) => {
+        if (visualKeyRef.current !== key) return; // superseded meanwhile
+        setVisual({ config, slides, error: null });
+      })
+      .catch((e) => {
+        if (visualKeyRef.current !== key) return;
+        setVisual({ config, slides: [], error: String(e) });
+      });
+  }, []);
+
   // Build the player once the manifest is loaded (and the variable context
   // — passed-in or fetched environment vars — is settled).
   useEffect(() => {
@@ -154,6 +195,7 @@ export function AudioPlayerOverlay({ src, onClose, onEnded, variables }: Props) 
     const player = new ManifestPlayer({
       onPrompt: setPrompt,
       onPlayingChange: setPlaying,
+      onVisual: handleVisual,
       onEnded: () => {
         setFinished(true);
         setPlaying(false);
@@ -173,7 +215,7 @@ export function AudioPlayerOverlay({ src, onClose, onEnded, variables }: Props) 
       player.destroy();
       playerRef.current = null;
     };
-  }, [phase, src, fail, onEnded, variables, envVars]);
+  }, [phase, src, fail, onEnded, variables, envVars, handleVisual]);
 
   const start = useCallback(async () => {
     const root = rootRef.current;
@@ -198,13 +240,33 @@ export function AudioPlayerOverlay({ src, onClose, onEnded, variables }: Props) 
 
   return (
     <div className="fixed inset-0 z-50 bg-[var(--color-surface)] flex flex-col">
-      <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--color-border)]">
+      {/* <visual> slideshow layer — full-bleed behind the player controls.
+          The header/content column below stays on top (z-10). */}
+      {visual && (
+        <VisualStage
+          config={visual.config}
+          slides={visual.slides}
+          error={visual.error}
+          playing={playing}
+        />
+      )}
+      <div
+        className={`relative z-10 flex items-center justify-between px-4 py-3 border-b ${
+          visual
+            ? "border-transparent bg-black/60 text-white"
+            : "border-[var(--color-border)]"
+        }`}
+      >
         <div className="text-sm font-semibold truncate">▶ {src}</div>
         <Button variant="ghost" size="sm" onClick={onClose} aria-label="Close player">
           <X className="size-4" />
         </Button>
       </div>
-      <div className="flex-1 flex flex-col items-center justify-center gap-6 px-6 text-center">
+      <div
+        className={`relative z-10 flex-1 flex flex-col items-center gap-6 px-6 text-center ${
+          visual ? "justify-start pt-6" : "justify-center"
+        }`}
+      >
         {phase === "checking" && <Spinner className="size-6" />}
         {phase === "rendering" && (
           <div className="flex flex-col items-center gap-3 w-full max-w-sm px-4">

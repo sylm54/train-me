@@ -167,7 +167,8 @@ pub fn count_speakable_nodes(nodes: &[Node]) -> usize {
             | Node::Background { children, .. }
             | Node::Until { children, .. }
             | Node::Section { children, .. }
-            | Node::Beatmeter { children, .. } => {
+            | Node::Beatmeter { children, .. }
+            | Node::Visual { children, .. } => {
                 count += count_speakable_nodes(children);
             }
             Node::Loop { loops, children } => {
@@ -636,6 +637,15 @@ impl AudioRenderer {
                     bail!(
                         "<if> cannot be rendered inline — it is only allowed in playback \
                          sequence content (not inside <effect> or <until>)"
+                    );
+                }
+
+                Node::Visual { .. } => {
+                    // Same class of rejection as `<if>`: only a nested spot
+                    // that can't hold a split point can land here.
+                    bail!(
+                        "<visual> cannot be rendered inline — it is only allowed in playback \
+                         sequence content (not inside <effect>, <until> or <beatmeter>)"
                     );
                 }
             }
@@ -1260,6 +1270,14 @@ impl AudioRenderer {
                     bail!(
                         "<if> cannot be rendered inline — it is only allowed in playback \
                          sequence content (not inside <effect> or <until>)"
+                    );
+                }
+
+                Node::Visual { .. } => {
+                    // Same class of rejection as `<if>` (see the untracked path).
+                    bail!(
+                        "<visual> cannot be rendered inline — it is only allowed in playback \
+                         sequence content (not inside <effect>, <until> or <beatmeter>)"
                     );
                 }
             }
@@ -1918,6 +1936,23 @@ impl AudioRenderer {
                 src, out_dir, script_dir, agent_dir, tracks_dir, visited, progress,
             ),
 
+            Node::Visual { config, children } => {
+                if ctx.forbid_pause {
+                    bail!("<visual> is not allowed inside <background> or <overlay>");
+                }
+                // Transparent to audio: the child subtree renders exactly as
+                // if the wrapper were absent; the config rides along in the
+                // manifest for the player's per-playback playlist fetch.
+                let child = self.walk(
+                    children, ctx, out_dir, script_dir, agent_dir, tracks_dir, counter, visited,
+                    progress,
+                )?;
+                Ok(Segment::Visual {
+                    config: config.clone(),
+                    child: Box::new(child),
+                })
+            }
+
             Node::If {
                 cond,
                 then_branch,
@@ -2287,6 +2322,7 @@ fn collect_include_srcs(nodes: &[Node], out: &mut Vec<String>) {
             | Node::Until { children, .. }
             | Node::Section { children, .. }
             | Node::Beatmeter { children, .. }
+            | Node::Visual { children, .. }
             | Node::Loop { children, .. } => collect_include_srcs(children, out),
             Node::Overlay { parts, .. }
             | Node::Random { parts }
@@ -2540,7 +2576,8 @@ fn collect_glob_include_srcs(nodes: &[Node], out: &mut Vec<String>) {
             | Node::Background { children, .. }
             | Node::Until { children, .. }
             | Node::Section { children, .. }
-            | Node::Beatmeter { children, .. } => {
+            | Node::Beatmeter { children, .. }
+            | Node::Visual { children, .. } => {
                 collect_glob_include_srcs(children, out);
             }
             Node::Overlay { parts, .. }
@@ -2752,6 +2789,11 @@ fn resolve_includes_in_node(
                 accent_gain,
                 children,
             }]
+        }
+
+        Node::Visual { config, children } => {
+            let children = resolve_includes_inner(children, base_dir, visited);
+            vec![Node::Visual { config, children }]
         }
 
         // Leaves with no nested children — pass through unchanged.
@@ -4106,7 +4148,8 @@ mod tests {
             | Node::Background { children, .. }
             | Node::Until { children, .. }
             | Node::Section { children, .. }
-            | Node::Beatmeter { children, .. } => {
+            | Node::Beatmeter { children, .. }
+            | Node::Visual { children, .. } => {
                 for child in children {
                     collect_text_recursive(child, texts);
                 }

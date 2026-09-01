@@ -46,6 +46,10 @@ export function nominalDuration(seg: Segment): number {
         : seg.parts.reduce((m, p) => Math.max(m, nominalDuration(p.segment)), 0);
     case "section":
       return nominalDuration(seg.child);
+    case "visual":
+      // A visual wraps its subtree (mirrors the backend): the slideshow is
+      // display-only and contributes the child's duration.
+      return nominalDuration(seg.child);
     case "cond":
       // Best-effort estimate: the `then` branch (mirrors the backend).
       return nominalDuration(seg.then);
@@ -79,6 +83,8 @@ export function containsInteractive(seg: Segment): boolean {
     case "overlay":
       return seg.parts.some((p) => containsInteractive(p.segment));
     case "section":
+      return containsInteractive(seg.child);
+    case "visual":
       return containsInteractive(seg.child);
     case "cond":
       return containsInteractive(seg.then) || (!!seg.else && containsInteractive(seg.else));

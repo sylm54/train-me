@@ -148,6 +148,15 @@ pub enum Segment {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         r#else: Option<Box<Segment>>,
     },
+
+    /// Slideshow layer (`<visual>`). Transparent to audio: `child` is the
+    /// fully-rendered subtree; the player mounts a gif/image slideshow
+    /// (resolved per playback from `config` via the `visual_fetch` command)
+    /// over it for the child's duration. See `crate::visual`.
+    Visual {
+        config: crate::visual::VisualConfig,
+        child: Box<Segment>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -361,7 +370,8 @@ pub(crate) fn contains_split(node: &Node) -> bool {
         | Node::Beatmeter { .. }
         | Node::Rating { .. }
         | Node::React { .. }
-        | Node::If { .. } => true,
+        | Node::If { .. }
+        | Node::Visual { .. } => true,
 
         Node::Voice { children, .. }
         | Node::Speed { children, .. }
@@ -413,6 +423,7 @@ pub(crate) fn nominal_duration(seg: &Segment) -> f32 {
         }
         Segment::Section { child, .. } => nominal_duration(child),
         Segment::Cond { then, .. } => nominal_duration(then),
+        Segment::Visual { child, .. } => nominal_duration(child),
     }
 }
 
@@ -558,6 +569,11 @@ pub(crate) fn resolve_paths_recursive(value: &mut serde_json::Value, base_dir: &
                 resolve_paths_recursive(seg, base_dir);
             }
             if let Some(seg) = value.get_mut("else") {
+                resolve_paths_recursive(seg, base_dir);
+            }
+        }
+        Some("visual") => {
+            if let Some(seg) = value.get_mut("child") {
                 resolve_paths_recursive(seg, base_dir);
             }
         }

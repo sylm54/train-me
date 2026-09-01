@@ -55,6 +55,44 @@ export interface ProgressState {
   beatmeter?: BeatmeterMeta;
 }
 
+/**
+ * Playback config of a `<visual>` segment — mirrors the backend's
+ * `visual::VisualConfig` exactly (serde field names). The player surfaces it
+ * via `onVisual`; the host resolves it to slides with the `visual_fetch`
+ * command and mounts the slideshow.
+ */
+export interface VisualConfig {
+  /** Visual source plugin id (e.g. `redgifs`). */
+  source: string;
+  /** Tags/niches the source should match. */
+  tags: string[];
+  /** Tags that disqualify a result. */
+  block: string[];
+  /** Free-text search hint. */
+  query?: string;
+  /** Ordering hint passed to the source (e.g. `recent`/`trending`). */
+  order?: string;
+  /** Slide interval bounds (s); a fresh value is drawn per slide. */
+  every_min: number;
+  every_max: number;
+  /** How many distinct slides to fetch (1–40). */
+  count: number;
+  /** Caption mode: `off` (default) or `meta` (show the source's captions). */
+  captions: "off" | "meta";
+  /** Visual effect presets (`cut`, `zoom`, `vignette`, …). */
+  effects: string[];
+  /** Authored `<caption>` lines, shown shuffled per playback. */
+  lines: string[];
+}
+
+/** One slideshow slide resolved by the backend's `visual_fetch` command. */
+export interface VisualSlide {
+  /** Absolute URL on the audio server's `/visuals` mount. */
+  url: string;
+  kind: "video" | "image";
+  caption?: string;
+}
+
 export type Segment =
   | { type: "sequence"; children: Segment[] }
   | { type: "static"; file: string; duration: number; beatmeter?: BeatmeterMeta }
@@ -107,6 +145,13 @@ export type Segment =
       cond: string;
       then: Segment;
       else?: Segment;
+    }
+  | {
+      /** Slideshow layer (`<visual>`): the child subtree plays normally while
+       * the host shows a gif/image slideshow driven by `config`. */
+      type: "visual";
+      config: VisualConfig;
+      child: Segment;
     };
 
 /** A prompt surfaced to the UI for interactive (`until` / `choice` / …) nodes. */
@@ -177,9 +222,17 @@ export interface ManifestPlayerOptions {
   /**
    * Run-context variables for `<if>` condition segments, frozen when
    * playback starts. Sessions pass the run context (engine vars + the
-   * user's answers); standalone playback passes environment-only vars.
+   * user's answers); standalone playback gets environment-only variables.
    */
   variables?: CondVars;
+  /**
+   * Notified when a `<visual>` segment's scope is entered or exited (and on
+   * `stop()`). The payload is the INNERMOST active visual config, or `null`
+   * when no visual scope is open — the host owns fetching the playlist and
+   * mounting/unmounting the slideshow layer. Deduping identical consecutive
+   * configs (e.g. a visual inside a looped `<main>`) is the host's job.
+   */
+  onVisual?: (config: VisualConfig | null) => void;
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -215,6 +268,12 @@ export class ManifestPlayer {
   private readonly mainRepeats: number;
   /** Run-context variables for `<if>` segments (frozen at play start). */
   private readonly variables: CondVars;
+  /**
+   * Stack of open `<visual>` scopes. The player notifies `onVisual` with the
+   * innermost config on push/pop so nested visual scopes (an inner one, then
+   * back to the outer one) resolve to the right layer.
+   */
+  private visualStack: VisualConfig[] = [];
 
   // ── Progress / beatmeter tracking ────────────────────────────────────
   /** Monotonic id of the segment currently (or about to be) playing. */
@@ -259,6 +318,11 @@ export class ManifestPlayer {
       this.opts.onError(e instanceof Error ? e : new Error(String(e)));
     } finally {
       this.stopTickLoop();
+      // An error unwind can leave a visual scope open (its own finally only
+      // runs along the normal async unwinding) — make sure the host's
+      // slideshow layer always goes away with playback.
+      this.visualStack = [];
+      this.opts.onVisual?.(null);
     }
   }
 
@@ -380,6 +444,9 @@ export class ManifestPlayer {
         await this.play(branch, trackIndex);
         return;
       }
+      case "visual":
+        await this.playVisual(seg, trackIndex);
+        return;
       default: {
         // Exhaustiveness guard — should be unreachable if the union matches
         // the backend.
@@ -639,6 +706,26 @@ export class ManifestPlayer {
       } finally {
         for (const t of partTracks) this.freeTrack(t);
       }
+    }
+  }
+
+  /**
+   * Visual scope: notify the host (innermost-config semantics) and play the
+   * child subtree; the slideshow lives and dies with the scope. The host
+   * keeps flipping slides through nested pauses and interactive prompts —
+   * the visual never blocks audio.
+   */
+  private async playVisual(
+    seg: { type: "visual"; config: VisualConfig; child: Segment },
+    trackIndex: number,
+  ): Promise<void> {
+    this.visualStack.push(seg.config);
+    this.opts.onVisual?.(seg.config);
+    try {
+      await this.play(seg.child, trackIndex);
+    } finally {
+      this.visualStack.pop();
+      this.opts.onVisual?.(this.visualStack[this.visualStack.length - 1] ?? null);
     }
   }
 
@@ -911,6 +998,8 @@ export class ManifestPlayer {
     this.aborted = true;
     this.stopTickLoop();
     this.beatScheduler.stop();
+    this.visualStack = [];
+    this.opts.onVisual?.(null);
     // Abort any active react scope so its main clip resolves promptly instead
     // of orphaning a dangling playFile promise.
     this.reactCtl?.abort();
