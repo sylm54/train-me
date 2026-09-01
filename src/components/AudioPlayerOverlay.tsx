@@ -324,7 +324,7 @@ export function AudioPlayerOverlay({ src, onClose, onEnded, variables }: Props) 
   );
 
   return (
-    <div className="fixed inset-0 z-50 bg-[var(--color-surface)] flex flex-col">
+    <div className="fixed inset-0 z-[60] bg-[var(--color-surface)] flex flex-col">
       {/* <visual> slideshow layer — truly fullscreen: with a slideshow up,
           ALL chrome collapses to floating corner controls and a bottom-sheet
           prompt panel, leaving the visuals unobstructed. */}

@@ -121,7 +121,7 @@ A gif/image slideshow layered over its children for as long as they play (the au
 - `captions` — default `off`. `meta` shows each slide's own caption from the source.
 - `effect` — optional; comma-separated effects. Transition: `cut` (hard cut — the default is a crossfade). Motion per switch: `zoom` (slow Ken-Burns drift on each slide), `pulse`, `shake`, `flash`. Filters: `grayscale`, `sepia`, `contrast`, `blur`. Overlays: `vignette`, `scanlines`.
 
-Child tag: `<caption>` — one authored caption line; valid only directly inside `<visual>`. Lines are shuffled per playback and shown one per slide whenever `captions` is not `off`.
+Child tag: `<caption>` — one authored caption line; valid only directly inside `<visual>`. Lines are shuffled per playback and shown one per slide - ALWAYS, regardless of `captions` (which only controls the source's own captions).
 
 Placement: valid in sequence content (top level, inside `<voice>`/`<loop>`/`<main>`, or inside a `<choice>`/`<random>`/`<react>` part). Also valid inside `<effect>` (decorates the effected clip) and as a DIRECT child of `<beatmeter>` (decorates the whole beat-metered clip — the slideshow runs while the beatmeter plays; interactive content inside such a visual is still rejected). NOT allowed inside another `<visual>`, an `<until>`, or `<background>`/`<overlay>` (concurrent audio streams). Contributes no audio of its own.
 
