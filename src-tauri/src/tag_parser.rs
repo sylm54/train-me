@@ -822,18 +822,22 @@ impl TagParser {
     }
 
     /// Parse `<visual>` — a slideshow container over its (audio) children.
-    /// Attributes: `source` (default `redgifs`), `tags`/`block` (comma
-    /// lists), `query`, `order`, `every` (seconds or `min..max`) / `bpm`,
-    /// `count`, `captions` (`off`/`meta`) and `effect` (comma list).
-    /// `<caption>` children are collected into `config.lines` as authored
-    /// caption text; everything else is regular audio content. Numeric and
-    /// value-set validation happens in `validate`.
+    /// Attributes: `source` (default `redgifs`), `niche` (curated source
+    /// communities), `tags`/`block` (comma lists), `query`, `order`, `every`
+    /// (seconds or `min..max`) / `bpm`, `count`, `captions` (`off`/`meta`)
+    /// and `effect` (comma list). `<caption>` children are collected into
+    /// `config.lines` as authored caption text; everything else is regular
+    /// audio content. Numeric and value-set validation happens in `validate`.
     fn parse_visual_tag(&mut self) -> Result<Node> {
         let attrs = self.read_attributes();
         let source = attrs
             .get("source")
             .cloned()
             .unwrap_or_else(|| visual::DEFAULT_SOURCE.to_string());
+        let niches = visual::parse_attr_list(attrs.get("niche"))
+            .into_iter()
+            .map(|n| visual::canonical_niche(&n))
+            .collect();
         let tags = visual::parse_attr_list(attrs.get("tags"));
         let block = visual::parse_attr_list(attrs.get("block"));
         let query = attrs
@@ -932,6 +936,7 @@ impl TagParser {
         Ok(Node::Visual {
             config: VisualConfig {
                 source,
+                niches,
                 tags,
                 block,
                 query,
@@ -1608,22 +1613,17 @@ fn validate_nodes(
             Node::Visual { config, children } => {
                 // Nesting/containment: a visual inside another visual is
                 // meaningless (one screen), and a visual inside a concurrent
-                // audio layer or a single-clip construct can't scope — the
-                // flat path would have to bake it into one WAV. `<effect>`
-                // breadcrumbs carry the effect type (`<effect type="echo">`),
-                // hence the prefix match.
+                // audio layer or an `<until>` (whose body is one baked clip
+                // the visual can't attach to) can't scope. `<effect>` and
+                // `<beatmeter>` ARE allowed — the slideshow rides the baked
+                // clip as segment metadata (see `Segment::Static::visual`).
                 let parent = breadcrumb.iter().rev().find(|b| {
                     let b = b.as_str();
-                    b == "<visual>"
-                        || b == "<until>"
-                        || b.starts_with("<effect")
-                        || b == "<beatmeter>"
-                        || b == "<background>"
-                        || b == "<overlay>"
+                    b == "<visual>" || b == "<until>" || b == "<background>" || b == "<overlay>"
                 });
                 if let Some(parent) = parent {
                     errors.push(format!(
-                        "<visual> is not allowed inside {parent} — place it in sequence content (top level, inside <voice>/<loop>/<main>, a <choice>/<random>/<react> part, …)"
+                        "<visual> is not allowed inside {parent} — place it in sequence content (top level, inside <voice>/<loop>/<main>, a <choice>/<random>/<react> part, an <effect>, or directly in a <beatmeter>)"
                     ));
                 }
                 config.validate_into(errors);
@@ -2257,13 +2257,40 @@ mod tests {
         assert!(validate(&nodes).is_err());
         let nodes = parse(r#"<until><visual>x</visual></until>"#).unwrap();
         assert!(validate(&nodes).is_err());
-        // Overlay parts and effect bodies are rejected too (the overlay arm
-        // must breadcrumb its parts; effect breadcrumbs carry the type).
+        // Overlay parts are rejected…
         let nodes = parse(r#"<overlay><part><visual>x</visual></part></overlay>"#).unwrap();
         assert!(validate(&nodes).is_err());
+        // …but <effect> and <beatmeter> host a baked-in visual now.
         let nodes = parse(r#"<effect type="echo"><visual>x</visual></effect>"#).unwrap();
-        assert!(validate(&nodes).is_err());
+        validate(&nodes).unwrap();
+        let nodes = parse(r#"<beatmeter bpm="120"><visual><pause duration="4"/></visual>Match this</beatmeter>"#).unwrap();
+        validate(&nodes).unwrap();
+        // A visual whose own content is interactive is still too dynamic for
+        // a beat schedule, and a voice-wrapped visual is not a direct child.
+        let nodes = parse(r#"<beatmeter><visual><until button="b">x</until></visual></beatmeter>"#).unwrap();
+        assert!(validate(&nodes).is_ok(), "validate allows it; the RENDER rejects the interactive content");
         // <caption> is only consumed inside <visual>.
         assert!(parse(r#"<caption>x</caption>"#).is_err());
+    }
+
+    #[test]
+    fn test_parse_visual_niche() {
+        let nodes =
+            parse(r#"<visual niche="Just Boobs, tik-tok" tags="gooning">x</visual>"#).unwrap();
+        match &nodes[0] {
+            Node::Visual { config, .. } => {
+                // Display names fold onto hyphenated ids ("Just Boobs" →
+                // `just-boobs`).
+                assert_eq!(config.niches, vec!["just-boobs", "tik-tok"]);
+                assert_eq!(config.tags, vec!["gooning"]);
+            }
+            _ => panic!("expected Visual"),
+        }
+        validate(&nodes).unwrap();
+        // Unknown order values are a validation error (server 400s on them).
+        let nodes = parse(r#"<visual order="recent">x</visual>"#).unwrap();
+        assert!(validate(&nodes).is_err());
+        let nodes = parse(r#"<visual order="top7">x</visual>"#).unwrap();
+        validate(&nodes).unwrap();
     }
 }

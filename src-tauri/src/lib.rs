@@ -880,17 +880,20 @@ fn read_manifest(manifest_path: String) -> Result<serde_json::Value, String> {
 /// Resolve a `<visual>` config into a playable slideshow playlist. Hits the
 /// configured visual source (network) and downloads any not-yet-cached media
 /// into `data_dir/visuals/`; the returned slides point at the audio server's
-/// `/visuals` mount. Runs on a blocking thread (the source client is
-/// synchronous reqwest, like the model downloader).
+/// `/visuals` mount. Also refreshes the source-vocabulary discovery snapshot
+/// (cached a day) and mirrors it into the agent sandbox's
+/// `docs/redgifs-discovery.md`. Runs on a blocking thread (the source client
+/// is synchronous reqwest, like the model downloader).
 #[tauri::command]
 async fn visual_fetch(
     config: visual::VisualConfig,
     state: State<'_, AppState>,
 ) -> Result<Vec<visual::VisualSlide>, String> {
     let cache_dir = state.data_dir.join("visuals");
+    let agent_dir = state.agent_dir.clone();
     let base_url = state.audio_base_url.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        visual::fetch_playlist(&config, &cache_dir, &base_url)
+        visual::fetch_playlist(&config, &cache_dir, &agent_dir, &base_url)
     })
     .await
     .map_err(|e| format!("visual fetch task failed: {e}"))?
