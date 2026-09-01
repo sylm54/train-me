@@ -21,6 +21,8 @@ import { Spinner } from "@/components/ui/spinner";
 import {
   ManifestPlayer,
   type ActivePrompt,
+  type BeatmeterMeta,
+  type ProgressState,
   type Segment,
   type VisualConfig,
   type VisualSlide,
@@ -68,8 +70,44 @@ interface Props {
   variables?: Record<string, string | number | boolean>;
 }
 
+/**
+ * On-screen beat meter for a `<beatmeter>` clip: tick marks at each beat
+ * (accented beats stand out) and a cursor tracking playback position.
+ */
+function BeatStrip({
+  meta,
+  time,
+  duration,
+}: {
+  meta: BeatmeterMeta;
+  time: number;
+  duration: number;
+}) {
+  const pct = (t: number) =>
+    `${Math.min(100, Math.max(0, (t / duration) * 100))}%`;
+  return (
+    <div className="relative h-6 w-64 rounded-full border border-white/15 bg-black/50 backdrop-blur-sm">
+      {meta.beats.map((b, i) => (
+        <span
+          key={i}
+          className={`absolute top-1/2 -translate-y-1/2 rounded-full ${
+            b.accent ? "h-3.5 w-[3px] bg-[var(--color-pink-500)]" : "h-2 w-[2px] bg-white/50"
+          }`}
+          style={{ left: pct(b.time) }}
+        />
+      ))}
+      <span
+        className="absolute top-0 h-full w-[2px] bg-white shadow-[0_0_6px_rgba(255,255,255,0.8)]"
+        style={{ left: pct(time) }}
+      />
+    </div>
+  );
+}
+
 export function AudioPlayerOverlay({ src, onClose, onEnded, variables }: Props) {
-  const [phase, setPhase] = useState<"checking" | "rendering" | "ready" | "error">("checking");
+  const [phase, setPhase] = useState<
+    "checking" | "rendering" | "ready" | "error" | "engine"
+  >("checking");
   const [renderLabel, setRenderLabel] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [playing, setPlaying] = useState(false);
@@ -88,6 +126,17 @@ export function AudioPlayerOverlay({ src, onClose, onEnded, variables }: Props) 
   const visualKeyRef = useRef<string | null>(null);
   /** True once playback has begun — distinguishes Resume from Play. */
   const startedRef = useRef(false);
+  /** Live beatmeter frame (only fires while a <beatmeter> clip plays). */
+  const [beat, setBeat] = useState<ProgressState | null>(null);
+  // Voice-engine gate: render errors that are just 'model not enabled'
+  // get an enable button instead of a dead-end error.
+  const [retry, setRetry] = useState(0);
+  const [engineStatus, setEngineStatus] = useState<{
+    downloaded: boolean;
+    loaded: boolean;
+  } | null>(null);
+  const [engineBusy, setEngineBusy] = useState(false);
+  const [engineError, setEngineError] = useState<string | null>(null);
   // App-wide render entry for this script (seeded by markStart below) —
   // drives the progress bar + time-remaining readout while rendering.
   const renderEntry = useRenderStore().get(src) ?? null;
@@ -159,13 +208,56 @@ export function AudioPlayerOverlay({ src, onClose, onEnded, variables }: Props) 
         setPhase("ready");
       } catch (e) {
         markError(src, String(e));
-        if (!cancelled) fail(String(e));
+        const msg = String(e);
+        if (!cancelled) {
+          // A missing/disabled TTS engine is recoverable in-place —
+          // offer the enable button instead of a dead-end error.
+          if (/model/i.test(msg)) {
+            setPhase("engine");
+          } else {
+            fail(msg);
+          }
+        }
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [src, fail]);
+  }, [src, fail, retry]);
+
+  // Poll model status while the engine gate is up.
+  useEffect(() => {
+    if (phase !== "engine") return;
+    let cancelled = false;
+    invoke<{ downloaded: boolean; loaded: boolean }>("get_model_status")
+      .then((st) => {
+        if (!cancelled) setEngineStatus(st);
+      })
+      .catch((e) => {
+        if (!cancelled) setEngineError(String(e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [phase, retry, engineBusy]);
+
+  const enableEngine = useCallback(async () => {
+    setEngineBusy(true);
+    setEngineError(null);
+    try {
+      // Fresh status at click time — a stale snapshot could trigger a
+      // pointless re-download after the files were restored/added.
+      const st = await invoke<{ downloaded: boolean; loaded: boolean }>("get_model_status");
+      if (!st.downloaded) await invoke("download_model");
+      if (!(st.downloaded && st.loaded)) await invoke("load_model");
+      setRetry((r) => r + 1);
+      setPhase("checking");
+    } catch (e) {
+      setEngineError(String(e));
+    } finally {
+      setEngineBusy(false);
+    }
+  }, [engineStatus]);
 
   /**
    * `<visual>` scope notifications from the player. The slideshow itself is
@@ -203,6 +295,7 @@ export function AudioPlayerOverlay({ src, onClose, onEnded, variables }: Props) 
       onPrompt: setPrompt,
       onPlayingChange: setPlaying,
       onVisual: handleVisual,
+      onProgress: setBeat,
       onEnded: () => {
         setFinished(true);
         setPlaying(false);
@@ -282,7 +375,11 @@ export function AudioPlayerOverlay({ src, onClose, onEnded, variables }: Props) 
           <Button
             key={i}
             variant="outline"
-            className="w-full justify-start"
+            className={`w-full justify-start ${
+              visual
+                ? "border-white/25 bg-white/10 text-white hover:bg-white/20 hover:text-white"
+                : ""
+            }`}
             onClick={() => {
               void logActivity(
                 "script",
@@ -304,7 +401,11 @@ export function AudioPlayerOverlay({ src, onClose, onEnded, variables }: Props) 
                 key={value}
                 variant="outline"
                 size="sm"
-                className="h-8 w-8 p-0"
+                className={`h-8 w-8 p-0 ${
+                  visual
+                    ? "border-white/25 bg-white/10 text-white hover:bg-white/20 hover:text-white"
+                    : ""
+                  }`}
                 onClick={() => {
                   void logActivity(
                     "script",
@@ -416,6 +517,27 @@ export function AudioPlayerOverlay({ src, onClose, onEnded, variables }: Props) 
                 </div>
               </div>
             )}
+            {phase === "engine" && (
+              <div className="flex max-w-sm flex-col items-center gap-3">
+                <div className="text-sm font-medium">The voice engine isn’t enabled yet</div>
+                <div className="text-sm text-muted-foreground">
+                  {engineStatus && !engineStatus.downloaded
+                    ? "Scripts need the speech model — it downloads once, then plays offline."
+                    : "The speech model is downloaded but not loaded."}
+                </div>
+                {engineError && (
+                  <div className="text-xs text-[var(--color-danger)]">{engineError}</div>
+                )}
+                <Button onClick={enableEngine} disabled={engineBusy}>
+                  {engineBusy && <Spinner className="size-4" />}
+                  {engineBusy
+                    ? "Working…"
+                    : engineStatus && !engineStatus.downloaded
+                      ? "Download voice engine"
+                      : "Enable voice engine"}
+                </Button>
+              </div>
+            )}
             {phase === "error" && (
               <div className="max-w-md text-sm text-[var(--color-danger)]">{error}</div>
             )}
@@ -436,6 +558,19 @@ export function AudioPlayerOverlay({ src, onClose, onEnded, variables }: Props) 
             )}
           </div>
         </>
+      )}
+
+      {/* On-screen beat meter for <beatmeter> clips (both modes). */}
+      {beat?.beatmeter && beat.currentTime < beat.duration - 0.05 && (
+        <div className={`absolute inset-x-0 z-10 flex justify-center ${
+          visual ? "bottom-20" : "bottom-8"
+        }`}>
+          <BeatStrip
+            meta={beat.beatmeter}
+            time={beat.currentTime}
+            duration={beat.duration}
+          />
+        </div>
       )}
     </div>
   );
