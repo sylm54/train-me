@@ -14,6 +14,7 @@ mod audio_server;
 mod bash;
 mod chastity;
 mod cond;
+mod debug_time;
 mod economy;
 // `expression` is public only so its doctests compile — doctests build as
 // an external crate and can't reach private modules. Not part of the app's
@@ -1846,6 +1847,12 @@ pub fn run() {
             schedule::v2_purchase,
             schedule::v2_upcoming,
             prerender::v2_prerender,
+            // Debug tooling (time machine, point grants) — inert stubs in
+            // release builds (see debug_time.rs).
+            debug_time::debug_tools_enabled,
+            debug_time::debug_time_state,
+            debug_time::debug_set_time_offset,
+            debug_time::debug_grant_points,
             onboarding::onboarding_questions,
             onboarding::onboarding_step,
             onboarding::save_onboarding_answers,

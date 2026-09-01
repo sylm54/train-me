@@ -19,13 +19,19 @@ import {
   Play,
   Shield,
   ShoppingCart,
+  Timer,
   Volume2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { AudioPlayerOverlay } from "@/components/AudioPlayerOverlay";
+import { DayTimeline } from "@/components/DayTimeline";
 import { MarkdownBody } from "@/components/MarkdownBody";
 import { parseSchedule } from "@/lib/cron";
+import { humanDuration } from "@/lib/v2";
 import {
+  debugSetTimeOffset,
+  debugTimeState,
+  debugToolsEnabled,
   describeAction,
   dismissPending,
   fetchHabitDetail,
@@ -36,7 +42,9 @@ import {
   reconcile,
   startRun,
   templateToPath,
+  type DebugTimeState,
   type HabitDetail,
+  type TimelineItem,
   type V2Summary,
 } from "@/lib/v2";
 
@@ -64,6 +72,8 @@ export function TodayView({ onRequestSession }: Props) {
   const [habitBusy, setHabitBusy] = useState(false);
   // Prerender target in flight ("all" or a container path).
   const [prerendering, setPrerendering] = useState<string | null>(null);
+  // Debug time machine (debug builds only; null = unavailable/release).
+  const [debugTime, setDebugTime] = useState<DebugTimeState | null>(null);
 
   const refresh = useCallback(() => {
     fetchSummary()
@@ -75,7 +85,15 @@ export function TodayView({ onRequestSession }: Props) {
     void reconcile().catch(() => undefined);
     refresh();
     const un = listen("v2-reconciled", () => refresh());
+    let alive = true;
+    debugToolsEnabled()
+      .then(async (enabled) => {
+        if (!enabled || !alive) return;
+        setDebugTime(await debugTimeState());
+      })
+      .catch(() => undefined);
     return () => {
+      alive = false;
       void un.then((f) => f());
     };
   }, [refresh]);
@@ -101,6 +119,41 @@ export function TodayView({ onRequestSession }: Props) {
     try {
       await startRun("task", iid);
       onRequestSession({ kind: "task", ref: iid });
+    } catch (e) {
+      showLines([String(e)]);
+    }
+  };
+
+  // ── Day timeline ─────────────────────────────────────────────────────
+
+  /** Start/resume the routine behind a timeline block (same paths as the
+   * routine cards — the timetable is another door into the engine). */
+  const activateTimelineItem = async (item: TimelineItem) => {
+    const card = summary?.routines.find((r) => r.path === item.container);
+    if (!card) return;
+    if (card.in_progress) {
+      onRequestSession({ kind: "routine", ref: card.path });
+      return;
+    }
+    if (card.locked) {
+      showLines([`${card.title}: ${card.locked}`]);
+      return;
+    }
+    await startRoutine(
+      card.path,
+      item.status === "pending" ? item.occurrence : card.current?.occurrence,
+    );
+  };
+
+  // ── Debug time machine (debug builds only) ───────────────────────────
+
+  const setDebugOffset = async (secs: number) => {
+    try {
+      setDebugTime(await debugSetTimeOffset(secs));
+      // Same reconcile the app runs on every view open — this is what turns
+      // a skip into due occurrences, lapses, and rolled-over habit days.
+      await reconcile();
+      refresh();
     } catch (e) {
       showLines([String(e)]);
     }
@@ -198,6 +251,19 @@ export function TodayView({ onRequestSession }: Props) {
       summary.pending.length >
     0;
 
+  // Routines with a slot on today's timeline live there (the timetable is
+  // their card); the list below keeps on-demand routines and scheduled ones
+  // with no occurrence today (e.g. a weekly routine on its off-day).
+  const timelineContainers = new Set(
+    summary.timeline.filter((t) => !t.adhoc).map((t) => t.container),
+  );
+  const listedRoutines = summary.routines.filter(
+    (r) => r.on_demand || !timelineContainers.has(r.path),
+  );
+  const hasScheduled = summary.routines.some((r) => !r.on_demand);
+
+  const debugOffset = debugTime?.offset_secs ?? 0;
+
   const anyAudio =
     summary.routines.some((r) => r.audio.length > 0) ||
     summary.habits.some((h) => h.audio.length > 0) ||
@@ -236,6 +302,46 @@ export function TodayView({ onRequestSession }: Props) {
           </div>
         )}
 
+        {/* Debug time machine banner (debug builds only) */}
+        {debugTime && debugOffset !== 0 && (
+          <div className="flex flex-wrap items-center gap-2 rounded-lg border border-dashed border-[var(--color-pink-400)] bg-[var(--color-pink-50)] px-3 py-2 text-xs">
+            <Timer className="size-3.5 text-[var(--color-pink-700)]" />
+            <span>
+              Debug clock{" "}
+              <span className="font-semibold tabular-nums">
+                {debugOffset > 0 ? "+" : "−"}
+                {humanDuration(Math.abs(debugOffset))}
+              </span>{" "}
+              — engine time{" "}
+              <span className="font-semibold tabular-nums">
+                {new Date(debugTime.engine_now).toLocaleTimeString(undefined, {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                })}
+              </span>
+            </span>
+            <Button
+              size="sm"
+              variant="outline"
+              className="ml-auto h-6 px-2 text-xs"
+              onClick={() => void setDebugOffset(0)}
+            >
+              Back to real time
+            </Button>
+          </div>
+        )}
+
+        {/* Day timetable — today's routine occurrences on a 24h timeline */}
+        {(hasScheduled || summary.timeline.length > 0) && (
+          <Section title="Today's schedule">
+            <DayTimeline
+              items={summary.timeline}
+              clockOffsetSecs={debugOffset}
+              onActivate={(item) => void activateTimelineItem(item)}
+            />
+          </Section>
+        )}
+
         {!hasContent && (
           <div className="rounded-lg border border-dashed border-[var(--color-border)] p-8 text-center text-sm text-muted-foreground">
             Nothing here yet. The agent creates routines, habits, tasks, and store
@@ -267,10 +373,10 @@ export function TodayView({ onRequestSession }: Props) {
           </Section>
         )}
 
-        {/* Routines */}
-        {summary.routines.length > 0 && (
+        {/* Routines not already on the timeline (on-demand + off-day ones) */}
+        {listedRoutines.length > 0 && (
           <Section title="Routines">
-            {summary.routines.map((r) => (
+            {listedRoutines.map((r) => (
               <div
                 key={r.path}
                 className="flex items-center gap-3 rounded-lg border border-[var(--color-border)] p-3"

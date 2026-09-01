@@ -154,6 +154,18 @@ export interface StoreCard {
   audio: string[];
 }
 
+/** One routine occurrence on the Today view's day timeline. */
+export interface TimelineItem {
+  container: string;
+  title: string;
+  occurrence: string;
+  due: string;
+  window_end: string;
+  status: "pending" | "in_progress" | "completed" | "failed" | "lapsed" | "lapsed-exempt";
+  /** Ad-hoc on-demand start (activity history, not a timetable slot). */
+  adhoc: boolean;
+}
+
 export interface V2Summary {
   balance: number;
   exemptions: { scope: string; ts: string; until: string }[];
@@ -163,6 +175,8 @@ export interface V2Summary {
   habits: HabitCard[];
   tasks: TaskCard[];
   store: StoreCard[];
+  /** Routine occurrences overlapping today (local day). */
+  timeline: TimelineItem[];
 }
 
 export interface ReconcileReport {
@@ -261,6 +275,37 @@ export function fetchHabitDetail(habitRef: string): Promise<HabitDetail> {
  */
 export function prerender(paths?: string[]): Promise<PrerenderReport> {
   return invoke("v2_prerender", { paths: paths ?? null });
+}
+
+// ── Debug tooling (debug builds only; release stubs refuse) ───────────────
+
+export interface DebugTimeState {
+  enabled: boolean;
+  offset_secs: number;
+  /** The engine's current time, RFC3339 (UTC). */
+  engine_now: string;
+}
+
+/** Whether debug tooling (time machine, point grants) is available. */
+export function debugToolsEnabled(): Promise<boolean> {
+  return invoke("debug_tools_enabled");
+}
+
+export function debugTimeState(): Promise<DebugTimeState> {
+  return invoke("debug_time_state");
+}
+
+/**
+ * Set the engine-clock offset (seconds). The caller must run `reconcile`
+ * afterwards for the skip to materialize/lapse — exactly what the app does
+ * on every view open and notifier tick anyway.
+ */
+export function debugSetTimeOffset(offsetSecs: number): Promise<DebugTimeState> {
+  return invoke("debug_set_time_offset", { offsetSecs });
+}
+
+export function debugGrantPoints(delta: number): Promise<{ balance: number }> {
+  return invoke("debug_grant_points", { delta });
 }
 
 // ── Display helpers ────────────────────────────────────────────────────────
