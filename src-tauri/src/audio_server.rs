@@ -54,17 +54,19 @@ struct AudioServerState {
     token: String,
 }
 
-/// Build the router that serves `tracks_dir` under `/tracks/...` with full
-/// Range/206 support (via `tower-http`'s `ServeDir`). Every request is gated
-/// behind the token middleware so a port-scanner without the token gets `404`
-/// (not `401`).
-fn audio_router(tracks_dir: PathBuf, token: String) -> Router {
+/// Build the router that serves `tracks_dir` under `/tracks/...` (rendered
+/// audio) and `visuals_dir` under `/visuals/...` (cached `<visual>` slides)
+/// with full Range/206 support (via `tower-http`'s `ServeDir`). Every request
+/// is gated behind the token middleware so a port-scanner without the token
+/// gets `404` (not `401`).
+fn audio_router(tracks_dir: PathBuf, visuals_dir: PathBuf, token: String) -> Router {
     // `from_fn_with_state` clones the state into each request, so a single
     // owned `AudioServerState` here is fine. The router itself has no
     // handler-level state (ServeDir and the middleware carry their own), so
     // we bind it to `()` via `with_state` to pin the `Router<()>` type.
     Router::new()
         .nest_service("/tracks", ServeDir::new(tracks_dir))
+        .nest_service("/visuals", ServeDir::new(visuals_dir))
         .layer(axum::middleware::from_fn_with_state(
             AudioServerState { token },
             require_token,
@@ -98,21 +100,23 @@ async fn require_token(
     }
 }
 
-/// Bind a loopback listener on an OS-assigned port and start serving `tracks_dir`
-/// at `/tracks/...`. Returns the bound address (so the caller can build the
-/// base URL) and a detached task handle.
+/// Bind a loopback listener on an OS-assigned port and start serving
+/// `tracks_dir` at `/tracks/...` and `visuals_dir` at `/visuals/...`.
+/// Returns the bound address (so the caller can build the base URL) and a
+/// detached task handle.
 ///
 /// The listener is read for its `local_addr()` *before* being moved into
 /// `axum::serve` (which consumes it).
 pub async fn bind_audio_server(
     tracks_dir: PathBuf,
+    visuals_dir: PathBuf,
     token: String,
 ) -> std::io::Result<(SocketAddr, JoinHandle<()>)> {
     // ":0" → OS picks a free ephemeral port. Loopback only (see module docs).
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
 
-    let app = audio_router(tracks_dir, token);
+    let app = audio_router(tracks_dir, visuals_dir, token);
     let handle = tauri::async_runtime::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
             log::error!("audio server exited: {e}");

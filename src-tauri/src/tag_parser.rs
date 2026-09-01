@@ -8,6 +8,8 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+use crate::visual::{self, VisualConfig};
+
 /// Which structural section a `<intro>`/`<main>`/`<outro>` block belongs to.
 ///
 /// Sections are transparent to flat audio synthesis but are preserved through
@@ -207,6 +209,18 @@ pub enum Node {
         #[serde(skip_serializing_if = "Option::is_none")]
         r#else: Option<Vec<Node>>,
     },
+
+    /// A gif/image slideshow layered over the inner content at playback.
+    /// Transparent to audio synthesis (children render exactly as if the
+    /// wrapper were absent); the config is carried into the manifest as a
+    /// `Visual` segment and resolved to a media playlist by the player via
+    /// the `visual_fetch` command at PLAYBACK. `<caption>` children are
+    /// pulled out into `config.lines` (authored caption text) and are not
+    /// spoken. See `crate::visual`.
+    Visual {
+        config: VisualConfig,
+        children: Vec<Node>,
+    },
 }
 
 /// A part within an overlay.
@@ -318,6 +332,7 @@ impl TagParser {
             "rating" => self.parse_rating_tag(),
             "react" => self.parse_react_tag(),
             "if" => self.parse_if_tag(),
+            "visual" => self.parse_visual_tag(),
             "else" => bail!("<else> is only valid inside an <if> block"),
             other => bail!("Unknown tag: <{}>", other),
         }
@@ -806,6 +821,132 @@ impl TagParser {
         })
     }
 
+    /// Parse `<visual>` — a slideshow container over its (audio) children.
+    /// Attributes: `source` (default `redgifs`), `tags`/`block` (comma
+    /// lists), `query`, `order`, `every` (seconds or `min..max`) / `bpm`,
+    /// `count`, `captions` (`off`/`meta`) and `effect` (comma list).
+    /// `<caption>` children are collected into `config.lines` as authored
+    /// caption text; everything else is regular audio content. Numeric and
+    /// value-set validation happens in `validate`.
+    fn parse_visual_tag(&mut self) -> Result<Node> {
+        let attrs = self.read_attributes();
+        let source = attrs
+            .get("source")
+            .cloned()
+            .unwrap_or_else(|| visual::DEFAULT_SOURCE.to_string());
+        let tags = visual::parse_attr_list(attrs.get("tags"));
+        let block = visual::parse_attr_list(attrs.get("block"));
+        let query = attrs
+            .get("query")
+            .map(|q| q.trim().to_string())
+            .filter(|q| !q.is_empty());
+        let order = attrs
+            .get("order")
+            .map(|q| q.trim().to_string())
+            .filter(|q| !q.is_empty());
+        let bpm = attrs
+            .get("bpm")
+            .map(|v| {
+                v.parse::<f32>()
+                    .map_err(|_| anyhow::anyhow!("<visual bpm=\"{v}\"> is not a number"))
+            })
+            .transpose()?;
+        // `every` is the interval spec; a `bpm` overrides it (60/bpm seconds
+        // per slide). Invalid `every` strings are a parse error so the
+        // writer agent sees them immediately.
+        let (every_min, every_max) = match (&attrs.get("every").cloned(), bpm) {
+            (Some(raw), None) => visual::parse_every(&raw)
+                .map_err(|e| anyhow::anyhow!("<visual every=\"{raw}\">: {e}"))?,
+            (Some(raw), Some(_)) => {
+                bail!("<visual> accepts either every=\"…\" or bpm=\"…\", not both (got every=\"{raw}\")")
+            }
+            (None, Some(b)) => {
+                if !(b > 0.0) {
+                    bail!("<visual bpm=\"{b}\"> must be > 0");
+                }
+                (60.0 / b, 60.0 / b)
+            }
+            (None, None) => (visual::DEFAULT_EVERY_MIN, visual::DEFAULT_EVERY_MAX),
+        };
+        let count = attrs
+            .get("count")
+            .map(|v| {
+                v.parse::<u32>()
+                    .map_err(|_| anyhow::anyhow!("<visual count=\"{v}\"> is not a number"))
+            })
+            .transpose()?
+            .unwrap_or(visual::DEFAULT_COUNT);
+        let captions = attrs
+            .get("captions")
+            .cloned()
+            .unwrap_or_else(|| "off".to_string());
+        let effects = visual::parse_attr_list(attrs.get("effect"));
+
+        if self.peek_str("/>") {
+            self.expect_str("/>")?;
+            bail!("<visual> tag must have children");
+        }
+        self.expect_str(">")?;
+
+        // Custom child loop: `<caption>` elements are pulled out as authored
+        // caption lines (not spoken, not rendered to audio); everything else
+        // parses normally. `<caption>` outside `<visual>` remains an unknown
+        // tag because only this loop consumes it.
+        let mut children: Vec<Node> = Vec::new();
+        let mut lines: Vec<String> = Vec::new();
+        loop {
+            self.skip_ws();
+            if self.pos >= self.input.len() {
+                bail!("<visual> is never closed (missing </visual>)");
+            }
+            if self.peek_str("</visual>") {
+                self.skip_ws();
+                self.expect_str("</visual>")?;
+                break;
+            }
+            if self.peek_str("<caption") {
+                self.expect_str("<caption")?;
+                let _caption_attrs = self.read_attributes();
+                self.skip_ws();
+                if self.peek_str("/>") {
+                    self.expect_str("/>")?;
+                    continue; // empty caption — nothing to add
+                }
+                self.expect_str(">")?;
+                let inner = self.parse_nodes()?;
+                self.expect_closing("caption")?;
+                let text = extract_text(&inner);
+                let text = text.trim();
+                if !text.is_empty() {
+                    lines.push(text.to_string());
+                }
+                continue;
+            }
+            if self.peek_str("<") {
+                children.push(self.parse_tag()?);
+            } else {
+                children.push(self.parse_text()?);
+            }
+        }
+
+        Ok(Node::Visual {
+            config: VisualConfig {
+                source,
+                tags,
+                block,
+                query,
+                order,
+                every_min,
+                every_max,
+                count,
+                captions,
+                effects,
+                lines,
+            },
+            children: filter_empty_text(children),
+        })
+    }
+
     // --- Helper methods ---
 
     fn peek_str(&self, s: &str) -> bool {
@@ -1006,7 +1147,8 @@ fn extract_text_recursive(node: &Node, texts: &mut Vec<String>) {
         | Node::Background { children, .. }
         | Node::Until { children, .. }
         | Node::Section { children, .. }
-        | Node::Beatmeter { children, .. } => {
+        | Node::Beatmeter { children, .. }
+        | Node::Visual { children, .. } => {
             for child in children {
                 extract_text_recursive(child, texts);
             }
@@ -1331,10 +1473,21 @@ fn validate_nodes(
                 breadcrumb.pop();
             }
 
-            Node::Overlay { parts, .. }
-            | Node::Random { parts }
-            | Node::Scramble { parts }
-            | Node::Choice { options: parts, .. } => {
+            Node::Overlay { parts, .. } => {
+                breadcrumb.push("<overlay>".to_string());
+                for part in parts {
+                    // `role` is only meaningful on a `<part>` inside `<react>`.
+                    if part.role.is_some() {
+                        errors.push(
+                            "<part role=\"…\"> is only valid inside <react>".to_string(),
+                        );
+                    }
+                    validate_nodes(&part.children, errors, seen_includes, breadcrumb);
+                }
+                breadcrumb.pop();
+            }
+
+            Node::Random { parts } | Node::Scramble { parts } | Node::Choice { options: parts, .. } => {
                 for part in parts {
                     // `role` is only meaningful on a `<part>` inside `<react>`.
                     if part.role.is_some() {
@@ -1449,6 +1602,33 @@ fn validate_nodes(
                 if let Some(else_nodes) = r#else {
                     validate_nodes(else_nodes, errors, seen_includes, breadcrumb);
                 }
+                breadcrumb.pop();
+            }
+
+            Node::Visual { config, children } => {
+                // Nesting/containment: a visual inside another visual is
+                // meaningless (one screen), and a visual inside a concurrent
+                // audio layer or a single-clip construct can't scope — the
+                // flat path would have to bake it into one WAV. `<effect>`
+                // breadcrumbs carry the effect type (`<effect type="echo">`),
+                // hence the prefix match.
+                let parent = breadcrumb.iter().rev().find(|b| {
+                    let b = b.as_str();
+                    b == "<visual>"
+                        || b == "<until>"
+                        || b.starts_with("<effect")
+                        || b == "<beatmeter>"
+                        || b == "<background>"
+                        || b == "<overlay>"
+                });
+                if let Some(parent) = parent {
+                    errors.push(format!(
+                        "<visual> is not allowed inside {parent} — place it in sequence content (top level, inside <voice>/<loop>/<main>, a <choice>/<random>/<react> part, …)"
+                    ));
+                }
+                config.validate_into(errors);
+                breadcrumb.push("<visual>".to_string());
+                validate_nodes(children, errors, seen_includes, breadcrumb);
                 breadcrumb.pop();
             }
 
@@ -1988,5 +2168,102 @@ mod tests {
         assert_eq!(SectionRole::from_tag("main"), Some(SectionRole::Main));
         assert_eq!(SectionRole::from_tag("outro"), Some(SectionRole::Outro));
         assert_eq!(SectionRole::from_tag("verse"), None);
+    }
+
+    #[test]
+    fn test_parse_visual() {
+        let input = r#"<visual source="redgifs" tags="hypno, Joi" block="feet"
+                             query="edging" every="4..8" count="10"
+                             captions="meta" effect="zoom,vignette">
+          <caption>Sink deeper.</caption>
+          <voice speaker="female">Watch the screen.</voice>
+        </visual>"#;
+        let nodes = parse(input).unwrap();
+        let Node::Visual { config, children } = &nodes[0] else {
+            panic!("expected Visual");
+        };
+        assert_eq!(config.source, "redgifs");
+        assert_eq!(config.tags, vec!["hypno", "joi"]);
+        assert_eq!(config.block, vec!["feet"]);
+        assert_eq!(config.query.as_deref(), Some("edging"));
+        assert_eq!(config.every_min, 4.0);
+        assert_eq!(config.every_max, 8.0);
+        assert_eq!(config.count, 10);
+        assert_eq!(config.captions, "meta");
+        assert_eq!(config.effects, vec!["zoom", "vignette"]);
+        assert_eq!(config.lines, vec!["Sink deeper."]);
+        // The caption is pulled out; the voice is the only audio child.
+        assert_eq!(children.len(), 1);
+        assert!(matches!(&children[0], Node::Voice { .. }));
+        // Caption text must not be spoken.
+        assert_eq!(extract_text(&nodes), "Watch the screen.");
+        validate(&nodes).unwrap();
+    }
+
+    #[test]
+    fn test_parse_visual_defaults() {
+        let nodes = parse(r#"<visual>hello</visual>"#).unwrap();
+        match &nodes[0] {
+            Node::Visual { config, children } => {
+                assert_eq!(config.source, "redgifs");
+                assert!(config.tags.is_empty());
+                assert_eq!(config.every_min, visual::DEFAULT_EVERY_MIN);
+                assert_eq!(config.every_max, visual::DEFAULT_EVERY_MAX);
+                assert_eq!(config.count, visual::DEFAULT_COUNT);
+                assert_eq!(config.captions, "off");
+                assert_eq!(children.len(), 1);
+            }
+            _ => panic!("expected Visual"),
+        }
+    }
+
+    #[test]
+    fn test_parse_visual_bpm_folds_into_every() {
+        let nodes = parse(r#"<visual bpm="30"><pause duration="2"/></visual>"#).unwrap();
+        match &nodes[0] {
+            Node::Visual { config, .. } => {
+                // 60/30 bpm = one slide every 2 seconds.
+                assert_eq!(config.every_min, 2.0);
+                assert_eq!(config.every_max, 2.0);
+            }
+            _ => panic!("expected Visual"),
+        }
+        validate(&nodes).unwrap();
+    }
+
+    #[test]
+    fn test_parse_visual_rejects() {
+        // every + bpm are mutually exclusive.
+        assert!(parse(r#"<visual every="4" bpm="30">x</visual>"#).is_err());
+        // Self-closing (no content to show anything over).
+        assert!(parse(r#"<visual/>"#).is_err());
+        // Bad interval specs are parse errors.
+        assert!(parse(r#"<visual every="8..4">x</visual>"#).is_err());
+        assert!(parse(r#"<visual every="abc">x</visual>"#).is_err());
+        // Unknown values parse structurally but fail validate.
+        let nodes = parse(r#"<visual source="vimeo">x</visual>"#).unwrap();
+        assert!(validate(&nodes).is_err());
+        let nodes = parse(r#"<visual effect="laser">x</visual>"#).unwrap();
+        assert!(validate(&nodes).is_err());
+        let nodes = parse(r#"<visual captions="always">x</visual>"#).unwrap();
+        assert!(validate(&nodes).is_err());
+        let nodes = parse(r#"<visual count="99">x</visual>"#).unwrap();
+        assert!(validate(&nodes).is_err());
+        // Nested visuals are rejected.
+        let nodes = parse(r#"<visual><visual>x</visual></visual>"#).unwrap();
+        assert!(validate(&nodes).is_err());
+        // Forbidden parents.
+        let nodes = parse(r#"<background><visual>x</visual></background>"#).unwrap();
+        assert!(validate(&nodes).is_err());
+        let nodes = parse(r#"<until><visual>x</visual></until>"#).unwrap();
+        assert!(validate(&nodes).is_err());
+        // Overlay parts and effect bodies are rejected too (the overlay arm
+        // must breadcrumb its parts; effect breadcrumbs carry the type).
+        let nodes = parse(r#"<overlay><part><visual>x</visual></part></overlay>"#).unwrap();
+        assert!(validate(&nodes).is_err());
+        let nodes = parse(r#"<effect type="echo"><visual>x</visual></effect>"#).unwrap();
+        assert!(validate(&nodes).is_err());
+        // <caption> is only consumed inside <visual>.
+        assert!(parse(r#"<caption>x</caption>"#).is_err());
     }
 }

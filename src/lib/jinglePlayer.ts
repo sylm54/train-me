@@ -189,6 +189,9 @@ async function isInteractive(seg: Segment, seen: Set<string>): Promise<boolean> 
     }
     case "section":
       return isInteractive(seg.child, seen);
+    case "visual":
+      // A visual is not itself interactive; its wrapped content may be.
+      return isInteractive(seg.child, seen);
     case "cond":
       // Both branches may carry prompts; check the ones that exist.
       return (

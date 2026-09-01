@@ -634,7 +634,8 @@ fn collect_include_srcs(nodes: &[crate::tag_parser::Node]) -> Vec<String> {
                 | Node::Until { children, .. }
                 | Node::Loop { children, .. }
                 | Node::Section { children, .. }
-                | Node::Beatmeter { children, .. } => rec(children, out),
+                | Node::Beatmeter { children, .. }
+                | Node::Visual { children, .. } => rec(children, out),
                 Node::If {
                     then_branch, r#else, ..
                 } => {

@@ -35,6 +35,7 @@ mod schedule;
 mod sounds;
 mod tag_parser;
 mod validators;
+mod visual;
 
 /// Emitted whenever files that feed the system prompt change on disk
 /// (framework install rewriting the prompt store, onboarding answers
@@ -876,6 +877,26 @@ fn read_manifest(manifest_path: String) -> Result<serde_json::Value, String> {
     Ok(value)
 }
 
+/// Resolve a `<visual>` config into a playable slideshow playlist. Hits the
+/// configured visual source (network) and downloads any not-yet-cached media
+/// into `data_dir/visuals/`; the returned slides point at the audio server's
+/// `/visuals` mount. Runs on a blocking thread (the source client is
+/// synchronous reqwest, like the model downloader).
+#[tauri::command]
+async fn visual_fetch(
+    config: visual::VisualConfig,
+    state: State<'_, AppState>,
+) -> Result<Vec<visual::VisualSlide>, String> {
+    let cache_dir = state.data_dir.join("visuals");
+    let base_url = state.audio_base_url.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        visual::fetch_playlist(&config, &cache_dir, &base_url)
+    })
+    .await
+    .map_err(|e| format!("visual fetch task failed: {e}"))?
+    .map_err(|e| format!("{:#}", e))
+}
+
 /// List every top-level manifest under `tracks/` (one level deep). The
 /// `imports/` skip is legacy: v3 renders includes into each script's own
 /// canonical directory, and the first full prerender pass GCs the old
@@ -1024,7 +1045,8 @@ fn collect_includes(
             | tag_parser::Node::Until { children, .. }
             | tag_parser::Node::Loop { children, .. }
             | tag_parser::Node::Section { children, .. }
-            | tag_parser::Node::Beatmeter { children, .. } => {
+            | tag_parser::Node::Beatmeter { children, .. }
+            | tag_parser::Node::Visual { children, .. } => {
                 collect_includes(children, script_dir, agent_dir, out, visited, warnings);
             }
             tag_parser::Node::If {
@@ -1715,8 +1737,13 @@ pub fn run() {
             // `audio_server` module docs for why we serve audio over HTTP
             // rather than Tauri's `asset://` protocol.
             let audio_token = generate_audio_token();
+            let visuals_dir = data_dir.join("visuals");
             let audio_base_url = match tauri::async_runtime::block_on(
-                audio_server::bind_audio_server(tracks_dir.clone(), audio_token.clone()),
+                audio_server::bind_audio_server(
+                    tracks_dir.clone(),
+                    visuals_dir,
+                    audio_token.clone(),
+                ),
             ) {
                 Ok((addr, _join)) => {
                     let url = format!(
@@ -1776,6 +1803,8 @@ pub fn run() {
             read_manifest,
             list_manifests,
             delete_manifest,
+            // <visual> slideshow playlist resolution (playback-time)
+            visual_fetch,
             // Debug: export all conditioning scripts (+ includes) as a zip
             export_scripts_zip,
             // Full backup: export all data (except the TTS model) as a zip

@@ -31,6 +31,8 @@ export type Node =
   | { kind: "react"; parts: Part[] }
   | { kind: "rating"; min: number; max: number }
   | { kind: "if"; cond: string; children: Node[] }
+  | { kind: "visual"; source: string; everyMin: number; everyMax: number; count: number;
+    captions: string; effects: string[]; children: Node[] }
   | { kind: "include"; src: string };
 
 // ── known values (mirror tag_parser.rs) ────────────────────────────────────
@@ -54,6 +56,17 @@ const VALID_SPEAKERS = [
   "male", "male2", "male3", "male4", "male5",
   "female", "female2", "female3", "female4", "female5",
 ];
+
+// <visual> known values (mirror tag_parser.rs / visual.rs).
+const VALID_VISUAL_SOURCES = ["redgifs"];
+const VALID_VISUAL_EFFECTS = [
+  "cut", "zoom", "pulse", "flash", "shake", "grayscale", "sepia", "contrast",
+  "blur", "vignette", "scanlines",
+];
+const VALID_CAPTION_MODES = ["off", "meta"];
+const DEFAULT_EVERY_MIN = 5;
+const DEFAULT_EVERY_MAX = 9;
+const DEFAULT_VISUAL_COUNT = 16;
 
 // ── glob <include> helpers (mirror tag_parser.rs) ─────────────────────────
 
@@ -96,7 +109,7 @@ export function wildcardMatch(pattern: string, name: string): boolean {
 const CONTAINER_TAGS = new Set([
   "voice", "speed", "volume", "effect", "overlay", "loop", "background",
   "until", "random", "scramble", "choice", "react", "beatmeter",
-  "intro", "main", "outro", "if",
+  "intro", "main", "outro", "if", "visual",
 ]);
 
 // ── parser ─────────────────────────────────────────────────────────────────
@@ -372,10 +385,110 @@ class Parser {
         const children = this.parseIfChildren();
         return { kind: "if", cond, children };
       }
+      case "visual":
+        // `attrs` was already consumed by parseTag — pass it down (a second
+        // readAttributes() here would return an empty map).
+        return this.parseVisual(attrs, num);
       default:
         // pause/sound/tone/include/rating reached here = not self-closing.
         throw new ParseError(`<${tag}> must be self-closing (ends with '/>')`, this.pos);
     }
+  }
+
+  /**
+   * Parse `<visual>` — slideshow attributes (`every` scalar or `min..max`,
+   * or `bpm` folding to 60/bpm) plus a custom child loop that consumes
+   * `<caption>` elements (authored caption lines; not spoken, not validated
+   * beyond their container role). `<caption>` outside `<visual>` stays an
+   * unknown-tag error, mirroring the Rust parser.
+   */
+  private parseVisual(
+    attrs: Map<string, string>,
+    num: (k: string) => number | undefined,
+  ): Node {
+    const source = attrs.get("source") ?? "redgifs";
+    const list = (k: string): string[] =>
+      (attrs.get(k) ?? "")
+        .split(",")
+        .map((s) => s.trim().toLowerCase())
+        .filter((s) => s !== "");
+
+    let everyMin: number;
+    let everyMax: number;
+    const bpm = num("bpm");
+    const everyRaw = attrs.get("every");
+    if (everyRaw !== undefined && bpm !== undefined) {
+      throw new ParseError(
+        `<visual> accepts either every="…" or bpm="…", not both`,
+        this.pos,
+      );
+    } else if (everyRaw !== undefined) {
+      const t = everyRaw.trim();
+      if (t.includes("..")) {
+        const [lo, hi] = t.split("..", 2);
+        everyMin = parseFloat(lo!);
+        everyMax = parseFloat(hi!);
+        if (!Number.isFinite(everyMin) || !Number.isFinite(everyMax)) {
+          throw new ParseError(`<visual every="${everyRaw}"> is not a number range`, this.pos);
+        }
+      } else {
+        everyMin = parseFloat(t);
+        everyMax = everyMin;
+        if (!Number.isFinite(everyMin)) {
+          throw new ParseError(`<visual every="${everyRaw}"> is not a number`, this.pos);
+        }
+      }
+    } else if (bpm !== undefined) {
+      everyMin = 60 / bpm;
+      everyMax = everyMin;
+    } else {
+      everyMin = DEFAULT_EVERY_MIN;
+      everyMax = DEFAULT_EVERY_MAX;
+    }
+    const count = num("count") ?? DEFAULT_VISUAL_COUNT;
+    const captions = attrs.get("captions") ?? "off";
+    const effects = list("effect");
+
+    this.skipWs();
+    if (this.peekStr("/>")) {
+      this.pos += 2;
+      throw new ParseError(`<visual> tag must have children`, this.pos);
+    }
+    this.expectStr(">");
+    const children: Node[] = [];
+    for (;;) {
+      this.skipWs();
+      if (this.pos >= this.input.length) {
+        throw new ParseError("<visual> is never closed (missing </visual>)", this.pos);
+      }
+      if (this.peekStr("</visual>")) {
+        this.skipWs();
+        this.expectStr("</visual>");
+        break;
+      }
+      if (this.peekStr("<caption")) {
+        this.expectStr("<caption");
+        this.readAttributes();
+        this.skipWs();
+        if (this.peekStr("/>")) {
+          this.pos += 2;
+          continue;
+        }
+        this.expectStr(">");
+        this.parseNodes(); // caption body — consumed, not part of the AST
+        this.expectClosing("caption");
+        continue;
+      }
+      if (this.peekStr("<")) {
+        children.push(this.parseTag());
+      } else {
+        const start = this.pos;
+        const lt = this.input.indexOf("<", this.pos);
+        this.pos = lt === -1 ? this.input.length : lt;
+        if (this.input.slice(start, this.pos).trim()) children.push({ kind: "text" });
+      }
+    }
+    return { kind: "visual", source, everyMin, everyMax, count, captions, effects, children };
   }
 
   /**
@@ -428,14 +541,19 @@ class Parser {
 
 // ── semantic validation (mirror tag_parser.rs `validate`) ──────────────────
 
-function validateNodes(nodes: Node[], errors: string[], seenIncludes: Set<string>): void {
+function validateNodes(
+  nodes: Node[],
+  errors: string[],
+  seenIncludes: Set<string>,
+  parents: string[] = [],
+): void {
   for (const node of nodes) {
     switch (node.kind) {
       case "voice":
         if (!VALID_SPEAKERS.includes(node.speaker)) {
           errors.push(`unknown speaker '${node.speaker}' — valid: ${VALID_SPEAKERS.join(", ")}`);
         }
-        validateNodes(node.children, errors, seenIncludes);
+        validateNodes(node.children, errors, seenIncludes, [...parents, "voice"]);
         break;
       case "speed":
       case "volume":
@@ -443,13 +561,13 @@ function validateNodes(nodes: Node[], errors: string[], seenIncludes: Set<string
       case "background":
       case "section":
       case "beatmeterContainer":
-        validateNodes(node.children, errors, seenIncludes);
+        validateNodes(node.children, errors, seenIncludes, [...parents, node.kind]);
         break;
       case "until":
         if (node.waitingSound && !VALID_SOUND_TYPES.includes(node.waitingSound)) {
           errors.push(`unknown waiting-sound '${node.waitingSound}' in <until> — valid: ${VALID_SOUND_TYPES.join(", ")}`);
         }
-        validateNodes(node.children, errors, seenIncludes);
+        validateNodes(node.children, errors, seenIncludes, [...parents, "until"]);
         break;
       case "beatmeter":
         if (node.bpm <= 0) errors.push(`<beatmeter> bpm must be > 0 (got ${node.bpm})`);
@@ -465,7 +583,7 @@ function validateNodes(nodes: Node[], errors: string[], seenIncludes: Set<string
             errors.push(`invalid pattern char '${bad}' in <beatmeter pattern="${node.pattern}"> — only X, x, . are allowed`);
           }
         }
-        validateNodes(node.children, errors, seenIncludes);
+        validateNodes(node.children, errors, seenIncludes, [...parents, "beatmeter"]);
         break;
       case "sound":
         if (!VALID_SOUND_TYPES.includes(node.soundType)) {
@@ -490,7 +608,7 @@ function validateNodes(nodes: Node[], errors: string[], seenIncludes: Set<string
         if (node.children.some((c) => c.kind === "if")) {
           errors.push(`<if> is not allowed directly inside <effect> — move it outside the effect`);
         }
-        validateNodes(node.children, errors, seenIncludes);
+        validateNodes(node.children, errors, seenIncludes, [...parents, "effect"]);
         break;
       case "overlay":
       case "random":
@@ -500,7 +618,7 @@ function validateNodes(nodes: Node[], errors: string[], seenIncludes: Set<string
           if (part.role !== undefined) {
             errors.push(`<part role="..."> is only valid inside <react>`);
           }
-          validateNodes(part.children, errors, seenIncludes);
+          validateNodes(part.children, errors, seenIncludes, [...parents, node.kind]);
         }
         break;
       case "react": {
@@ -513,7 +631,9 @@ function validateNodes(nodes: Node[], errors: string[], seenIncludes: Set<string
             errors.push(`<part role="${p.role}"> is not valid in <react> (use "main" or "fallback")`);
           }
         }
-        for (const part of node.parts) validateNodes(part.children, errors, seenIncludes);
+        for (const part of node.parts) {
+          validateNodes(part.children, errors, seenIncludes, [...parents, "react"]);
+        }
         break;
       }
       case "rating":
@@ -524,7 +644,37 @@ function validateNodes(nodes: Node[], errors: string[], seenIncludes: Set<string
         if (!parsed.ok) {
           errors.push(`<if cond="${node.cond}">: ${parsed.error}`);
         }
-        validateNodes(node.children, errors, seenIncludes);
+        validateNodes(node.children, errors, seenIncludes, [...parents, "if"]);
+        break;
+      }
+      case "visual": {
+        // Containment: one screen at a time, and never inside a concurrent
+        // audio layer or a single-clip construct (mirrors tag_parser.rs).
+        for (const parent of ["visual", "until", "effect", "beatmeter", "background", "overlay"]) {
+          if (parents.includes(parent)) {
+            errors.push(
+              `<visual> is not allowed inside <${parent}> — place it in sequence content (top level, inside <voice>/<loop>/<main>, a <choice>/<random>/<react> part, …)`,
+            );
+          }
+        }
+        if (!VALID_VISUAL_SOURCES.includes(node.source)) {
+          errors.push(`unknown source '${node.source}' in <visual source="..."> — valid: ${VALID_VISUAL_SOURCES.join(", ")}`);
+        }
+        if (!(node.everyMin > 0) || node.everyMax < node.everyMin) {
+          errors.push(`<visual> every/bpm must be > 0 with min ≤ max (got ${node.everyMin}..${node.everyMax})`);
+        }
+        if (node.count < 1 || node.count > 40) {
+          errors.push(`<visual> count must be between 1 and 40 (got ${node.count})`);
+        }
+        if (!VALID_CAPTION_MODES.includes(node.captions)) {
+          errors.push(`unknown captions mode '${node.captions}' in <visual captions="..."> — valid: ${VALID_CAPTION_MODES.join(", ")}`);
+        }
+        for (const e of node.effects) {
+          if (!VALID_VISUAL_EFFECTS.includes(e)) {
+            errors.push(`unknown effect '${e}' in <visual effect="..."> — valid: ${VALID_VISUAL_EFFECTS.join(", ")}`);
+          }
+        }
+        validateNodes(node.children, errors, seenIncludes, [...parents, "visual"]);
         break;
       }
       case "include":
