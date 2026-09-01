@@ -1141,47 +1141,7 @@ fn collect_visual_configs(
     nodes: &[crate::tag_parser::Node],
     out: &mut Vec<crate::visual::VisualConfig>,
 ) {
-    use crate::tag_parser::Node;
-    for node in nodes {
-        match node {
-            Node::Visual { config, children } => {
-                out.push(config.clone());
-                collect_visual_configs(children, out);
-            }
-            Node::Voice { children, .. }
-            | Node::Speed { children, .. }
-            | Node::Volume { children, .. }
-            | Node::Effect { children, .. }
-            | Node::Background { children, .. }
-            | Node::Until { children, .. }
-            | Node::Loop { children, .. }
-            | Node::Section { children, .. }
-            | Node::Beatmeter { children, .. } => collect_visual_configs(children, out),
-            Node::If {
-                then_branch, r#else, ..
-            } => {
-                collect_visual_configs(then_branch, out);
-                if let Some(else_nodes) = r#else {
-                    collect_visual_configs(else_nodes, out);
-                }
-            }
-            Node::Overlay { parts, .. }
-            | Node::Random { parts }
-            | Node::Scramble { parts }
-            | Node::Choice { options: parts, .. }
-            | Node::React { parts, .. } => {
-                for part in parts {
-                    collect_visual_configs(&part.children, out);
-                }
-            }
-            Node::Text(_)
-            | Node::Pause { .. }
-            | Node::Sound { .. }
-            | Node::Tone { .. }
-            | Node::Rating { .. }
-            | Node::Include { .. } => {}
-        }
-    }
+    visual::collect_configs(nodes, out);
 }
 
 fn validate_data_files_inner(path: Option<String>, state: &State<'_, AppState>) -> ValidateReport {

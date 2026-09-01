@@ -63,6 +63,18 @@ export default function App() {
     return () => window.clearTimeout(t);
   }, [autoPrerender]);
 
+  // Visual prefetch: resolve every `<visual>` slideshow config in the sandbox
+  // into the on-disk playlist cache (search + media downloads), so playback
+  // never sits on "Fetching visuals…". Mirrors the audio prerender opt-out;
+  // the command itself skips configs that are already warm and fresh.
+  useEffect(() => {
+    if (!autoPrerender) return;
+    const t = window.setTimeout(() => {
+      void invoke("visual_prefetch").catch(() => undefined);
+    }, 20_000);
+    return () => window.clearTimeout(t);
+  }, [autoPrerender]);
+
   // Foreground getter shared by the notice overlay and the jingle player.
   // Engine notifications arrive as events (the Rust side must not touch
   // the notification plugin beyond render_notify — see schedule.rs) and
