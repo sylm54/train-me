@@ -151,6 +151,8 @@ pub enum AnswerKind {
     Choice,
     /// A number in `[min, max]` (default 1..=10).
     Rating,
+    /// All of `choices`, ordered by preference (stored as the ranked array).
+    Ranking,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -363,10 +365,10 @@ pub fn parse_flow(json: &str) -> Result<Vec<OnboardingItem>, String> {
                 if q.min >= q.max {
                     return Err(format!("question `{}`: min must be below max", q.id));
                 }
-                if let AnswerKind::Choice = q.answer {
+                if matches!(q.answer, AnswerKind::Choice | AnswerKind::Ranking) {
                     if q.choices.len() < 2 {
                         return Err(format!(
-                            "question `{}`: choice questions need at least 2 choices",
+                            "question `{}`: choice/ranking questions need at least 2 choices",
                             q.id
                         ));
                     }
@@ -847,6 +849,12 @@ pub(crate) fn write_user_md(agent_dir: &Path, data_dir: &Path) -> Result<(), Str
                 q.min,
                 q.max
             ),
+            // Rankings keep the user's order; "a > b > c" reads as preference.
+            (AnswerKind::Ranking, serde_json::Value::Array(items)) => {
+                let ranked: Vec<&str> =
+                    items.iter().filter_map(|v| v.as_str()).collect();
+                format!("**{}** (ranking) {}", q.prompt, ranked.join(" > "))
+            }
             (_, other) => format!(
                 "**{}** {}",
                 q.prompt,
@@ -1259,7 +1267,9 @@ mod tests {
             { "kind": "question", "id": "style", "answer": "choice",
               "prompt": "Style?", "choices": ["strict", "gentle"] },
             { "kind": "question", "id": "heat", "answer": "rating", "min": 1, "max": 5,
-              "prompt": "Heat?" }
+              "prompt": "Heat?" },
+            { "kind": "question", "id": "order", "answer": "ranking",
+              "prompt": "Prefer?", "choices": ["rope", "impact"] }
         ]"###,
         )
         .unwrap();
@@ -1268,13 +1278,43 @@ mod tests {
         answers.insert("topics".into(), json!(["voice", "fitness"]));
         answers.insert("style".into(), json!("strict"));
         answers.insert("heat".into(), json!(4));
+        answers.insert("order".into(), json!(["impact", "rope"]));
         std::fs::write(data.join(ANSWERS_FILE), serde_json::to_string(&answers).unwrap()).unwrap();
         write_user_md(&agent, data).unwrap();
         let md = std::fs::read_to_string(agent.join("USER.md")).unwrap();
         assert!(md.contains("**Topics?** (multiple choice) voice, fitness (not chosen: posture)"));
         assert!(md.contains("**Style?** strict (not chosen: gentle)"));
         assert!(md.contains("**Heat?** 4 (scale 1–5)"));
+        assert!(md.contains("**Prefer?** (ranking) impact > rope"));
         let _ = tmp;
+    }
+
+    #[test]
+    fn ranking_questions_validate_and_answer_like_arrays() {
+        // Ranking needs choices, same as choice…
+        assert!(parse_flow(
+            r#"[{ "kind": "question", "id": "r", "answer": "ranking", "prompt": "p" }]"#
+        )
+        .is_err());
+        assert!(parse_flow(
+            r#"[{ "kind": "question", "id": "r", "answer": "ranking", "prompt": "p", "choices": ["a"] }]"#
+        )
+        .is_err());
+        let flow = parse_flow(
+            r#"[{ "kind": "question", "id": "r", "answer": "ranking", "prompt": "p", "choices": ["a", "b"] }]"#
+        )
+        .unwrap();
+
+        // …and a ranked answer is a plain array, so `includes` conditions
+        // match against its entries.
+        let mut a = Answers::new();
+        a.insert("r".into(), json!(["b", "a"]));
+        assert!(eval_condition(
+            &serde_json::from_str::<Condition>(r#"{ "id": "r", "includes": "b" }"#).unwrap(),
+            &a,
+            &no_parts()
+        ));
+        assert!(is_answered(a.get("r")));
     }
 
     #[test]

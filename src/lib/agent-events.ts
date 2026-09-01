@@ -79,6 +79,12 @@ export type AgentEvent =
        */
       depth: number;
       label: string;
+      /**
+       * The `label` the parent agent passed to `spawn_agent` — what the copy
+       * is working on. Stays on the frame while `label` tracks the current
+       * step, so the user can see what each delegation is for.
+       */
+      task?: string;
       ts: number;
     }
   | {

@@ -9,7 +9,7 @@
  * Lifecycle:
 
  *   Main agent
- *     └─ tool: spawn_agent(task)   → copy @ depth 1
+ *     └─ tool: spawn_agent(label, task) → copy @ depth 1
  *          └─ streamText(main prompt, copy tools)
  *               ├─ bash / read_file / write_file / edit_file / list_files
  *               └─ validate_files
@@ -146,12 +146,13 @@ const STEP_LABEL: Record<string, string> = {
 };
 
 /** Push a subagent-start event so the UI can show progress etc. */
-function emitStart(agent: SubagentName, depth: number) {
+function emitStart(agent: SubagentName, depth: number, label?: string) {
   emitAgentEvent({
     type: "subagent-start",
     agent,
     depth,
-    label: START_LABEL[agent],
+    label: label ? `Working on: ${label}` : START_LABEL[agent],
+    task: label,
     ts: Date.now(),
   });
 }
@@ -237,6 +238,8 @@ async function runSubagent(opts: {
   agent: SubagentName;
   /** Chain depth of this run (always 1 — copies get no spawn tool). */
   depth: number;
+  /** What the copy was spawned for — surfaced on the UI progress feed. */
+  label?: string;
   systemPrompt: string;
   messages: UIMessage[];
   tools: ToolSet;
@@ -254,7 +257,7 @@ async function runSubagent(opts: {
     opts.depth,
     `▶ starting (${opts.settings.agents.main.provider}/${cfg.model})`,
   );
-  emitStart(opts.agent, opts.depth);
+  emitStart(opts.agent, opts.depth, opts.label);
 
   // `result` is declared outside the try so the `finally` block can read
   // its (fallback) usage; `streamText` runs synchronously, but the awaited
@@ -514,6 +517,8 @@ function buildSpawnedTools(): ToolSet {
 export async function spawnAgent(opts: {
   settings: AgentSettings;
   task: string;
+  /** Short human-readable label for what this copy is for. */
+  label?: string;
 }): Promise<string> {
   const depth = 1;
   const systemPrompt = await loadPrompt("main_agent.md");
@@ -526,7 +531,11 @@ export async function spawnAgent(opts: {
     );
   }
 
-  console.groupCollapsed(`%c${tag("spawn", depth)}`, LOG_STYLE, `▶ spawn_agent`);
+  console.groupCollapsed(
+    `%c${tag("spawn", depth)}`,
+    LOG_STYLE,
+    `▶ spawn_agent${opts.label ? ` — ${opts.label}` : ""}`,
+  );
   log("spawn", depth, "task", preview(opts.task));
 
   try {
@@ -542,6 +551,7 @@ export async function spawnAgent(opts: {
       settings: opts.settings,
       agent: "spawn",
       depth,
+      label: opts.label,
       systemPrompt,
       messages,
       tools: buildSpawnedTools(),
@@ -564,10 +574,11 @@ export async function spawnAgent(opts: {
 /**
  * Build the `spawn_agent` tool as exposed to the main agent.
  *
- * The tool takes a single self-contained `task` string and returns the
- * copy's final answer (which the parent sees as the tool result). Rebuilt
- * whenever `settings` change because it captures the settings for the
- * spawned LLM call.
+ * The tool takes a short human-readable `label` (what the copy is for —
+ * shown on the UI progress feed so the user can follow the delegation) and a
+ * self-contained `task` string, and returns the copy's final answer (which
+ * the parent sees as the tool result). Rebuilt whenever `settings` change
+ * because it captures the settings for the spawned LLM call.
  */
 export function buildSpawnAgentTool(settings: AgentSettings) {
   return tool({
@@ -584,6 +595,13 @@ export function buildSpawnAgentTool(settings: AgentSettings) {
       "self-contained brief — include the goal, relevant paths and context, " +
       "and any constraints; assume the copy reads no part of this chat.",
     inputSchema: z.object({
+      label: z
+        .string()
+        .describe(
+          "Short name for what this copy is working on (a few words, e.g. " +
+            "'evening audio script' or 'habit feature files'). Shown to the " +
+            "user on the progress feed while the copy runs.",
+        ),
       task: z
         .string()
         .describe(
@@ -593,15 +611,15 @@ export function buildSpawnAgentTool(settings: AgentSettings) {
             "sees this chat — include all relevant detail.",
         ),
     }),
-    execute: async ({ task }) => {
+    execute: async ({ label, task }) => {
       console.groupCollapsed(
         `%c[main]`,
         "color:#10b981;font-weight:bold",
-        `▶ spawn_agent tool`,
+        `▶ spawn_agent tool${label ? ` — ${label}` : ""}`,
       );
       console.log("task", preview(task));
       try {
-        const output = await spawnAgent({ settings, task });
+        const output = await spawnAgent({ settings, task, label });
         console.log(
           `%c[main]`,
           "color:#10b981;font-weight:bold",

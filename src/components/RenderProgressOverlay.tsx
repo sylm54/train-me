@@ -15,6 +15,7 @@
 
 import { useEffect } from "react";
 import { AlertCircle, CheckCircle2, AudioLines } from "lucide-react";
+import { useSettings } from "@/lib/settings";
 import {
   clear,
   ensureGlobalListener,
@@ -143,6 +144,7 @@ function Pill({
 
 export function RenderProgressOverlay({ composer }: { composer?: boolean }) {
   const store = useRenderStore();
+  const { settings } = useSettings();
 
   // The registry attaches its listeners on first subscription; make sure
   // they exist from app start so no early render event is missed.
@@ -156,6 +158,9 @@ export function RenderProgressOverlay({ composer }: { composer?: boolean }) {
     [...store.values()].some((e) => e.status === "rendering"),
   );
 
+  // Setting: the popup can be hidden entirely. Renders keep running in the
+  // background either way — this only mutes the visual feedback.
+  if (!settings.audio.showRenderPill) return null;
   if (store.size === 0) return null;
 
   // The pill is informational only — the whole overlay is click-through, so

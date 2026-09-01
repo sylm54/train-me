@@ -89,6 +89,32 @@ function save(s: AgentSettings) {
   } catch (e) {
     console.warn("Failed to persist settings:", e);
   }
+  notifyListeners();
+}
+
+/** Same-window subscribers that re-read settings after any write. */
+const settingsListeners = new Set<() => void>();
+let notifyScheduled = false;
+
+/**
+ * Re-read settings in every subscribed hook instance. Deferred to a
+ * microtask: `save` can run inside a `setSettings` updater, and updating
+ * other components synchronously from there trips React's
+ * "cannot update a component while rendering another" guard.
+ */
+function notifyListeners() {
+  if (notifyScheduled) return;
+  notifyScheduled = true;
+  queueMicrotask(() => {
+    notifyScheduled = false;
+    for (const listener of settingsListeners) {
+      try {
+        listener();
+      } catch {
+        // ignore
+      }
+    }
+  });
 }
 
 /**
@@ -105,7 +131,13 @@ export function useSettings() {
       }
     }
     window.addEventListener("storage", onStorage);
-    return () => window.removeEventListener("storage", onStorage);
+    // Same-window sync: re-read whenever another component's write lands.
+    const update = () => setSettings(load());
+    settingsListeners.add(update);
+    return () => {
+      window.removeEventListener("storage", onStorage);
+      settingsListeners.delete(update);
+    };
   }, []);
 
   const setApiKey = useCallback((provider: ProviderName, value: string) => {

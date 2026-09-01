@@ -597,6 +597,16 @@ export function SettingsView() {
               }}
             />
 
+            <ToggleField
+              label="Show render progress popup"
+              value={settings.audio.showRenderPill}
+              hint="While a script renders, a small progress popup floats above the message box. Turn this off to hide the popup; renders continue silently in the background."
+              onChange={(v) => {
+                setAudio({ showRenderPill: v });
+                flashSave();
+              }}
+            />
+
             <ChatNumberField
               label="Beat click offset (ms)"
               value={settings.playback.beatOffsetMs}

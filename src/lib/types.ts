@@ -91,11 +91,18 @@ export interface AudioSettings {
    * view's "Pre-render audio" button runs a full pass manually.
    */
   autoPrerender: boolean;
+  /**
+   * Show the floating render-progress popup (pill) while TTS scripts render.
+   * When false the pill never appears; renders continue silently in the
+   * background.
+   */
+  showRenderPill: boolean;
 }
 
 /** Default audio rendering settings. */
 export const DEFAULT_AUDIO_SETTINGS: AudioSettings = {
   autoPrerender: true,
+  showRenderPill: true,
 };
 
 /** Complete settings persisted to localStorage. */

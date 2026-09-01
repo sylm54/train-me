@@ -5,15 +5,21 @@
  * visible unresolved question — asking the backend for the next screen
  * after every answer, so `showIf` conditionals hide/show live without
  * any duplicated logic on this side. Optional questions may be skipped
- * (stored as `null`). Non-open questions (choice, rating) also get an
- * optional free-text clarification, stored under the `note:<id>` answer
- * key and only kept alongside an actual answer. When the flow completes
- * it saves the session (which regenerates `agent_data/USER.md`) and
- * calls `onFinish`.
+ * (stored as `null`). Non-open questions (choice, rating, ranking) also
+ * get an optional free-text clarification, stored under the `note:<id>`
+ * answer key and only kept alongside an actual answer. When the flow
+ * completes it saves the session (which regenerates `agent_data/USER.md`)
+ * and calls `onFinish`.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ArrowLeft, ArrowRight, Check } from "lucide-react";
+import {
+  ArrowLeft,
+  ArrowRight,
+  Check,
+  ChevronDown,
+  ChevronUp,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
@@ -25,6 +31,7 @@ import {
   type AnswerMap,
   type AnswerValue,
   type OnboardingStep,
+  type QuestionItem,
 } from "@/lib/onboarding";
 
 interface Props {
@@ -36,6 +43,26 @@ function isAnswered(answer: AnswerValue | undefined): boolean {
   if (typeof answer === "string") return answer.trim().length > 0;
   if (Array.isArray(answer)) return answer.length > 0;
   return true;
+}
+
+/**
+ * The ranking a `ranking` question is currently showing: the draft array
+ * when it's a full permutation of the choices, otherwise the choices in
+ * their listed order (the default ranking).
+ */
+function rankingOrder(
+  q: QuestionItem,
+  draft: AnswerValue | undefined,
+): string[] {
+  const choices = q.choices ?? [];
+  if (
+    Array.isArray(draft) &&
+    draft.length === choices.length &&
+    draft.every((c) => choices.includes(c))
+  ) {
+    return draft;
+  }
+  return choices;
 }
 
 export function OnboardingFlow({ onFinish }: Props) {
@@ -59,8 +86,18 @@ export function OnboardingFlow({ onFinish }: Props) {
       const next = await fetchOnboardingStep(answers);
       setStep(next);
       // Pre-fill the draft when re-visiting an answered question (Back).
+      // Ranking questions also pre-fill on first visit: a ranking is always
+      // a complete answer, so it starts as the choices' listed order.
       const q = next.question;
-      setDraft(q ? answers[q.id] : undefined);
+      if (!q) {
+        setDraft(undefined);
+      } else if (q.id in answers) {
+        setDraft(answers[q.id]);
+      } else if (q.answer === "ranking") {
+        setDraft(q.choices ?? []);
+      } else {
+        setDraft(undefined);
+      }
       const note = q && q.answer !== "open" ? answers[noteKey(q.id)] : undefined;
       setNoteDraft(typeof note === "string" ? note : "");
     } catch (e) {
@@ -145,6 +182,17 @@ export function OnboardingFlow({ onFinish }: Props) {
 
   const q = step.question;
   const answeredCount = step.total - step.remaining + (q ? 1 : 0);
+
+  /** Swap a ranking entry with its neighbour (delta −1 = up, +1 = down). */
+  const moveChoice = (index: number, delta: number) => {
+    if (!q || q.answer !== "ranking") return;
+    const order = rankingOrder(q, draft);
+    const j = index + delta;
+    if (j < 0 || j >= order.length) return;
+    const next = [...order];
+    [next[index], next[j]] = [next[j], next[index]];
+    setDraft(next);
+  };
 
   return (
     <div className="space-y-5">
@@ -233,6 +281,50 @@ export function OnboardingFlow({ onFinish }: Props) {
                   {value}
                 </Button>
               ))}
+            </div>
+          )}
+
+          {q.answer === "ranking" && (
+            <div className="space-y-1">
+              <div className="flex flex-col gap-1">
+                {rankingOrder(q, draft).map((choice, i, order) => (
+                  <div
+                    key={choice}
+                    className="flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-2.5 py-1.5"
+                  >
+                    <span className="w-5 shrink-0 text-center text-xs tabular-nums text-muted-foreground">
+                      {i + 1}.
+                    </span>
+                    <span className="min-w-0 flex-1 truncate text-sm">{choice}</span>
+                    <span className="flex shrink-0 flex-col">
+                      <button
+                        type="button"
+                        onClick={() => moveChoice(i, -1)}
+                        disabled={i === 0}
+                        aria-label={`Move ${choice} up`}
+                        title="Move up"
+                        className="grid size-5 place-items-center rounded text-muted-foreground hover:bg-[var(--color-pink-100)] hover:text-[var(--color-foreground)] disabled:opacity-25"
+                      >
+                        <ChevronUp className="size-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => moveChoice(i, 1)}
+                        disabled={i === order.length - 1}
+                        aria-label={`Move ${choice} down`}
+                        title="Move down"
+                        className="grid size-5 place-items-center rounded text-muted-foreground hover:bg-[var(--color-pink-100)] hover:text-[var(--color-foreground)] disabled:opacity-25"
+                      >
+                        <ChevronDown className="size-3.5" />
+                      </button>
+                    </span>
+                  </div>
+                ))}
+              </div>
+              <p className="text-[11px] text-muted-foreground">
+                Order by preference — use the arrows. The current order is
+                your answer.
+              </p>
             </div>
           )}
 
