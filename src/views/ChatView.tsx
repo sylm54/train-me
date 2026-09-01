@@ -65,6 +65,8 @@ import {
   Archive,
   Brain,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   Clock,
   Loader2,
   MessageCircleQuestion,
@@ -89,6 +91,7 @@ import {
 import { createMainAgentTransport } from "@/lib/agent";
 import type { AgentSettings } from "@/lib/types";
 import { useAgentEvents, useSessionUsage, type AgentEvent } from "@/lib/agent-events";
+import { useRenderStore } from "@/lib/renderRegistry";
 import {
   archiveChat,
   createChat,
@@ -331,6 +334,14 @@ function ChatViewInner({
 
   const chats = useChats();
   const activeChat = chats.find((c) => c.id === activeChatId);
+
+  // Render-pill awareness: while a TTS render runs, its floating popup
+  // hovers over the bottom of the conversation — reserve space below the
+  // last message so it can scroll clear of the pill (unless the user hid
+  // the popup in Settings).
+  const renderStore = useRenderStore();
+  const renderPillVisible =
+    settings.audio.showRenderPill && renderStore.size > 0;
 
   // ── Rehydrate messages for this chat on mount ───────────────────────
   // useChat keeps an internal store keyed by `id`, so returning to a chat
@@ -737,6 +748,10 @@ function ChatViewInner({
           {emptyResponse && !isGenerating && !error && (
             <EmptyResponseBanner onRetry={onRetry} />
           )}
+
+          {/* Keep the last answer scrollable clear of the floating audio
+              render popup while one is visible (see renderPillVisible). */}
+          {renderPillVisible && <div aria-hidden className="h-40 shrink-0" />}
         </ConversationContent>
         <ConversationScrollButton />
       </Conversation>
@@ -1046,7 +1061,9 @@ function ContextFooter({
               </span>
             ))}
             <span className="opacity-40">·</span>
-            <span className="truncate">{activeSubagent?.label}</span>
+            <span className="truncate">
+              {activeSubagent?.task ?? activeSubagent?.label}
+            </span>
             {activeSubagent?.attempt && activeSubagent.attempt > 1 && (
               <span className="opacity-60 shrink-0">
                 · attempt {activeSubagent.attempt}
@@ -1529,6 +1546,11 @@ interface ActiveSubagent {
   /** Chain depth (always 1 today — copies get no spawn tool). */
   depth: number;
   label: string;
+  /**
+   * The `label` the agent passed to `spawn_agent` — what this copy is for.
+   * Stays fixed on the frame while `label` tracks the current step.
+   */
+  task?: string;
   startedAt: number;
   /** Reserved for retry-aware tool steps (currently unused). */
   attempt?: number;
@@ -1574,6 +1596,7 @@ function deriveStats(events: AgentEvent[]): {
           agent: e.agent,
           depth: e.depth,
           label: e.label,
+          task: e.task,
           startedAt: e.ts,
           attempt: undefined,
         });
@@ -1847,6 +1870,21 @@ function SubagentProgressIndicator({
             {sa.depth > 1 && (
               <span className="opacity-50 shrink-0">L{sa.depth}</span>
             )}
+            {/* What this copy is for (the spawn_agent `label`) — stays put
+                while sa.label tracks the current step. */}
+            {sa.task && (
+              <>
+                <span className="opacity-40">·</span>
+                <span
+                  className={`truncate max-w-[16rem] ${
+                    isInnermost ? "" : "opacity-70"
+                  }`}
+                  title={sa.task}
+                >
+                  {sa.task}
+                </span>
+              </>
+            )}
             <span className="opacity-40">·</span>
             <span className={isInnermost ? "" : "opacity-70"}>{sa.label}</span>
             {isInnermost && sa.attempt && sa.attempt > 1 && (
@@ -2092,8 +2130,13 @@ function summarizeToolPart(part: UIMessage["parts"][number]): {
         cmd && cmd.length > 60 ? cmd.slice(0, 60) + "…" : cmd;
       return { label: "Ran command", detail };
     }
-    case "spawn_agent":
-      return { label: "Delegating" };
+    case "spawn_agent": {
+      const label =
+        typeof input.label === "string" && input.label.trim()
+          ? input.label.trim()
+          : undefined;
+      return { label: "Delegating", detail: label };
+    }
     default:
       return { label: name };
   }
@@ -2246,14 +2289,61 @@ function AskedQuestionCard({
  * Renders any questions the agent is currently blocking on (from the
  * `ask_question` tool). Shown directly above the composer. Empty when there
  * are none.
+ *
+ * The agent can fire several `ask_question` calls in one turn (parallel tool
+ * calls). Rather than stacking every card, show ONE at a time with prev/next
+ * buttons: the user answers them one by one, and each card still shows the
+ * full question text the agent wrote. Non-shown cards stay mounted (hidden)
+ * so anything typed into them survives flipping back and forth.
  */
 function PendingQuestions() {
   const questions = usePendingQuestions();
-  if (questions.length === 0) return null;
+  // Registry order is newest-first; answer oldest-first so the exchange
+  // reads in the order the agent asked.
+  const ordered = useMemo(() => [...questions].reverse(), [questions]);
+  // May point past the end after an answer shrinks the list — clamped below.
+  const [index, setIndex] = useState(0);
+  const safeIndex = Math.min(index, ordered.length - 1);
+  if (ordered.length === 0) return null;
+
+  const move = (delta: number) =>
+    setIndex(Math.max(0, Math.min(ordered.length - 1, safeIndex + delta)));
+
   return (
     <div className="flex flex-col gap-2 border-t border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2">
-      {questions.map((q) => (
-        <QuestionCard key={q.id} q={q} />
+      {ordered.length > 1 && (
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-[11px] font-medium uppercase tracking-wide text-[var(--color-muted-foreground)]">
+            {ordered.length} questions — {safeIndex + 1} of {ordered.length}
+          </span>
+          <div className="flex items-center gap-1">
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              onClick={() => move(-1)}
+              disabled={safeIndex === 0}
+              aria-label="Previous question"
+              title="Previous question"
+            >
+              <ChevronLeft size={14} />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              onClick={() => move(1)}
+              disabled={safeIndex === ordered.length - 1}
+              aria-label="Next question"
+              title="Next question"
+            >
+              <ChevronRight size={14} />
+            </Button>
+          </div>
+        </div>
+      )}
+      {ordered.map((q, i) => (
+        <div key={q.id} className={i === safeIndex ? "contents" : "hidden"}>
+          <QuestionCard q={q} />
+        </div>
       ))}
     </div>
   );

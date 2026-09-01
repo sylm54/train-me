@@ -14,13 +14,13 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
-export type AnswerKind = "open" | "choice" | "rating";
+export type AnswerKind = "open" | "choice" | "rating" | "ranking";
 
 export interface QuestionItem {
   id: string;
   answer: AnswerKind;
   prompt: string;
-  /** `choice` answers only. */
+  /** `choice`/`ranking` answers only. */
   choices?: string[];
   /** `choice` answers only — collect several. */
   multiple?: boolean;

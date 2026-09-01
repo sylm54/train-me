@@ -182,16 +182,16 @@ function validateItems(items: Json[], knownParts: string[] | null, diags: Diag[]
         diags.push({ severity: "error", message: `${label}: \`prompt\` must not be empty` });
       }
       const answer = item.answer;
-      if (!["open", "choice", "rating"].includes(String(answer))) {
+      if (!["open", "choice", "rating", "ranking"].includes(String(answer))) {
         diags.push({
           severity: "error",
-          message: `${label}: \`answer\` must be open, choice, or rating`,
+          message: `${label}: \`answer\` must be open, choice, rating, or ranking`,
         });
-      } else if (answer === "choice") {
+      } else if (answer === "choice" || answer === "ranking") {
         if (!Array.isArray(item.choices) || item.choices.length < 2) {
           diags.push({
             severity: "error",
-            message: `${label}: choice questions need at least 2 \`choices\``,
+            message: `${label}: choice/ranking questions need at least 2 \`choices\``,
           });
         }
       } else if (answer === "rating") {
