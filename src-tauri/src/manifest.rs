@@ -48,6 +48,12 @@ pub enum Segment {
         /// meter without re-deriving anything.
         #[serde(skip_serializing_if = "Option::is_none")]
         beatmeter: Option<BeatmeterMeta>,
+        /// Slideshow config when a `<visual>` was baked INTO this clip (a
+        /// visual directly inside a `<beatmeter>`, or inside an `<effect>`).
+        /// The player mounts the slideshow for the clip's duration. Visuals
+        /// in sequence content become their own `Visual` segment instead.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        visual: Option<crate::visual::VisualConfig>,
     },
 
     /// Loop the inner clip until the user presses `button`. An optional
@@ -391,6 +397,18 @@ pub(crate) fn contains_split(node: &Node) -> bool {
     }
 }
 
+/// Like [`contains_split`], but a `<visual>` is TRANSPARENT: the slideshow
+/// produces no audio and can be baked into a clip (its config rides the
+/// resulting `Static` segment), so it must not by itself make content
+/// "dynamic". A blocking split INSIDE the visual still counts — recursed
+/// through here.
+pub(crate) fn contains_blocking_split(node: &Node) -> bool {
+    match node {
+        Node::Visual { children, .. } => children.iter().any(contains_blocking_split),
+        other => contains_split(other),
+    }
+}
+
 /// Best-effort nominal duration (seconds) of a segment tree.
 ///
 /// `Import` contributes `0.0` (reading sub-manifests here would require file
@@ -695,6 +713,7 @@ mod tests {
                     file: "a.wav".into(),
                     duration: 2.0,
                     beatmeter: None,
+                    visual: None,
                 },
                 Segment::Random {
                     options: vec![
@@ -702,11 +721,13 @@ mod tests {
                             file: "b.wav".into(),
                             duration: 3.0,
                             beatmeter: None,
+                            visual: None,
                         },
                         Segment::Static {
                             file: "c.wav".into(),
                             duration: 5.0,
                             beatmeter: None,
+                            visual: None,
                         },
                     ],
                 },
@@ -716,6 +737,7 @@ mod tests {
                         file: "d.wav".into(),
                         duration: 1.0,
                         beatmeter: None,
+                        visual: None,
                     }),
                 },
             ],
@@ -732,11 +754,13 @@ mod tests {
                             file: "x.wav".into(),
                             duration: 1.0,
                             beatmeter: None,
+                            visual: None,
                         },
                         Segment::Static {
                             file: "y.wav".into(),
                             duration: 2.0,
                             beatmeter: None,
+                            visual: None,
                         },
                     ],
                 },
@@ -747,6 +771,7 @@ mod tests {
                         file: "bg.wav".into(),
                         duration: 100.0,
                         beatmeter: None,
+                        visual: None,
                     }),
                 },
             ],
@@ -805,6 +830,7 @@ mod tests {
                 file: "a.wav".into(),
                 duration: 10.0,
                 beatmeter: None,
+                visual: None,
             }),
         };
         assert!((nominal_duration(&seg) - 10.0).abs() < 1e-6);

@@ -31,8 +31,8 @@ export type Node =
   | { kind: "react"; parts: Part[] }
   | { kind: "rating"; min: number; max: number }
   | { kind: "if"; cond: string; children: Node[] }
-  | { kind: "visual"; source: string; everyMin: number; everyMax: number; count: number;
-    captions: string; effects: string[]; children: Node[] }
+  | { kind: "visual"; source: string; niches: string[]; everyMin: number; everyMax: number;
+    count: number; captions: string; order?: string; effects: string[]; children: Node[] }
   | { kind: "include"; src: string };
 
 // ── known values (mirror tag_parser.rs) ────────────────────────────────────
@@ -64,6 +64,7 @@ const VALID_VISUAL_EFFECTS = [
   "blur", "vignette", "scanlines",
 ];
 const VALID_CAPTION_MODES = ["off", "meta"];
+const VALID_VISUAL_ORDERS = ["top", "top7", "top28", "latest", "score", "trending"];
 const DEFAULT_EVERY_MIN = 5;
 const DEFAULT_EVERY_MAX = 9;
 const DEFAULT_VISUAL_COUNT = 16;
@@ -412,6 +413,9 @@ class Parser {
         .split(",")
         .map((s) => s.trim().toLowerCase())
         .filter((s) => s !== "");
+    // Niche ids are lowercase hyphenated; display names ("Just Boobs") fold
+    // onto the same form.
+    const niches = list("niche").map((n) => n.replace(/ /g, "-"));
 
     let everyMin: number;
     let everyMax: number;
@@ -447,6 +451,7 @@ class Parser {
     }
     const count = num("count") ?? DEFAULT_VISUAL_COUNT;
     const captions = attrs.get("captions") ?? "off";
+    const order = attrs.get("order");
     const effects = list("effect");
 
     this.skipWs();
@@ -488,7 +493,7 @@ class Parser {
         if (this.input.slice(start, this.pos).trim()) children.push({ kind: "text" });
       }
     }
-    return { kind: "visual", source, everyMin, everyMax, count, captions, effects, children };
+    return { kind: "visual", source, niches, everyMin, everyMax, count, captions, order, effects, children };
   }
 
   /**
@@ -649,11 +654,12 @@ function validateNodes(
       }
       case "visual": {
         // Containment: one screen at a time, and never inside a concurrent
-        // audio layer or a single-clip construct (mirrors tag_parser.rs).
-        for (const parent of ["visual", "until", "effect", "beatmeter", "background", "overlay"]) {
+        // audio layer or an `<until>` (mirrors tag_parser.rs). `<effect>` and
+        // `<beatmeter>` host a baked-in visual (direct child for beatmeter).
+        for (const parent of ["visual", "until", "background", "overlay"]) {
           if (parents.includes(parent)) {
             errors.push(
-              `<visual> is not allowed inside <${parent}> — place it in sequence content (top level, inside <voice>/<loop>/<main>, a <choice>/<random>/<react> part, …)`,
+              `<visual> is not allowed inside <${parent}> — place it in sequence content (top level, inside <voice>/<loop>/<main>, a <choice>/<random>/<react> part, an <effect>, or directly in a <beatmeter>)`,
             );
           }
         }
@@ -668,6 +674,9 @@ function validateNodes(
         }
         if (!VALID_CAPTION_MODES.includes(node.captions)) {
           errors.push(`unknown captions mode '${node.captions}' in <visual captions="..."> — valid: ${VALID_CAPTION_MODES.join(", ")}`);
+        }
+        if (node.order !== undefined && !VALID_VISUAL_ORDERS.includes(node.order)) {
+          errors.push(`unknown order '${node.order}' in <visual order="..."> — valid: ${VALID_VISUAL_ORDERS.join(", ")}`);
         }
         for (const e of node.effects) {
           if (!VALID_VISUAL_EFFECTS.includes(e)) {

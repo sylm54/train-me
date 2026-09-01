@@ -103,11 +103,14 @@ A metronome over its (non-interactive) children. The renderer bakes the children
 
 ### `<visual>` — container (children required)
 A gif/image slideshow layered over its children for as long as they play (the audio itself is unaffected). The slideshow is resolved PER PLAYBACK: the player asks the configured source for a fresh playlist of slides and flips through them on the tag's tempo, so each listen can draw different media. `<caption>` children are pulled out as authored caption text (shown on the slideshow, never spoken); every other child is ordinary audio content, and interactive tags are allowed — the slideshow keeps flipping through pauses and button-waits.
+
+**Niches vs tags.** A `niche` is a curated source community — RedGIFs' subreddit-like buckets (e.g. `just-boobs`, `tik-tok`). Use niches to pick WHAT you want to show. A `tag` is free-form descriptive metadata the server matches loosely (`tags="gooning, edging"`) — use tags to fine-tune within the niche. Tags need no lookup; niches are checked by the app against a live snapshot: an unknown niche id is a validation warning, and the current list ships in the agent sandbox at `docs/redgifs-discovery.md` (top niches by subscribers + trending tags, refreshed automatically whenever a visual script is validated or played).
 - `source` — default `redgifs`; the pluggable visual source id (see below).
-- `tags` — optional; comma-separated tags/niches to include (e.g. `tags="hypno, spiral"`).
+- `niche` — optional; comma-separated niche ids/names to pull content from (e.g. `niche="just-boobs, Just Boobs"` — both forms work). Preferred over tags for steering.
+- `tags` — optional; comma-separated descriptive tags to include (e.g. `tags="hypno, spiral"`).
 - `block` — optional; comma-separated tags that disqualify a slide.
 - `query` — optional; free-text search hint for the source.
-- `order` — optional; ordering hint passed to the source (e.g. `recent`, `trending`).
+- `order` — optional; result ordering: `trending` (default), `latest`, `top`, `top7`, `top28`, `score`.
 - `every` — default `5..9`; seconds per slide — a fixed value (`every="6"`) or a `min..max` range a fresh value is drawn from per slide (`every="4..8"`).
 - `bpm` — alternative tempo spec: one slide per beat (`bpm="30"` = a slide every 2s). Mutually exclusive with `every`.
 - `count` — default `16`; how many distinct slides to fetch (1–40). The playlist loops when exhausted.
@@ -116,9 +119,9 @@ A gif/image slideshow layered over its children for as long as they play (the au
 
 Child tag: `<caption>` — one authored caption line; valid only directly inside `<visual>`. Lines are shuffled per playback and shown one per slide whenever `captions` is not `off`.
 
-Not allowed inside another `<visual>`, `<until>`, `<effect>`, `<beatmeter>`, `<background>` or `<overlay>` — place it in sequence content (top level, inside `<voice>`/`<loop>`/`<main>`, or inside a `<choice>`/`<random>`/`<react>` part). Contributes no audio of its own.
+Placement: valid in sequence content (top level, inside `<voice>`/`<loop>`/`<main>`, or inside a `<choice>`/`<random>`/`<react>` part). Also valid inside `<effect>` (decorates the effected clip) and as a DIRECT child of `<beatmeter>` (decorates the whole beat-metered clip — the slideshow runs while the beatmeter plays; interactive content inside such a visual is still rejected). NOT allowed inside another `<visual>`, an `<until>`, or `<background>`/`<overlay>` (concurrent audio streams). Contributes no audio of its own.
 
-**Visual sources.** `source` picks the provider; new providers implement the `VisualSource` trait in `src-tauri/src/visual.rs` and register there. `redgifs` — RedGIFs (redgifs.com): an anonymous temporary token (`/v2/auth/temporary`) plus a `/v2/links/search` query built from `tags`/`query`/`order`; matches are downloaded once into an on-device cache (reused across plays, so previously-seen slides work offline) and served to the player locally. RedGIFs tag names with spaces are matched with underscores; `block` drops any result whose tag set intersects.
+**Visual sources.** `source` picks the provider; new providers implement the `VisualSource` trait in `src-tauri/src/visual.rs` and register there. `redgifs` — RedGIFs (redgifs.com): an anonymous temporary token (`/v2/auth/temporary`) plus a `/v2/gifs/search` query built from `niche`/`tags`/`query`/`order`; matches are downloaded once into an on-device cache (reused across plays, so previously-seen slides work offline) and served to the player locally. RedGIFs tag names with spaces are matched in any form (`big-ass`, `big_ass`, `Big Ass`).
 
 ### `<if>` / `<else>` — conditional branches (playback-time)
 Plays exactly ONE branch per playback, chosen by evaluating `cond` against the **run-context variables** (see below) when playback starts. Both branches are fully rendered; the skipped branch's clips are simply never touched — so conditionals never fork the render cache. `cond` is an expression in the condition DSL (`weekday == "sunday" and streak >= 7` — see FORMAT.md §2.6 for the grammar and variable list). An optional `<else>` container inside the `<if>` provides the false branch. A broken or unknown-variable condition evaluates to false. Like the other interactive tags, `<if>` is not allowed inside a `<background>` layer or an `<overlay>` part, not inside `<effect>` (its content bakes into one clip), and not inside `<beatmeter>` children.
@@ -193,7 +196,7 @@ Constant folding: literals, binops of constants, and `@max`/`@min`/`@step`/`@rou
 - `<overlay>` mixes all parts concurrently (all start together). `<loop>` repeats sequentially.
 - `<include>` renders to a linked sub-manifest in the target's own track directory (context resets at the boundary); each file is hashed separately for incremental re-rendering, and a glob include becomes a per-playback random pick among its linked matches.
 - Interactive tags `<until>`/`<random>`/`<scramble>`/`<choice>`/`<rating>`/`<react>` produce segment boundaries; decisions for `<random>`/`<scramble>`/`<choice>` happen per-playback, so each listen can differ. `<until>`, `<choice>`, `<rating>`, `<react>`, `<beatmeter>`, and `<if>` are rejected inside `<background>`/`<overlay>` (they would block or conflict with a concurrent stream); `<random>`/`<scramble>`/`<loop>`/`<include>` are allowed there. A `<background>` whose layer contains no interactive tag is baked into its surrounding segment; one with an interactive layer plays on a parallel track scoped to its enclosing sequence. The listener's `<choice>`/`<rating>`/`<react>` decisions are recorded to the activity log (`feature = script`, `action = choice`).
-- `<visual>` layers a gif/image slideshow over its children (audio unaffected). Slides resolve per playback from a pluggable source (default `redgifs`); tempo via `every`/`bpm`, plus optional `tags`/`block`/`captions`/`effect`. Never nested or inside `<until>`/`<effect>`/`<beatmeter>`/`<background>`/`<overlay>`.
+- `<visual>` layers a gif/image slideshow over its children (audio unaffected). Slides resolve per playback from a pluggable source (default `redgifs`): steer with `niche` (curated communities — see `docs/redgifs-discovery.md`), fine-tune with free-form `tags`, tempo via `every`/`bpm`, plus `block`/`captions`/`effect`. Also allowed inside `<effect>` and as a direct child of `<beatmeter>`; never nested, inside `<until>`, or inside `<background>`/`<overlay>`.
 - Note that <interactive> is not a valid tag; use <until>, <random>, <scramble>, <choice>, <rating>, or <react> instead.
 - `<intro>`/`<main>`/`<outro>` are optional structural markers (transparent to audio). When a non-interactive `<main>` is present, the listener gets a pre-play "Repeat length" slider that loops `<main>` to extend the session up to 10h; intro/outro always play once.
 
@@ -300,10 +303,12 @@ Constant folding: literals, binops of constants, and `@max`/`@min`/`@step`/`@rou
   <voice speaker='male'>Well done. Return gently when you are ready.</voice>
 </outro>
 
-<!-- A slideshow over the audio: slides tagged hypno/spiral (never blocked
-     tags), switching every 4-8 seconds with a slow zoom + vignette and
-     authored captions. The slideshow keeps running through the until-wait. -->
-<visual tags="hypno, spiral" block="feet" every="4..8" effect="zoom,vignette" captions="meta">
+<!-- A slideshow over the audio: pulled from the tik-tok + just-boobs niches
+     (docs/redgifs-discovery.md has the full list), fine-tuned with tags,
+     never showing blocked ones, switching every 4-8 seconds with a slow
+     zoom + vignette and authored captions. The slideshow keeps running
+     through the until-wait. -->
+<visual niche="tik-tok" tags="hypno, spiral" block="feet" every="4..8" effect="zoom,vignette" captions="meta">
   <caption>Watch. Don't blink.</caption>
   <caption>The screen does the thinking now.</caption>
   <voice speaker="female">Keep your eyes on the screen.</voice>

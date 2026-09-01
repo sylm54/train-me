@@ -64,6 +64,8 @@ export interface ProgressState {
 export interface VisualConfig {
   /** Visual source plugin id (e.g. `redgifs`). */
   source: string;
+  /** Curated source communities (the `niche` attribute, e.g. `just-boobs`). */
+  niches: string[];
   /** Tags/niches the source should match. */
   tags: string[];
   /** Tags that disqualify a result. */
@@ -95,7 +97,15 @@ export interface VisualSlide {
 
 export type Segment =
   | { type: "sequence"; children: Segment[] }
-  | { type: "static"; file: string; duration: number; beatmeter?: BeatmeterMeta }
+  | {
+      type: "static";
+      file: string;
+      duration: number;
+      beatmeter?: BeatmeterMeta;
+      /** Slideshow baked INTO this clip (a `<visual>` directly inside a
+       * `<beatmeter>`, or inside an `<effect>`): shown for the clip. */
+      visual?: VisualConfig;
+    }
   | {
       type: "until";
       file: string;
@@ -737,7 +747,13 @@ export class ManifestPlayer {
    * beat setup/teardown cleanly around {@link playFile}.
    */
   private async playStatic(
-    seg: { type: "static"; file: string; duration: number; beatmeter?: BeatmeterMeta },
+    seg: {
+      type: "static";
+      file: string;
+      duration: number;
+      beatmeter?: BeatmeterMeta;
+      visual?: VisualConfig;
+    },
     trackIndex: number,
   ): Promise<void> {
     this.segmentId++;
@@ -747,10 +763,22 @@ export class ManifestPlayer {
       // playFile reuses the pooled element for this track.
       this.beginBeat(this.elementFor(trackIndex), seg.duration, meta);
     }
+    // A visual baked into the clip (beatmeter/effect scope) shows for the
+    // clip's duration, through the same innermost-scope notification path
+    // as a wrapping `<visual>` node.
+    const hasVisual = seg.visual != null;
+    if (hasVisual) {
+      this.visualStack.push(seg.visual!);
+      this.opts.onVisual?.(seg.visual!);
+    }
     try {
       await this.playFile(seg.file, trackIndex);
     } finally {
       if (meta) this.endBeat();
+      if (hasVisual) {
+        this.visualStack.pop();
+        this.opts.onVisual?.(this.visualStack[this.visualStack.length - 1] ?? null);
+      }
     }
   }
 

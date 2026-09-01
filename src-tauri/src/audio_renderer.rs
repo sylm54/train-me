@@ -19,6 +19,7 @@ use crate::manifest::{
 use crate::model_downloader;
 use crate::sounds::SoundType;
 use crate::tag_parser::{self, include_src_is_glob, split_glob_src, wildcard_match, Node, OverlayPart};
+use crate::visual::VisualConfig;
 use crate::RenderedManifest;
 
 use rand::seq::SliceRandom;
@@ -1671,6 +1672,40 @@ impl AudioRenderer {
         Ok(Segment::Sequence { children })
     }
 
+    /// Extract `<visual>` configs from a node list that is about to be baked
+    /// into ONE clip, REMOVING the visual nodes so only their audio content
+    /// renders (a visual is audio-transparent — its children splice in
+    /// place). Recurses through `<effect>` bodies, the only container that
+    /// bakes without splitting; sequence-level visuals never reach a bake
+    /// buffer because the walker splits them out first.
+    fn take_visuals(nodes: &mut Vec<Node>, out: &mut Vec<VisualConfig>) {
+        let mut result = Vec::with_capacity(nodes.len());
+        for node in nodes.drain(..) {
+            match node {
+                Node::Visual { config, children } => {
+                    out.push(config);
+                    result.extend(children);
+                }
+                Node::Effect {
+                    effect_type,
+                    preset,
+                    cutoff,
+                    children: mut kids,
+                } => {
+                    Self::take_visuals(&mut kids, out);
+                    result.push(Node::Effect {
+                        effect_type,
+                        preset,
+                        cutoff,
+                        children: kids,
+                    });
+                }
+                other => result.push(other),
+            }
+        }
+        *nodes = result;
+    }
+
     /// Render the accumulated `static_buf` to a single `Static` segment (if
     /// non-empty) and append it to `children`.
     fn flush_static(
@@ -1701,10 +1736,23 @@ impl AudioRenderer {
         };
         let file = self.write_seg(out_dir, counter, &samples)?;
         let duration = samples.len() as f32 / self.sample_rate as f32;
+        // A `<visual>` inside this baked run (only reachable via `<effect>`
+        // bodies — sequence-level visuals split out before reaching here)
+        // decorates the whole clip: strip the config out and attach it.
+        let mut visuals = Vec::new();
+        Self::take_visuals(buf, &mut visuals);
+        match visuals.len() {
+            0 => {}
+            1 => {}
+            n => bail!(
+                "{n} <visual> tags bake into this single clip — split the content so at most one <visual> is baked together"
+            ),
+        }
         children.push(Segment::Static {
             file,
             duration,
             beatmeter: None,
+            visual: visuals.into_iter().next(),
         });
         buf.clear();
         Ok(())
@@ -1883,24 +1931,39 @@ impl AudioRenderer {
                     bail!("<beatmeter> is not allowed inside <background> or <overlay>");
                 }
                 // The wrapped content must be non-interactive: a beat schedule
-                // is only meaningful over a single continuous clip, so any split
-                // (until/choice/random/…/nested beatmeter/include) is rejected.
-                if children.iter().any(manifest::contains_split) {
+                // is only meaningful over a single continuous clip, so any
+                // blocking split (until/choice/random/…/nested beatmeter/include)
+                // is rejected. A `<visual>` is NOT blocking — display-only —
+                // but it must be a DIRECT child: the slideshow then decorates
+                // the whole clip. (`<voice>`-wrapped visuals still count as
+                // splits via contains_split, and an interactive tag inside the
+                // visual recurses through contains_blocking_split.)
+                if children.iter().any(manifest::contains_blocking_split) {
                     bail!(
-                        "<beatmeter> may only wrap non-interactive content (no <until>/<choice>/<random>/<scramble>/<include>/<beatmeter>)"
+                        "<beatmeter> may only wrap non-interactive content (no <until>/<choice>/<random>/<scramble>/<include>/<beatmeter>; a <visual> is fine as a direct child but must not contain them)"
                     );
                 }
+                let mut baked = children.clone();
+                let mut visuals = Vec::new();
+                Self::take_visuals(&mut baked, &mut visuals);
+                let visual = match visuals.len() {
+                    0 => None,
+                    1 => Some(visuals.pop().expect("len 1")),
+                    n => bail!(
+                        "{n} <visual> tags bake into this one <beatmeter> clip — use at most one"
+                    ),
+                };
                 // Bake the wrapped content into one clip.
                 let (samples, _dur) = if let Some(tracker) = progress {
                     self.render_nodes_tracked(
-                        children,
+                        &baked,
                         &ctx.speaker,
                         ctx.volume_scale,
                         ctx.speed_scale,
                         tracker,
                     )?
                 } else {
-                    self.render_nodes(children, &ctx.speaker, ctx.volume_scale, ctx.speed_scale)?
+                    self.render_nodes(&baked, &ctx.speaker, ctx.volume_scale, ctx.speed_scale)?
                 };
                 let file = self.write_seg(out_dir, counter, &samples)?;
                 let duration = samples.len() as f32 / self.sample_rate as f32;
@@ -1929,6 +1992,7 @@ impl AudioRenderer {
                         accent_gain: accent_gain.unwrap_or(1.5),
                         beats,
                     }),
+                    visual,
                 })
             }
 

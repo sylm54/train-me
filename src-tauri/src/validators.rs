@@ -27,6 +27,7 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::AppState;
+use crate::visual;
 
 // ============================================================================
 // Report types
@@ -1053,8 +1054,137 @@ fn list_dir_files_recursive(dir_rel: &str, agent_dir: &Path) -> Vec<(String, Pat
 /// because import validity is checked "up to the .json root"; scoping a bare
 /// `.xml` (e.g. `"hypnos/foo.xml"`) lints that script standalone. When `path`
 /// is `None`, every known feature file is validated as before.
+///
+/// Async so the `<visual>` discovery pass (a network refresh, cached a day)
+/// runs off the main thread; the result shape is unchanged for callers.
 #[tauri::command]
-pub fn validate_data_files(path: Option<String>, state: State<'_, AppState>) -> ValidateReport {
+pub async fn validate_data_files(
+    path: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<ValidateReport, String> {
+    let mut report = validate_data_files_inner(path, &state);
+    visual_discovery_pass(&mut report, &state).await;
+    Ok(report)
+}
+
+/// Best-effort `<visual>` discovery pass: when any validated script uses the
+/// tag, refresh the source-vocabulary snapshot (cached on disk; the network
+/// fetch is bounded by the HTTP client's timeouts and skipped entirely when
+/// the cache is fresh) and warn about niche ids the source doesn't know. The
+/// snapshot is also mirrored into `docs/redgifs-discovery.md` so the writing
+/// agent can browse valid niches/tags. Fully offline-tolerant: any failure
+/// leaves the report untouched.
+async fn visual_discovery_pass(report: &mut ValidateReport, state: &State<'_, AppState>) {
+    let agent_dir = state.agent_dir.clone();
+    let mut visual_files: Vec<(String, PathBuf)> = Vec::new();
+    for r in &report.files {
+        if !r.path.to_ascii_lowercase().ends_with(".xml") {
+            continue;
+        }
+        let full = agent_dir.join(&r.path);
+        let uses = std::fs::read_to_string(&full)
+            .map(|c| c.contains("<visual"))
+            .unwrap_or(false);
+        if uses {
+            visual_files.push((r.path.clone(), full));
+        }
+    }
+    if visual_files.is_empty() {
+        return;
+    }
+    let cache_dir = state.data_dir.join("visuals");
+    let disc = tauri::async_runtime::spawn_blocking(move || {
+        visual::refresh_discovery(&cache_dir, visual::DISCOVERY_TTL)
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some(disc) = disc else {
+        return; // offline, no cache — no opinion
+    };
+    visual::write_agent_doc(&agent_dir, Some(&disc));
+
+    for (rel, full) in visual_files {
+        let Ok(content) = std::fs::read_to_string(&full) else {
+            continue;
+        };
+        // Parse failures are already reported by the main pass; skip them.
+        let Ok(nodes) = crate::tag_parser::parse(&content) else {
+            continue;
+        };
+        let mut cfgs = Vec::new();
+        collect_visual_configs(&nodes, &mut cfgs);
+        let mut unknown: Vec<String> = Vec::new();
+        for cfg in cfgs {
+            for n in visual::unknown_niches(&cfg, Some(&disc)) {
+                if !unknown.contains(&n) {
+                    unknown.push(n);
+                }
+            }
+        }
+        if unknown.is_empty() {
+            continue;
+        }
+        if let Some(r) = report.files.iter_mut().find(|r| r.path == rel) {
+            r.push(warn(format!(
+                "unknown redgifs niche{}: {} — browse docs/redgifs-discovery.md for valid ids (tags are free-form and need no lookup)",
+                if unknown.len() > 1 { "s" } else { "" },
+                unknown.join(", "),
+            )));
+            report.warnings += 1;
+        }
+    }
+}
+
+/// Gather the `<visual>` configs of an AST, at any depth.
+fn collect_visual_configs(
+    nodes: &[crate::tag_parser::Node],
+    out: &mut Vec<crate::visual::VisualConfig>,
+) {
+    use crate::tag_parser::Node;
+    for node in nodes {
+        match node {
+            Node::Visual { config, children } => {
+                out.push(config.clone());
+                collect_visual_configs(children, out);
+            }
+            Node::Voice { children, .. }
+            | Node::Speed { children, .. }
+            | Node::Volume { children, .. }
+            | Node::Effect { children, .. }
+            | Node::Background { children, .. }
+            | Node::Until { children, .. }
+            | Node::Loop { children, .. }
+            | Node::Section { children, .. }
+            | Node::Beatmeter { children, .. } => collect_visual_configs(children, out),
+            Node::If {
+                then_branch, r#else, ..
+            } => {
+                collect_visual_configs(then_branch, out);
+                if let Some(else_nodes) = r#else {
+                    collect_visual_configs(else_nodes, out);
+                }
+            }
+            Node::Overlay { parts, .. }
+            | Node::Random { parts }
+            | Node::Scramble { parts }
+            | Node::Choice { options: parts, .. }
+            | Node::React { parts, .. } => {
+                for part in parts {
+                    collect_visual_configs(&part.children, out);
+                }
+            }
+            Node::Text(_)
+            | Node::Pause { .. }
+            | Node::Sound { .. }
+            | Node::Tone { .. }
+            | Node::Rating { .. }
+            | Node::Include { .. } => {}
+        }
+    }
+}
+
+fn validate_data_files_inner(path: Option<String>, state: &State<'_, AppState>) -> ValidateReport {
     let agent_dir = state.agent_dir.clone();
     let mut files: Vec<FileReport> = Vec::new();
     let mut errors = 0usize;
@@ -1222,6 +1352,10 @@ pub fn validate_data_files(path: Option<String>, state: State<'_, AppState>) -> 
         files,
     }
 }
+
+// ============================================================================
+// <visual> discovery pass
+// ============================================================================
 
 // ============================================================================
 // Unit tests (pure helpers; no Tauri state)
