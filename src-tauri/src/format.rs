@@ -546,6 +546,13 @@ struct CondFrame {
     line: usize,
 }
 
+/// Error message for the common inline-form mistake. Markers must each be
+/// on their own line; the engine gates whole lines/elements, so a one-line
+/// `{{#if x}} ... {{/if}}` cannot be supported.
+const INLINE_IF_MSG: &str = "`{{#if}}` / `{{/if}}` must be on their own lines — \
+    inline forms like `{{#if x}}- [ ] item{{/if}}` are not supported. \
+    Put the markers on separate lines.";
+
 /// The effective condition for a line: the conjunction of every open
 /// frame's branch predicate (else-branches contribute `not(pred)`).
 /// `None` when no `{{#if}}` is open (unconditional text).
@@ -663,22 +670,41 @@ pub fn parse_pages(body: &str, first_line: usize) -> (Vec<Page>, Vec<Diag>) {
 
         // Conditional markers — recognized only as whole (trimmed) lines.
         let trimmed = line.trim();
-        if trimmed.starts_with("{{#if ") && trimmed.ends_with("}}") {
-            let pred = trimmed["{{#if ".len()..trimmed.len() - 2].trim();
-            if pred.is_empty() {
-                diags.push(error_at(
-                    Some(line_no),
-                    "`{{#if}}` needs a condition: `{{#if <expr>}}`",
-                ));
-            } else if let Err(e) = crate::cond::parse(pred) {
-                diags.push(error_at(Some(line_no), format!("`{{{{#if}}}}` condition: {e}")));
+        if trimmed.starts_with("{{#if ") {
+            // A marker must be the entire line: inline forms like
+            // `{{#if x}} - [ ] item{{/if}}` on one line are not supported
+            // (the engine gates whole lines/elements). Catch the common
+            // mistakes with actionable messages instead of a confusing
+            // condition-parse error + spurious "never closed".
+            let after = &trimmed["{{#if ".len()..];
+            if after.contains("{{") {
+                // Another `{{...}}` on the line — a closer (or stray
+                // marker) glued after the opener's `}}`.
+                if after.contains("{{/if") {
+                    diags.push(error_at(Some(line_no), INLINE_IF_MSG));
+                } else {
+                    diags.push(error_at(Some(line_no), "`{{#if}}` must be on its own line"));
+                }
+            } else if after.ends_with("}}") {
+                let pred = after[..after.len() - 2].trim();
+                if pred.is_empty() {
+                    diags.push(error_at(
+                        Some(line_no),
+                        "`{{#if}}` needs a condition: `{{#if <expr>}}`",
+                    ));
+                } else if let Err(e) = crate::cond::parse(pred) {
+                    diags.push(error_at(Some(line_no), format!("`{{{{#if}}}}` condition: {e}")));
+                }
+                cond_stack.push(CondFrame {
+                    pred: pred.to_string(),
+                    in_else: false,
+                    else_seen: false,
+                    line: line_no,
+                });
+            } else {
+                // Prose trailing the opener's `}}` on the same line.
+                diags.push(error_at(Some(line_no), "`{{#if}}` must be on its own line"));
             }
-            cond_stack.push(CondFrame {
-                pred: pred.to_string(),
-                in_else: false,
-                else_seen: false,
-                line: line_no,
-            });
             continue;
         }
         if trimmed == "{{#else}}" {
@@ -706,6 +732,27 @@ pub fn parse_pages(body: &str, first_line: usize) -> (Vec<Page>, Vec<Diag>) {
                     "`{{/if}}` without a matching `{{#if}}`",
                 )),
             }
+            continue;
+        }
+        if trimmed.starts_with("{{/if") {
+            diags.push(error_at(Some(line_no), "`{{/if}}` must be on its own line"));
+            continue;
+        }
+        if trimmed.starts_with("{{#else") {
+            diags.push(error_at(Some(line_no), "`{{#else}}` must be on its own line"));
+            continue;
+        }
+        // A marker anywhere else in the line (mid-prose, glued to text) is
+        // not supported — markers gate whole lines/elements.
+        if trimmed.contains("{{#if") || trimmed.contains("{{#else") || trimmed.contains("{{/if") {
+            let which = if trimmed.contains("{{#if") {
+                "`{{#if}}`"
+            } else if trimmed.contains("{{#else") {
+                "`{{#else}}`"
+            } else {
+                "`{{/if}}`"
+            };
+            diags.push(error_at(Some(line_no), format!("{which} must be on its own line")));
             continue;
         }
 
@@ -2357,6 +2404,57 @@ mod tests {
             "{ \"title\": \"x\", \"action\": { \"type\": \"notification\", \"text\": \"y\" } }",
         );
         assert!(errs(&d2).iter().any(|m| m.contains("`price` is required")));
+    }
+
+    #[test]
+    fn inline_conditional_markers_error_clearly() {
+        // `{{#if}}` / `{{/if}}` on one line was previously misread as a
+        // valid opener (the line starts with `{{#if ` and ends with `}}`),
+        // producing a confusing condition-parse error *and* a spurious
+        // "never closed". Now it's one actionable error, no stack junk.
+        let one_line = "---\nformat: 2\ntitle: T\n---\n{{#if weekday == \"monday\"}}- [ ] item{{/if}}\n";
+        let (_, d) = parse_routine(one_line);
+        assert!(
+            errs(&d).iter().any(|m| m.contains("must be on their own lines")),
+            "{d:?}"
+        );
+        // No leftover open frame → no "never closed" error.
+        assert!(
+            !errs(&d).iter().any(|m| m.contains("never closed")),
+            "{d:?}"
+        );
+
+        // A marker in the middle of prose is also rejected explicitly.
+        let mid = "---\nformat: 2\ntitle: T\n---\nToday {{#if weekday == \"monday\"}}is monday{{/if}}.\n";
+        let (_, d2) = parse_routine(mid);
+        assert!(
+            errs(&d2).iter().any(|m| m.contains("must be on its own line")),
+            "{d:?}"
+        );
+        let mid_errs = errs(&d2);
+        assert_eq!(mid_errs.len(), 1, "{mid_errs:?}");
+
+        // Proper block syntax still parses clean.
+        let block = "---\nformat: 2\ntitle: T\n---\n{{#if weekday == \"monday\"}}\n- [ ] item\n{{/if}}\n";
+        let (_, d3) = parse_routine(block);
+        assert!(errs(&d3).is_empty(), "{d3:?}");
+        assert!(warns(&d3).is_empty(), "{d3:?}");
+    }
+
+    #[test]
+    fn mid_line_closers_error_clearly() {
+        let closer = "---\nformat: 2\ntitle: T\n---\n- [ ] item {{/if}}\n";
+        let (_, d) = parse_routine(closer);
+        assert!(
+            errs(&d).iter().any(|m| m.contains("`{{/if}}` must be on its own line")),
+            "{d:?}"
+        );
+        let else_mid = "---\nformat: 2\ntitle: T\n---\n{{#else}} oops\n";
+        let (_, d2) = parse_routine(else_mid);
+        assert!(
+            errs(&d2).iter().any(|m| m.contains("`{{#else}}` must be on its own line")),
+            "{d2:?}"
+        );
     }
 
     // ── shipped examples stay valid (dogfood) ──────────────────────────

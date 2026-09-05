@@ -8,6 +8,7 @@ description: Feature-file grammar — front-matter, the page model, and feature 
 
 - Front-matter: `format: 2` (required), `title`, optional `schedule` (cron; absent = on-demand), optional `timeframe` (completion window), `success`/`failure` actions, and for on-demand routines `cooldown` + `limit` (anti-farming: a routine without an explicit `limit` defaults to one rewarded completion per day).
 - Body: pages split on `---` lines. Pages contain markdown, `- [ ]` checklist items, links to `.xml` scripts, and ``` `feature` ``` blocks. EVERY checklist item, audio link, and feature block on a page must be completed before the next page unlocks; finishing the last page fires the success actions, giving up fires the failure actions.
+- Conditional content: `@when <expr>` as a page's first line gates the whole page; `{{#if <expr>}}` / `{{#else}}` / `{{/if}}` gate the markdown and checklist items between them. Each marker must be on its OWN line — inline one-liners like `{{#if x}}- [ ] item{{/if}}` are a validation error.
 - Feature block types: `voice` (see `docs/internal/voice-training.md`), `wait` (duration), `chastity` (see `docs/internal/chastity.md`), `input` (field), `choice` (options), `slider` (min/max/label), `audio` (src → .xml script).
 
 ## Habits (`habits/*.md`)

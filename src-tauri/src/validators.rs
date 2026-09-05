@@ -956,37 +956,6 @@ fn check_md_links(body: &str, agent_dir: &Path, report: &mut FileReport) {
 // Directory walking
 // ============================================================================
 
-/// List non-recursive file entries (name + full path) under `dir_rel`.
-/// Returns an empty vec if the directory doesn't exist (mirrors
-/// `list_data_files`).
-fn list_dir_files(dir_rel: &str, agent_dir: &Path) -> Vec<(String, PathBuf)> {
-    let Ok(dir) = crate::bash::resolve_under(agent_dir, dir_rel) else {
-        return Vec::new();
-    };
-    let Ok(rd) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for entry in rd.flatten() {
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if !meta.is_file() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().to_string();
-        let rel = format!("{dir_rel}/{name}");
-        out.push((rel, entry.path()));
-    }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
-}
-
-// ============================================================================
-// The Tauri command
-// ============================================================================
-
 /// Normalize a relative path to forward slashes with no leading `.`/`/`, for
 /// prefix-matching against a scope.
 fn norm_rel(p: &str) -> String {
@@ -1012,9 +981,25 @@ fn in_scope(rel_path: &str, scope: &str) -> bool {
     rel.starts_with(&format!("{scope}/"))
 }
 
+/// Whether `scope` points at a specific file (as opposed to a directory /
+/// prefix). Used to decide whether a container's recursive walk should
+/// descend into subdirectories: scoping a file dir must not pull in
+/// siblings, but scoping a directory (or omitting the scope) should cover
+/// nested subdirs too.
+fn scope_is_file(scope: Option<&str>) -> bool {
+    scope
+        .map(|s| {
+            let norm = norm_rel(s);
+            !norm.is_empty() && !norm.ends_with('/') && Path::new(&norm).extension().is_some()
+        })
+        .unwrap_or(false)
+}
+
 /// Recursively list `(rel, full)` pairs for every regular file under `dir_rel`
 /// (relative to `agent_dir`). Returns empty if the dir doesn't exist. Used to
-/// walk `hypnos/` at arbitrary depth for standalone/unreferenced XML.
+/// walk `hypnos/` at arbitrary depth for standalone/unreferenced XML, and the
+/// v2 container dirs so files in nested subdirectories (e.g.
+/// `routines/_tmp/test.md`) are validated too.
 fn list_dir_files_recursive(dir_rel: &str, agent_dir: &Path) -> Vec<(String, PathBuf)> {
     let Ok(dir) = crate::bash::resolve_under(agent_dir, dir_rel) else {
         return Vec::new();
@@ -1171,7 +1156,7 @@ fn validate_data_files_inner(path: Option<String>, state: &State<'_, AppState>) 
 
     // Resolve + validate the scope itself: a malformed/escaping scope yields a
     // single error report and nothing else. An absent scope dir yields an empty
-    // report (matches `list_dir_files`). Bare-existence of the scope as a path
+    // report. Bare-existence of the scope as a path
     // is *not* required (e.g. `path="routines"` when that dir exists is fine,
     // but `path="conditioning/missing.json"` just lints nothing under it).
     let scope: Option<String> = match &path {
@@ -1195,14 +1180,19 @@ fn validate_data_files_inner(path: Option<String>, state: &State<'_, AppState>) 
         Some(s) => in_scope(rel, s),
         None => true,
     };
+    // Scope semantics: scoping an exact file (e.g. `routines/foo.md`) still
+    // walks the whole routines dir (subdirs too) but only that file is
+    // kept; scoping a directory covers its subdirectories as well.
+    let scope_is_file = scope_is_file(scope.as_deref());
 
     // XML scripts reached by any in-scope entry (conditioning JSONs and
     // v2 audio features / script actions) — the unreferenced-XML pass
     // below uses this to tell standalone scripts apart from reachable ones.
     let mut reachable_xml: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // routines/*.md (parsed + validated by format.rs)
-    for (rel, full) in list_dir_files("routines", &agent_dir) {
+    // routines/*.md (parsed + validated by format.rs). Recursive so files
+    // in nested dirs (e.g. `routines/_tmp/test.md`) are validated too.
+    for (rel, full) in list_dir_files_recursive("routines", &agent_dir) {
         if !rel.to_ascii_lowercase().ends_with(".md") || !in_scope_of(&rel) {
             continue;
         }
@@ -1215,8 +1205,8 @@ fn validate_data_files_inner(path: Option<String>, state: &State<'_, AppState>) 
         }
     }
 
-    // habits/*.md (v2)
-    for (rel, full) in list_dir_files("habits", &agent_dir) {
+    // habits/*.md (v2), recursive.
+    for (rel, full) in list_dir_files_recursive("habits", &agent_dir) {
         if !rel.to_ascii_lowercase().ends_with(".md") || !in_scope_of(&rel) {
             continue;
         }
@@ -1229,8 +1219,8 @@ fn validate_data_files_inner(path: Option<String>, state: &State<'_, AppState>) 
         }
     }
 
-    // tasks/*.md (v2)
-    for (rel, full) in list_dir_files("tasks", &agent_dir) {
+    // tasks/*.md (v2), recursive.
+    for (rel, full) in list_dir_files_recursive("tasks", &agent_dir) {
         if !rel.to_ascii_lowercase().ends_with(".md") || !in_scope_of(&rel) {
             continue;
         }
@@ -1243,8 +1233,8 @@ fn validate_data_files_inner(path: Option<String>, state: &State<'_, AppState>) 
         }
     }
 
-    // store/*.json (v2)
-    for (rel, full) in list_dir_files("store", &agent_dir) {
+    // store/*.json (v2), recursive.
+    for (rel, full) in list_dir_files_recursive("store", &agent_dir) {
         if !rel.to_ascii_lowercase().ends_with(".json") || !in_scope_of(&rel) {
             continue;
         }
@@ -1261,7 +1251,7 @@ fn validate_data_files_inner(path: Option<String>, state: &State<'_, AppState>) 
     // in-scope conditioning entry reached. These are linted (parse + semantic
     // + their own includes) and warned — not errored — for being unreferenced.
     // Skipped entirely when the scope doesn't cover hypnos/.
-    if in_scope_of("hypnos") || scope.as_deref() == Some("hypnos") {
+    if !scope_is_file && (in_scope_of("hypnos") || scope.as_deref() == Some("hypnos")) {
         for (rel, full) in list_dir_files_recursive("hypnos", &agent_dir) {
             if !rel.to_ascii_lowercase().ends_with(".xml") || !in_scope_of(&rel) {
                 continue;
@@ -1617,6 +1607,35 @@ mod tests {
         assert!(in_scope("./conditioning/a.json", "./conditioning"));
         // Empty scope matches everything.
         assert!(in_scope("anything", ""));
+    }
+
+    #[test]
+    fn recursive_list_covers_nested_subdirs() {
+        let dir = agent_dir_with(&[
+            ("routines/a.md", "---\nformat: 2\ntitle: A\n---\n"),
+            ("routines/sub/b.md", "---\nformat: 2\ntitle: B\n---\n"),
+            ("routines/deep/nested/c.md", "---\nformat: 2\ntitle: C\n---\n"),
+            // Non-.md files are listed too (the per-dir walkers filter);
+            // only the file-bearing reports matter here.
+            ("routines/scratch.txt", "not a feature"),
+        ]);
+        let listed = list_dir_files_recursive("routines", dir.path());
+        let rels: Vec<String> = listed.into_iter().map(|(rel, _)| rel).collect();
+        assert!(rels.contains(&"routines/a.md".to_string()));
+        assert!(rels.contains(&"routines/sub/b.md".to_string()));
+        assert!(rels.contains(&"routines/deep/nested/c.md".to_string()));
+        assert!(rels.contains(&"routines/scratch.txt".to_string()));
+    }
+
+    #[test]
+    fn scope_file_and_scope_dir_semantics() {
+        // A file-scope doesn't pull in siblings' directories.
+        assert!(scope_is_file(Some("routines/foo.md")));
+        assert!(scope_is_file(Some("routines/sub/foo.md")));
+        assert!(!scope_is_file(Some("routines")));
+        assert!(!scope_is_file(Some("routines/sub")));
+        assert!(!scope_is_file(Some("routines/")));
+        assert!(!scope_is_file(None));
     }
 
     // ── v2 feature format (format.rs grammar) ───────────────────────────

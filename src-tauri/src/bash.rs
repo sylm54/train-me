@@ -58,11 +58,22 @@ impl BashSandbox {
     /// startup bootstrap (schema init) all funnel here. Commands are
     /// processed serially by the dedicated worker thread, so callers may
     /// queue behind a long-running agent command.
+    ///
+    /// Every invocation starts from the sandbox root `/` again. Bashkit's
+    /// shell keeps its `cwd` across `exec()` calls (like a real shell), so
+    /// a `cd /somewhere` inside one script would otherwise leak into the
+    /// next one — and with several agents (spawned copies) sharing this
+    /// sandbox, a subagent's `cd` would silently change where the main
+    /// agent's relative paths resolve. The `cd /` line makes each
+    /// command's working directory self-contained: a `cd` inside a single
+    /// command still works exactly as written. (Prefixed on its own line,
+    /// not `cd / && …`, so scripts starting with comments / heredocs /
+    /// continuations parse the same as before.)
     pub async fn exec(&self, command: &str) -> Result<BashResult, String> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let tx = self.tx.lock().clone();
         tx.send(ExecRequest {
-            command: command.to_string(),
+            command: format!("cd /\n{command}"),
             reply: reply_tx,
         })
         .map_err(|e| format!("bash worker disconnected: {}", e))?;
@@ -628,6 +639,39 @@ mod tests {
         let root = tmp.path().canonicalize().unwrap();
         // `C:\...` must not be resolved under the agent dir.
         assert!(resolve_under(&root, "C:\\Windows\\system32").is_err());
+    }
+
+    // --- the CWD leak fix: every exec starts from the sandbox root --------
+
+    /// A `cd` inside one exec() must not leak into the next one. Subagents
+    /// share this sandbox with the main agent, so without the per-exec
+    /// `cd /` reset a spawned builder's `cd /hypnos/...` silently changed
+    /// where the parent's later relative paths resolved.
+    #[tokio::test]
+    async fn bash_cwd_resets_between_execs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent_data");
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let sandbox = create_bash_sandbox(&agent_dir, &state_dir).unwrap();
+
+        let r = sandbox
+            .exec("mkdir -p /sub && cd /sub && pwd")
+            .await
+            .unwrap();
+        assert_eq!(r.exit_code, 0, "stderr: {}", r.stderr);
+        assert_eq!(r.stdout.trim(), "/sub");
+
+        // A `cd` inside a single command still works as written…
+        let r2 = sandbox.exec("cd /sub && pwd").await.unwrap();
+        assert_eq!(r2.exit_code, 0, "stderr: {}", r2.stderr);
+        assert_eq!(r2.stdout.trim(), "/sub");
+
+        // …but the NEXT invocation starts back at the sandbox root.
+        let r3 = sandbox.exec("pwd").await.unwrap();
+        assert_eq!(r3.exit_code, 0, "stderr: {}", r3.stderr);
+        assert_eq!(r3.stdout.trim(), "/");
     }
 
     // --- the actual fix: bash writes are visible on the host --------------

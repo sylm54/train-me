@@ -492,7 +492,7 @@ function parseBody(body: string, firstLine: number, diags: Diag[]): string[] {
   const scripts: string[] = [];
   const lines = body.split("\n");
   let i = 0;
-  let inPlainCode = false;
+let inPlainCode = false;
   // Conditional syntax (`{{#if}}` markers, `@when` pages, feature `when:`).
   const condStack: { line: number }[] = [];
   const conds: { expr: string; line: number }[] = [];
@@ -590,16 +590,40 @@ function parseBody(body: string, firstLine: number, diags: Diag[]): string[] {
       continue;
     }
     // Conditional markers — whole (trimmed) lines only.
-    if (trimmed.startsWith("{{#if ") && trimmed.endsWith("}}")) {
-      const expr = trimmed.slice("{{#if ".length, -2).trim();
-      const parsed = parseCondition(expr);
-      if (!expr) {
-        diags.push({ severity: "error", line: lineNo, message: "`{{#if}}` needs a condition: `{{#if <expr>}}`" });
-      } else if (!parsed.ok) {
-        diags.push({ severity: "error", line: lineNo, message: `\`{{#if}}\` condition: ${parsed.error}` });
+    if (trimmed.startsWith("{{#if ")) {
+      // A marker must be the entire line: inline forms like
+      // `{{#if x}}- [ ] item{{/if}}` are not supported (the engine gates
+      // whole lines/elements, not mid-line spans). Catch the common
+      // mistakes explicitly with actionable messages instead of falling
+      // through to a confusing condition-parse error + spurious
+      // "never closed".
+      const after = trimmed.slice("{{#if ".length);
+      if (after.includes("{{")) {
+        // Another `{{...}}` on the line — the closer (or a stray marker)
+        // glued after the opener's `}}`.
+        if (after.includes("{{/if")) {
+          diags.push({
+            severity: "error", line: lineNo,
+            message:
+              "`{{#if}}` / `{{/if}}` must be on their own lines — inline forms like `{{#if x}}- [ ] item{{/if}}` are not supported. Put the markers on separate lines.",
+          });
+        } else {
+          diags.push({ severity: "error", line: lineNo, message: "`{{#if}}` must be on its own line" });
+        }
+      } else if (after.endsWith("}}")) {
+        const expr = after.slice(0, -2).trim();
+        const parsed = parseCondition(expr);
+        if (!expr) {
+          diags.push({ severity: "error", line: lineNo, message: "`{{#if}}` needs a condition: `{{#if <expr>}}`" });
+        } else if (!parsed.ok) {
+          diags.push({ severity: "error", line: lineNo, message: `\`{{#if}}\` condition: ${parsed.error}` });
+        }
+        condStack.push({ line: lineNo });
+        conds.push({ expr, line: lineNo });
+      } else {
+        // Prose trailing the opener's `}}` on the same line.
+        diags.push({ severity: "error", line: lineNo, message: "`{{#if}}` must be on its own line" });
       }
-      condStack.push({ line: lineNo });
-      conds.push({ expr, line: lineNo });
       i++;
       continue;
     }
@@ -614,6 +638,27 @@ function parseBody(body: string, firstLine: number, diags: Diag[]): string[] {
       if (condStack.pop() === undefined) {
         diags.push({ severity: "error", line: lineNo, message: "`{{/if}}` without a matching `{{#if}}`" });
       }
+      i++;
+      continue;
+    }
+    if (trimmed.startsWith("{{/if")) {
+      diags.push({ severity: "error", line: lineNo, message: "`{{/if}}` must be on its own line" });
+      i++;
+      continue;
+    }
+    if (trimmed.startsWith("{{#else")) {
+      diags.push({ severity: "error", line: lineNo, message: "`{{#else}}` must be on its own line" });
+      i++;
+      continue;
+    }
+    // A marker anywhere else in the line (mid-prose, glued to text) is not
+    // supported — the engine gates whole lines/elements, not mid-line spans.
+    const midMarker = trimmed.match(/\{\{(#if|#else|\/if)/);
+    if (midMarker) {
+      diags.push({
+        severity: "error", line: lineNo,
+        message: `\`{{${midMarker[1]}}}\` must be on its own line`,
+      });
       i++;
       continue;
     }
