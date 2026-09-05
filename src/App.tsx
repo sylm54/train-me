@@ -52,26 +52,16 @@ export default function App() {
 
   // Background pre-render: warm every script in the agent sandbox shortly
   // after startup (hash-keyed — edited scripts re-render, renders of deleted
-  // scripts are GC'd). Opt-out via Settings; when off, scripts still render
-  // on demand when played, or via the Today view's manual pass.
+  // scripts are GC'd). The same pass also prefetches the `<visual>` slideshow
+  // clips those scripts use, so playback never waits on a cold fetch. Opt-out
+  // via Settings; when off, scripts still render on demand when played, or
+  // via the Today view's manual pass.
   const autoPrerender = settings.audio.autoPrerender;
   useEffect(() => {
     if (!autoPrerender) return;
     const t = window.setTimeout(() => {
       void invoke("v2_prerender").catch(() => undefined);
     }, 15_000);
-    return () => window.clearTimeout(t);
-  }, [autoPrerender]);
-
-  // Visual prefetch: resolve every `<visual>` slideshow config in the sandbox
-  // into the on-disk playlist cache (search + media downloads), so playback
-  // never sits on "Fetching visuals…". Mirrors the audio prerender opt-out;
-  // the command itself skips configs that are already warm and fresh.
-  useEffect(() => {
-    if (!autoPrerender) return;
-    const t = window.setTimeout(() => {
-      void invoke("visual_prefetch").catch(() => undefined);
-    }, 20_000);
     return () => window.clearTimeout(t);
   }, [autoPrerender]);
 

@@ -496,11 +496,31 @@ fn spawn_refresh(cfg: VisualConfig, cache_dir: PathBuf, agent_dir: PathBuf) {
 /// cold path. Mirrors the audio prerender pass; failures are per-config and
 /// collected, never fatal.
 pub fn prefetch_all(cache_dir: &Path, agent_dir: &Path) -> PrefetchReport {
+    prefetch_configs(cache_dir, agent_dir, collect_configs_in_agent_dir(agent_dir), None)
+}
+
+/// Prefetch a specific set of configs (the ones the given scripts use) —
+/// the per-pass counterpart of [`prefetch_all`]. Skips configs already warm,
+/// fresh AND complete; failures are per-config and never fatal. `progress`,
+/// when given, is called once per config with `(index, total)` — announced
+/// BEFORE the config resolves, so a caller's bar never reads complete while
+/// downloads are still running — plus a final `(total, total)`.
+pub fn prefetch_configs(
+    cache_dir: &Path,
+    agent_dir: &Path,
+    configs: Vec<VisualConfig>,
+    progress: Option<&dyn Fn(usize, usize)>,
+) -> PrefetchReport {
     let mut report = PrefetchReport::default();
-    let configs = collect_configs_in_agent_dir(agent_dir);
     report.configs = configs.len();
+    let total = report.configs;
     let mut seen: HashSet<String> = HashSet::new();
-    for cfg in configs {
+    for (index, cfg) in configs.into_iter().enumerate() {
+        // Announce the config BEFORE resolving it, so a caller's progress
+        // never shows the phase complete while downloads are still running.
+        if let Some(p) = progress {
+            p(index, total);
+        }
         let hash = config_hash(&cfg);
         if !seen.insert(hash.clone()) {
             continue; // duplicate config elsewhere in the sandbox
@@ -528,6 +548,9 @@ pub fn prefetch_all(cache_dir: &Path, agent_dir: &Path) -> PrefetchReport {
                     .push(format!("{}: {:#}", describe_config(&cfg), e));
             }
         }
+    }
+    if let Some(p) = progress {
+        p(total, total);
     }
     report
 }
@@ -560,6 +583,29 @@ fn describe_config(cfg: &VisualConfig) -> String {
         parts.push("unfiltered".to_string());
     }
     parts.join(" ")
+}
+
+/// Collect the `<visual>` configs of specific scripts (agent-relative
+/// forward-slash paths, as collected by the prerender pass) — so a prerender
+/// can prefetch exactly the clips those scripts use. Scripts that fail to
+/// read/parse contribute nothing (the audio render surfaces real errors).
+pub fn collect_configs_in_scripts(agent_dir: &Path, srcs: &[String]) -> Vec<VisualConfig> {
+    let mut out = Vec::new();
+    for src in srcs {
+        let Ok(path) = crate::bash::resolve_under(agent_dir, src) else {
+            continue;
+        };
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if !content.contains("<visual") {
+            continue;
+        }
+        if let Ok(nodes) = crate::tag_parser::parse(&content) {
+            collect_configs(&nodes, &mut out);
+        }
+    }
+    out
 }
 
 /// Collect every `<visual>` config authored in the agent sandbox (recursive
@@ -1376,6 +1422,43 @@ mod tests {
         let again = prefetch_all(&cache_dir, &agent_dir);
         assert_eq!(again.failed, 0, "{}", again.errors.join("; "));
     }
+    #[test]
+    fn test_collect_configs_in_scripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path();
+        std::fs::create_dir_all(agent.join("hypnos")).unwrap();
+        std::fs::write(
+            agent.join("hypnos/vis.xml"),
+            "<visual tags=\"hypno\" count=\"4\" niche=\"just-boobs\"><voice>watch</voice></visual>",
+        )
+        .unwrap();
+        std::fs::write(
+            agent.join("hypnos/other.xml"),
+            "<voice>no visuals here</voice>",
+        )
+        .unwrap();
+        // Contains the substring but fails to parse — contributes nothing.
+        std::fs::write(
+            agent.join("hypnos/broken.xml"),
+            "<visual count=\"notanumber\"><voice>x</voice></visual>",
+        )
+        .unwrap();
+
+        let configs = collect_configs_in_scripts(
+            agent,
+            &[
+                "hypnos/vis.xml".into(),
+                "hypnos/other.xml".into(),
+                "hypnos/broken.xml".into(),
+                "hypnos/missing.xml".into(),
+            ],
+        );
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].tags, vec!["hypno".to_string()]);
+        assert_eq!(configs[0].count, 4);
+        assert_eq!(configs[0].niches, vec!["just-boobs".to_string()]);
+    }
+
     #[test]
     fn test_agent_doc_render() {
         let disc = Discovery {

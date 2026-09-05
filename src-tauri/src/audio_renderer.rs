@@ -2342,7 +2342,7 @@ fn compute_beats(bpm: f32, pattern: Option<&str>, duration: f32) -> Vec<BeatMark
 }
 
 /// True if `dir` contains at least one `.wav` file (freshness precondition).
-fn has_any_wav(dir: &Path) -> bool {
+pub(crate) fn has_any_wav(dir: &Path) -> bool {
     let Ok(entries) = fs::read_dir(dir) else {
         return false;
     };
