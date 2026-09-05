@@ -14,7 +14,7 @@
  * static filters (grayscale/sepia/contrast/blur) and overlay layers
  * (vignette/scanlines). `cut` disables the default crossfade. Authored
  * `<caption>` lines (or the source's own captions under `captions="meta"`)
- * render along the bottom.
+ * render centered over the stage.
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -137,7 +137,10 @@ export function VisualStage({ config, slides, error, playing }: VisualStageProps
   const caption = pickCaption(config, lines, slides, index);
 
   return (
-    <div ref={rootRef} className="absolute inset-0 overflow-hidden bg-black">
+    <div
+      ref={rootRef}
+      className="absolute inset-0 overflow-hidden bg-black animate-[visual-fade_600ms_ease-out]"
+    >
       {/* Slides. The outer layer crossfades (and shakes, if asked) — both
           animations land on one element so the transform actually moves the
           picture; the inner wrapper carries filters + ken-burns/pulse. */}
@@ -235,16 +238,14 @@ export function VisualStage({ config, slides, error, playing }: VisualStageProps
         />
       )}
 
-      {/* Bottom scrim + caption */}
+      {/* Centered caption — a soft dark pill keeps it readable over any
+          slide without dimming the whole picture. */}
       {caption && (
-        <>
-          <div className="pointer-events-none absolute inset-x-0 bottom-0 h-2/5 bg-gradient-to-t from-black/80 to-transparent" />
-          <div className="pointer-events-none absolute inset-x-0 bottom-0 px-6 pb-8 text-center">
-            <span className="text-lg font-semibold leading-snug text-white drop-shadow-[0_2px_6px_rgba(0,0,0,0.9)]">
-              {caption}
-            </span>
-          </div>
-        </>
+        <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center px-8">
+          <span className="max-w-full rounded-lg bg-black/50 px-4 py-2 text-center text-lg font-semibold leading-snug text-white backdrop-blur-[2px] drop-shadow-[0_2px_6px_rgba(0,0,0,0.9)]">
+            {caption}
+          </span>
+        </div>
       )}
 
     </div>

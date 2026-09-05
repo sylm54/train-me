@@ -2078,13 +2078,22 @@ impl AudioRenderer {
             }
 
             Node::Overlay { duration, parts } => {
-                let part_ctx = ctx.clone().with_forbid_pause(true);
                 let seg_parts = parts
                     .iter()
                     .map(|p| {
-                        let seg = self.walk_part(
-                            p, &part_ctx, out_dir, script_dir, agent_dir, tracks_dir, counter,
-                            visited, progress,
+                        // Bake the part's volume/speed into its clip synthesis
+                        // (same as walk_part does for random/scramble/choice
+                        // parts) — playback-time element volume can't express
+                        // >1.0 or speed, so the manifest's copies are
+                        // informational only and must not be re-applied.
+                        let part_ctx = ctx
+                            .clone()
+                            .with_forbid_pause(true)
+                            .with_vol(p.volume.as_deref())
+                            .with_speed(p.speed.as_deref());
+                        let seg = self.walk(
+                            &p.children, &part_ctx, out_dir, script_dir, agent_dir, tracks_dir,
+                            counter, visited, progress,
                         )?;
                         Ok(OverlayPartSegment {
                             looped: p.looped,

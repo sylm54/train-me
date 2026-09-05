@@ -137,6 +137,8 @@ export type Segment =
       duration?: number;
       parts: {
         looped?: boolean;
+        /** Raw attribute strings — already baked into the clips by the
+         * renderer; carried for parity with the script, not for playback. */
         volume?: string;
         speed?: string;
         segment: Segment;
@@ -538,8 +540,9 @@ export class ManifestPlayer {
       waitingTrack = this.allocateTrack();
       const el = this.pool[waitingTrack];
       el.loop = true;
+      // The clip was rendered at waiting-sound-volume × context scale —
+      // don't set el.volume from `waiting_sound_volume` on top of it.
       el.src = await audioUrlForPath(seg.waiting_sound);
-      el.volume = clampVolume(seg.waiting_sound_volume);
       this.active.add(el);
       this.opts.onPlayingChange(true);
       void el.play().catch(() => {
@@ -582,6 +585,9 @@ export class ManifestPlayer {
     try {
       this.promptCtx = { kind: "choice", options: labels };
       const idx = await this.awaitPrompt();
+      // Drop the option card the moment a pick lands — the chosen branch
+      // plays with the UI clear (the finally below stays as the safety net).
+      this.opts.onPrompt(null);
       if (this.cancelled()) return;
       const chosen = seg.options[idx];
       if (chosen) await this.play(chosen.segment, trackIndex);
@@ -695,8 +701,9 @@ export class ManifestPlayer {
     seg.parts.forEach((part) => {
       const track = this.allocateTrack();
       partTracks.push(track);
+      // Part volume/speed are baked into the rendered clips by the backend —
+      // applying them again here would attenuate twice.
       const el = this.pool[track];
-      el.volume = clampVolume(part.volume);
       // Only a single static node can use the native element loop flag.
       if (part.looped && part.segment.type === "static") {
         el.loop = true;
@@ -1066,14 +1073,8 @@ export class ManifestPlayer {
 function fisherYates<T>(input: T[]): T[] {
   const out = input.slice();
   for (let i = out.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
+    const j = Math.floor(Math.random() * out.length);
     [out[i], out[j]] = [out[j], out[i]];
   }
   return out;
-}
-
-function clampVolume(raw: number | string | undefined): number {
-  const v = typeof raw === "number" ? raw : parseFloat(raw ?? "1");
-  if (Number.isNaN(v)) return 1;
-  return Math.min(1, Math.max(0, v));
 }
