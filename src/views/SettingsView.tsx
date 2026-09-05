@@ -585,6 +585,15 @@ export function SettingsView() {
                 {formatMinutes(settings.chat.idleClearMinutes)} of inactivity.
               </p>
             )}
+            <ToggleField
+              label="Sound when the agent finishes"
+              value={settings.chat.completionSound}
+              hint="Play a short chime when the agent completes its response — handy when a long run finishes while you're looking elsewhere. Subagent activity doesn't chime; only the finished answer does."
+              onChange={(v) => {
+                setChat({ completionSound: v });
+                flashSave();
+              }}
+            />
           </div>
         </section>
 

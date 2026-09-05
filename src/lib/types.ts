@@ -60,6 +60,11 @@ export interface ChatSettings {
    * `0` disables the idle timer entirely.
    */
   idleClearMinutes: number;
+  /**
+   * Play a short chime when the agent finishes a response. Useful when the
+   * user has switched away mid-generation.
+   */
+  completionSound: boolean;
 }
 
 /**

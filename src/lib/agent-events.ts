@@ -22,8 +22,11 @@
  *
  * Subagents are NOT recursive: a spawned copy gets no `spawn_agent` tool, so
  * delegation is capped at depth 1 structurally. Events still carry a `depth`
- * (always 1 today) so the UI's stack rendering keeps working if deeper
- * delegation is ever introduced.
+ * (always 1 today) so the UI's nesting rendering keeps working if deeper
+ * delegation is ever introduced. Each event also carries a unique `runId`:
+ * the model may spawn several copies in PARALLEL (multiple `spawn_agent`
+ * calls in one turn), and those are siblings the UI must track separately —
+ * not frames of one stack.
  *
  * Events are best-effort: a listener that throws never breaks a producer.
  */
@@ -74,8 +77,15 @@ export type AgentEvent =
       type: "subagent-start";
       agent: Exclude<AgentRole, "main">;
       /**
+       * Unique id for this spawned run. Several copies can run in PARALLEL
+       * (the model may issue multiple `spawn_agent` calls in one turn), so
+       * `agent` + `depth` alone don't identify a frame — the UI keys each
+       * delegation on this id instead.
+       */
+      runId: string;
+      /**
        * Recursion depth (always 1 today — copies get no spawn tool).
-       * Identifies the frame within the current delegation stack.
+       * Identifies the nesting level within a delegation chain.
        */
       depth: number;
       label: string;
@@ -90,6 +100,7 @@ export type AgentEvent =
   | {
       type: "subagent-step";
       agent: Exclude<AgentRole, "main">;
+      runId: string;
       depth: number;
       label: string;
       /** Optional detail (e.g. a friendly path) shown after the label. */
@@ -102,6 +113,7 @@ export type AgentEvent =
       /** One completed tool call by a subagent; accumulated into the history. */
       type: "subagent-tool";
       agent: Exclude<AgentRole, "main">;
+      runId: string;
       depth: number;
       toolName: string;
       /** Friendly label (e.g. "Reading file"). */
@@ -117,6 +129,7 @@ export type AgentEvent =
   | {
       type: "subagent-end";
       agent: Exclude<AgentRole, "main">;
+      runId: string;
       depth: number;
       ts: number;
     };

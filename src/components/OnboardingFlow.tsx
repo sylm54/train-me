@@ -134,6 +134,14 @@ export function OnboardingFlow({ onFinish }: Props) {
       const nextStep = await fetchOnboardingStep(next);
       setStep(nextStep);
       setDraft(nextStep.question ? next[nextStep.question.id] : undefined);
+      // Reset the clarification draft for the new question — otherwise the
+      // previous question's note lingers in the textarea and gets saved
+      // under the next question's `note:<id>` key. Pre-fill when the next
+      // question was already answered (Back then forward again).
+      const nq = nextStep.question;
+      const nextNote =
+        nq && nq.answer !== "open" ? next[noteKey(nq.id)] : undefined;
+      setNoteDraft(typeof nextNote === "string" ? nextNote : "");
       if (nextStep.question === null && nextStep.remaining === 0) {
         setSaving(true);
         try {

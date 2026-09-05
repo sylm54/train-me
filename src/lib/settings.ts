@@ -39,6 +39,9 @@ export const DEFAULT_CHAT_SETTINGS: ChatSettings = {
   compactKeepTurns: 6,
   // 4 hours of inactivity before an idle chat auto-archives. 0 disables.
   idleClearMinutes: 240,
+  // Chime when the agent finishes a response (toggleable — audible feedback
+  // for runs that end while the user looks elsewhere).
+  completionSound: true,
 };
 
 const DEFAULT_SETTINGS: AgentSettings = {
