@@ -50,6 +50,10 @@ pub struct PrerenderReport {
     pub model_missing: bool,
     /// Per-script render errors (rendering continues past them).
     pub errors: Vec<String>,
+    /// Visual clip prefetch for the `<visual>` tags these scripts use —
+    /// resolved into the playlist cache so playback never waits on the
+    /// network (see `crate::visual`).
+    pub visuals: crate::visual::PrefetchReport,
 }
 
 // ============================================================================
@@ -272,16 +276,16 @@ pub fn gc_targets(
 
 /// True when `tracks/<manifest_id(src)>/manifest.json` exists, its format
 /// version is current, its stored hash matches the current script bytes,
-/// and — when the script declares glob includes — its stored glob digest
-/// matches the current expansion (so adding/removing a matching file makes
-/// the script stale and it re-renders with fresh links).
+/// its glob digest matches the current expansion, and at least one `.wav`
+/// survived in the track dir (the same freshness the render path applies —
+/// a manifest without audio would make playback re-render on demand, so
+/// the pass must not call it fresh and skip).
 fn is_fresh(tracks_dir: &Path, agent_dir: &Path, src: &str) -> bool {
     let Ok(script_bytes) = std::fs::read(agent_dir.join(src)) else {
         return false;
     };
-    let manifest_path = tracks_dir
-        .join(crate::manifest::manifest_id(src))
-        .join("manifest.json");
+    let track_dir = tracks_dir.join(crate::manifest::manifest_id(src));
+    let manifest_path = track_dir.join("manifest.json");
     let Ok(raw) = std::fs::read_to_string(&manifest_path) else {
         return false;
     };
@@ -299,6 +303,7 @@ fn is_fresh(tracks_dir: &Path, agent_dir: &Path, src: &str) -> bool {
     existing.version == crate::manifest::MANIFEST_VERSION
         && existing.hash == crate::manifest::hash_bytes(&script_bytes)
         && existing.glob_digest == current_glob_digest
+        && crate::audio_renderer::has_any_wav(&track_dir)
 }
 
 // ============================================================================
@@ -335,6 +340,7 @@ pub fn prerender_blocking(
     state_dir: &Path,
     tracks_dir: &Path,
     model_dir: &Path,
+    visual_cache_dir: &Path,
     renderer_arc: &parking_lot::Mutex<Option<crate::audio_renderer::AudioRenderer>>,
     only: Option<&[String]>,
     app: Option<&tauri::AppHandle>,
@@ -378,10 +384,12 @@ pub fn prerender_blocking(
                 }
             }
             if let Some(renderer) = guard.as_mut() {
-                for r in &stale {
+                let stale_count = stale.len();
+                for (pass_index, r) in stale.iter().enumerate() {
                     // Progress tracker mirroring the UI render path: a
                     // seeded "Pre-rendering…" tick (so the frontend entry
-                    // exists before the first engine phase) plus ~2 Hz
+                    // exists before the first engine phase, and the pill
+                    // shows where in the PASS this script sits) plus ~2 Hz
                     // throttled step updates, finalized by a done event.
                     let tracker = app.map(|app| {
                         let app = app.clone();
@@ -393,23 +401,26 @@ pub fn prerender_blocking(
                                 step: 0,
                                 total: 0,
                                 callback: Box::new(move |step, total, label| {
+                                    // The completion tick (step == total)
+                                    // always emits: the throttle would
+                                    // otherwise swallow it right behind the
+                                    // last leaf tick and the bar would end
+                                    // at N-1/N, never landing on 100%.
                                     let should_emit = {
                                         let mut guard = last.lock();
                                         let now = std::time::Instant::now();
-                                        match *guard {
-                                            None => {
-                                                *guard = Some(now);
-                                                true
+                                        let due = match *guard {
+                                            None => true,
+                                            Some(prev) => {
+                                                now.duration_since(prev)
+                                                    >= std::time::Duration::from_millis(500)
+                                                    || (total > 0 && step >= total)
                                             }
-                                            Some(prev)
-                                                if now.duration_since(prev)
-                                                    >= std::time::Duration::from_millis(500) =>
-                                            {
-                                                *guard = Some(now);
-                                                true
-                                            }
-                                            _ => false,
+                                        };
+                                        if due {
+                                            *guard = Some(now);
                                         }
+                                        due
                                     };
                                     if should_emit {
                                         emit_progress(&app, &script, step, total, label);
@@ -419,7 +430,13 @@ pub fn prerender_blocking(
                         ))
                     });
                     if let Some(app) = app {
-                        emit_progress(app, &r.src, 0, 0, "Pre-rendering…");
+                        emit_progress(
+                            app,
+                            &r.src,
+                            0,
+                            0,
+                            &format!("Pre-rendering ({}/{} of pass)…", pass_index + 1, stale_count),
+                        );
                     }
                     match renderer.render_manifest(&r.src, agent_dir, tracks_dir, tracker.as_ref())
                     {
@@ -447,6 +464,54 @@ pub fn prerender_blocking(
             report.gc_removed.push(dir);
         }
     }
+
+    // Visual clips: prefetch the `<visual>` slideshow playlists (and their
+    // media) for every script in this pass — stale or fresh, an unrendered
+    // script can still reference clips the player will need — so playback
+    // never sits on "Fetching visuals…". Failures are per-config and soft
+    // (the player falls back to a cold fetch). Surfaced through the same
+    // progress pill under a pseudo-script name so the pass's visual phase
+    // is visible like the audio one.
+    let srcs: Vec<String> = refs.iter().map(|r| r.src.clone()).collect();
+    let configs = crate::visual::collect_configs_in_scripts(agent_dir, &srcs);
+    if !configs.is_empty() {
+        let pseudo = "⟨visual clips⟩";
+        if let Some(app) = app {
+            emit_progress(app, pseudo, 0, configs.len(), "Prefetching visual clips…");
+        }
+        report.visuals = crate::visual::prefetch_configs(
+            visual_cache_dir,
+            agent_dir,
+            configs,
+            Some(&|done, total| {
+                if let Some(app) = app {
+                    emit_progress(app, pseudo, done, total, "Prefetching visual clips…");
+                }
+            }),
+        );
+        if let Some(app) = app {
+            let error = if report.visuals.failed == 0 {
+                None
+            } else {
+                Some(format!(
+                    "{} visual clip prefetch(es) failed",
+                    report.visuals.failed
+                ))
+            };
+            emit_done(app, pseudo, error.as_deref());
+        }
+    }
+
+    log::info!(
+        "prerender pass: referenced={} rendered={} fresh={} gc={} visuals(found={}, prefetched={}, failed={})",
+        report.referenced,
+        report.rendered.len(),
+        report.fresh,
+        report.gc_removed.len(),
+        report.visuals.configs,
+        report.visuals.prefetched,
+        report.visuals.failed,
+    );
     report
 }
 
@@ -468,6 +533,7 @@ pub async fn v2_prerender(
     let state_dir = state.state_dir.clone();
     let tracks_dir = state.tracks_dir.clone();
     let model_dir = state.model_dir.clone();
+    let visual_cache_dir = state.data_dir.join("visuals");
     let renderer_arc = state.renderer.clone();
     let report_app = app.clone();
     let report = tauri::async_runtime::spawn_blocking(move || {
@@ -476,6 +542,7 @@ pub async fn v2_prerender(
             &state_dir,
             &tracks_dir,
             &model_dir,
+            &visual_cache_dir,
             &renderer_arc,
             paths.as_deref(),
             Some(&report_app),
@@ -640,7 +707,8 @@ x
         std::fs::write(dir.join("manifest.json"), v2.to_string()).unwrap();
         assert!(!is_fresh(&tracks, &agent, "hypnos/a.xml"));
 
-        // Current version + matching hash → fresh.
+        // Current version + matching hash but NO audio → stale (a manifest
+        // without wavs would make playback re-render on demand).
         let v3 = serde_json::json!({
             "version": crate::manifest::MANIFEST_VERSION,
             "hash": hash,
@@ -648,6 +716,10 @@ x
             "root": { "type": "sequence", "children": [] },
         });
         std::fs::write(dir.join("manifest.json"), v3.to_string()).unwrap();
+        assert!(!is_fresh(&tracks, &agent, "hypnos/a.xml"));
+
+        // With a rendered wav in the track dir → fresh.
+        std::fs::write(dir.join("seg-000.wav"), b"fake").unwrap();
         assert!(is_fresh(&tracks, &agent, "hypnos/a.xml"));
         let _ = tmp;
     }
@@ -674,6 +746,7 @@ x
         .unwrap();
         let dir = tracks.join(crate::manifest::manifest_id("hypnos/main.xml"));
         std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("seg-000.wav"), b"fake").unwrap();
         std::fs::write(
             dir.join("manifest.json"),
             serde_json::json!({

@@ -187,6 +187,12 @@ export function TodayView({ onRequestSession }: Props) {
     setPrerendering(key);
     try {
       const r = await prerender(paths);
+      const visualLines = [
+        ...(r.visuals.prefetched > 0
+          ? [`Fetched ${r.visuals.prefetched} visual clip set${r.visuals.prefetched === 1 ? "" : "s"}.`]
+          : []),
+        ...r.visuals.errors.slice(0, 2).map((e) => `visual: ${e}`),
+      ];
       if (r.model_missing) {
         showLines([
           "TTS model not downloaded yet — download it (TTS Studio) and pre-render will run in the background.",
@@ -196,12 +202,14 @@ export function TodayView({ onRequestSession }: Props) {
           r.referenced === 0
             ? "No audio scripts in the sandbox right now."
             : `Audio already rendered — ${r.fresh} script${r.fresh === 1 ? "" : "s"} up to date.`,
+          ...visualLines,
         ]);
       } else {
         showLines([
           `Rendered ${r.rendered.length} script${r.rendered.length === 1 ? "" : "s"}${
             r.fresh > 0 ? ` (${r.fresh} already up to date)` : ""
           }.`,
+          ...visualLines,
           ...r.errors.slice(0, 3).map((e) => `error: ${e}`),
         ]);
       }

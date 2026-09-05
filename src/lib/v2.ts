@@ -214,6 +214,18 @@ export interface HabitDetail {
 
 // ── Prerender (v2_prerender) ───────────────────────────────────────────────
 
+/** Summary of the visual clip prefetch phase of a prerender pass. */
+export interface VisualPrefetchReport {
+  /** Distinct `<visual>` configs found in the pass's scripts. */
+  configs: number;
+  /** Configs (re)resolved this pass (search + media downloads). */
+  prefetched: number;
+  /** Configs whose resolution failed. */
+  failed: number;
+  /** Per-config failure messages. */
+  errors: string[];
+}
+
 export interface PrerenderReport {
   referenced: number;
   rendered: string[];
@@ -221,6 +233,8 @@ export interface PrerenderReport {
   gc_removed: string[];
   model_missing: boolean;
   errors: string[];
+  /** Visual clip prefetch for the `<visual>` tags these scripts use. */
+  visuals: VisualPrefetchReport;
 }
 
 // ── Invoke wrappers ────────────────────────────────────────────────────────

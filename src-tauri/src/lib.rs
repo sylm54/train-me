@@ -683,21 +683,23 @@ async fn render_manifest(
     const EMIT_THROTTLE: Duration = Duration::from_millis(500);
     let progress_callback = Box::new(move |step: usize, total: usize, label: &str| {
         // Throttle the push event to ~2 Hz. Always emit the first tick of a
-        // render so the bar moves immediately; otherwise require the gap.
+        // render so the bar moves immediately; otherwise require the gap —
+        // except for the completion tick (step == total), which always emits
+        // or the throttle would swallow it right behind the last leaf tick
+        // and the bar would end at N-1/N, never landing on 100%.
         let should_emit = {
             let mut guard = emit_last.lock();
             let now = Instant::now();
-            match *guard {
-                None => {
-                    *guard = Some(now);
-                    true
+            let due = match *guard {
+                None => true,
+                Some(last) => {
+                    now.duration_since(last) >= EMIT_THROTTLE || (total > 0 && step >= total)
                 }
-                Some(last) if now.duration_since(last) >= EMIT_THROTTLE => {
-                    *guard = Some(now);
-                    true
-                }
-                _ => false,
+            };
+            if due {
+                *guard = Some(now);
             }
+            due
         };
         if should_emit {
             let _ = progress_app.emit(
