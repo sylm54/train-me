@@ -19,7 +19,9 @@ use crate::audio_renderer::resolve_scalar;
 use crate::tag_parser::{Node, SectionRole};
 
 /// Current on-disk manifest format version (see [`Manifest::version`]).
-pub const MANIFEST_VERSION: u32 = 3;
+/// v4: overlay `<part volume/speed>` are baked into clip synthesis by the
+/// renderer instead of being left to the player.
+pub const MANIFEST_VERSION: u32 = 4;
 
 // ============================================================================
 // Segment tree

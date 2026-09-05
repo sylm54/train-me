@@ -7,10 +7,11 @@
  * scale). Completes (calls `onEnded` once) when the whole segment tree has
  * finished playing through any branch.
  *
- * While a `<visual>` slideshow is up, the player goes truly fullscreen:
- * all chrome collapses to floating corner controls and a translucent
- * bottom-sheet prompt panel so the visuals stay unobstructed. Without
- * visuals the classic centered layout (header bar + controls) is used.
+ * One layout serves both modes: a dark stage with a translucent header, a
+ * centered play/pause control and a bottom-sheet prompt panel. When a
+ * `<visual>` slideshow is up ONLY the background changes (black stage →
+ * fullscreen media behind the same chrome), so the switch reads as a fade
+ * rather than a re-arrangement — and the player is dark either way.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -346,24 +347,13 @@ export function AudioPlayerOverlay({ src, onClose, onEnded, variables }: Props) 
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  // The interactive prompt card. Over a slideshow it becomes a translucent
-  // dark bottom sheet; plain mode keeps the surface card.
+  // The interactive prompt card. One shared style: a translucent dark sheet
+  // that reads over both the plain black stage and slideshow visuals, so a
+  // prompt looks the same whichever mode the player is in.
   const promptCard = prompt && (
-    <div
-      className={`w-full max-w-md space-y-3 rounded-lg border p-4 shadow-sm ${
-        visual
-          ? "border-white/15 bg-black/70 text-white backdrop-blur-md"
-          : "border-[var(--color-border)] bg-[var(--color-surface)]"
-      }`}
-    >
-      {prompt.prompt && (
-        <div className={`text-sm font-medium ${visual ? "text-white" : ""}`}>{prompt.prompt}</div>
-      )}
-      {prompt.text && (
-        <div className={`text-sm ${visual ? "text-white/70" : "text-muted-foreground"}`}>
-          {prompt.text}
-        </div>
-      )}
+    <div className="w-full max-w-md space-y-3 rounded-lg border border-white/15 bg-black/70 p-4 shadow-sm backdrop-blur-md">
+      {prompt.prompt && <div className="text-sm font-medium">{prompt.prompt}</div>}
+      {prompt.text && <div className="text-sm text-white/70">{prompt.text}</div>}
       {prompt.kind === "until" && prompt.button && (
         <Button onClick={() => playerRef.current?.continueUntil()}>{prompt.button}</Button>
       )}
@@ -375,11 +365,7 @@ export function AudioPlayerOverlay({ src, onClose, onEnded, variables }: Props) 
           <Button
             key={i}
             variant="outline"
-            className={`w-full justify-start ${
-              visual
-                ? "border-white/25 bg-white/10 text-white hover:bg-white/20 hover:text-white"
-                : ""
-            }`}
+            className="w-full justify-start border-white/25 bg-white/10 text-white hover:bg-white/20 hover:text-white"
             onClick={() => {
               void logActivity(
                 "script",
@@ -401,11 +387,7 @@ export function AudioPlayerOverlay({ src, onClose, onEnded, variables }: Props) 
                 key={value}
                 variant="outline"
                 size="sm"
-                className={`h-8 w-8 p-0 ${
-                  visual
-                    ? "border-white/25 bg-white/10 text-white hover:bg-white/20 hover:text-white"
-                    : ""
-                  }`}
+                className="h-8 w-8 p-0 border-white/25 bg-white/10 text-white hover:bg-white/20 hover:text-white"
                 onClick={() => {
                   void logActivity(
                     "script",
@@ -425,10 +407,9 @@ export function AudioPlayerOverlay({ src, onClose, onEnded, variables }: Props) 
   );
 
   return (
-    <div className="fixed inset-0 z-[60] bg-[var(--color-surface)] flex flex-col">
-      {/* <visual> slideshow layer — truly fullscreen: with a slideshow up,
-          ALL chrome collapses to floating corner controls and a bottom-sheet
-          prompt panel, leaving the visuals unobstructed. */}
+    <div className="fixed inset-0 z-[60] flex flex-col bg-black text-white">
+      {/* <visual> slideshow layer — fullscreen behind the shared chrome; the
+          stage fades in so the plain→slideshow switch isn’t a hard cut. */}
       {visual && (
         <VisualStage
           config={visual.config}
@@ -438,133 +419,121 @@ export function AudioPlayerOverlay({ src, onClose, onEnded, variables }: Props) 
         />
       )}
 
-      {visual ? (
-        <>
-          {phase === "ready" && !finished && !playing && (
-            <Button
-              size="lg"
-              onClick={playOrResume}
-              className="absolute left-1/2 top-1/2 z-10 -translate-x-1/2 -translate-y-1/2"
-            >
-              {playLabel}
-            </Button>
-          )}
-          {phase === "ready" && !finished && playing && !prompt && (
-            <button
-              onClick={() => playerRef.current?.pause()}
-              aria-label="Pause"
-              className="absolute bottom-4 right-4 z-20 grid size-10 place-items-center rounded-full bg-black/50 text-white/90 backdrop-blur-sm"
-            >
-              <Pause className="size-4" />
-            </button>
-          )}
-          {phase === "ready" && !finished && prompt && (
-            <div className="absolute inset-x-0 bottom-0 z-10 flex justify-center px-4 pb-5">
-              {promptCard}
+      {/* Header — translucent so it reads over slides too. */}
+      <div className="relative z-10 flex items-center justify-between gap-3 border-b border-white/10 bg-black/50 px-4 py-3 backdrop-blur-sm">
+        <div className="truncate text-sm font-semibold">▶ {src}</div>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={onClose}
+          aria-label="Close player"
+          className="text-white hover:bg-white/10 hover:text-white"
+        >
+          <X className="size-4" />
+        </Button>
+      </div>
+
+      {/* Center column: phases while preparing; Play/Pause + finished state
+          once ready (hidden while playing without a prompt — the floating
+          pause button below takes over). */}
+      <div className="relative z-10 flex flex-1 flex-col items-center justify-center gap-6 px-6 text-center">
+        {phase === "checking" && <Spinner className="size-6" />}
+        {phase === "rendering" && (
+          <div className="flex flex-col items-center gap-3 w-full max-w-sm px-4">
+            <Spinner className="size-6" />
+            <div className="text-sm text-white/60">Rendering audio… {renderLabel}</div>
+            <div className="w-full space-y-1.5">
+              {renderEntry && renderEntry.total > 0 ? (
+                <div className="h-1.5 rounded-full bg-white/15 overflow-hidden">
+                  <div
+                    className="h-full rounded-full bg-[var(--color-pink-500)] transition-all duration-200 ease-out"
+                    style={{
+                      width: `${Math.min(
+                        100,
+                        Math.round((renderEntry.step / renderEntry.total) * 100),
+                      )}%`,
+                    }}
+                  />
+                </div>
+              ) : (
+                <div className="h-1.5 rounded-full bg-white/15 overflow-hidden">
+                  <div className="h-full w-1/3 rounded-full bg-[var(--color-pink-500)] animate-[render-indeterminate_1.1s_ease-in-out_infinite]" />
+                </div>
+              )}
+              <div className="flex items-center justify-between text-[11px] text-white/50">
+                <span className="tabular-nums">
+                  {renderEntry && renderEntry.total > 0
+                    ? `${renderEntry.step}/${renderEntry.total}`
+                    : ""}
+                </span>
+                {eta != null && (
+                  <span className="tabular-nums">~{formatClock(eta)} left</span>
+                )}
+              </div>
             </div>
-          )}
-          {/* Always-available exit, clear of everything. */}
-          <button
-            onClick={onClose}
-            aria-label="Close player"
-            className="absolute right-3 top-3 z-20 grid size-9 place-items-center rounded-full bg-black/50 text-white/90 backdrop-blur-sm"
-          >
-            <X className="size-4" />
-          </button>
-        </>
-      ) : (
-        <>
-          <div className="relative z-10 flex items-center justify-between border-b border-[var(--color-border)] px-4 py-3">
-            <div className="truncate text-sm font-semibold">▶ {src}</div>
-            <Button variant="ghost" size="sm" onClick={onClose} aria-label="Close player">
-              <X className="size-4" />
+          </div>
+        )}
+        {phase === "engine" && (
+          <div className="flex max-w-sm flex-col items-center gap-3">
+            <div className="text-sm font-medium">The voice engine isn’t enabled yet</div>
+            <div className="text-sm text-white/60">
+              {engineStatus && !engineStatus.downloaded
+                ? "Scripts need the speech model — it downloads once, then plays offline."
+                : "The speech model is downloaded but not loaded."}
+            </div>
+            {engineError && (
+              <div className="text-xs text-[var(--color-danger)]">{engineError}</div>
+            )}
+            <Button onClick={enableEngine} disabled={engineBusy}>
+              {engineBusy && <Spinner className="size-4" />}
+              {engineBusy
+                ? "Working…"
+                : engineStatus && !engineStatus.downloaded
+                  ? "Download voice engine"
+                  : "Enable voice engine"}
             </Button>
           </div>
-          <div className="relative z-10 flex flex-1 flex-col items-center justify-center gap-6 px-6 text-center">
-            {phase === "checking" && <Spinner className="size-6" />}
-            {phase === "rendering" && (
-              <div className="flex flex-col items-center gap-3 w-full max-w-sm px-4">
-                <Spinner className="size-6" />
-                <div className="text-sm text-muted-foreground">Rendering audio… {renderLabel}</div>
-                <div className="w-full space-y-1.5">
-                  {renderEntry && renderEntry.total > 0 ? (
-                    <div className="h-1.5 rounded-full bg-[var(--color-border)] overflow-hidden">
-                      <div
-                        className="h-full rounded-full bg-[var(--color-pink-500)] transition-all duration-200 ease-out"
-                        style={{
-                          width: `${Math.min(
-                            100,
-                            Math.round((renderEntry.step / renderEntry.total) * 100),
-                          )}%`,
-                        }}
-                      />
-                    </div>
-                  ) : (
-                    <div className="h-1.5 rounded-full bg-[var(--color-border)] overflow-hidden">
-                      <div className="h-full w-1/3 rounded-full bg-[var(--color-pink-500)] animate-[render-indeterminate_1.1s_ease-in-out_infinite]" />
-                    </div>
-                  )}
-                  <div className="flex items-center justify-between text-[11px] text-muted-foreground">
-                    <span className="tabular-nums">
-                      {renderEntry && renderEntry.total > 0
-                        ? `${renderEntry.step}/${renderEntry.total}`
-                        : ""}
-                    </span>
-                    {eta != null && (
-                      <span className="tabular-nums">~{formatClock(eta)} left</span>
-                    )}
-                  </div>
-                </div>
-              </div>
-            )}
-            {phase === "engine" && (
-              <div className="flex max-w-sm flex-col items-center gap-3">
-                <div className="text-sm font-medium">The voice engine isn’t enabled yet</div>
-                <div className="text-sm text-muted-foreground">
-                  {engineStatus && !engineStatus.downloaded
-                    ? "Scripts need the speech model — it downloads once, then plays offline."
-                    : "The speech model is downloaded but not loaded."}
-                </div>
-                {engineError && (
-                  <div className="text-xs text-[var(--color-danger)]">{engineError}</div>
-                )}
-                <Button onClick={enableEngine} disabled={engineBusy}>
-                  {engineBusy && <Spinner className="size-4" />}
-                  {engineBusy
-                    ? "Working…"
-                    : engineStatus && !engineStatus.downloaded
-                      ? "Download voice engine"
-                      : "Enable voice engine"}
+        )}
+        {phase === "error" && (
+          <div className="max-w-md text-sm text-[var(--color-danger)]">{error}</div>
+        )}
+        {phase === "ready" && (
+          <>
+            {finished ? (
+              <div className="text-base font-semibold">Finished ✓</div>
+            ) : (
+              (!playing || prompt) && (
+                <Button
+                  size="lg"
+                  onClick={playing ? () => playerRef.current?.pause() : playOrResume}
+                >
+                  {playing ? "Pause" : playLabel}
                 </Button>
-              </div>
+              )
             )}
-            {phase === "error" && (
-              <div className="max-w-md text-sm text-[var(--color-danger)]">{error}</div>
-            )}
-            {phase === "ready" && (
-              <>
-                {finished ? (
-                  <div className="text-base font-semibold">Finished ✓</div>
-                ) : (
-                  <Button
-                    size="lg"
-                    onClick={playing ? () => playerRef.current?.pause() : playOrResume}
-                  >
-                    {playing ? "Pause" : playLabel}
-                  </Button>
-                )}
-                {promptCard}
-              </>
-            )}
-          </div>
-        </>
+          </>
+        )}
+      </div>
+
+      {/* Interactive prompt — bottom sheet in BOTH modes. */}
+      {phase === "ready" && !finished && prompt && (
+        <div className="relative z-10 flex justify-center px-4 pb-5">{promptCard}</div>
       )}
 
-      {/* On-screen beat meter for <beatmeter> clips (both modes). */}
+      {/* Floating pause while audio plays without a prompt (both modes). */}
+      {phase === "ready" && !finished && playing && !prompt && (
+        <button
+          onClick={() => playerRef.current?.pause()}
+          aria-label="Pause"
+          className="absolute bottom-4 right-4 z-20 grid size-10 place-items-center rounded-full bg-black/50 text-white/90 backdrop-blur-sm"
+        >
+          <Pause className="size-4" />
+        </button>
+      )}
+
+      {/* On-screen beat meter for <beatmeter> clips. */}
       {beat?.beatmeter && beat.currentTime < beat.duration - 0.05 && (
-        <div className={`absolute inset-x-0 z-10 flex justify-center ${
-          visual ? "bottom-20" : "bottom-8"
-        }`}>
+        <div className="absolute inset-x-0 bottom-24 z-10 flex justify-center">
           <BeatStrip
             meta={beat.beatmeter}
             time={beat.currentTime}
