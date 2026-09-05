@@ -84,6 +84,7 @@ import {
 } from "lucide-react";
 
 import { useSettings } from "@/lib/settings";
+import { playCompletionSound } from "@/lib/completionSound";
 import {
   loadPrompt,
   resetIncludeSnapshots,
@@ -384,6 +385,7 @@ function ChatViewInner({
   const isGenerating = status === "submitted" || status === "streaming";
   const wasGenerating = useRef(false);
   const [emptyResponse, setEmptyResponse] = useState(false);
+  const completionSoundEnabled = settings.chat.completionSound;
   useEffect(() => {
     if (wasGenerating.current && !isGenerating && messages.length > 0) {
       saveMessages(activeChatId, messages);
@@ -406,11 +408,17 @@ function ChatViewInner({
           );
         // An empty assistant message carries only reasoning (stripped from the
         // stream) or nothing at all.
-        setEmptyResponse(lastIsUser || (lastAssistantEmpty && messages.length >= 1));
+        const isEmpty = lastIsUser || (lastAssistantEmpty && messages.length >= 1);
+        setEmptyResponse(isEmpty);
+        // Completion chime (Settings → Chat toggle): audible "the agent is
+        // done" feedback for runs that end while the user is elsewhere. Not
+        // played for the empty-response failure — that gets its own Retry
+        // affordance instead of a success signal.
+        if (!isEmpty && completionSoundEnabled) playCompletionSound();
       }
     }
     wasGenerating.current = isGenerating;
-  }, [isGenerating, messages, activeChatId, error]);
+  }, [isGenerating, messages, activeChatId, error, completionSoundEnabled]);
 
   // ── Stream liveness: "thinking" vs "waiting on the network" ────────
   // The SDK bumps `messages` on every stream chunk (reasoning/text deltas,
@@ -1039,27 +1047,36 @@ function ContextFooter({
           </span>
         ) : subagentStack.length > 0 ? (
           <span className="flex items-center gap-1 truncate">
-            {subagentStack.map((sa, i) => (
-              <span key={sa.depth} className="flex items-center gap-1">
-                {i > 0 && <span className="opacity-30 mx-0.5">›</span>}
-                <span
-                  className="size-1.5 rounded-full shrink-0"
-                  style={{ background: SUBAGENT_COLOR[sa.agent] }}
-                />
-                <span
-                  className={`capitalize ${
-                    i === subagentStack.length - 1
-                      ? "font-medium"
-                      : "opacity-50"
-                  }`}
-                >
-                  {sa.agent}
+            {subagentStack.map((sa, i) => {
+              // `›` joins nested levels (a child running under its parent);
+              // `+` joins parallel siblings spawned side by side.
+              const prev = i > 0 ? subagentStack[i - 1] : null;
+              const separator =
+                prev && sa.depth > prev.depth ? "›" : i > 0 ? "+" : null;
+              return (
+                <span key={sa.runId} className="flex items-center gap-1">
+                  {separator && (
+                    <span className="opacity-30 mx-0.5">{separator}</span>
+                  )}
+                  <span
+                    className="size-1.5 rounded-full shrink-0"
+                    style={{ background: SUBAGENT_COLOR[sa.agent] }}
+                  />
+                  <span
+                    className={`capitalize ${
+                      i === subagentStack.length - 1
+                        ? "font-medium"
+                        : "opacity-50"
+                    }`}
+                  >
+                    {sa.agent}
+                  </span>
+                  {sa.depth > 1 && (
+                    <span className="opacity-50 shrink-0">L{sa.depth}</span>
+                  )}
                 </span>
-                {sa.depth > 1 && (
-                  <span className="opacity-50 shrink-0">L{sa.depth}</span>
-                )}
-              </span>
-            ))}
+              );
+            })}
             <span className="opacity-40">·</span>
             <span className="truncate">
               {activeSubagent?.task ?? activeSubagent?.label}
@@ -1543,6 +1560,8 @@ const SUBAGENT_COLOR: Record<"spawn", string> = {
 
 interface ActiveSubagent {
   agent: "spawn";
+  /** Unique id for this run — several copies can run in parallel. */
+  runId: string;
   /** Chain depth (always 1 today — copies get no spawn tool). */
   depth: number;
   label: string;
@@ -1559,6 +1578,8 @@ interface ActiveSubagent {
 /** One recorded subagent tool call (for the expandable history). */
 interface ToolHistoryEntry {
   agent: "spawn";
+  /** Run that performed this call. */
+  runId: string;
   /** Depth of the spawned copy that performed this call. */
   depth: number;
   toolName: string;
@@ -1570,16 +1591,17 @@ interface ToolHistoryEntry {
 }
 
 /**
- * Walk the event stream and derive (a) the currently-active delegation stack
- * and (b) the full tool-call history across delegation levels. (Cumulative
- * token/cost totals live in `useSessionUsage` — they must survive this
- * component's per-chat remount.)
+ * Walk the event stream and derive (a) the currently-active delegation
+ * frames and (b) the full tool-call history across delegation levels.
+ * (Cumulative token/cost totals live in `useSessionUsage` — they must
+ * survive this component's per-chat remount.)
  *
- * Subagents are strictly nested (a child fully completes within its
- * parent's run), so we model activity as a push/pop stack keyed by the
- * event's `depth`: `start` pushes a frame, `end` pops it, and `step` /
- * `tool` events are attributed to the frame at their depth. Frames left
- * open at the end of the stream are the still-running delegation chain.
+ * Frames are keyed by the events' `runId`, not their depth: the model can
+ * issue several `spawn_agent` calls in ONE turn, and those copies run in
+ * PARALLEL at the same depth — they're siblings, not a nested chain. `start`
+ * pushes a frame, `end` removes the matching one, and `step` / `tool` events
+ * are attributed to the frame with their runId. Frames left open at the end
+ * of the stream are the still-running delegations.
  */
 function deriveStats(events: AgentEvent[]): {
   activeSubagent: ActiveSubagent | null;
@@ -1594,6 +1616,7 @@ function deriveStats(events: AgentEvent[]): {
       case "subagent-start":
         stack.push({
           agent: e.agent,
+          runId: e.runId,
           depth: e.depth,
           label: e.label,
           task: e.task,
@@ -1602,17 +1625,22 @@ function deriveStats(events: AgentEvent[]): {
         });
         break;
       case "subagent-step": {
-        // Update the matching frame (the running one at this depth).
-        const frame = stack.find((s) => s.depth === e.depth);
-        if (frame) {
-          frame.label = e.label;
-          frame.attempt = e.attempt;
+        // Update the matching frame (keyed by run; depth is only a fallback
+        // for events emitted before run ids existed).
+        const frame = e.runId
+          ? stack.find((s) => s.runId === e.runId)
+          : undefined;
+        const target = frame ?? stack.find((s) => s.depth === e.depth);
+        if (target) {
+          target.label = e.label;
+          target.attempt = e.attempt;
         }
         break;
       }
       case "subagent-tool":
         toolHistory.push({
           agent: e.agent,
+          runId: e.runId,
           depth: e.depth,
           toolName: e.toolName,
           label: e.label,
@@ -1623,15 +1651,18 @@ function deriveStats(events: AgentEvent[]): {
         });
         break;
       case "subagent-end": {
-        // Pop the frame at this depth. With strict nesting it's the top;
-        // searching from the end is robust if events ever arrive slightly
-        // out of order. (Manual loop because Array.findLastIndex is ES2023
-        // and our lib target is ES2022.)
+        // Remove the frame with this run's id (falling back to the last
+        // frame at this depth if an id is somehow absent).
         let idx = -1;
-        for (let j = stack.length - 1; j >= 0; j--) {
-          if (stack[j].depth === e.depth) {
-            idx = j;
-            break;
+        if (e.runId) {
+          idx = stack.findIndex((s) => s.runId === e.runId);
+        }
+        if (idx < 0) {
+          for (let j = stack.length - 1; j >= 0; j--) {
+            if (stack[j].depth === e.depth) {
+              idx = j;
+              break;
+            }
           }
         }
         if (idx >= 0) stack.splice(idx, 1);
@@ -1788,8 +1819,13 @@ function StreamPhaseRow({
 }
 
 /**
- * Stacked progress indicator showing the full subagent delegation chain plus
- * an expandable tool-call history for the active subagent.
+ * Progress indicator showing the active subagent delegations plus an
+ * expandable tool-call history for the working agent(s).
+ *
+ * Several copies can run in PARALLEL (multiple `spawn_agent` calls in one
+ * turn): same-depth frames are siblings and render flush at the same indent,
+ * each with its own spinner. Only a frame with something nested UNDER it
+ * (a deeper depth still running) renders as a dim, waiting parent.
  */
 function SubagentProgressIndicator({
   stack,
@@ -1819,41 +1855,48 @@ function SubagentProgressIndicator({
     );
   }
 
-  // Tool history for the innermost active level — i.e. the agent actually
-  // doing work right now. Outer (waiting) levels' past calls aren't useful
-  // while a child runs, so we focus the list on the current depth.
-  const innermostDepth =
-    stack.length > 0 ? stack[stack.length - 1].depth : null;
-  const relevantHistory =
-    innermostDepth != null
-      ? toolHistory.filter((h) => h.depth === innermostDepth)
-      : [];
+  // A frame is WORKING when nothing deeper is running under it (with the
+  // depth-1 cap today, every parallel copy is a working leaf).
+  const deepest = Math.max(...stack.map((s) => s.depth));
+  const isWorking = (sa: ActiveSubagent) => sa.depth === deepest;
+
+  // Tool history for the working agents — a waiting parent's past calls
+  // aren't useful while a child runs.
+  const workingIds = new Set(
+    stack.filter(isWorking).map((s) => s.runId),
+  );
+  const workingDepths = new Set(
+    stack.filter(isWorking).map((s) => s.depth),
+  );
+  const relevantHistory = toolHistory.filter(
+    (h) => workingIds.has(h.runId) || (!h.runId && workingDepths.has(h.depth)),
+  );
 
   return (
     <div className="flex flex-col gap-0.5 pl-1 py-1">
-      {stack.map((sa, i) => {
-        const isInnermost = i === stack.length - 1;
+      {stack.map((sa) => {
+        const working = isWorking(sa);
         const elapsed = Math.max(0, Math.round((now - sa.startedAt) / 1000));
 
         return (
           <div
-            key={sa.depth}
+            key={sa.runId}
             className={`flex items-center gap-1.5 text-xs ${
-              isInnermost
+              working
                 ? "text-[var(--color-foreground)]"
                 : "text-[var(--color-muted-foreground)]"
             }`}
-            // Indent each nested level so the delegation chain reads as a
-            // hierarchy (depth 1 flush, each deeper level shifted right).
-            style={{ marginLeft: i * 14 }}
+            // Indent by nesting level so a delegation chain reads as a
+            // hierarchy; parallel siblings (same depth) stay aligned.
+            style={{ marginLeft: (sa.depth - 1) * 14 }}
           >
             {/* Color dot */}
             <span
               className="size-1.5 rounded-full shrink-0"
               style={{ background: SUBAGENT_COLOR[sa.agent] }}
             />
-            {/* Spinner (innermost) or dim dot (outer / waiting) */}
-            {isInnermost ? (
+            {/* Spinner (working) or dim dot (nested-under / waiting) */}
+            {working ? (
               <Loader2
                 size={12}
                 className="shrink-0 animate-spin"
@@ -1877,7 +1920,7 @@ function SubagentProgressIndicator({
                 <span className="opacity-40">·</span>
                 <span
                   className={`truncate max-w-[16rem] ${
-                    isInnermost ? "" : "opacity-70"
+                    working ? "" : "opacity-70"
                   }`}
                   title={sa.task}
                 >
@@ -1886,12 +1929,12 @@ function SubagentProgressIndicator({
               </>
             )}
             <span className="opacity-40">·</span>
-            <span className={isInnermost ? "" : "opacity-70"}>{sa.label}</span>
-            {isInnermost && sa.attempt && sa.attempt > 1 && (
+            <span className={working ? "" : "opacity-70"}>{sa.label}</span>
+            {working && sa.attempt && sa.attempt > 1 && (
               <span className="opacity-60 shrink-0">· attempt {sa.attempt}</span>
             )}
-            {/* Elapsed time + pulse on the active (innermost) agent */}
-            {isInnermost && (
+            {/* Elapsed time + pulse on each working agent */}
+            {working && (
               <span className="tabular-nums opacity-50 animate-[pulse-subtle_2s_ease-in-out_infinite]">
                 {formatElapsed(elapsed)}
               </span>
@@ -1900,7 +1943,7 @@ function SubagentProgressIndicator({
         );
       })}
 
-      {/* Expandable tool-call history for the active subagent(s). */}
+      {/* Expandable tool-call history for the working subagent(s). */}
       {relevantHistory.length > 0 && (
         <ToolHistoryList entries={relevantHistory} />
       )}

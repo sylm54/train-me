@@ -39,6 +39,7 @@ import {
   isLoopFinished,
 } from "ai";
 import { z } from "zod";
+import { nanoid } from "nanoid";
 
 import { loadPrompt } from "./prompts";
 import { getProvider, buildProviderOptions } from "./agent";
@@ -146,10 +147,16 @@ const STEP_LABEL: Record<string, string> = {
 };
 
 /** Push a subagent-start event so the UI can show progress etc. */
-function emitStart(agent: SubagentName, depth: number, label?: string) {
+function emitStart(
+  agent: SubagentName,
+  runId: string,
+  depth: number,
+  label?: string,
+) {
   emitAgentEvent({
     type: "subagent-start",
     agent,
+    runId,
     depth,
     label: label ? `Working on: ${label}` : START_LABEL[agent],
     task: label,
@@ -160,6 +167,7 @@ function emitStart(agent: SubagentName, depth: number, label?: string) {
 /** Update the current step label for a running subagent. */
 function emitStep(
   agent: SubagentName,
+  runId: string,
   depth: number,
   toolName: string,
   detail?: string,
@@ -168,6 +176,7 @@ function emitStep(
   emitAgentEvent({
     type: "subagent-step",
     agent,
+    runId,
     depth,
     label: STEP_LABEL[toolName] ?? toolName,
     detail,
@@ -179,6 +188,7 @@ function emitStep(
 /** Record one completed subagent tool call in the UI history feed. */
 function emitTool(
   agent: SubagentName,
+  runId: string,
   depth: number,
   toolName: string,
   detail: string | undefined,
@@ -188,6 +198,7 @@ function emitTool(
   emitAgentEvent({
     type: "subagent-tool",
     agent,
+    runId,
     depth,
     toolName,
     label: STEP_LABEL[toolName] ?? toolName,
@@ -199,8 +210,14 @@ function emitTool(
 }
 
 /** Pop a subagent activity when its run completes. */
-function emitEnd(agent: SubagentName, depth: number) {
-  emitAgentEvent({ type: "subagent-end", agent, depth, ts: Date.now() });
+function emitEnd(agent: SubagentName, runId: string, depth: number) {
+  emitAgentEvent({
+    type: "subagent-end",
+    agent,
+    runId,
+    depth,
+    ts: Date.now(),
+  });
 }
 
 /** Report normalized token usage for a subagent step to the UI bus. */
@@ -252,12 +269,17 @@ async function runSubagent(opts: {
     );
   }
 
+  // Unique id for THIS run. The model may spawn several copies in parallel
+  // (multiple spawn_agent calls in one turn) — all at depth 1 — so the UI
+  // keys each delegation frame on this id, not on the depth.
+  const runId = `spawn-${nanoid()}`;
+
   log(
     opts.agent,
     opts.depth,
     `▶ starting (${opts.settings.agents.main.provider}/${cfg.model})`,
   );
-  emitStart(opts.agent, opts.depth, opts.label);
+  emitStart(opts.agent, runId, opts.depth, opts.label);
 
   // `result` is declared outside the try so the `finally` block can read
   // its (fallback) usage; `streamText` runs synchronously, but the awaited
@@ -309,6 +331,7 @@ async function runSubagent(opts: {
     ) => {
       emitTool(
         opts.agent,
+        runId,
         opts.depth,
         toolName,
         toolDetail(toolName, input),
@@ -373,7 +396,7 @@ async function runSubagent(opts: {
           toolInputBuffers.set(part.id, "");
           toolNamesById.set(part.id, part.toolName);
           // Surface a friendly step label to the UI progress feed.
-          emitStep(opts.agent, opts.depth, part.toolName, undefined, undefined);
+          emitStep(opts.agent, runId, opts.depth, part.toolName, undefined, undefined);
           break;
         }
 
@@ -455,7 +478,7 @@ async function runSubagent(opts: {
         // ignore — usage is best-effort
       }
     }
-    emitEnd(opts.agent, opts.depth);
+    emitEnd(opts.agent, runId, opts.depth);
   }
 }
 
