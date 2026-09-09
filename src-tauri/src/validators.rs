@@ -1056,9 +1056,8 @@ pub async fn validate_data_files(
 /// tag, refresh the source-vocabulary snapshot (cached on disk; the network
 /// fetch is bounded by the HTTP client's timeouts and skipped entirely when
 /// the cache is fresh) and warn about niche ids the source doesn't know. The
-/// snapshot is also mirrored into `docs/redgifs-discovery.md` so the writing
-/// agent can browse valid niches/tags. Fully offline-tolerant: any failure
-/// leaves the report untouched.
+/// agent explores the live vocabulary itself via the `redgifs` builtin. Fully
+/// offline-tolerant: any failure leaves the report untouched.
 async fn visual_discovery_pass(report: &mut ValidateReport, state: &State<'_, AppState>) {
     let agent_dir = state.agent_dir.clone();
     let mut visual_files: Vec<(String, PathBuf)> = Vec::new();
@@ -1087,7 +1086,6 @@ async fn visual_discovery_pass(report: &mut ValidateReport, state: &State<'_, Ap
     let Some(disc) = disc else {
         return; // offline, no cache — no opinion
     };
-    visual::write_agent_doc(&agent_dir, Some(&disc));
 
     for (rel, full) in visual_files {
         let Ok(content) = std::fs::read_to_string(&full) else {
@@ -1112,7 +1110,7 @@ async fn visual_discovery_pass(report: &mut ValidateReport, state: &State<'_, Ap
         }
         if let Some(r) = report.files.iter_mut().find(|r| r.path == rel) {
             r.push(warn(format!(
-                "unknown redgifs niche{}: {} — browse docs/redgifs-discovery.md for valid ids (tags are free-form and need no lookup)",
+                "unknown redgifs niche{}: {} — run `redgifs niches <query>` in bash for valid ids (tags are free-form and need no lookup)",
                 if unknown.len() > 1 { "s" } else { "" },
                 unknown.join(", "),
             )));

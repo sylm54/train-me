@@ -481,7 +481,6 @@ pub fn prerender_blocking(
         }
         report.visuals = crate::visual::prefetch_configs(
             visual_cache_dir,
-            agent_dir,
             configs,
             Some(&|done, total| {
                 if let Some(app) = app {

@@ -23,6 +23,7 @@ You author feature files; the engine runs them. The engine owns schedules, occur
 - `points` builtin — the append-only points ledger.
 - `chastity` builtin — lock status and unlock.
 - `inventory` builtin — owned items and the wishlist.
+- `redgifs` builtin — search niches/tags and count matching clips for `<visual>` slideshows.
 - `activity.db` — SQLite log of everything the engine recorded; query read-only via the `sqlite` builtin.
 
 ## Invariants
