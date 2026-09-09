@@ -178,6 +178,7 @@ pub fn create_bash_sandbox(agent_dir: &Path, state_dir: &Path) -> anyhow::Result
                 builder,
                 state_dir_owned.join("economy.db"),
             );
+            let builder = crate::redgifs_cli::RedgifsBuiltin::register(builder);
             let mut bash = builder.build();
 
             rt.block_on(async move {
@@ -463,6 +464,13 @@ pub fn ensure_agent_dir(data_dir: &Path) -> std::io::Result<()> {
     // see FORMAT.md.)
     for sub in ["docs", "routines", "habits", "tasks", "store", "hypnos"] {
         std::fs::create_dir_all(agent.join(sub))?;
+    }
+    // The old auto-generated RedGIFs discovery snapshot — replaced by the
+    // agent-facing `redgifs` builtin (live lookups). App-managed, so remove
+    // the stale copy rather than let it drift from reality.
+    let legacy_discovery = agent.join("docs").join("redgifs-discovery.md");
+    if legacy_discovery.is_file() {
+        std::fs::remove_file(&legacy_discovery)?;
     }
     seed_examples(&agent)?;
     seed_internal_docs(&agent)?;

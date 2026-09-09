@@ -108,12 +108,12 @@ A metronome over its (non-interactive) children. The renderer bakes the children
 ### `<visual>` — container (children required)
 A gif/image slideshow layered over its children for as long as they play (the audio itself is unaffected). Slides are PREFETCHED in the background (alongside audio prerender) into an on-device cache keyed by the tag's config, so playback serves the playlist instantly; when the cache ages past half a day the next playback refreshes it in the background, and each listen still shuffles the pool into a fresh order. `<caption>` children are pulled out as authored caption text (shown on the slideshow, never spoken); every other child is ordinary audio content, and interactive tags are allowed — the slideshow keeps flipping through pauses and button-waits.
 
-**Niches vs tags.** A `niche` is a curated source community — RedGIFs' subreddit-like buckets (e.g. `just-boobs`, `tik-tok`). Use niches to pick WHAT you want to show. A `tag` is free-form descriptive metadata the server matches loosely (`tags="gooning, edging"`) — use tags to fine-tune within the niche. Tags need no lookup; niches are checked by the app against a live snapshot: an unknown niche id is a validation warning, and the current list ships in the agent sandbox at `docs/redgifs-discovery.md` (top niches by subscribers + trending tags, refreshed automatically whenever a visual script is validated or played).
+**Niches vs tags.** A `niche` is a curated source community — RedGIFs' subreddit-like buckets (e.g. `just-boobs`, `tik-tok`). Use niches to pick WHAT you want to show. A `tag` is free-form descriptive metadata the server matches loosely (`tags="gooning, edging"`) — use tags to fine-tune within the niche. Tags need no lookup; niches are checked against a live snapshot, and an unknown niche id is a validation warning. Don't guess vocabulary — explore it from the sandbox shell with the `redgifs` builtin: `redgifs niches <query>` searches communities (id, size, subscribers, their tags), `redgifs tags <query>` lists trending tags with counts, and `redgifs count --niche a,b --tags x,y --search "text"` reports how many gifs a combination resolves to (plus the top tags the matches actually carry). When a pick is uncertain, run `redgifs count` before committing it to a script.
 - `source` — default `redgifs`; the pluggable visual source id (see below).
 - `niche` — optional; comma-separated niche ids/names to pull content from (e.g. `niche="just-boobs, Just Boobs"` — both forms work). Preferred over tags for steering.
 - `tags` — optional; comma-separated descriptive tags to include (e.g. `tags="hypno, spiral"`).
 - `block` — optional; comma-separated tags that disqualify a slide.
-- `query` — optional; free-text search hint for the source.
+- `query` — optional; free-text search for the source. NOT a second niche: the niche already scopes the content, so reach for `query` only when you want something MORE specific than the niche implies (e.g. `niche="tik-tok" query="mirror dance"`). It is ANDed with the niche/tags server-side, so a vague or redundant `query` only shrinks the pool — when in doubt, compare `redgifs count` with and without it.
 - `order` — optional; result ordering: `trending` (default), `latest`, `top`, `top7`, `top28`, `score`.
 - `every` — default `5..9`; seconds per slide — a fixed value (`every="6"`) or a `min..max` range a fresh value is drawn from per slide (`every="4..8"`).
 - `bpm` — alternative tempo spec: one slide per beat (`bpm="30"` = a slide every 2s). Mutually exclusive with `every`.
@@ -199,7 +199,7 @@ Constant folding: literals, binops of constants, and `@max`/`@min`/`@step`/`@rou
 - `<overlay>` mixes all parts concurrently (all start together). `<loop>` repeats sequentially.
 - `<include>` renders to a deduped sub-manifest (context resets at the boundary); each file is hashed separately for incremental re-rendering.
 - Interactive tags `<until>`/`<random>`/`<scramble>`/`<choice>`/`<rating>`/`<react>` produce segment boundaries; decisions for `<random>`/`<scramble>`/`<choice>` happen per-playback, so each listen can differ. `<until>`, `<choice>`, `<rating>`, `<react>`, and `<beatmeter>` are rejected inside `<background>`/`<overlay>` (they would block or conflict with a concurrent stream); `<random>`/`<scramble>`/`<loop>`/`<include>` are allowed there. A `<background>` whose layer contains no interactive tag is baked into its surrounding segment; one with an interactive layer plays on a parallel track scoped to its enclosing sequence. The listener's `<choice>`/`<rating>`/`<react>` decisions are recorded to the activity log (`feature = script`, `action = choice`).
-- `<visual>` layers a gif/image slideshow over its children (audio unaffected). Slides resolve per playback from a pluggable source (default `redgifs`): steer with `niche` (curated communities — see `docs/redgifs-discovery.md`), fine-tune with free-form `tags`, tempo via `every`/`bpm`, plus `block`/`captions`/`effect`. Also allowed inside `<effect>` and as a direct child of `<beatmeter>`; never nested, inside `<until>`, or inside `<background>`/`<overlay>`.
+- `<visual>` layers a gif/image slideshow over its children (audio unaffected). Slides resolve per playback from a pluggable source (default `redgifs`): steer with `niche` (curated communities — search them with `redgifs niches`), fine-tune with free-form `tags`, tempo via `every`/`bpm`, plus `block`/`captions`/`effect`. Also allowed inside `<effect>` and as a direct child of `<beatmeter>`; never nested, inside `<until>`, or inside `<background>`/`<overlay>`.
 - Note that <interactive> is not a valid tag; use <until>, <random>, <scramble>, <choice>, <rating>, or <react> instead.
 - `<intro>`/`<main>`/`<outro>` are optional structural markers (transparent to audio). When a non-interactive `<main>` is present, the listener gets a pre-play "Repeat length" slider that loops `<main>` to extend the session up to 10h; intro/outro always play once.
 
@@ -307,7 +307,7 @@ Constant folding: literals, binops of constants, and `@max`/`@min`/`@step`/`@rou
 </outro>
 
 <!-- A slideshow over the audio: pulled from the tik-tok + just-boobs niches
-     (docs/redgifs-discovery.md has the full list), fine-tuned with tags,
+     (run `redgifs niches` for the list), fine-tuned with tags,
      never showing blocked ones, switching every 4-8 seconds with a slow
      zoom + vignette and authored captions. The slideshow keeps running
      through the until-wait. -->

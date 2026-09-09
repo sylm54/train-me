@@ -21,9 +21,9 @@
 //! server-side — the fine-tuning. Niches the server doesn't know are silently
 //! ignored in the query, so they are checked client-side against a cached
 //! [`Discovery`] snapshot (see [`refresh_discovery`]); tags need no check.
-//! The discovery snapshot is also written to
-//! `agent_data/docs/redgifs-discovery.md` so the writing agent can browse
-//! what exists.
+//! The writing agent browses the live vocabulary itself via the `redgifs`
+//! bash builtin ([`crate::redgifs_cli`]): niche search, tag search, and
+//! result counts for a niche+tags+search combination.
 //!
 //! Resolution happens at PLAYBACK, not render time — but a cold fetch
 //! (search + N video downloads) takes long enough that the player would sit
@@ -366,12 +366,10 @@ fn now_secs() -> u64 {
 /// mount). Serves from the playlist cache whenever possible so playback
 /// never waits on the network; cold and stale cases resolve (and refresh)
 /// as described in the module docs. `cache_dir` is the media cache
-/// (`<data_dir>/visuals`); `agent_dir` is where the discovery snapshot's
-/// agent-readable doc is written.
+/// (`<data_dir>/visuals`).
 pub fn fetch_playlist(
     cfg: &VisualConfig,
     cache_dir: &Path,
-    agent_dir: &Path,
     base_url: &str,
 ) -> Result<Vec<VisualSlide>> {
     std::fs::create_dir_all(cache_dir)
@@ -392,27 +390,19 @@ pub fn fetch_playlist(
                     // A previous resolve hit the fetch budget — top the
                     // playlist up in the background (cached media is free,
                     // so the next pass gathers fresh slides).
-                    spawn_refresh(
-                        cfg.clone(),
-                        cache_dir.to_path_buf(),
-                        agent_dir.to_path_buf(),
-                    );
+                    spawn_refresh(cfg.clone(), cache_dir.to_path_buf());
                 }
                 return Ok(serve_playlist(&entry.slides, base_url));
             }
             // Fresh enough to serve, old enough to refresh in the background
             // so the NEXT playback gets a current pool.
-            spawn_refresh(
-                cfg.clone(),
-                cache_dir.to_path_buf(),
-                agent_dir.to_path_buf(),
-            );
+            spawn_refresh(cfg.clone(), cache_dir.to_path_buf());
             return Ok(serve_playlist(&entry.slides, base_url));
         }
         // Media files vanished (GC'd/deleted) - fall through and re-resolve.
     }
 
-    let slides = resolve_and_store(cfg, cache_dir, agent_dir)?;
+    let slides = resolve_and_store(cfg, cache_dir)?;
     Ok(serve_playlist(&slides, base_url))
 }
 
@@ -422,12 +412,11 @@ pub fn fetch_playlist(
 fn resolve_and_store(
     cfg: &VisualConfig,
     cache_dir: &Path,
-    agent_dir: &Path,
 ) -> Result<Vec<CachedSlide>> {
     let source = source_by_id(&cfg.source)
         .ok_or_else(|| anyhow!("unknown visual source '{}'", cfg.source))?;
     // Best-effort discovery refresh (cached for a day): drives niche
-    // validation and keeps the agent's browsing doc current.
+    // validation and keeps the vocabulary snapshot current.
     let discovery = refresh_discovery(cache_dir, DISCOVERY_TTL);
     let assets = source.fetch(cfg, cache_dir, discovery.as_ref())?;
     if assets.is_empty() {
@@ -459,7 +448,6 @@ fn resolve_and_store(
             slides: slides.clone(),
         },
     );
-    write_agent_doc(agent_dir, discovery.as_ref());
     Ok(slides)
 }
 
@@ -480,9 +468,9 @@ fn serve_playlist(slides: &[CachedSlide], base_url: &str) -> Vec<VisualSlide> {
 
 /// Detached worker that re-resolves one config's playlist into the cache.
 /// Failures are logged, never surfaced - the serving copy stays valid.
-fn spawn_refresh(cfg: VisualConfig, cache_dir: PathBuf, agent_dir: PathBuf) {
+fn spawn_refresh(cfg: VisualConfig, cache_dir: PathBuf) {
     std::thread::spawn(move || {
-        if let Err(e) = resolve_and_store(&cfg, &cache_dir, &agent_dir) {
+        if let Err(e) = resolve_and_store(&cfg, &cache_dir) {
             log::warn!(
                 "visual playlist refresh failed ({}): {e:#}",
                 describe_config(&cfg)
@@ -496,7 +484,7 @@ fn spawn_refresh(cfg: VisualConfig, cache_dir: PathBuf, agent_dir: PathBuf) {
 /// cold path. Mirrors the audio prerender pass; failures are per-config and
 /// collected, never fatal.
 pub fn prefetch_all(cache_dir: &Path, agent_dir: &Path) -> PrefetchReport {
-    prefetch_configs(cache_dir, agent_dir, collect_configs_in_agent_dir(agent_dir), None)
+    prefetch_configs(cache_dir, collect_configs_in_agent_dir(agent_dir), None)
 }
 
 /// Prefetch a specific set of configs (the ones the given scripts use) —
@@ -507,7 +495,6 @@ pub fn prefetch_all(cache_dir: &Path, agent_dir: &Path) -> PrefetchReport {
 /// downloads are still running — plus a final `(total, total)`.
 pub fn prefetch_configs(
     cache_dir: &Path,
-    agent_dir: &Path,
     configs: Vec<VisualConfig>,
     progress: Option<&dyn Fn(usize, usize)>,
 ) -> PrefetchReport {
@@ -539,7 +526,7 @@ pub fn prefetch_configs(
                 continue;
             }
         }
-        match resolve_and_store(&cfg, cache_dir, agent_dir) {
+        match resolve_and_store(&cfg, cache_dir) {
             Ok(_) => report.prefetched += 1,
             Err(e) => {
                 report.failed += 1;
@@ -720,17 +707,19 @@ pub struct VisualSlide {
 // RedGIFs source (modeled after the `redgifs` Python library's http.py)
 // ============================================================================
 
-const REDGIFS_API: &str = "https://api.redgifs.com";
-const REDGIFS_REFERER: &str = "https://www.redgifs.com/";
+pub(crate) const REDGIFS_API: &str = "https://api.redgifs.com";
+pub(crate) const REDGIFS_REFERER: &str = "https://www.redgifs.com/";
 /// Desktop-browser-ish UA: the API and CDN are stricter with unknown agents.
-const REDGIFS_UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0";
+pub(crate) const REDGIFS_UA: &str =
+    "Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0";
 /// How long to reuse the anonymous temporary token before re-fetching.
 /// RedGIFs temporary tokens are valid ~24h; refresh well before that.
 const TOKEN_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// Cache of the anonymous temporary auth token (`/v2/auth/temporary`),
 /// shared across fetches so a slideshow's paging doesn't re-auth per call.
-static TEMP_TOKEN: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+/// Also reused by the agent-facing `redgifs` builtin (same crate-wide cache).
+pub(crate) static TEMP_TOKEN: Mutex<Option<(String, Instant)>> = Mutex::new(None);
 
 struct RedgifsSource;
 
@@ -795,7 +784,7 @@ impl VisualSource for RedgifsSource {
                     .collect();
                 if kept.is_empty() {
                     bail!(
-                        "none of the requested niches exist on redgifs: {:?} — browse docs/redgifs-discovery.md for valid ids",
+                        "none of the requested niches exist on redgifs: {:?} — run `redgifs niches <query>` in bash for valid ids",
                         cfg.niches
                     );
                 }
@@ -1001,7 +990,7 @@ fn temp_token(http: &reqwest::blocking::Client) -> Result<String> {
 }
 
 /// Minimal percent-encoding for search query values (spaces, `&`, `#`, …).
-fn urlencode(v: &str) -> String {
+pub(crate) fn urlencode(v: &str) -> String {
     let mut out = String::with_capacity(v.len());
     for b in v.as_bytes() {
         match b {
@@ -1012,6 +1001,34 @@ fn urlencode(v: &str) -> String {
         }
     }
     out
+}
+
+/// Async twin of [`temp_token`] for the agent-facing `redgifs` builtin
+/// (bashkit builtins are async; sharing [`TEMP_TOKEN`] means the builtin and
+/// the player reuse one token).
+pub(crate) async fn temp_token_async(http: &reqwest::Client) -> Result<String> {
+    if let Some((token, at)) = TEMP_TOKEN.lock().unwrap().clone() {
+        if at.elapsed() < TOKEN_TTL {
+            return Ok(token);
+        }
+    }
+    let resp = http
+        .get(format!("{REDGIFS_API}/v2/auth/temporary"))
+        .header("Referer", REDGIFS_REFERER)
+        .send()
+        .await
+        .context("token request failed")?;
+    if !resp.status().is_success() {
+        bail!("redgifs auth returned {}", resp.status());
+    }
+    let body: serde_json::Value = resp.json().await.context("decoding token response")?;
+    let token = body
+        .get("token")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| anyhow!("token response missing 'token' field"))?
+        .to_string();
+    *TEMP_TOKEN.lock().unwrap() = Some((token.clone(), Instant::now()));
+    Ok(token)
 }
 
 // ============================================================================
@@ -1047,9 +1064,9 @@ pub struct TagInfo {
 /// A cached snapshot of the source's vocabulary: which niches exist (so
 /// `<visual niche>` typos can be flagged at validate/fetch time) and which
 /// tags are currently trending. Refreshed lazily — whenever a `<visual>`
-/// script is validated or its slideshow fetched — and mirrored into
-/// `docs/redgifs-discovery.md` in the agent sandbox so the writing agent can
-/// browse what exists.
+/// script is validated or its slideshow fetched. (The writing agent browses
+/// the live vocabulary itself via the `redgifs` builtin — see
+/// [`crate::redgifs_cli`] — this snapshot is only for validation.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Discovery {
     /// Unix seconds of the fetch.
@@ -1198,41 +1215,6 @@ fn fetch_discovery() -> Option<Discovery> {
         niches,
         trending_tags,
     })
-}
-
-/// Mirror the discovery snapshot into the agent sandbox as
-/// `docs/redgifs-discovery.md` (surfaced to the agent by `{{docs}}`) so the
-/// script-writing agent can browse valid niche ids and trending tags.
-/// App-managed content in the agent's docs tree: always overwritten with the
-/// latest snapshot; removed when discovery has never succeeded.
-pub fn write_agent_doc(agent_dir: &Path, disc: Option<&Discovery>) {
-    let path = agent_dir.join("docs").join("redgifs-discovery.md");
-    let Some(disc) = disc else { return };
-    let mut md = String::new();
-    md.push_str("---\n");
-    md.push_str("description: Live RedGIFs niches + trending tags for <visual> scripts (app-managed, refreshed automatically)\n");
-    md.push_str("---\n\n");
-    md.push_str("# RedGIFs discovery\n\n");
-    md.push_str(
-        "App-managed snapshot for `<visual>` sources — do not edit by hand; \
-         it is refreshed automatically (on validation/playback of a visual script, \
-         at most once a day). Use niche ids verbatim in `<visual niche=\"…\">`; \
-         tags are free-form descriptions the server matches loosely, so prefer \
-         ids/names from the lists below.\n\n",
-    );
-    md.push_str("## Niches (top by subscribers)\n\n");
-    md.push_str("| niche id | name | gifs |\n|---|---|---|\n");
-    for n in disc.niches.iter().take(200) {
-        md.push_str(&format!("| `{}` | {} | {} |\n", n.id, n.name, n.gifs));
-    }
-    if !disc.trending_tags.is_empty() {
-        md.push_str("\n## Trending tags\n\n");
-        for t in &disc.trending_tags {
-            md.push_str(&format!("- `{}` ({})\n", t.name, t.count));
-        }
-    }
-    let _ = std::fs::create_dir_all(path.parent().unwrap_or(agent_dir));
-    let _ = std::fs::write(&path, md);
 }
 
 #[cfg(test)]
@@ -1404,13 +1386,8 @@ mod tests {
         // Playback then serves from the playlist cache.
         let mut configs = collect_configs_in_agent_dir(&agent_dir);
         assert_eq!(configs.len(), 1);
-        let slides = fetch_playlist(
-            &configs.remove(0),
-            &cache_dir,
-            &agent_dir,
-            "http://127.0.0.1:1?t=x",
-        )
-        .unwrap();
+        let slides =
+            fetch_playlist(&configs.remove(0), &cache_dir, "http://127.0.0.1:1?t=x").unwrap();
         eprintln!("served {} slides", slides.len());
         assert!(!slides.is_empty());
         for s in &slides {
@@ -1457,28 +1434,6 @@ mod tests {
         assert_eq!(configs[0].tags, vec!["hypno".to_string()]);
         assert_eq!(configs[0].count, 4);
         assert_eq!(configs[0].niches, vec!["just-boobs".to_string()]);
-    }
-
-    #[test]
-    fn test_agent_doc_render() {
-        let disc = Discovery {
-            fetched_at: 0,
-            niches: vec![NicheInfo {
-                id: "just-boobs".into(),
-                name: "Just Boobs".into(),
-                gifs: 869_026,
-            }],
-            trending_tags: vec![TagInfo {
-                name: "gooning".into(),
-                count: 12_345,
-            }],
-        };
-        let dir = tempfile::tempdir().unwrap();
-        write_agent_doc(dir.path(), Some(&disc));
-        let md = std::fs::read_to_string(dir.path().join("docs/redgifs-discovery.md")).unwrap();
-        assert!(md.contains("description:"), "needs {{docs}} frontmatter");
-        assert!(md.contains("`just-boobs`"));
-        assert!(md.contains("gooning"));
     }
 
     #[test]
