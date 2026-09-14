@@ -18,8 +18,9 @@ import { AlertCircle, CheckCircle2, AudioLines } from "lucide-react";
 import { useSettings } from "@/lib/settings";
 import {
   clear,
-  ensureGlobalListener,
+  displayPct,
   elapsedMs,
+  ensureGlobalListener,
   estimateRemainingMs,
   formatClock,
   isAutoCreated,
@@ -61,7 +62,7 @@ function TimeReadout({ entry, now }: { entry: RenderEntry; now: number }) {
 
 function ProgressBar({ entry }: { entry: RenderEntry }) {
   if (entry.total > 0) {
-    const pct = Math.min(100, Math.round((entry.step / entry.total) * 100));
+    const pct = displayPct(entry);
     return (
       <div className="h-1.5 rounded-full bg-[var(--color-border)] overflow-hidden">
         <div
@@ -96,9 +97,6 @@ function Pill({
   }, [script, entry.status]);
 
   const terminal = entry.status !== "rendering";
-  // Defensive clamp: the backend clamps what it emits, but the counter must
-  // never read above the total (e.g. "70/62") whatever the source.
-  const shownStep = Math.min(entry.step, entry.total);
 
   return (
     <div className="render-pill w-[min(92vw,24rem)] rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] px-4 py-2.5 shadow-lg space-y-1.5">
@@ -115,9 +113,11 @@ function Pill({
         <span className="font-medium truncate flex-1 min-w-0" title={script}>
           {basename(script)}
         </span>
+        {/* Progress reads as percent: raw step/total are abstract cost units
+            (words for TTS, 1 per pasted clip), meaningless to a user. */}
         {!terminal && entry.total > 0 && (
           <span className="shrink-0 tabular-nums text-muted-foreground">
-            {shownStep}/{entry.total}
+            {displayPct(entry)}%
           </span>
         )}
         {!terminal && <TimeReadout entry={entry} now={now} />}

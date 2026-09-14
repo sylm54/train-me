@@ -1,22 +1,26 @@
-//! Native notification for manifest rendering.
+//! Native notification + progress-event glue for manifest rendering.
 //!
-//! A low-key "Rendering…" notification shown while `render_manifest` is
-//! working. Distinct from routine reminders: it lives on its own
-//! (`rendering`) channel, is `ongoing` (non-dismissible on Android) while a
-//! render is in flight, and is updated in place by re-issuing the same stable
-//! notification id. Cleared on success or failure.
+//! This module owns the Tauri-facing half of the progress pipeline (the pure
+//! half lives in [`crate::progress`]): it converts [`crate::progress::Snapshot`]
+//! ticks into (a) the throttled `render-manifest-progress` push event the
+//! frontend's render registry listens on, and (b) an in-place update of a
+//! low-key native "Rendering…" notification.
 //!
-//! All entry points are best-effort: errors are logged and swallowed so a
-//! notification hiccup can never fail a render. `NotificationExt::show()` is
-//! safe to call from the `spawn_blocking` worker — Tauri hands the actual JNI
-//! work to its Android looper thread, so no manual thread attachment is
+//! The notification lives on its own (`rendering`) channel, is `ongoing`
+//! (non-dismissible on Android) while a render is in flight, and is updated
+//! by re-issuing the same stable notification id. Cleared on success or
+//! failure. All entry points are best-effort: errors are logged and swallowed
+//! so a notification hiccup can never fail a render. `NotificationExt::show()`
+//! is safe to call from the `spawn_blocking` worker — Tauri hands the actual
+//! JNI work to its Android looper thread, so no manual thread attachment is
 //! needed (and on desktop it's a plain OS call).
 
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
 use tauri::AppHandle;
 use tauri_plugin_notification::NotificationExt;
+
+use crate::progress::{self, EtaEstimator, Snapshot, Throttle};
 
 /// Dedicated channel id for render-progress notifications. Kept separate
 /// from `routine-reminders` so its importance/vibration can be tuned
@@ -27,19 +31,14 @@ const RENDER_CHANNEL_ID: &str = "rendering";
 /// notification in place rather than stacking a new one.
 pub const RENDER_NOTIF_ID: i32 = 7777;
 
+/// Minimum gap between `render-manifest-progress` push events (~2 Hz). Fast
+/// synthesis ticks get coalesced; it's fine to drop updates of a purely
+/// cosmetic bar.
+const EVENT_THROTTLE: Duration = Duration::from_millis(500);
+
 /// Minimum gap between notification body updates. Long renders can emit
 /// hundreds of progress ticks; we don't want to flood the notification shade.
-const UPDATE_THROTTLE: Duration = Duration::from_millis(400);
-
-/// Render a human-friendly body for a progress notification.
-fn body_for(title: &str, step: usize, total: usize) -> String {
-    if total > 0 {
-        let pct = ((step as f64 / total as f64) * 100.0).round() as u32;
-        format!("{} — {}% ({} / {})", title, pct.min(100), step.min(total), total)
-    } else {
-        title.to_string()
-    }
-}
+const NOTIF_THROTTLE: Duration = Duration::from_millis(400);
 
 /// Create the `rendering` channel on Android (no-op elsewhere). Channel
 /// creation is idempotent at the OS level, so calling this every render is
@@ -89,15 +88,15 @@ pub fn request_permission_detached<R: tauri::Runtime>(app: &AppHandle<R>) {
     });
 }
 
-/// Show (or update) the render-progress notification. Marked `ongoing` so it
-/// can't be dismissed while a render is in flight.
+/// Show (or update) the render-progress notification from a snapshot. Marked
+/// `ongoing` so it can't be dismissed while a render is in flight.
 pub fn show_render_progress<R: tauri::Runtime>(
     app: &AppHandle<R>,
     title: &str,
-    step: usize,
-    total: usize,
+    snap: &Snapshot,
+    eta_secs: Option<u64>,
 ) {
-    let body = body_for(title, step, total);
+    let body = progress::body_for(title, snap, eta_secs);
     let result = app
         .notification()
         .builder()
@@ -132,55 +131,47 @@ pub fn clear_render_progress<R: tauri::Runtime>(app: &AppHandle<R>) {
     }
 }
 
-/// A throttle guard shared across progress ticks for a single render.
-/// Construct one per render; call [`Self::maybe_update`] on each tick.
-pub struct RenderNotifyThrottle {
-    last: Mutex<Option<Instant>>,
-}
-
-impl RenderNotifyThrottle {
-    pub fn new() -> Self {
-        Self {
-            last: Mutex::new(None),
-        }
-    }
-
-    /// Update the notification only if at least `UPDATE_THROTTLE` has elapsed
-    /// since the last update (or this is the first call). Always allowed to be
-    /// called on every tick; cheap when throttled.
-    pub fn maybe_update<R: tauri::Runtime>(
-        &self,
-        app: &AppHandle<R>,
-        title: &str,
-        step: usize,
-        total: usize,
-    ) {
+/// Build the per-render tick sink shared by every render driver (the UI
+/// command and background pre-render passes): a [`Snapshot`] consumer that
+/// emits the throttled `render-manifest-progress` event with a backend-ETA
+/// estimate and — when `notify` is `Some` — updates the native notification
+/// on its own (slightly faster) throttle. The completion tick always passes
+/// both throttles so the bar lands exactly on 100%.
+///
+/// `notify` is `Some((app, title))` only for foreground UI renders; background
+/// prerenders don't drive the native notification (the app may be in the
+/// background and the pass is incremental).
+pub fn make_tick_sink<R: tauri::Runtime>(
+    progress_app: AppHandle<R>,
+    script: String,
+    notify: Option<(AppHandle<R>, String)>,
+) -> progress::ProgressSink {
+    let mut event_throttle = Throttle::new(EVENT_THROTTLE);
+    let mut notif_throttle = Throttle::new(NOTIF_THROTTLE);
+    let mut eta = EtaEstimator::default();
+    Box::new(move |snap: &Snapshot| {
         let now = Instant::now();
-        let should_update = {
-            let mut guard = self.last.lock();
-            match *guard {
-                None => {
-                    *guard = Some(now);
-                    true
-                }
-                Some(last) => {
-                    if now.duration_since(last) >= UPDATE_THROTTLE {
-                        *guard = Some(now);
-                        true
-                    } else {
-                        false
-                    }
-                }
-            }
-        };
-        if should_update {
-            show_render_progress(app, title, step, total);
+        // Estimated seconds remaining from the cost rate (Some only once
+        // synthesis has begun and progress exists; sticky afterwards).
+        let eta_secs = eta.observe(now, snap.done, snap.total);
+        if event_throttle.ready_or_complete(now, snap) {
+            use tauri::Emitter;
+            let _ = progress_app.emit(
+                "render-manifest-progress",
+                serde_json::json!({
+                    "script": script,
+                    "done": snap.done,
+                    "total": snap.total,
+                    "pct": snap.pct,
+                    "label": snap.label,
+                    "eta_secs": eta_secs,
+                }),
+            );
         }
-    }
-}
-
-impl Default for RenderNotifyThrottle {
-    fn default() -> Self {
-        Self::new()
-    }
+        if let Some((app, title)) = &notify {
+            if notif_throttle.ready_or_complete(now, snap) {
+                show_render_progress(app, title, snap, eta_secs);
+            }
+        }
+    })
 }
