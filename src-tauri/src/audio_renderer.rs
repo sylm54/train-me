@@ -17,6 +17,7 @@ use crate::manifest::{
     OverlayPartSegment, Segment, WalkCtx,
 };
 use crate::model_downloader;
+use crate::progress;
 use crate::sounds::SoundType;
 use crate::tag_parser::{self, include_src_is_glob, split_glob_src, wildcard_match, Node, OverlayPart};
 use crate::visual::VisualConfig;
@@ -112,99 +113,17 @@ impl BgLayer {
 // Progress tracking
 // ============================================================================
 
-/// Progress tracker for synthesis rendering.
-///
-/// Passed through `render_nodes_tracked` to emit progress after each
-/// "speakable" (leaf) node is rendered.
-pub struct ProgressTracker {
-    pub step: usize,
-    pub total: usize,
-    pub callback: Box<dyn Fn(usize, usize, &str) + Send>,
-}
+// The progress machinery (cost model, ledger, throttle, ETA) lives in
+// [`crate::progress`] as a pure, unit-tested core. The renderer only feeds
+// it: the pre-count seeds the ledger's total cost (see [`count_render_cost`])
+// and the render paths report each leaf's completion cost as it finishes.
 
-impl ProgressTracker {
-    pub(crate) fn emit(&mut self, label: &str) {
-        // Never report more steps than the announced total: the total is an
-        // estimate (see `count_speakable_nodes`), so a construct the estimate
-        // under-counts must not push the bar past 100% (e.g. "70/62").
-        let step = if self.total > 0 {
-            self.step.min(self.total)
-        } else {
-            self.step
-        };
-        (self.callback)(step, self.total, label);
-    }
-
-    /// Emit a "phase" event: relabel the progress bar WITHOUT advancing the
-    /// leaf counter. Used for pre-walk steps (acquiring the engine, reading &
-    /// hashing the script, freshness check, parsing) that happen before the
-    /// first speakable node finishes synthesizing — i.e. the window where, on
-    /// a slow/mobile device, the bar used to look frozen at an opaque
-    /// "Preparing…". `step` and `total` are reported as-is so a phase set just
-    /// before the first leaf tick doesn't wipe the walker's running totals.
-    pub(crate) fn emit_phase(&mut self, phase: &str) {
-        (self.callback)(self.step, self.total, phase);
-    }
-}
-
-/// Count the number of "speakable" (leaf) nodes in an AST.
-///
-/// Speakable nodes are those that produce audio: `Text` (with non-empty
-/// content), `Pause`, `Sound`, `Tone`. Container nodes (`Voice`, `Speed`,
-/// `Volume`, `Effect`, `Background`, `Until`) recurse into children but are
-/// not counted themselves. `Overlay` counts each part's children. `Loop`
-/// multiplies by the loop count.
-pub fn count_speakable_nodes(nodes: &[Node]) -> usize {
-    let mut count = 0;
-    for node in nodes {
-        match node {
-            Node::Text(t) if !t.is_empty() => count += 1,
-            Node::Text(_) => {}
-            Node::Pause { .. } | Node::Sound { .. } | Node::Tone { .. } => count += 1,
-            Node::Voice { children, .. }
-            | Node::Speed { children, .. }
-            | Node::Volume { children, .. }
-            | Node::Effect { children, .. }
-            | Node::Background { children, .. }
-            | Node::Until { children, .. }
-            | Node::Section { children, .. }
-            | Node::Beatmeter { children, .. }
-            | Node::Visual { children, .. } => {
-                count += count_speakable_nodes(children);
-            }
-            Node::Loop { loops, children } => {
-                count += count_speakable_nodes(children) * (*loops as usize);
-            }
-            Node::Overlay { parts, .. } => {
-                for part in parts {
-                    count += count_speakable_nodes(&part.children);
-                }
-            }
-            Node::Random { parts } | Node::Scramble { parts } | Node::React { parts, .. } => {
-                // Upper-bound estimate: count all parts (only one will be picked
-                // for Random, but we can't know which at count time).
-                for part in parts {
-                    count += count_speakable_nodes(&part.children);
-                }
-            }
-            Node::Choice { options, .. } => {
-                for part in options {
-                    count += count_speakable_nodes(&part.children);
-                }
-            }
-            Node::If {
-                then_branch, r#else, ..
-            } => {
-                // Upper-bound estimate: both branches are rendered.
-                count += count_speakable_nodes(then_branch);
-                if let Some(else_nodes) = r#else {
-                    count += count_speakable_nodes(else_nodes);
-                }
-            }
-            Node::Include { .. } | Node::Rating { .. } => {}
-        }
-    }
-    count
+/// Exact pre-count of the total render cost a manifest walk of `nodes` will
+/// report, mirroring the walker's traversal so the ledger's total matches
+/// what the walker will actually synthesize. See [`progress::ast_cost`] for
+/// the per-node rules.
+fn walker_nodes_cost(nodes: &[Node]) -> u64 {
+    progress::ast_cost(nodes, progress::CountMode::Walker)
 }
 
 // ============================================================================
@@ -258,15 +177,14 @@ impl AudioRenderer {
         &mut self,
         nodes: &[Node],
         output_path: &Path,
-        tracker: Arc<Mutex<ProgressTracker>>,
+        tracker: Arc<Mutex<progress::ProgressTracker>>,
     ) -> Result<f32> {
         let (samples, duration) = self.render_nodes_tracked(nodes, "male", 1.0, 1.0, &tracker)?;
         write_wav_file(output_path, &samples, self.sample_rate as i32)
             .context("Failed to write WAV file")?;
-        // Emit final 100% event
+        // Terminal 100% tick (completion bypasses downstream throttles).
         if let Ok(mut t) = tracker.lock() {
-            t.step = t.total;
-            t.emit("Writing WAV…");
+            t.finish("Writing WAV…");
         }
         Ok(duration)
     }
@@ -871,7 +789,7 @@ impl AudioRenderer {
         default_speaker: &str,
         volume_scale: f32,
         speed_scale: f32,
-        tracker: &Arc<Mutex<ProgressTracker>>,
+        tracker: &Arc<Mutex<progress::ProgressTracker>>,
     ) -> Result<(Vec<f32>, f32)> {
         let mut foreground = Vec::new();
         let mut bg_layers: Vec<BgLayer> = Vec::new();
@@ -890,7 +808,13 @@ impl AudioRenderer {
                     let scaled = apply_volume(&samples, volume_scale);
                     foreground.extend_from_slice(&scaled);
                     _total_duration += dur;
-                    self.emit_progress(tracker, &truncate_label(text, 30));
+                    // Cost = words: synthesis time scales with text length,
+                    // and the pre-count seeded the total on the same scale.
+                    self.emit_progress(
+                        tracker,
+                        progress::text_cost(text),
+                        &truncate_label(text, 30),
+                    );
                 }
 
                 Node::Voice {
@@ -938,7 +862,7 @@ impl AudioRenderer {
                     let num_samples = (*duration * self.sample_rate as f32) as usize;
                     foreground.extend(std::iter::repeat(0.0f32).take(num_samples));
                     _total_duration += *duration;
-                    self.emit_progress(tracker, "Pause");
+                    self.emit_progress(tracker, progress::PASTE_COST, "Pause");
                 }
 
                 Node::Sound {
@@ -950,7 +874,11 @@ impl AudioRenderer {
                     let (samples, dur) = self.render_sound(sound_type, sound_vol * volume_scale)?;
                     foreground.extend_from_slice(&samples);
                     _total_duration += dur;
-                    self.emit_progress(tracker, &format!("Sound: {}", sound_type));
+                    self.emit_progress(
+                        tracker,
+                        progress::PASTE_COST,
+                        &format!("Sound: {}", sound_type),
+                    );
                 }
 
                 Node::Tone {
@@ -970,7 +898,11 @@ impl AudioRenderer {
                         vol,
                     );
                     bg_layers.push(BgLayer::tone(base_samples, foreground.len()));
-                    self.emit_progress(tracker, &format!("Tone: {}", preset));
+                    self.emit_progress(
+                        tracker,
+                        progress::PASTE_COST,
+                        &format!("Tone: {}", preset),
+                    );
                 }
 
                 Node::Speed { value, children } => {
@@ -1204,6 +1136,9 @@ impl AudioRenderer {
                         let mut aligned = vec![0.0f32; foreground.len()];
                         aligned.extend_from_slice(&ws_samples);
                         bg_layers.push(BgLayer::background(aligned));
+                        // Accounted as its own paste-cost leaf, matching
+                        // `ast_cost`'s Until arm.
+                        self.emit_progress(tracker, progress::PASTE_COST, "Waiting sound");
                     }
 
                     if let Some(pp) = post_pause {
@@ -1339,7 +1274,7 @@ impl AudioRenderer {
         volume_scale: f32,
         speed_scale: f32,
         fixed_duration: Option<f32>,
-        tracker: &Arc<Mutex<ProgressTracker>>,
+        tracker: &Arc<Mutex<progress::ProgressTracker>>,
     ) -> Result<(Vec<f32>, f32)> {
         let mut rendered_parts: Vec<(Vec<f32>, bool)> = Vec::new();
 
@@ -1419,21 +1354,27 @@ impl AudioRenderer {
         Ok((mixed, duration))
     }
 
-    /// Increment the progress counter and emit a progress event.
-    fn emit_progress(&self, tracker: &Arc<Mutex<ProgressTracker>>, label: &str) {
+    /// Record one leaf's completed cost and emit a progress event. The cost
+    /// must be the same value the pre-count charged for this leaf (words for
+    /// Text, `PASTE_COST` for clips) so done converges exactly on total.
+    fn emit_progress(
+        &self,
+        tracker: &Arc<Mutex<progress::ProgressTracker>>,
+        cost: u64,
+        label: &str,
+    ) {
         if let Ok(mut t) = tracker.lock() {
-            t.step += 1;
-            t.emit(label);
+            t.emit_leaf(cost, label);
         }
     }
 
-    /// Emit a progress label WITHOUT advancing the leaf counter. The flat
+    /// Emit a progress label WITHOUT advancing the cost counter. The flat
     /// path's "Random branch"/"Scramble part"/"Choice option" markers sit on
     /// top of the branch's own leaf ticks, so counting them as steps pushed
     /// the bar past its pre-counted total (e.g. 70/62).
-    fn emit_label(&self, tracker: &Arc<Mutex<ProgressTracker>>, label: &str) {
+    fn emit_label(&self, tracker: &Arc<Mutex<progress::ProgressTracker>>, label: &str) {
         if let Ok(mut t) = tracker.lock() {
-            t.emit(label);
+            t.emit_phase(label);
         }
     }
 
@@ -1451,7 +1392,7 @@ impl AudioRenderer {
         script_rel: &str,
         agent_dir: &Path,
         tracks_dir: &Path,
-        progress: Option<&Arc<Mutex<ProgressTracker>>>,
+        progress: Option<&Arc<Mutex<progress::ProgressTracker>>>,
     ) -> Result<RenderedManifest> {
         let source_abs = normalize_path(&agent_dir.join(script_rel));
         if !source_abs.exists() {
@@ -1468,7 +1409,7 @@ impl AudioRenderer {
         // re-render.
         let mut visited: HashSet<PathBuf> = HashSet::new();
         visited.insert(source_abs.clone());
-        // Seed the tracker's total with the exact leaf count of everything
+        // Seed the tracker's total with the exact render cost of everything
         // this render will synthesize (top file + stale includes) before any
         // synthesis starts, so the bar is monotonic — growing the total as
         // includes parse mid-walk made it jump backwards (64/64 → 65/128).
@@ -1476,10 +1417,10 @@ impl AudioRenderer {
         // (total 0) and the render below surfaces the real error.
         if let Some(tracker) = progress {
             let mut counted = HashSet::new();
-            let total = count_render_leaves(&source_abs, agent_dir, tracks_dir, &mut counted)
+            let total = count_render_cost(&source_abs, agent_dir, tracks_dir, &mut counted)
                 .unwrap_or(0);
             if let Ok(mut t) = tracker.lock() {
-                t.total = total;
+                t.ledger.seed(total);
             }
         }
         self.render_manifest_file(
@@ -1513,7 +1454,7 @@ impl AudioRenderer {
         tracks_dir: &Path,
         script_dir: &Path,
         visited: &mut HashSet<PathBuf>,
-        progress: Option<&Arc<Mutex<ProgressTracker>>>,
+        progress: Option<&Arc<Mutex<progress::ProgressTracker>>>,
     ) -> Result<RenderedManifest> {
         // Surface each pre-walk step as a phase so a hang on a slow/mobile
         // device points at the offending step instead of an opaque
@@ -1597,10 +1538,13 @@ impl AudioRenderer {
         // counted per iteration; a flat-path <random> renders one branch but
         // is counted with all of them), and the ~2 Hz emit throttle can drop
         // the very last leaf ticks.
+        // Land the bar exactly on 100%: the ledger's completion bypasses any
+        // downstream throttle, and `finish` pins done to the seeded total so
+        // unaccounted paste work (beat click samples, …) can't end the render
+        // at 99%.
         if let Some(tracker) = progress {
             if let Ok(mut t) = tracker.lock() {
-                t.step = t.total;
-                t.emit("Writing manifest…");
+                t.finish("Writing manifest…");
             }
         }
         let duration = nominal_duration(&manifest.root);
@@ -1629,7 +1573,7 @@ impl AudioRenderer {
         tracks_dir: &Path,
         counter: &mut usize,
         visited: &mut HashSet<PathBuf>,
-        progress: Option<&Arc<Mutex<ProgressTracker>>>,
+        progress: Option<&Arc<Mutex<progress::ProgressTracker>>>,
     ) -> Result<Segment> {
         let mut static_buf: Vec<Node> = Vec::new();
         let mut children: Vec<Segment> = Vec::new();
@@ -1715,7 +1659,7 @@ impl AudioRenderer {
         out_dir: &Path,
         counter: &mut usize,
         children: &mut Vec<Segment>,
-        progress: Option<&Arc<Mutex<ProgressTracker>>>,
+        progress: Option<&Arc<Mutex<progress::ProgressTracker>>>,
     ) -> Result<()> {
         if buf.is_empty() {
             return Ok(());
@@ -1777,7 +1721,7 @@ impl AudioRenderer {
         tracks_dir: &Path,
         counter: &mut usize,
         visited: &mut HashSet<PathBuf>,
-        progress: Option<&Arc<Mutex<ProgressTracker>>>,
+        progress: Option<&Arc<Mutex<progress::ProgressTracker>>>,
     ) -> Result<Segment> {
         match node {
             Node::Until {
@@ -1816,6 +1760,11 @@ impl AudioRenderer {
                     let (ws_samples, _) = self.render_sound(ws, ws_vol)?;
                     ws_file = Some(self.write_seg(out_dir, counter, &ws_samples)?);
                     ws_vol_out = Some(ws_vol);
+                    // Accounted as its own paste-cost leaf (the pre-count
+                    // charges it via `ast_cost`'s Until arm).
+                    if let Some(tracker) = progress {
+                        self.emit_progress(tracker, progress::PASTE_COST, "Waiting sound");
+                    }
                 }
                 Ok(Segment::Until {
                     file,
@@ -2178,7 +2127,7 @@ impl AudioRenderer {
         tracks_dir: &Path,
         counter: &mut usize,
         visited: &mut HashSet<PathBuf>,
-        progress: Option<&Arc<Mutex<ProgressTracker>>>,
+        progress: Option<&Arc<Mutex<progress::ProgressTracker>>>,
     ) -> Result<Segment> {
         let pc = ctx
             .clone()
@@ -2226,7 +2175,7 @@ impl AudioRenderer {
         agent_dir: &Path,
         tracks_dir: &Path,
         visited: &mut HashSet<PathBuf>,
-        progress: Option<&Arc<Mutex<ProgressTracker>>>,
+        progress: Option<&Arc<Mutex<progress::ProgressTracker>>>,
     ) -> Result<Segment> {
         let is_glob = include_src_is_glob(src);
         let mut targets = resolve_include_targets(src, script_dir, agent_dir)?;
@@ -2356,7 +2305,7 @@ pub(crate) fn has_any_wav(dir: &Path) -> bool {
 }
 
 /// Freshness test shared by the render path and the progress pre-count
-/// ([`count_render_leaves`]): a manifest is reusable when its stored format
+/// ([`count_render_cost`]): a manifest is reusable when its stored format
 /// version, script hash and glob-include digest match the current script and
 /// at least one `.wav` survives in its directory. Returns the parsed
 /// `Some(existing)` manifest when reusable (the caller links to it instead
@@ -2424,15 +2373,16 @@ fn collect_include_srcs(nodes: &[Node], out: &mut Vec<String>) {
     }
 }
 
-/// Exact pre-count of the speakable leaves a render of `source_abs` will
-/// synthesize, so the progress bar's total is seeded once, before synthesis
-/// begins. Seeding per file as `<include>` targets parse mid-walk made the
-/// total (and the bar) jump backwards — e.g. 64/64 → 65/128 when the walker
-/// reached an include after finishing the top file's own leaves.
+/// Exact pre-count of the total render cost (see [`progress::ast_cost`]) the
+/// walk of `source_abs` will report, so the progress ledger's total is seeded
+/// once, before synthesis begins. Seeding per file as `<include>` targets
+/// parse mid-walk made the total (and the bar) jump backwards — e.g. 64/64 →
+/// 65/128 when the walker reached an include after finishing the top file's
+/// own leaves.
 ///
 /// Mirrors `render_manifest_file`'s traversal: a fresh manifest contributes
 /// nothing (it's reused, not synthesized); a stale file contributes its own
-/// leaf count plus whatever its includes will render. `counted` is a
+/// AST cost plus whatever its includes will render. `counted` is a
 /// persistent set (not a recursion stack) so a diamond — the same subscript
 /// included via two parents — counts once, matching the walker, where the
 /// first encounter renders the file and every later one reuses the fresh
@@ -2440,12 +2390,12 @@ fn collect_include_srcs(nodes: &[Node], out: &mut Vec<String>) {
 /// rules the walker applies; glob matches already counted (or on the
 /// recursion stack, which `counted` subsumes) are skipped, matching the
 /// walker's cycle filtering.
-fn count_render_leaves(
+fn count_render_cost(
     source_abs: &Path,
     agent_dir: &Path,
     tracks_dir: &Path,
     counted: &mut HashSet<PathBuf>,
-) -> Result<usize> {
+) -> Result<u64> {
     if !counted.insert(source_abs.to_path_buf()) {
         return Ok(0);
     }
@@ -2475,12 +2425,12 @@ fn count_render_leaves(
         .with_context(|| format!("script {} is not UTF-8", source_abs.display()))?;
     let nodes =
         tag_parser::parse(source).with_context(|| format!("parse {}", source_abs.display()))?;
-    let mut count = count_speakable_nodes(&nodes);
+    let mut count = walker_nodes_cost(&nodes);
     let mut includes = Vec::new();
     collect_include_srcs(&nodes, &mut includes);
     for src in includes {
         for target in resolve_include_targets(&src, &script_dir, agent_dir)? {
-            count += count_render_leaves(&target, agent_dir, tracks_dir, counted)?;
+            count += count_render_cost(&target, agent_dir, tracks_dir, counted)?;
         }
     }
     Ok(count)
@@ -4445,14 +4395,14 @@ mod tests {
     }
 
     #[test]
-    fn count_render_leaves_seeds_exact_total_across_includes() {
+    fn count_render_cost_seeds_exact_total_across_includes() {
         let tmp = tempdir().expect("tempdir");
         let agent = tmp.path().join("agent");
         let tracks = tmp.path().join("tracks");
         fs::create_dir_all(agent.join("hypnos")).expect("mkdir");
         fs::create_dir_all(&tracks).expect("mkdir");
-        // Top file: 2 speakable leaves (text + pause) + a nested include
-        // (found through the <voice> container) whose target adds 3 more.
+        // Top file: 2 leaves (1-word text + pause) + a nested include (found
+        // through the <voice> container) whose target adds 1+1+1 more.
         fs::write(
             agent.join("hypnos/main.xml"),
             r#"<voice speaker="a">hello <pause duration="1"/> <include src="sub.xml"/></voice>"#,
@@ -4466,13 +4416,14 @@ mod tests {
 
         let mut counted = std::collections::HashSet::new();
         let total =
-            count_render_leaves(&agent.join("hypnos/main.xml"), &agent, &tracks, &mut counted)
+            count_render_cost(&agent.join("hypnos/main.xml"), &agent, &tracks, &mut counted)
                 .expect("count");
-        assert_eq!(total, 5, "2 own leaves + 3 from the include");
+        // Cost units: 1 (word) + 1 (pause) from main, 1+1+1 from the include.
+        assert_eq!(total, 5, "2 own units + 3 from the include");
     }
 
     #[test]
-    fn count_render_leaves_skips_fresh_and_counts_diamonds_once() {
+    fn count_render_cost_skips_fresh_and_counts_diamonds_once() {
         let tmp = tempdir().expect("tempdir");
         let agent = tmp.path().join("agent");
         let tracks = tmp.path().join("tracks");
@@ -4492,8 +4443,112 @@ mod tests {
 
         let mut counted = std::collections::HashSet::new();
         let total =
-            count_render_leaves(&agent.join("main.xml"), &agent, &tracks, &mut counted)
+            count_render_cost(&agent.join("main.xml"), &agent, &tracks, &mut counted)
                 .expect("count");
-        assert_eq!(total, 2, "1 leaf each from a and b; shared is fresh");
+        // a.xml and b.xml are single 1-word texts (their fresh include adds 0).
+        assert_eq!(total, 2, "1 unit each from a and b; shared is fresh");
+    }
+
+    // ── Full-render progress integration (needs the TTS model) ─────────────
+    //
+    // Exercises the whole progress pipeline — pre-count seeding, per-leaf cost
+    // completion, ledger clamping, terminal finish — against a real render.
+    // Skips silently when the model isn't present; point TRAIN_ME_MODEL_DIR at
+    // a model directory (onnx/…) to run it anywhere.
+
+    /// The snapshot log shared with the tracker's sink.
+    type SnapLog = std::sync::Arc<std::sync::Mutex<Vec<progress::Snapshot>>>;
+
+    fn recording_tracker() -> (Arc<std::sync::Mutex<progress::ProgressTracker>>, SnapLog) {
+        let log: SnapLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_log = log.clone();
+        let tracker = Arc::new(std::sync::Mutex::new(progress::ProgressTracker {
+            ledger: progress::Ledger::new(),
+            callback: Box::new(move |snap: &progress::Snapshot| {
+                sink_log.lock().unwrap().push(snap.clone());
+            }),
+        }));
+        (tracker, log)
+    }
+
+    #[test]
+    fn render_manifest_progress_is_monotonic_and_lands_on_100() {
+        let model_dir = std::env::var_os("TRAIN_ME_MODEL_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(
+                r"C:\Users\bldng\AppData\Roaming\com.sylm54.train\model",
+            ));
+        if !model_downloader::is_model_downloaded(&model_dir) {
+            eprintln!(
+                "skipping: no TTS model at {} (set TRAIN_ME_MODEL_DIR)",
+                model_dir.display()
+            );
+            return;
+        }
+
+        let tmp = tempdir().expect("tempdir");
+        let agent = tmp.path().join("agent");
+        let tracks = tmp.path().join("tracks");
+        fs::create_dir_all(&agent).expect("mkdir");
+        // Mixed content on purpose: word-costed TTS leaves + paste-costed
+        // clip leaves, so the ledger must handle both scales in one render.
+        fs::write(
+            agent.join("main.xml"),
+            "Warm up slowly. <pause duration=\"0.3\"/> \
+             <sound type=\"pop\"/> Breathing deepens now. \
+             <sound type=\"snap\"/> Good.",
+        )
+        .expect("write script");
+
+        let (tracker, log) = recording_tracker();
+
+        let mut renderer = AudioRenderer::new(&model_dir).expect("load model");
+        renderer
+            .render_manifest("main.xml", &agent, &tracks, Some(&tracker))
+            .expect("render");
+
+        let snaps = log.lock().unwrap().clone();
+        assert!(
+            snaps.len() >= 5,
+            "expected leaf ticks, got {}",
+            snaps.len()
+        );
+
+        // The seed must equal the independent pre-count for this script.
+        let expected_total = progress::ast_cost(
+            &tag_parser::parse(&fs::read_to_string(agent.join("main.xml")).unwrap()).unwrap(),
+            progress::CountMode::Walker,
+        );
+        let seeded = snaps.iter().find(|s| s.total > 0).expect("total seeded");
+        assert_eq!(seeded.total, expected_total, "pre-count must match seeds");
+
+        // Monotonic percent, never past 100, display-done never past total.
+        let mut last_pct = 0u8;
+        for s in &snaps {
+            assert!(s.pct <= 100, "pct above 100: {:?}", s);
+            assert!(s.pct >= last_pct, "pct regressed: {:?}", s);
+            assert!(s.done <= s.total, "done above total: {:?}", s);
+            last_pct = s.pct;
+        }
+        // The walker's terminal finish pins 100% exactly once at the end.
+        let final_snap = snaps.last().unwrap();
+        assert_eq!(final_snap.pct, 100, "render must land on 100%");
+        assert!(final_snap.is_complete());
+    }
+
+    #[test]
+    fn ledger_survives_over_emission() {
+        // A ledger fed MORE cost than seeded (a construct the pre-count
+        // under-counts) must still read ≤ 100% with done clamped for
+        // display — no model needed.
+        let (tracker, log) = recording_tracker();
+        tracker.lock().unwrap().ledger.seed(3);
+        for i in 0..10 {
+            tracker.lock().unwrap().emit_leaf(1, &format!("leaf {i}"));
+        }
+        let snaps = log.lock().unwrap();
+        let last = snaps.last().unwrap();
+        assert_eq!(last.pct, 100);
+        assert_eq!(last.done, 3, "display clamped to seeded total");
     }
 }

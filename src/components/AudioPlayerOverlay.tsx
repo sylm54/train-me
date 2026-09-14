@@ -32,6 +32,7 @@ import { VisualStage } from "@/components/VisualStage";
 import { logActivity } from "@/lib/activity";
 import { setAudioBusy } from "@/lib/audioBus";
 import {
+  displayPct,
   ensureGlobalListener,
   estimateRemainingMs,
   formatClock,
@@ -447,12 +448,7 @@ export function AudioPlayerOverlay({ src, onClose, onEnded, variables }: Props) 
                 <div className="h-1.5 rounded-full bg-white/15 overflow-hidden">
                   <div
                     className="h-full rounded-full bg-[var(--color-pink-500)] transition-all duration-200 ease-out"
-                    style={{
-                      width: `${Math.min(
-                        100,
-                        Math.round((renderEntry.step / renderEntry.total) * 100),
-                      )}%`,
-                    }}
+                    style={{ width: `${displayPct(renderEntry)}%` }}
                   />
                 </div>
               ) : (
@@ -462,9 +458,7 @@ export function AudioPlayerOverlay({ src, onClose, onEnded, variables }: Props) 
               )}
               <div className="flex items-center justify-between text-[11px] text-white/50">
                 <span className="tabular-nums">
-                  {renderEntry && renderEntry.total > 0
-                    ? `${renderEntry.step}/${renderEntry.total}`
-                    : ""}
+                  {renderEntry && renderEntry.total > 0 ? `${displayPct(renderEntry)}%` : ""}
                 </span>
                 {eta != null && (
                   <span className="tabular-nums">~{formatClock(eta)} left</span>

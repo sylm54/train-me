@@ -36,8 +36,20 @@ export type RenderStatus = "rendering" | "done" | "error";
 
 export interface RenderEntry {
   status: RenderStatus;
-  step: number;
+  /**
+   * Cost units completed. The backend measures progress in units proportional
+   * to real work: a `Text` leaf costs its word count (TTS synthesis time
+   * scales with words), a pasted clip (`<sound>`/`<pause>`/`<tone>`) costs a
+   * small constant. Raw units are meaningless to users — display `pct`.
+   */
+  done: number;
   total: number;
+  /**
+   * Monotonic percent from the backend's progress ledger (0–100, never
+   * regresses or exceeds 100 regardless of count/render drift). `0` while
+   * `total` is still unseeded (indeterminate bar).
+   */
+  pct: number;
   label: string;
   /** Present only when `status === "error"`. */
   error: string | null;
@@ -50,27 +62,37 @@ export interface RenderEntry {
   startedAt: number | null;
   /**
    * Epoch ms when the walker first reported a non-zero `total` — i.e. the
-   * moment the "Synthesizing audio…" step-counting phase began. Used together
-   * with {@link countedStep} to estimate remaining time from the per-step rate.
-   * `null` until the walker seeds the total (and for renders that never reach
-   * the walk, e.g. a freshness short-circuit).
+   * moment the "Synthesizing audio…" cost-counting phase began. Baseline for
+   * the local rate-based ETA fallback. `null` until the walker seeds the
+   * total (and for renders that never reach the walk, e.g. a freshness
+   * short-circuit).
    */
   countedAt: number | null;
   /**
-   * The `step` value observed when {@link countedAt} was stamped. Steps
-   * completed since the count began = `step - countedStep`, the denominator for
-   * the per-step rate. Captured at count time (not assumed 0/1) because the
+   * The `done` value observed when {@link countedAt} was stamped. Cost units
+   * completed since the count began = `done - countedDone`, the denominator
+   * for the per-unit rate. Captured at count time (not assumed 0) because the
    * ~2 Hz throttle can coalesce the very first ticks.
    */
-  countedStep: number;
+  countedDone: number;
+  /**
+   * Backend ETA (seconds) from the latest progress event, stamped at
+   * {@link etaAt}. The backend derives it from the cost completion rate, so
+   * it already accounts for TTS-vs-paste work asymmetry.
+   */
+  etaSecs: number | null;
+  /** Epoch ms when {@link etaSecs} was received (see {@link estimateRemainingMs}). */
+  etaAt: number | null;
 }
 
 /** Shape of the backend's `render-manifest-progress` event payload. */
 interface RenderProgressEvent {
   script: string;
-  step: number;
+  done: number;
   total: number;
+  pct: number;
   label: string;
+  eta_secs: number | null;
 }
 
 // ── Store ──────────────────────────────────────────────────────────────────
@@ -140,7 +162,7 @@ export function ensureGlobalListener(): Promise<void> {
       const unlisten: UnlistenFn = await listen<RenderProgressEvent>(
         "render-manifest-progress",
         (e) => {
-          const { script, step, total, label } = e.payload;
+          const { script, done, total, pct, label, eta_secs } = e.payload;
           let cur = store.get(script);
           if (!cur) {
             // A background render nobody marked (pre-render pass, jingle):
@@ -148,13 +170,16 @@ export function ensureGlobalListener(): Promise<void> {
             autoCreated.add(script);
             cur = {
               status: "rendering",
-              step: 0,
+              done: 0,
               total: 0,
+              pct: 0,
               label: "",
               error: null,
               startedAt: Date.now(),
               countedAt: null,
-              countedStep: 0,
+              countedDone: 0,
+              etaSecs: null,
+              etaAt: null,
             };
           } else if (cur.status !== "rendering") {
             // Ignore stray events for renders that already reached a
@@ -162,20 +187,23 @@ export function ensureGlobalListener(): Promise<void> {
             return;
           }
           // The first time the walker reports a non-zero `total`, stamp the
-          // rate baseline (timestamp + step) so the UI can estimate remaining
-          // time from the per-step rate. The throttle can coalesce the very
-          // first ticks, so capture the actual `step` here rather than assuming
-          // 0/1.
+          // rate baseline (timestamp + done) so the local fallback ETA can
+          // estimate remaining time from the per-unit rate. The throttle can
+          // coalesce the very first ticks, so capture the actual `done` here
+          // rather than assuming 0.
           const countBegins = total > 0 && cur.countedAt == null;
           setEntry(script, {
             status: "rendering",
-            step,
+            done,
             total,
+            pct,
             label,
             error: null,
             startedAt: cur.startedAt,
             countedAt: countBegins ? Date.now() : cur.countedAt,
-            countedStep: countBegins ? step : cur.countedStep,
+            countedDone: countBegins ? done : cur.countedDone,
+            etaSecs: eta_secs ?? cur.etaSecs,
+            etaAt: eta_secs != null ? Date.now() : cur.etaAt,
           });
         },
       );
@@ -216,13 +244,16 @@ export function markStart(scriptPath: string): void {
   autoCreated.delete(scriptPath);
   setEntry(scriptPath, {
     status: "rendering",
-    step: 0,
+    done: 0,
     total: 0,
+    pct: 0,
     label: "",
     error: null,
     startedAt: Date.now(),
     countedAt: null,
-    countedStep: 0,
+    countedDone: 0,
+    etaSecs: null,
+    etaAt: null,
   });
 }
 
@@ -243,13 +274,16 @@ export function setPhase(scriptPath: string, phase: string): void {
 export function markDone(scriptPath: string): void {
   setEntry(scriptPath, {
     status: "done",
-    step: 0,
+    done: 0,
     total: 0,
+    pct: 0,
     label: "",
     error: null,
     startedAt: null,
     countedAt: null,
-    countedStep: 0,
+    countedDone: 0,
+    etaSecs: null,
+    etaAt: null,
   });
 }
 
@@ -257,13 +291,16 @@ export function markDone(scriptPath: string): void {
 export function markError(scriptPath: string, message: string): void {
   setEntry(scriptPath, {
     status: "error",
-    step: 0,
+    done: 0,
     total: 0,
+    pct: 0,
     label: "",
     error: message,
     startedAt: null,
     countedAt: null,
-    countedStep: 0,
+    countedDone: 0,
+    etaSecs: null,
+    etaAt: null,
   });
 }
 
@@ -295,22 +332,44 @@ export function useRenderStore(): ReadonlyMap<string, RenderEntry> {
 // ── Time estimates ──────────────────────────────────────────────────────────
 
 /**
+ * Percent to display for a render: the backend's monotonic ledger percent,
+ * with a defensive local clamp (the backend guarantees 0–100 already, but the
+ * counter must never read above the total whatever the source).
+ */
+export function displayPct(entry: RenderEntry): number {
+  const fallback =
+    entry.total > 0
+      ? Math.min(100, Math.round((entry.done / entry.total) * 100))
+      : 0;
+  return Math.min(100, Math.max(0, entry.pct || fallback));
+}
+
+/**
  * Estimate the remaining render time in ms, or `null` when no estimate is
- * possible yet. Based on the per-step rate since the walker first seeded
- * `total` (see {@link RenderEntry.countedAt}): steps are the leaf nodes of
- * the script AST and render at roughly a uniform cost, so the early rate
- * extrapolates well. Returns null until at least one step completed after
- * the count began.
+ * possible yet.
+ *
+ * Preferred source: the backend's own ETA (`etaSecs`, derived from the cost
+ * completion rate — cost units are words for TTS leaves, a constant for
+ * pasted clips, so the rate tracks real work). Because progress events are
+ * throttled to ~2 Hz, the stored estimate is adjusted by the time elapsed
+ * since it arrived so the readout keeps ticking down between events.
+ *
+ * Fallback: a local per-unit rate estimate since the walker first seeded
+ * `total` (see {@link RenderEntry.countedAt}) — same math over the same cost
+ * units, used when an older backend hasn't sent `eta_secs` yet.
  */
 export function estimateRemainingMs(entry: RenderEntry, now = Date.now()): number | null {
+  if (entry.etaSecs != null && entry.etaAt != null) {
+    return Math.max(0, entry.etaSecs * 1000 - (now - entry.etaAt));
+  }
   if (entry.countedAt == null || entry.total <= 0) return null;
-  const done = entry.step - entry.countedStep;
+  const done = entry.done - entry.countedDone;
   if (done <= 0) return null;
   const elapsedSec = (now - entry.countedAt) / 1000;
   if (elapsedSec <= 0) return null;
-  const rate = done / elapsedSec; // steps per second
-  const remainingSteps = Math.max(0, entry.total - entry.step);
-  return (remainingSteps / rate) * 1000;
+  const rate = done / elapsedSec; // cost units per second
+  const remainingUnits = Math.max(0, entry.total - entry.done);
+  return (remainingUnits / rate) * 1000;
 }
 
 /** Milliseconds since the render started (covers pre-walk phases too). */

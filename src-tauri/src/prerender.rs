@@ -313,15 +313,22 @@ fn is_fresh(tracks_dir: &Path, agent_dir: &Path, src: &str) -> bool {
 /// Emit one `render-manifest-progress` event (same payload as the UI
 /// `render_manifest` command) so the frontend's app-wide render registry —
 /// and its progress pill — covers background prerenders too.
-fn emit_progress(app: &tauri::AppHandle, script: &str, step: usize, total: usize, label: &str) {
+fn emit_progress(app: &tauri::AppHandle, script: &str, done: usize, total: usize, label: &str) {
     use tauri::Emitter;
+    let pct = if total > 0 {
+        (((done.min(total) as f64) / total as f64) * 100.0).floor() as u8
+    } else {
+        0
+    };
     let _ = app.emit(
         "render-manifest-progress",
         serde_json::json!({
             "script": script,
-            "step": step,
+            "done": done,
             "total": total,
+            "pct": pct,
             "label": label,
+            "eta_secs": null,
         }),
     );
 }
@@ -386,46 +393,20 @@ pub fn prerender_blocking(
             if let Some(renderer) = guard.as_mut() {
                 let stale_count = stale.len();
                 for (pass_index, r) in stale.iter().enumerate() {
-                    // Progress tracker mirroring the UI render path: a
-                    // seeded "Pre-rendering…" tick (so the frontend entry
-                    // exists before the first engine phase, and the pill
-                    // shows where in the PASS this script sits) plus ~2 Hz
-                    // throttled step updates, finalized by a done event.
+                    // Progress tracker mirroring the UI render path: a seeded
+                    // "Pre-rendering…" tick (so the frontend entry exists
+                    // before the first engine phase, and the pill shows where
+                    // in the PASS this script sits) plus throttled cost-unit
+                    // updates via the shared sink (no native notification —
+                    // background passes don't drive it), finalized by a done
+                    // event.
                     let tracker = app.map(|app| {
                         let app = app.clone();
                         let script = r.src.clone();
-                        let last: std::sync::Arc<parking_lot::Mutex<Option<std::time::Instant>>> =
-                            std::sync::Arc::new(parking_lot::Mutex::new(None));
                         std::sync::Arc::new(std::sync::Mutex::new(
-                            crate::audio_renderer::ProgressTracker {
-                                step: 0,
-                                total: 0,
-                                callback: Box::new(move |step, total, label| {
-                                    // The completion tick (step == total)
-                                    // always emits: the throttle would
-                                    // otherwise swallow it right behind the
-                                    // last leaf tick and the bar would end
-                                    // at N-1/N, never landing on 100%.
-                                    let should_emit = {
-                                        let mut guard = last.lock();
-                                        let now = std::time::Instant::now();
-                                        let due = match *guard {
-                                            None => true,
-                                            Some(prev) => {
-                                                now.duration_since(prev)
-                                                    >= std::time::Duration::from_millis(500)
-                                                    || (total > 0 && step >= total)
-                                            }
-                                        };
-                                        if due {
-                                            *guard = Some(now);
-                                        }
-                                        due
-                                    };
-                                    if should_emit {
-                                        emit_progress(&app, &script, step, total, label);
-                                    }
-                                }),
+                            crate::progress::ProgressTracker {
+                                ledger: crate::progress::Ledger::new(),
+                                callback: crate::render_notify::make_tick_sink(app, script, None),
                             },
                         ))
                     });

@@ -83,6 +83,7 @@ import {
   type DebugTimeState,
 } from "@/lib/v2";
 import {
+  displayPct,
   ensureGlobalListener,
   estimateRemainingMs,
   formatClock,
@@ -2119,7 +2120,7 @@ function RenderTestCard({ modelLoaded }: { modelLoaded: boolean }) {
             </span>
             {entry && entry.total > 0 && (
               <span className="shrink-0 ml-2 tabular-nums">
-                {entry.step}/{entry.total}
+                {displayPct(entry)}%
                 {eta != null ? ` · ~${formatClock(eta)} left` : ""}
               </span>
             )}
@@ -2128,12 +2129,7 @@ function RenderTestCard({ modelLoaded }: { modelLoaded: boolean }) {
             <div className="h-1.5 rounded-full bg-[var(--color-border)] overflow-hidden">
               <div
                 className="h-full rounded-full bg-[var(--color-pink-500)] transition-all duration-200 ease-out"
-                style={{
-                  width: `${Math.min(
-                    100,
-                    Math.round((entry.step / entry.total) * 100),
-                  )}%`,
-                }}
+                style={{ width: `${displayPct(entry)}%` }}
               />
             </div>
           ) : (

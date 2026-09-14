@@ -3,7 +3,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -31,6 +30,7 @@ mod onboarding;
 mod package_import;
 mod package_manifest;
 mod prerender;
+mod progress;
 mod redgifs_cli;
 mod render_notify;
 mod schedule;
@@ -246,27 +246,31 @@ async fn synthesize(
         // Missing/circular/invalid includes are silently skipped here.
         let nodes = audio_renderer::resolve_includes(nodes, &agent_dir);
 
-        // Count speakable nodes for progress tracking
-        let total = audio_renderer::count_speakable_nodes(&nodes);
+        // Seed the tracker with the render cost of this AST (flat-renderer
+        // semantics: `<loop>` repeats, `<random>` picks one part — see
+        // `progress::CountMode`). Cost units: words for text, a small
+        // constant for pasted clips — so time estimates track actual work.
+        let total = progress::ast_cost(&nodes, progress::CountMode::Flat);
 
         // Build progress callback that emits Tauri events
         let app_handle = app.clone();
-        let progress_callback = Box::new(move |step: usize, total: usize, label: &str| {
+        let progress_callback = Box::new(move |snap: &progress::Snapshot| {
             let _ = app_handle.emit(
                 "synthesize-progress",
                 serde_json::json!({
-                    "step": step,
-                    "total": total,
-                    "label": label,
+                    "done": snap.done,
+                    "total": snap.total,
+                    "pct": snap.pct,
+                    "label": snap.label,
                 }),
             );
         });
 
-        let tracker = Arc::new(std::sync::Mutex::new(audio_renderer::ProgressTracker {
-            step: 0,
-            total,
+        let tracker = Arc::new(std::sync::Mutex::new(progress::ProgressTracker {
+            ledger: progress::Ledger::new(),
             callback: progress_callback,
         }));
+        tracker.lock().unwrap().ledger.seed(total);
 
         // Lock renderer
         let mut guard = renderer_arc.lock();
@@ -663,59 +667,18 @@ async fn render_manifest(
     // `render-manifest-done` event emitted below.
     let done_script = script_path.clone();
 
-    // Progress tracker: each tick emits a Tauri push event for the in-app
-    // progress bar, throttled to 2 Hz (a render can emit hundreds of ticks —
-    // we don't need them all, and dropping is fine for a purely cosmetic bar).
-    // The native "Rendering…" notification is throttled independently. The
-    // total is seeded exactly, up front, inside `render_manifest` (see
-    // `count_render_leaves`).
+    // Progress tracker: each tick produces a pure `Snapshot` (cost units,
+    // monotonic clamped percent — see `progress.rs`); the sink below does the
+    // Tauri-specific fan-out: a `render-manifest-progress` push event for the
+    // in-app progress bar (~2 Hz, completion always passes) and the native
+    // "Rendering…" notification on its own throttle. Both throttles and the
+    // ETA estimator live in the tested progress core.
     let progress_app = app.clone();
     let progress_script = script_path.clone();
-    let notify_throttle = Arc::new(render_notify::RenderNotifyThrottle::new());
     let notify_app = app.clone();
     let notify_title = display_title.clone();
-    // Shared throttle state for the push-event emit. The first tick always
-    // emits; subsequent ticks emit only if ≥2 Hz has elapsed. Held behind a
-    // Mutex because the callback is `Fn` (called from the worker thread).
-    let emit_last: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
-    /// Minimum gap between `render-manifest-progress` push events (~2 Hz).
-    /// Phase labels (each does real work) are naturally further apart than
-    /// this, so they always come through; only fast synthesis ticks coalesce.
-    const EMIT_THROTTLE: Duration = Duration::from_millis(500);
-    let progress_callback = Box::new(move |step: usize, total: usize, label: &str| {
-        // Throttle the push event to ~2 Hz. Always emit the first tick of a
-        // render so the bar moves immediately; otherwise require the gap —
-        // except for the completion tick (step == total), which always emits
-        // or the throttle would swallow it right behind the last leaf tick
-        // and the bar would end at N-1/N, never landing on 100%.
-        let should_emit = {
-            let mut guard = emit_last.lock();
-            let now = Instant::now();
-            let due = match *guard {
-                None => true,
-                Some(last) => {
-                    now.duration_since(last) >= EMIT_THROTTLE || (total > 0 && step >= total)
-                }
-            };
-            if due {
-                *guard = Some(now);
-            }
-            due
-        };
-        if should_emit {
-            let _ = progress_app.emit(
-                "render-manifest-progress",
-                serde_json::json!({
-                    "script": progress_script,
-                    "step": step,
-                    "total": total,
-                    "label": label,
-                }),
-            );
-        }
-        // The notification has its own (independent) throttle.
-        notify_throttle.maybe_update(&notify_app, &notify_title, step, total);
-    });
+    let progress_callback =
+        render_notify::make_tick_sink(progress_app, progress_script, Some((notify_app, notify_title)));
 
     // Fire the notification-permission request detached, NOT on this async
     // command thread. On some Android OEM stacks (e.g. ColorOS/OxygenOS) the
@@ -736,9 +699,8 @@ async fn render_manifest(
         // First signal to the UI: the command reached the worker. If this
         // never appears, the hang is in dispatch (event-loop starvation), not
         // in the render itself.
-        let tracker = Arc::new(std::sync::Mutex::new(audio_renderer::ProgressTracker {
-            step: 0,
-            total: 0,
+        let tracker = Arc::new(std::sync::Mutex::new(progress::ProgressTracker {
+            ledger: progress::Ledger::new(),
             callback: progress_callback,
         }));
         log::info!("render_manifest: worker started");
@@ -751,7 +713,17 @@ async fn render_manifest(
         // render. Done after the "Entering worker…" phase so a hang in channel
         // creation / show is diagnosable too.
         render_notify::ensure_channel(&notify_app_for_setup);
-        render_notify::show_render_progress(&notify_app_for_setup, &notify_title_for_setup, 0, 0);
+        render_notify::show_render_progress(
+            &notify_app_for_setup,
+            &notify_title_for_setup,
+            &progress::Snapshot {
+                done: 0,
+                total: 0,
+                pct: 0,
+                label: String::new(),
+            },
+            None,
+        );
 
         // Surface the (possibly slow / contended) engine acquisition as its own
         // phase so a hang here doesn't read as an opaque "Preparing…".
