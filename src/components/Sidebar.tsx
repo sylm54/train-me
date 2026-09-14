@@ -8,7 +8,6 @@ import {
   MessageSquare,
   Settings as SettingsIcon,
   PackageOpen,
-  Activity as ActivityIcon,
   CalendarCheck,
   type LucideIcon,
 } from "lucide-react";
@@ -21,11 +20,11 @@ interface NavItem {
   disabled?: boolean;
 }
 
+// The activity log is reachable from Settings → Debug rather than the nav.
 const NAV_ITEMS: NavItem[] = [
   { view: "chat", label: "Agent", icon: MessageSquare },
   { view: "today", label: "Today", icon: CalendarCheck },
   { view: "inventory", label: "Inventory", icon: PackageOpen },
-  { view: "activity", label: "Activity", icon: ActivityIcon },
   { view: "settings", label: "Settings", icon: SettingsIcon },
 ];
 
