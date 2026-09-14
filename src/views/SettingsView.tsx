@@ -8,6 +8,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
+  Activity as ActivityIcon,
   AlertCircle,
   AlertTriangle,
   CheckCircle2,
@@ -108,7 +109,12 @@ const AGENT_PROMPTS: { agent: AgentName; file: string; label: string }[] = [
 
 type PromptMode = "rendered" | "raw";
 
-export function SettingsView() {
+export function SettingsView({
+  onOpenActivity,
+}: {
+  /** Navigate to the activity log (lives in the debug section, not the nav). */
+  onOpenActivity: () => void;
+}) {
   const {
     settings,
     setApiKey,
@@ -772,6 +778,18 @@ export function SettingsView() {
 
           {debugOpen && (
             <div className="space-y-3">
+              {/* ── Activity log nav (removed from the sidebar nav) ── */}
+              <button
+                onClick={onOpenActivity}
+                className="w-full flex items-center gap-3 rounded-md px-3 py-2 text-sm border border-[var(--color-border)] bg-[var(--color-surface)] hover:bg-[var(--color-pink-100)] hover:text-[var(--color-foreground)] transition-colors text-left"
+              >
+                <ActivityIcon size={16} className="text-[var(--color-muted-foreground)]" />
+                <span className="font-medium">Activity</span>
+                <span className="ml-auto text-[11px] text-[var(--color-muted-foreground)]">
+                  Open the activity log →
+                </span>
+              </button>
+
               {/* ── Time machine (debug builds only) ── */}
               {debugTools && <DebugTimeCard />}
 

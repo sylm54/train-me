@@ -114,7 +114,7 @@ export default function App() {
       body = <SessionView request={sessionRequest} navigate={navigate} />;
       break;
     case "settings":
-      body = <SettingsView />;
+      body = <SettingsView onOpenActivity={() => navigate("activity")} />;
       break;
     case "tts":
       body = <TtsView />;
