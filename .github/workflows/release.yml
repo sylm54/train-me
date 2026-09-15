@@ -120,11 +120,18 @@ jobs:
             --out train-me-${{ github.ref_name }}-arm64-v8a.apk \
             aligned.apk
 
+      # softprops/action-gh-release is avoided here: its update-existing-release
+      # path (a PATCH) fails with the workflow GITHUB_TOKEN ("Resource not
+      # accessible by integration", softprops/action-gh-release#836), while
+      # asset delete/upload still works — so upload via the gh CLI instead.
       - name: Upload APK to release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          draft: false
-          files: train-me-${{ github.ref_name }}-arm64-v8a.apk
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          APK="train-me-${TAG}-arm64-v8a.apk"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "train-me $TAG" \
+              --notes "See the assets below to download and install this version." || true
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" "$APK" --clobber
