@@ -55,8 +55,12 @@ jobs:
           distribution: zulu
           java-version: 21
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      # The runner image ships a full Android SDK (ANDROID_HOME, cmdline-tools,
+      # build-tools). The android-actions/setup-android action is no longer used
+      # because its `sdkmanager tools` step fails since Google removed the
+      # legacy "tools" package.
+      - name: Accept Android SDK licenses
+        run: yes | sdkmanager --licenses > /dev/null
 
       - name: Install Android NDK
         run: sdkmanager "ndk;27.2.12479018"
