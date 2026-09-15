@@ -1,11 +1,17 @@
 /**
  * Shared framework option-group rendering.
  *
- * Renders a framework's `config.json` option groups as radio groups (single)
- * or checkbox groups (multiple). Used by both onboarding and Settings
- * wherever a staged framework needs to be configured before install.
+ * Renders a framework's `config.json` option groups in the same visual
+ * language as the onboarding questionnaire (OnboardingFlow): question
+ * cards with outline pill buttons — pink border + check when selected.
+ * A `single` group acts as a radio set, a `multiple` group as toggles.
+ * Used by both onboarding and Settings wherever a staged framework needs
+ * to be configured before install.
  */
 
+import { Check } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import type {
   FrameworkChoices,
   FrameworkOptionGroup,
@@ -59,8 +65,9 @@ export function FrameworkOptionsList({
             key={g.id}
             group={g}
             selected={selected}
-            onSingle={(cid) => setSingle(g.id, cid)}
-            onToggle={(cid) => toggleMulti(g.id, cid)}
+            onSelect={(cid) =>
+              g.type === "single" ? setSingle(g.id, cid) : toggleMulti(g.id, cid)
+            }
           />
         );
       })}
@@ -71,51 +78,46 @@ export function FrameworkOptionsList({
 function OptionGroupCard({
   group,
   selected,
-  onSingle,
-  onToggle,
+  onSelect,
 }: {
   group: FrameworkOptionGroup;
   selected: string[];
-  onSingle: (choiceId: string) => void;
-  onToggle: (choiceId: string) => void;
+  onSelect: (choiceId: string) => void;
 }) {
   return (
-    <div className="border border-[var(--color-border)] rounded-lg p-4 bg-[var(--color-surface)] space-y-2">
-      <div>
-        <div className="text-sm font-medium">{group.title}</div>
-        {group.description && (
-          <p className="text-xs text-[var(--color-muted-foreground)] mt-0.5">
-            {group.description}
-          </p>
-        )}
-      </div>
-      <div className="grid gap-1.5">
+    <div className="rounded-lg border border-[var(--color-border)] p-4 space-y-3">
+      <div className="text-sm font-medium">{group.title}</div>
+      {group.description && (
+        <div className="text-xs text-muted-foreground -mt-2">
+          {group.description}
+        </div>
+      )}
+      <div className="flex flex-wrap gap-2">
         {group.choices.map((c) => {
-          const checked = selected.includes(c.id);
-          const kind = group.type === "single" ? "radio" : "checkbox";
+          const on = selected.includes(c.id);
           return (
-            <label
+            <Button
               key={c.id}
-              className="flex items-start gap-2.5 p-2 rounded-md cursor-pointer hover:bg-[var(--color-pink-50)]"
+              type="button"
+              variant="outline"
+              size="sm"
+              aria-pressed={on}
+              className={cn(
+                c.description ? "h-auto min-h-8 items-start py-1.5" : "",
+                on ? "border-[var(--color-pink-400)]" : "",
+              )}
+              onClick={() => onSelect(c.id)}
             >
-              <input
-                type={kind}
-                name={`grp-${group.id}`}
-                checked={checked}
-                onChange={() =>
-                  group.type === "single" ? onSingle(c.id) : onToggle(c.id)
-                }
-                className="mt-0.5 accent-[var(--color-pink-500)]"
-              />
-              <div className="min-w-0">
-                <div className="text-sm">{c.label}</div>
+              {on && <Check className="size-3.5" />}
+              <span className="min-w-0 text-left">
+                <span className="block leading-5">{c.label}</span>
                 {c.description && (
-                  <div className="text-xs text-[var(--color-muted-foreground)]">
+                  <span className="block text-[11px] font-normal text-[var(--color-muted-foreground)]">
                     {c.description}
-                  </div>
+                  </span>
                 )}
-              </div>
-            </label>
+              </span>
+            </Button>
           );
         })}
       </div>
