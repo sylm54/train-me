@@ -351,6 +351,7 @@ pub fn prerender_blocking(
     renderer_arc: &parking_lot::Mutex<Option<crate::audio_renderer::AudioRenderer>>,
     only: Option<&[String]>,
     app: Option<&tauri::AppHandle>,
+    service: Option<&tauri::Webview>,
 ) -> PrerenderReport {
     let mut report = PrerenderReport::default();
     let now = chrono::Utc::now();
@@ -376,6 +377,11 @@ pub fn prerender_blocking(
     let stale: Vec<&ScriptRef> = refs.iter().filter(|r| !is_fresh(tracks_dir, agent_dir, &r.src)).collect();
     report.fresh = refs.len() - stale.len();
 
+    // Foreground-service hold for this pass: acquired on the first real
+    // phase (synthesis batch or visual prefetch), released when the pass
+    // ends. Empty holds are free — a no-work pass never starts the service.
+    let mut hold = crate::render_service::RenderHold::new();
+
     if !stale.is_empty() {
         if !crate::model_downloader::is_model_downloaded(model_dir) {
             report.model_missing = true;
@@ -392,21 +398,34 @@ pub fn prerender_blocking(
             }
             if let Some(renderer) = guard.as_mut() {
                 let stale_count = stale.len();
+                if let Some(webview) = service {
+                    hold.hold(webview);
+                }
                 for (pass_index, r) in stale.iter().enumerate() {
                     // Progress tracker mirroring the UI render path: a seeded
                     // "Pre-rendering…" tick (so the frontend entry exists
                     // before the first engine phase, and the pill shows where
                     // in the PASS this script sits) plus throttled cost-unit
-                    // updates via the shared sink (no native notification —
-                    // background passes don't drive it), finalized by a done
-                    // event.
+                    // updates via the shared sink, finalized by a done event.
+                    // On Android the sink also drives the foreground-service
+                    // progress bar — the thing a backgrounded user actually
+                    // sees; on desktop background passes stay silent.
                     let tracker = app.map(|app| {
                         let app = app.clone();
                         let script = r.src.clone();
+                        #[cfg(target_os = "android")]
+                        let notify = service.map(|webview| {
+                            (
+                                webview.clone(),
+                                format!("{} ({}/{})", r.src, pass_index + 1, stale_count),
+                            )
+                        });
+                        #[cfg(not(target_os = "android"))]
+                        let notify = None;
                         std::sync::Arc::new(std::sync::Mutex::new(
                             crate::progress::ProgressTracker {
                                 ledger: crate::progress::Ledger::new(),
-                                callback: crate::render_notify::make_tick_sink(app, script, None),
+                                callback: crate::render_notify::make_tick_sink(app, script, notify),
                             },
                         ))
                     });
@@ -460,12 +479,33 @@ pub fn prerender_blocking(
         if let Some(app) = app {
             emit_progress(app, pseudo, 0, configs.len(), "Prefetching visual clips…");
         }
+        if let Some(webview) = service {
+            hold.hold(webview);
+        }
         report.visuals = crate::visual::prefetch_configs(
             visual_cache_dir,
             configs,
             Some(&|done, total| {
                 if let Some(app) = app {
                     emit_progress(app, pseudo, done, total, "Prefetching visual clips…");
+                }
+                #[cfg(target_os = "android")]
+                if let Some(webview) = service {
+                    crate::render_notify::show_render_progress(
+                        webview,
+                        "Prefetching visual clips…",
+                        &crate::progress::Snapshot {
+                            done: done as u64,
+                            total: total as u64,
+                            pct: if total > 0 {
+                                ((done.min(total) * 100 / total) as u8).clamp(0, 100)
+                            } else {
+                                0
+                            },
+                            label: String::new(),
+                        },
+                        None,
+                    );
                 }
             }),
         );
@@ -502,10 +542,13 @@ pub fn prerender_blocking(
 /// Run a prerender pass. Without `paths`, every referenced script is
 /// (re)rendered and unreferenced tracks are GC'd; with `paths`, only the
 /// scripts referenced by those container files (a per-item prerender from
-/// the Today view, without starting anything).
+/// the Today view, without starting anything). `app` drives the frontend
+/// progress events; `service` (the invoking webview) additionally drives
+/// the Android foreground-service notification for the pass.
 #[tauri::command]
 pub async fn v2_prerender(
     paths: Option<Vec<String>>,
+    webview: tauri::Webview,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<PrerenderReport, String> {
@@ -516,6 +559,7 @@ pub async fn v2_prerender(
     let visual_cache_dir = state.data_dir.join("visuals");
     let renderer_arc = state.renderer.clone();
     let report_app = app.clone();
+    let report_webview = webview.clone();
     let report = tauri::async_runtime::spawn_blocking(move || {
         prerender_blocking(
             &agent_dir,
@@ -526,11 +570,23 @@ pub async fn v2_prerender(
             &renderer_arc,
             paths.as_deref(),
             Some(&report_app),
+            Some(&report_webview),
         )
     })
     .await
     .map_err(|e| e.to_string())?;
     let _ = tauri::Emitter::emit(&app, "v2-prerender-done", &report);
+    // Completion notification, but only for passes that actually rendered
+    // something: the frontend re-invokes this command periodically (and at
+    // every startup) and a no-op "everything was already fresh" ping would
+    // be pure noise.
+    if !report.rendered.is_empty() {
+        crate::render_notify::notify_render_done(
+            &webview,
+            report.rendered.len(),
+            report.errors.len(),
+        );
+    }
     Ok(report)
 }
 

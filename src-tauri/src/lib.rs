@@ -33,6 +33,7 @@ mod prerender;
 mod progress;
 mod redgifs_cli;
 mod render_notify;
+mod render_service;
 mod schedule;
 mod sounds;
 mod tag_parser;
@@ -649,6 +650,7 @@ fn wipe_agent_data(agent_dir: &std::path::Path) -> Result<(), String> {
 #[tauri::command]
 async fn render_manifest(
     script_path: String,
+    webview: tauri::Webview,
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<RenderedManifest, String> {
@@ -675,10 +677,13 @@ async fn render_manifest(
     // ETA estimator live in the tested progress core.
     let progress_app = app.clone();
     let progress_script = script_path.clone();
-    let notify_app = app.clone();
+    let notify_webview = webview.clone();
     let notify_title = display_title.clone();
-    let progress_callback =
-        render_notify::make_tick_sink(progress_app, progress_script, Some((notify_app, notify_title)));
+    let progress_callback = render_notify::make_tick_sink(
+        progress_app,
+        progress_script,
+        Some((notify_webview, notify_title)),
+    );
 
     // Fire the notification-permission request detached, NOT on this async
     // command thread. On some Android OEM stacks (e.g. ColorOS/OxygenOS) the
@@ -689,7 +694,14 @@ async fn render_manifest(
     // Detaching means a blocked permission call can never stall the render.
     render_notify::request_permission_detached(&app);
 
+    // Hold the Android foreground service for the render's duration: keeps
+    // the process at foreground priority (the render survives the app being
+    // backgrounded) and owns the ongoing progress-bar notification. The
+    // first holder starts the service; releasing the last slot stops it.
+    crate::render_service::acquire(&webview);
+
     let notify_app_for_setup = app.clone();
+    let notify_webview_for_setup = webview.clone();
     let notify_title_for_setup = display_title.clone();
     log::info!(
         "render_manifest: dispatching to spawn_blocking (script={})",
@@ -714,7 +726,7 @@ async fn render_manifest(
         // creation / show is diagnosable too.
         render_notify::ensure_channel(&notify_app_for_setup);
         render_notify::show_render_progress(
-            &notify_app_for_setup,
+            &notify_webview_for_setup,
             &notify_title_for_setup,
             &progress::Snapshot {
                 done: 0,
@@ -745,9 +757,11 @@ async fn render_manifest(
     })
     .await;
 
-    // Whether the render succeeded or failed, tear down the notification so
-    // it doesn't linger forever.
+    // Whether the render succeeded or failed, tear down the notification and
+    // release the foreground-service slot (the service stops — and its
+    // ongoing notification goes away — once the last concurrent render ends).
     render_notify::clear_render_progress(&app);
+    crate::render_service::release(&webview);
 
     // Terminal signal for the frontend's render registry. The registry
     // tracks renders app-wide (its progress pill survives navigation), so
