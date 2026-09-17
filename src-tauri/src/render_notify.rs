@@ -3,14 +3,18 @@
 //! This module owns the Tauri-facing half of the progress pipeline (the pure
 //! half lives in [`crate::progress`]): it converts [`crate::progress::Snapshot`]
 //! ticks into (a) the throttled `render-manifest-progress` push event the
-//! frontend's render registry listens on, and (b) an in-place update of a
-//! low-key native "Rendering…" notification.
+//! frontend's render registry listens on, and (b) an in-place update of the
+//! native "Rendering audio" notification.
 //!
-//! The notification lives on its own (`rendering`) channel, is `ongoing`
-//! (non-dismissible on Android) while a render is in flight, and is updated
-//! by re-issuing the same stable notification id. Cleared on success or
-//! failure. All entry points are best-effort: errors are logged and swallowed
-//! so a notification hiccup can never fail a render. `NotificationExt::show()`
+//! On Android that notification is the foreground-service entry posted by
+//! [`crate::render_service`] (`RenderService.kt`): it carries a native
+//! progress bar and keeps the process at foreground priority while a render
+//! is in flight. Elsewhere it's a plain plugin notification on the
+//! `rendering` channel, `ongoing` (non-dismissible) while a render runs,
+//! updated by re-issuing the same stable notification id.
+//!
+//! All entry points are best-effort: errors are logged and swallowed so a
+//! notification hiccup can never fail a render. `NotificationExt::show()`
 //! is safe to call from the `spawn_blocking` worker — Tauri hands the actual
 //! JNI work to its Android looper thread, so no manual thread attachment is
 //! needed (and on desktop it's a plain OS call).
@@ -28,7 +32,12 @@ use crate::progress::{self, EtaEstimator, Snapshot, Throttle};
 const RENDER_CHANNEL_ID: &str = "rendering";
 
 /// Stable notification id. Re-showing with the same id updates the existing
-/// notification in place rather than stacking a new one.
+/// notification in place rather than stacking a new one. Must match
+/// `RenderService.PROGRESS_NOTIF_ID` (the Android foreground-service entry).
+// Unused on Android (the desktop-only plugin path consumes it; the service
+// hardcodes the same value in Kotlin) — kept defined everywhere so the
+// pairing with the Kotlin constant stays documented in one place.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub const RENDER_NOTIF_ID: i32 = 7777;
 
 /// Minimum gap between `render-manifest-progress` push events (~2 Hz). Fast
@@ -88,46 +97,76 @@ pub fn request_permission_detached<R: tauri::Runtime>(app: &AppHandle<R>) {
     });
 }
 
-/// Show (or update) the render-progress notification from a snapshot. Marked
-/// `ongoing` so it can't be dismissed while a render is in flight.
+/// Show (or update) the render-progress notification from a snapshot.
+/// Android: updates the foreground-service notification's progress bar (the
+/// service keeps the entry `ongoing` and non-dismissible). Desktop: a plain
+/// plugin notification, marked `ongoing` so it can't be dismissed mid-render.
 pub fn show_render_progress<R: tauri::Runtime>(
-    app: &AppHandle<R>,
+    webview: &tauri::Webview<R>,
     title: &str,
     snap: &Snapshot,
     eta_secs: Option<u64>,
 ) {
     let body = progress::body_for(title, snap, eta_secs);
-    let result = app
-        .notification()
-        .builder()
-        .id(RENDER_NOTIF_ID)
-        // `channel_id` only matters on Android, but the builder accepts it on
-        // all platforms and ignores it where irrelevant.
-        .channel_id(RENDER_CHANNEL_ID)
-        .title("Rendering…")
-        .body(&body)
-        .ongoing()
-        .show();
-    if let Err(e) = result {
-        log::debug!("show_render_progress failed: {e}");
+    #[cfg(target_os = "android")]
+    {
+        crate::render_service::update_progress(webview, &body, snap.done, snap.total);
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let result = webview
+            .notification()
+            .builder()
+            .id(RENDER_NOTIF_ID)
+            // `channel_id` only matters on Android, but the builder accepts
+            // it on all platforms and ignores it where irrelevant.
+            .channel_id(RENDER_CHANNEL_ID)
+            .title("Rendering…")
+            .body(&body)
+            .ongoing()
+            .show();
+        if let Err(e) = result {
+            log::debug!("show_render_progress failed: {e}");
+        }
     }
 }
 
 /// Remove the render-progress notification (e.g. on completion). Best-effort.
+///
+/// On Android this is deliberately a no-op: the ongoing notification is owned
+/// by the foreground service, which removes it when the LAST render finishes
+/// (see `render_service::release`). Clearing it per-render would strip the
+/// bar while a background prerender is still running under the same service.
+/// Desktop has no per-id cancel, so nothing to do — the notification is only
+/// ever replaced by the next render's update.
 pub fn clear_render_progress<R: tauri::Runtime>(app: &AppHandle<R>) {
-    // On mobile the notification is cancelled via `remove_active`; on desktop
-    // there's no per-id cancel, so we re-show a transient (non-ongoing)
-    // notification with the same id that the OS replaces — and it fades as a
-    // normal notification. This keeps the tray tidy.
+    let _ = app;
+}
+
+/// Post the "rendering finished" completion notification for a prerender
+/// pass. Android only — the pass is exactly the background flow this is for;
+/// on desktop prerender results surface in the UI the user launched them
+/// from. Fired by `v2_prerender` only when something actually rendered, so
+/// the periodic no-op passes (everything already fresh) stay silent.
+pub fn notify_render_done<R: tauri::Runtime>(
+    webview: &tauri::Webview<R>,
+    rendered: usize,
+    failed: usize,
+) {
     #[cfg(target_os = "android")]
     {
-        if let Err(e) = app.notification().remove_active(vec![RENDER_NOTIF_ID]) {
-            log::debug!("remove_active failed: {e}");
+        let mut body = format!(
+            "{rendered} script{} rendered",
+            if rendered == 1 { "" } else { "s" }
+        );
+        if failed > 0 {
+            body.push_str(&format!(", {failed} failed"));
         }
+        crate::render_service::notify_done(webview, "Audio rendering finished", &body);
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _ = app;
+        let _ = (webview, rendered, failed);
     }
 }
 
@@ -138,13 +177,14 @@ pub fn clear_render_progress<R: tauri::Runtime>(app: &AppHandle<R>) {
 /// on its own (slightly faster) throttle. The completion tick always passes
 /// both throttles so the bar lands exactly on 100%.
 ///
-/// `notify` is `Some((app, title))` only for foreground UI renders; background
-/// prerenders don't drive the native notification (the app may be in the
-/// background and the pass is incremental).
+/// `notify` is `Some((webview, title))` for foreground UI renders and for
+/// background prerender scripts on Android (where the notification is the
+/// foreground-service progress bar and is exactly what a backgrounded user
+/// sees); desktop background passes pass `None` (results surface in the UI).
 pub fn make_tick_sink<R: tauri::Runtime>(
     progress_app: AppHandle<R>,
     script: String,
-    notify: Option<(AppHandle<R>, String)>,
+    notify: Option<(tauri::Webview<R>, String)>,
 ) -> progress::ProgressSink {
     let mut event_throttle = Throttle::new(EVENT_THROTTLE);
     let mut notif_throttle = Throttle::new(NOTIF_THROTTLE);
@@ -168,9 +208,9 @@ pub fn make_tick_sink<R: tauri::Runtime>(
                 }),
             );
         }
-        if let Some((app, title)) = &notify {
+        if let Some((webview, title)) = &notify {
             if notif_throttle.ready_or_complete(now, snap) {
-                show_render_progress(app, title, snap, eta_secs);
+                show_render_progress(webview, title, snap, eta_secs);
             }
         }
     })
