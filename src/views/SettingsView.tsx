@@ -36,7 +36,7 @@ import {
   Timer,
 } from "lucide-react";
 import { useSettings, exportSettingsJson } from "@/lib/settings";
-import { loadMeta, loadMessages, clearAllChats } from "@/lib/chatStore";
+import { clearAllChats } from "@/lib/chatStore";
 import { getCachedBaseUrl } from "@/lib/audioUrl";
 import type {
   AgentName,
@@ -361,8 +361,9 @@ export function SettingsView({
     setResetBusy(true);
     try {
       await invoke("reset_app_data");
-      // Chats live entirely in frontend localStorage, so the backend reset
-      // doesn't touch them — clear them here too so the wipe is complete.
+      // The backend reset wipes the Rust-owned chat store (chats/); this
+      // also clears the frontend metadata cache and the compaction/anchor
+      // state so the wipe is complete from the UI's perspective too.
       clearAllChats();
       setResetDone(true);
       setResetArmed(false);
@@ -970,21 +971,6 @@ function formatMinutes(minutes: number): string {
   if (h === 0) return `${m}m`;
   if (m === 0) return `${h}h`;
   return `${h}h ${m}m`;
-}
-
-/**
- * Gather every chat (metadata + messages, active and archived) into a single
- * JSON blob for the backup ZIP. Replaces the old single-key `chat-history`
- * read now that chats are multi-entry. Returns null if there are no chats.
- */
-function collectAllChatHistoryJson(): string | null {
-  const chats = loadMeta();
-  if (chats.length === 0) return null;
-  const payload = chats.map((meta) => ({
-    meta,
-    messages: loadMessages(meta.id),
-  }));
-  return JSON.stringify(payload);
 }
 
 /** A labelled number input used in the Chat settings section. */
@@ -2199,10 +2185,11 @@ interface ExportResult {
 /**
  * Full backup: bundles prompts, agent_data (context, scripts, journal,
  * conditioning, routines, rules, activity.db, …), state (inventory.db +
- * chastity.json), rendered tracks, the backend settings (incl. API keys)
- * and the chat history (from localStorage) into a single ZIP. The TTS model
- * in `model/` is excluded (large and redownloadable). API keys ARE included
- * so this is a complete restorable backup — keep the file safe.
+ * chastity.json), the Rust-owned chat transcripts (chats/), rendered tracks,
+ * and the backend settings (incl. API keys) into a single ZIP — the backend
+ * walks those directories itself. The TTS model in `model/` is excluded
+ * (large and redownloadable). API keys ARE included so this is a complete
+ * restorable backup — keep the file safe.
  */
 function ExportAllDataCard() {
   const [busy, setBusy] = useState(false);
@@ -2230,18 +2217,16 @@ function ExportAllDataCard() {
       if (target === null) return; // user cancelled
     }
 
-    // Read the raw payloads so the backup captures settings (incl. API
-    // keys, fetched fresh from the backend's settings.json) and every chat
-    // transcript (active + archived, from localStorage).
+    // Read the raw settings payload (incl. API keys, fetched fresh from the
+    // backend's settings.json). Chat transcripts are bundled by the backend
+    // itself — they live in `<app_data>/chats/`.
     const settingsJson = await exportSettingsJson();
-    const chatHistoryJson = collectAllChatHistoryJson();
 
     setBusy(true);
     try {
       const res = await invoke<ExportResult>("export_all_zip", {
         outPath: target,
         settingsJson,
-        chatHistoryJson,
       });
       setResult(res);
       setOutPath(target);
