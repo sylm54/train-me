@@ -1,12 +1,19 @@
 /**
- * Settings store backed by localStorage.
+ * Settings store backed by the Rust side: everything (API keys, per-agent
+ * model config, chat/playback/audio prefs, onboarding flag) persists as
+ * pretty-printed JSON at `<app data dir>/settings.json` via the
+ * `get_settings` / `set_settings` Tauri commands (see
+ * `src-tauri/src/settings.rs`). The Rust structs mirror `AgentSettings`
+ * and fill per-field defaults, so the backend always returns a complete
+ * object.
  *
- * Persisted values:
- *  - API keys per provider (OpenRouter, OpenAI)
- *  - Model selection for the main agent
+ * Reads go through a module-level in-memory cache so the `useSettings` hook
+ * API stays synchronous for its callers; writes update the cache
+ * immediately and persist to the backend fire-and-forget.
  */
 
 import { useEffect, useState, useCallback } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import type {
   AgentSettings,
   AgentName,
@@ -21,10 +28,6 @@ import { DEFAULT_PLAYBACK_SETTINGS, DEFAULT_AUDIO_SETTINGS } from "./types";
 
 import { ensureNotificationPermission } from "./notifications";
 import { migrateChatSettings } from "./contextUsage";
-
-/** localStorage key under which settings (incl. API keys) are persisted.
- * Exported so the full-data backup can read the raw stored value. */
-export const STORAGE_KEY = "train-me.settings.v1";
 
 /** Default chat behaviour settings. */
 export const DEFAULT_CHAT_SETTINGS: ChatSettings = {
@@ -55,13 +58,16 @@ const DEFAULT_SETTINGS: AgentSettings = {
   onboarded: false,
 };
 
-function load(): AgentSettings {
+/**
+ * Fetch the persisted settings from the backend and merge them over the
+ * frontend defaults (same shape-tolerance the old localStorage loader had,
+ * in case the backend ever returns a partial object).
+ */
+async function load(): Promise<AgentSettings> {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return { ...DEFAULT_SETTINGS };
-    const parsed = JSON.parse(raw) as Partial<AgentSettings>;
+    const parsed = await invoke<AgentSettings>("get_settings");
     return {
-      apiKeys: { ...DEFAULT_SETTINGS.apiKeys, ...(parsed.apiKeys ?? {}) },
+      apiKeys: { ...parsed.apiKeys },
       agents: {
         ...DEFAULT_SETTINGS.agents,
         ...(parsed.agents ?? {}),
@@ -69,7 +75,7 @@ function load(): AgentSettings {
       chat: migrateChatSettings(
         parsed.chat ?? {},
         (parsed.agents?.main ?? DEFAULT_SETTINGS.agents.main),
-        DEFAULT_SETTINGS.chat,
+        DEFAULT_CHAT_SETTINGS,
       ),
       playback: {
         ...DEFAULT_SETTINGS.playback,
@@ -81,18 +87,44 @@ function load(): AgentSettings {
       },
       onboarded: parsed.onboarded ?? false,
     };
-  } catch {
+  } catch (e) {
+    console.warn("Failed to load settings:", e);
     return { ...DEFAULT_SETTINGS };
   }
 }
 
-function save(s: AgentSettings) {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
-  } catch (e) {
-    console.warn("Failed to persist settings:", e);
+/** In-memory mirror of the persisted settings; starts at the defaults. */
+let cache: AgentSettings = { ...DEFAULT_SETTINGS };
+
+/** Whether the initial backend read resolved (or a local write landed —
+ * either way `cache` is authoritative and an in-flight initial read must
+ * not clobber it). */
+let settled = false;
+let loadPromise: Promise<void> | null = null;
+
+/** Kick off the one-time initial load (shared by every hook instance). */
+function ensureLoaded(): Promise<void> {
+  if (!loadPromise) {
+    loadPromise = load().then((s) => {
+      // A write that landed while the read was in flight wins.
+      if (!settled) {
+        cache = s;
+        notifyListeners();
+      }
+      settled = true;
+    });
   }
+  return loadPromise;
+}
+
+function save(s: AgentSettings) {
+  cache = s;
+  // Our write supersedes any still-in-flight initial read.
+  settled = true;
   notifyListeners();
+  invoke("set_settings", { settings: s }).catch((e) => {
+    console.warn("Failed to persist settings:", e);
+  });
 }
 
 /** Same-window subscribers that re-read settings after any write. */
@@ -122,23 +154,21 @@ function notifyListeners() {
 
 /**
  * React hook providing reactive settings + setters.
- * Syncs across components via the storage event.
+ * Syncs across components via the shared in-memory cache (the settings
+ * themselves persist in the Rust backend).
  */
 export function useSettings() {
-  const [settings, setSettings] = useState<AgentSettings>(() => load());
+  const [settings, setSettings] = useState<AgentSettings>(cache);
 
   useEffect(() => {
-    function onStorage(e: StorageEvent) {
-      if (e.key === STORAGE_KEY) {
-        setSettings(load());
-      }
-    }
-    window.addEventListener("storage", onStorage);
-    // Same-window sync: re-read whenever another component's write lands.
-    const update = () => setSettings(load());
+    // Same-window sync: re-read the cache whenever another component's
+    // write lands. The one-time backend load also resolves through here.
+    const update = () => setSettings(cache);
     settingsListeners.add(update);
+    // If the initial load resolved before this effect ran (or resolves
+    // after), make sure this instance picks up the persisted values.
+    void ensureLoaded().then(update);
     return () => {
-      window.removeEventListener("storage", onStorage);
       settingsListeners.delete(update);
     };
   }, []);
@@ -190,14 +220,14 @@ export function useSettings() {
 
   const completeOnboarding = useCallback(() => {
     setSettings(() => {
-      // Re-read the freshest persisted state before flipping the flag.
-      // OnboardingView maintains its own useSettings() instance and writes the
-      // user's keys/models through save(), but the `storage` event only syncs
-      // *other* windows — so this hook's in-memory state is stale by the time
-      // the user finishes. Spreading `prev` here would clobber the just-entered
-      // API key and reasoning effort with a stale snapshot; load() reflects the
-      // values the onboarding UI actually persisted.
-      const next: AgentSettings = { ...load(), onboarded: true };
+      // Read the freshest persisted state before flipping the flag.
+      // OnboardingView maintains its own useSettings() instance and writes
+      // the user's keys/models through save(), which updates the module-level
+      // `cache` synchronously — so `cache` reflects the values the onboarding
+      // UI actually persisted, even if this hook instance's state lags a
+      // render behind. Spreading the stale hook state here would clobber the
+      // just-entered API key and reasoning effort.
+      const next: AgentSettings = { ...cache, onboarded: true };
       save(next);
       return next;
     });
@@ -259,4 +289,18 @@ export function useSettings() {
     completeOnboarding,
     resetOnboarding,
   };
+}
+
+/**
+ * Raw settings JSON as persisted by the backend, for the full-data backup
+ * (Settings → Export all data). `null` if the backend read failed, in which
+ * case the backup simply omits settings.
+ */
+export async function exportSettingsJson(): Promise<string | null> {
+  try {
+    return JSON.stringify(await invoke<AgentSettings>("get_settings"));
+  } catch (e) {
+    console.warn("Failed to read settings for backup:", e);
+    return null;
+  }
 }

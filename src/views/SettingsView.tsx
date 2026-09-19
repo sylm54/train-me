@@ -35,7 +35,7 @@ import {
   Sparkles,
   Timer,
 } from "lucide-react";
-import { useSettings, STORAGE_KEY } from "@/lib/settings";
+import { useSettings, exportSettingsJson } from "@/lib/settings";
 import { loadMeta, loadMessages, clearAllChats } from "@/lib/chatStore";
 import { getCachedBaseUrl } from "@/lib/audioUrl";
 import type {
@@ -370,7 +370,7 @@ export function SettingsView({
       // are no prompts/sandbox content left until a framework is imported).
       resetOnboarding();
       // Reload shortly so every view re-fetches from the now-empty backend.
-      // API keys + model selection (localStorage) and the TTS model survive.
+      // API keys + model selection (settings.json) and the TTS model survive.
       setTimeout(() => window.location.reload(), 1200);
     } catch (e) {
       setResetError(String(e));
@@ -2199,10 +2199,10 @@ interface ExportResult {
 /**
  * Full backup: bundles prompts, agent_data (context, scripts, journal,
  * conditioning, routines, rules, activity.db, …), state (inventory.db +
- * chastity.json), rendered tracks, and the frontend settings + chat history
- * (pulled from localStorage) into a single ZIP. The TTS model in `model/`
- * is excluded (large and redownloadable). API keys ARE included so this is
- * a complete restorable backup — keep the file safe.
+ * chastity.json), rendered tracks, the backend settings (incl. API keys)
+ * and the chat history (from localStorage) into a single ZIP. The TTS model
+ * in `model/` is excluded (large and redownloadable). API keys ARE included
+ * so this is a complete restorable backup — keep the file safe.
  */
 function ExportAllDataCard() {
   const [busy, setBusy] = useState(false);
@@ -2230,9 +2230,10 @@ function ExportAllDataCard() {
       if (target === null) return; // user cancelled
     }
 
-    // Read the raw localStorage payloads so the backup captures settings
-    // (incl. API keys) and every chat transcript (active + archived).
-    const settingsJson = localStorage.getItem(STORAGE_KEY);
+    // Read the raw payloads so the backup captures settings (incl. API
+    // keys, fetched fresh from the backend's settings.json) and every chat
+    // transcript (active + archived, from localStorage).
+    const settingsJson = await exportSettingsJson();
     const chatHistoryJson = collectAllChatHistoryJson();
 
     setBusy(true);
