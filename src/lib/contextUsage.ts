@@ -70,10 +70,12 @@ function messageChars(message: UIMessage): number {
 }
 
 /**
- * Char size of what the model is sent: `systemPrompt` (which already contains
- * the compaction summary when one exists — pass the summary-injected prompt,
- * see `systemPromptWithSummary`) plus the visible content of `messages`
- * (already filtered through `liveMessagesForModel` by the caller).
+ * Char size of a message list as the UI sees it: the visible content of
+ * `messages` (text + tool inputs/outputs), optionally prefixed by
+ * `systemPrompt` when the caller knows it (the agent loop composes the
+ * prompt backend-side now, so ChatView measures messages only — see
+ * `ChatView.useContextUsage` for how the missing constant cancels out of
+ * the growth estimate).
  */
 export function contextCharsOf(
   messages: UIMessage[],

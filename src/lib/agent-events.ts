@@ -1,24 +1,31 @@
 /**
- * Lightweight pub/sub for agent activity the UI cares about.
+ * Agent activity events, as seen by the UI.
  *
- * The agent runtime (transport + subagents) runs in plain TS modules that
- * the React layer can't otherwise observe. Rather than threading callbacks
- * through every tool, we expose a tiny event bus: producers call
- * `emitAgentEvent`, and `ChatView` subscribes via `useAgentEvents`.
+ * Since Stage 3a the agent loop runs natively in Rust
+ * (`src-tauri/src/agent/runner.rs`), and the backend broadcasts every
+ * activity event on the `agent-event` Tauri event. This module is the
+ * frontend's subscriber: it funnels those payloads into the same in-memory
+ * store the old JS loop fed directly, so the React surface
+ * (`useAgentEvents`, `useSessionUsage`) and every event type are unchanged.
  *
  * Two kinds of events flow through here:
  *
- *  - `usage`     — token usage per agent role, emitted when each `streamText`
- *                  step finishes (the main agent's tool loop emits one per
- *                  step, so the context meter advances during long turns).
- *                  The UI accumulates these to show a running token total,
- *                  a cache-hit rate, and (on OpenRouter) the money spent, and
- *                  anchors its live context-size estimate on the latest one.
- *  - `subagent*` — lifecycle + step events for the spawned copy (see
- *                  `subagents.ts`), so the UI can show high-level progress
- *                  ("Working on a task…", "Validating files…") without
- *                  exposing internals. Exact traces still go to the browser
- *                  console via the subagent logger.
+ *  - `usage`     — token usage per agent role, emitted by the backend when
+ *                  each model-call step finishes (a step's prompt tokens ARE
+ *                  the current context size, so the context meter advances
+ *                  during long turns). The UI accumulates these to show a
+ *                  running token total, a cache-hit rate, and (on OpenRouter)
+ *                  the money spent, and anchors its live context-size
+ *                  estimate on the latest one. Usage arrives already
+ *                  normalized (`normalize_usage` in `agent/convert.rs`).
+ *  - `subagent*` — lifecycle + step events for spawned copies
+ *                  (`agent/subagents.rs`), so the UI can show high-level
+ *                  progress ("Working on a task…", "Validating files…")
+ *                  without exposing internals.
+ *
+ * The backend also mirrors coarse activity on the same Tauri event as
+ * `{type:"agent-activity", …}` payloads for background-run progress; those
+ * are NOT part of this store (no consumer) and are filtered out here.
  *
  * Subagents are NOT recursive: a spawned copy gets no `spawn_agent` tool, so
  * delegation is capped at depth 1 structurally. Events still carry a `depth`
@@ -28,10 +35,11 @@
  * calls in one turn), and those are siblings the UI must track separately —
  * not frames of one stack.
  *
- * Events are best-effort: a listener that throws never breaks a producer.
+ * Events are best-effort: a listener that throws never breaks the pipeline.
  */
 
 import { useEffect, useState, useSyncExternalStore } from "react";
+import { listen } from "@tauri-apps/api/event";
 
 /** Which agent produced an event: the main chat loop or a spawned copy. */
 export type AgentRole = "main" | "spawn";
@@ -61,9 +69,9 @@ export type AgentEvent =
       usage: Usage;
       ts: number;
       /**
-       * Char size of what was sent in this call (system prompt + live
-       * messages), main role only. Lets the UI calibrate its char→token
-       * estimate between reports (see `contextUsage.ts`).
+       * Char size of what was sent in this call (system prompt incl. summary
+       * + live messages), main role only. Lets the UI calibrate its
+       * char→token estimate between reports (see `contextUsage.ts`).
        */
       contextChars?: number;
       /**
@@ -207,8 +215,8 @@ export function useSessionUsage(): UsageTotals {
   );
 }
 
-/** Broadcast an agent event to all subscribers. Failures are swallowed. */
-export function emitAgentEvent(event: AgentEvent): void {
+/** Distribute an event to subscribers and fold usage into the totals. */
+function dispatch(event: AgentEvent): void {
   if (event.type === "usage") accumulateUsage(event.usage);
   for (const listener of listeners) {
     try {
@@ -219,53 +227,38 @@ export function emitAgentEvent(event: AgentEvent): void {
   }
 }
 
-/** A finite non-negative number, or undefined when absent/invalid. */
-function num(v: unknown): number | undefined {
-  return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : undefined;
+/**
+ * Narrow an untrusted Tauri event payload to an `AgentEvent`. Anything the
+ * backend emits that this store doesn't model (e.g. `agent-activity`)
+ * returns null and is dropped.
+ */
+function asAgentEvent(payload: unknown): AgentEvent | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  switch ((payload as { type?: unknown }).type) {
+    case "usage":
+    case "subagent-start":
+    case "subagent-step":
+    case "subagent-tool":
+    case "subagent-end":
+      return payload as AgentEvent;
+    default:
+      return null;
+  }
 }
 
-/**
- * Normalize a step's usage object (plus its provider metadata) into a
- * `Usage`. Handles both v5 and v6 SDK field names and pulls the cache/cost
- * details from wherever the current version surfaces them:
- *
- *  - cached tokens: `inputTokenDetails.cacheReadTokens` (v6; the deprecated
- *    `cachedInputTokens` alias also works)
- *  - cost: the raw provider usage (`raw.cost` — OpenRouter reports the exact
- *    charge per call there) or the step's provider metadata
- *    (`openrouter.usage.cost`). OpenAI's API reports neither, so both stay
- *    undefined there and the UI hides the spend.
- */
-export function normalizeUsage(
-  usage: unknown,
-  providerMetadata?: unknown,
-): Usage {
-  const u = (usage ?? {}) as Record<string, unknown>;
-  const details = (u.inputTokenDetails ?? {}) as Record<string, unknown>;
-  const raw = (u.raw ?? {}) as Record<string, unknown>;
+// ── backend subscription ──────────────────────────────────────────────
+//
+// Started once at module load (like the chat store's hydration): the
+// backend owns event production now, and the session-usage totals should
+// accumulate from the first event even before any view subscribes.
 
-  const promptTokens = num(u.promptTokens ?? u.inputTokens) ?? 0;
-  const completionTokens = num(u.completionTokens ?? u.outputTokens) ?? 0;
-
-  const cachedTokens =
-    num(details.cacheReadTokens) ?? num(u.cachedInputTokens);
-
-  let cost = num(raw.cost);
-  if (cost === undefined) {
-    const or = (
-      ((providerMetadata as Record<string, unknown> | undefined)
-        ?.openrouter ?? {}) as Record<string, unknown>
-    )["usage"];
-    if (or != null) cost = num((or as Record<string, unknown>).cost);
-  }
-
-  return {
-    promptTokens,
-    completionTokens,
-    totalTokens: num(u.totalTokens) ?? promptTokens + completionTokens,
-    ...(cachedTokens !== undefined ? { cachedTokens } : {}),
-    ...(cost !== undefined ? { cost } : {}),
-  };
+if (typeof window !== "undefined") {
+  void listen<unknown>("agent-event", (event) => {
+    const agentEvent = asAgentEvent(event.payload);
+    if (agentEvent) dispatch(agentEvent);
+  }).catch((e) => {
+    console.warn("[agent-events] failed to subscribe to agent-event:", e);
+  });
 }
 
 /** Subscribe to agent events. Returns an unsubscribe function. */

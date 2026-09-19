@@ -4,6 +4,12 @@
  * Prompts live in `<app_data_dir>/prompts/`. The Tauri backend exposes
  * read_file / list_files commands scoped to that directory.
  *
+ * Since Stage 3b the agent loop builds its system prompts natively
+ * (`src-tauri/src/agent/prompts.rs` ports these directives verbatim); this
+ * client-side loader now serves only UI surfaces that preview prompt files
+ * (Settings' prompt editor). Keep the directive handling in sync with the
+ * backend port.
+ *
  * Supported directives:
  *
  *   {{embed 'path/to/file.md'}}       Inline the contents of `prompts/path/to/file.md`.
@@ -32,11 +38,26 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import type { FileEntry } from "./types";
-import {
-  LARGE_FILE_LINE_THRESHOLD,
-  READ_HEAD_LINES,
-  getMarkdownHeadingsSummary,
-} from "./tools";
+
+// ── large-file display helpers (inlined from the deleted tools.ts) ────
+
+/** Thresholds for large file handling. */
+const LARGE_FILE_LINE_THRESHOLD = 200;
+const READ_HEAD_LINES = 50;
+
+/** Extract markdown headings with line numbers for display. */
+function getMarkdownHeadingsSummary(content: string): string {
+  const lines = content.split("\n");
+  const headings: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (line.length === 0) continue;
+    if (!line.startsWith("#")) continue;
+    headings.push(`  L${i + 1}: ${line}`);
+  }
+  if (headings.length === 0) return "[No Markdown headings found.]";
+  return `\n[Headings:]\n${headings.join("\n")}\n[End of headings.]`;
+}
 
 // Accept both `{{embed ...}}` (consistent with the other directives) and the
 // legacy `{{{embed ...}}}` triple-brace form. A leading `./` on the path is

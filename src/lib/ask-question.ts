@@ -1,20 +1,32 @@
 /**
- * Pending-question manager: lets agent tools ask the user a question and
- * block (await) until the user answers or cancels.
+ * Pending-question manager: the UI's view of the agent's `ask_question`
+ * tool.
  *
- * A tool calls `poseQuestion`, which registers a promise keyed by an id and
- * notifies React subscribers. The UI (ChatView) renders the pending questions
- * via `usePendingQuestions` and resolves them with `respondToQuestion` /
- * `cancelQuestion`. The resolved value is what the tool returns to the LLM.
+ * Since Stage 3a the blocking registry lives in the Rust backend
+ * (`src-tauri/src/agent/questions.rs`): the tool awaits an answer inside the
+ * native loop, the registry survives process restarts (a snapshot is
+ * restored at boot), and a stale (post-restart) answer is recorded into the
+ * transcript with a continuation run queued automatically. This module is
+ * the frontend's view of that registry:
  *
- * Questions live in a module-level registry and are intentionally not tied to
- * a specific chat: a question blocks a single tool call, and the user should
- * be able to answer it regardless of which chat is active. Only one question
- * is normally in flight at a time (the agent blocks on the tool), but the
- * registry supports any number.
+ *  - hydrated once at load from `list_pending_questions` (newest first)
+ *  - kept live by the backend's `pending-questions-changed` event (each
+ *    change re-reads the authoritative snapshot)
+ *  - resolved with `respondToQuestion` / `cancelQuestion`, which invoke the
+ *    backend's `respond_question` command. The result is what the waiting
+ *    tool returns to the LLM; for an orphaned (post-restart) question the
+ *    backend records the answer into the transcript instead and reports
+ *    `continued: true`.
+ *
+ * Questions are intentionally not tied to a specific chat in the UI: a
+ * question blocks a single tool call, and the user should be able to answer
+ * it regardless of which chat is active. Several can be pending at once
+ * (parallel tool calls).
  */
 
 import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 /** Kind of question. Mirrors the `ask_question` tool's `type` field. */
 export type QuestionType =
@@ -25,7 +37,7 @@ export type QuestionType =
 
 /** A question awaiting the user's answer. */
 export interface PendingQuestion {
-  /** Unique id; used by the UI to resolve the right promise. */
+  /** Unique id; used to resolve the right backend waiter. */
   id: string;
   type: QuestionType;
   /** The question text to show the user. */
@@ -37,7 +49,7 @@ export interface PendingQuestion {
 }
 
 /**
- * What `poseQuestion` resolves with — and what the tool returns to the LLM.
+ * What an answer resolves with — and what the tool returns to the LLM.
  * On success, `answer` is a string ("open"/"single-choice"), a string array
  * ("multi-choice"), or a number ("rating").
  */
@@ -45,12 +57,20 @@ export type QuestionResult =
   | { ok: true; type: QuestionType; answer: string | number | string[] }
   | { ok: false; reason: string };
 
-interface PendingEntry {
-  question: PendingQuestion;
-  resolve: (r: QuestionResult) => void;
+/** What the backend's `respond_question` command reports back. */
+interface RespondOutcome {
+  /** A live tool call received the answer. */
+  delivered: boolean;
+  /** The question outlived its process: the answer was recorded into the
+   * transcript and a continuation run was queued. */
+  continued: boolean;
 }
 
-const pending = new Map<string, PendingEntry>();
+// ── registry snapshot (mirrors the backend) ────────────────────────────
+
+/** Current pending set, newest first (the backend's own ordering). */
+let questions: PendingQuestion[] = [];
+
 const listeners = new Set<() => void>();
 
 /** Notify every subscriber that the pending set changed. Best-effort. */
@@ -64,77 +84,68 @@ function notify() {
   }
 }
 
-/** Resolve a pending question (if any) and drop it from the registry. */
-function settle(id: string, result: QuestionResult): boolean {
-  const entry = pending.get(id);
-  if (!entry) return false;
-  pending.delete(id);
+function setQuestions(next: PendingQuestion[]) {
+  questions = Array.isArray(next) ? next : [];
   notify();
-  try {
-    entry.resolve(result);
-  } catch (e) {
-    console.warn("[ask-question] resolve threw:", e);
-  }
-  return true;
 }
 
-function newId(): string {
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return crypto.randomUUID();
-  }
-  return `q-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+/** Re-read the authoritative snapshot from the backend. Best-effort. */
+function refresh(): void {
+  invoke<PendingQuestion[]>("list_pending_questions")
+    .then(setQuestions)
+    .catch((e) =>
+      console.warn("[ask-question] failed to list pending questions:", e),
+    );
 }
+
+if (typeof window !== "undefined") {
+  refresh();
+  // The backend emits this on every pose/answer/cancel/restore. Re-reading
+  // the full snapshot (rather than diffing payloads) keeps this module
+  // trivial and the ordering exactly the backend's.
+  void listen("pending-questions-changed", () => refresh()).catch((e) =>
+    console.warn("[ask-question] failed to subscribe to changes:", e),
+  );
+}
+
+// ── public API ─────────────────────────────────────────────────────────
 
 /**
- * Pose a question to the user. The returned promise resolves when the user
- * answers (`respondToQuestion`) or cancels (`cancelQuestion`). If an
- * `abortSignal` is supplied — e.g. the generation's "Stop" signal — the
- * question is auto-cancelled with reason "aborted" so the tool call never
- * hangs waiting for a user who has moved on.
+ * Called by the UI when the user answers. Fire-and-forget: the card is
+ * removed when the backend's change event lands (near-instant), which also
+ * covers the orphaned-question path (answer recorded + continuation run).
  */
-export function poseQuestion(
-  q: Omit<PendingQuestion, "id">,
-  abortSignal?: AbortSignal,
-): Promise<QuestionResult> {
-  const id = newId();
-  return new Promise<QuestionResult>((resolve) => {
-    pending.set(id, { question: { id, ...q }, resolve });
-
-    if (abortSignal) {
-      if (abortSignal.aborted) {
-        // Already aborted before we registered: settle right away.
-        settle(id, { ok: false, reason: "aborted" });
-        return;
-      }
-      abortSignal.addEventListener(
-        "abort",
-        () => settle(id, { ok: false, reason: "aborted" }),
-        { once: true },
-      );
-    }
-
-    notify();
-  });
-}
-
-/** Called by the UI when the user answers. No-op if the id is unknown. */
 export function respondToQuestion(
   id: string,
   answer: string | number | string[],
 ): void {
-  const entry = pending.get(id);
-  if (!entry) return;
-  settle(id, { ok: true, type: entry.question.type, answer });
+  const q = questions.find((x) => x.id === id);
+  if (!q) return;
+  const result: QuestionResult = { ok: true, type: q.type, answer };
+  invoke<RespondOutcome>("respond_question", { id, result })
+    .then((out) => {
+      if (!out.delivered && !out.continued) {
+        // Neither live nor orphaned — already resolved elsewhere. The change
+        // event will prune it from the snapshot.
+        console.info(`[ask-question] answer for ${id} was not delivered`);
+      }
+    })
+    .catch((e) =>
+      console.warn(`[ask-question] failed to deliver answer for ${id}:`, e),
+    );
 }
 
-/** Called by the UI when the user dismisses/cancels. No-op if unknown. */
+/** Called by the UI when the user dismisses/cancels a question. */
 export function cancelQuestion(id: string, reason = "user cancelled"): void {
-  settle(id, { ok: false, reason });
+  const result: QuestionResult = { ok: false, reason };
+  invoke("respond_question", { id, result }).catch((e) =>
+    console.warn(`[ask-question] failed to cancel ${id}:`, e),
+  );
 }
 
 /** Snapshot of currently-pending questions, newest first. */
 export function getPendingQuestions(): PendingQuestion[] {
-  return Array.from(pending.values(), (e) => e.question).reverse();
+  return questions;
 }
 
 /**
