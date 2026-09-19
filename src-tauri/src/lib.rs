@@ -35,6 +35,7 @@ mod redgifs_cli;
 mod render_notify;
 mod render_service;
 mod schedule;
+mod settings;
 mod sounds;
 mod tag_parser;
 mod validators;
@@ -482,8 +483,8 @@ pub struct ResetReport {
 
 /// Tauri command: wipe all user data **except** the downloaded TTS model
 /// (in `<data_dir>/model/`) and the API keys / per-agent model selection
-/// (which live in the frontend's localStorage, never touched by the
-/// backend).
+/// (which live in `<data_dir>/settings.json` — never wiped by the reset;
+/// see the `settings` module).
 ///
 /// Reset categories:
 /// - `prompts/`   — cleared (no defaults re-seeded; re-import a framework)
@@ -493,7 +494,7 @@ pub struct ResetReport {
 /// - `chastity.json` — lock state reset to defaults
 /// - `tracks/`     — rendered TTS audio removed
 ///
-/// The TTS model directory and the frontend settings are intentionally
+/// The TTS model directory and `<data_dir>/settings.json` are intentionally
 /// preserved. After this returns, the frontend should reload so every
 /// view re-fetches from the now-empty backend.
 #[tauri::command]
@@ -1390,10 +1391,11 @@ struct ArchiveRoot {
 ///                           routines, rules, voice, `activity.db`, …
 /// - `state/`              — `inventory.db`, `chastity.json`
 /// - `tracks/`             — rendered TTS audio
-/// - `settings.json`       — frontend settings (incl. API keys) from localStorage
+/// - `settings.json`       — frontend settings (incl. API keys), read back
+///                           from `<data_dir>/settings.json` via get_settings
 /// - `chat-history.json`   — the saved chat transcript from localStorage
 ///
-/// `settings_json` / `chat_history_json` are the raw localStorage strings the
+/// `settings_json` / `chat_history_json` are the raw JSON strings the
 /// frontend passes in (they may be `None` if nothing is stored yet). The TTS
 /// model in `model/` is intentionally excluded.
 #[tauri::command]
@@ -1876,6 +1878,9 @@ pub fn run() {
             chastity::get_chastity_state,
             chastity::chastity_lock,
             chastity::chastity_unlock,
+            // App settings (settings.json — API keys, agent models, UI prefs)
+            settings::get_settings,
+            settings::set_settings,
             // v2 engine: economy + schedule (FORMAT.md)
             economy::economy_summary,
             economy::economy_dismiss_pending,

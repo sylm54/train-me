@@ -110,7 +110,8 @@ export const DEFAULT_AUDIO_SETTINGS: AudioSettings = {
   showRenderPill: true,
 };
 
-/** Complete settings persisted to localStorage. */
+/** Complete settings persisted to `<app data dir>/settings.json` (via the
+ * Rust backend's `get_settings` / `set_settings` commands). */
 export interface AgentSettings {
   apiKeys: ApiKeys;
   agents: Record<AgentName, AgentModelConfig>;
