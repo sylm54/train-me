@@ -1047,9 +1047,17 @@ pub async fn validate_data_files(
     path: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<ValidateReport, String> {
-    let mut report = validate_data_files_inner(path, &state);
-    visual_discovery_pass(&mut report, &state).await;
-    Ok(report)
+    Ok(validate_report(path, &state).await)
+}
+
+/// The full validation pipeline (parse/schema pass + visual discovery pass),
+/// shared by the `validate_data_files` command and the native agent's
+/// `validate_files` tool so both produce identical reports. Takes `&AppState`
+/// directly (the command passes `&State`, which deref-coerces).
+pub(crate) async fn validate_report(path: Option<String>, state: &AppState) -> ValidateReport {
+    let mut report = validate_data_files_inner(path, state);
+    visual_discovery_pass(&mut report, state).await;
+    report
 }
 
 /// Best-effort `<visual>` discovery pass: when any validated script uses the
@@ -1058,7 +1066,7 @@ pub async fn validate_data_files(
 /// the cache is fresh) and warn about niche ids the source doesn't know. The
 /// agent explores the live vocabulary itself via the `redgifs` builtin. Fully
 /// offline-tolerant: any failure leaves the report untouched.
-async fn visual_discovery_pass(report: &mut ValidateReport, state: &State<'_, AppState>) {
+async fn visual_discovery_pass(report: &mut ValidateReport, state: &AppState) {
     let agent_dir = state.agent_dir.clone();
     let mut visual_files: Vec<(String, PathBuf)> = Vec::new();
     for r in &report.files {
@@ -1127,7 +1135,7 @@ fn collect_visual_configs(
     visual::collect_configs(nodes, out);
 }
 
-fn validate_data_files_inner(path: Option<String>, state: &State<'_, AppState>) -> ValidateReport {
+fn validate_data_files_inner(path: Option<String>, state: &AppState) -> ValidateReport {
     let agent_dir = state.agent_dir.clone();
     let mut files: Vec<FileReport> = Vec::new();
     let mut errors = 0usize;

@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State};
 
 mod activity_db;
+// Native agent runtime (Stage 3a): the headless agent loop on rig. Public
+// only for its doctests-free command surface — see the module docs.
+pub mod agent;
 mod audio_renderer;
 mod audio_server;
 mod bash;
@@ -1726,6 +1729,13 @@ pub fn run() {
             std::fs::create_dir_all(data_dir.join("chats")).ok();
             chats::init(&data_dir);
 
+            // Bind the native agent runtime (agent loop on rig — see
+            // `agent/mod.rs`) and restore any questions that were pending
+            // when the process last died, so `respond_question` can resolve
+            // them via the restart path and the UI can re-render them.
+            agent::init(app);
+            agent::questions::restore(&data_dir);
+
             // Bootstrap the SQLite DB schemas.
             //
             // activity.db lives inside the agent sandbox (agent_dir/) so
@@ -1894,6 +1904,14 @@ pub fn run() {
             // App settings (settings.json — API keys, agent models, UI prefs)
             settings::get_settings,
             settings::set_settings,
+            // Native agent runtime (Stage 3a — see agent/mod.rs)
+            agent::agent_run,
+            agent::agent_abort,
+            agent::agent_wake_now,
+            agent::respond_question,
+            agent::list_pending_questions,
+            agent::agent_compact,
+            agent::agent_compaction_state,
             // Chat persistence (chats/ dir — index.json + per-chat JSONL)
             chats::chats_list,
             chats::chats_create,

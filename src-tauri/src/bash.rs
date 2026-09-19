@@ -267,7 +267,13 @@ pub fn resolve_under(root: &Path, rel: &str) -> Result<PathBuf, String> {
 /// directory (`<app_data>/agent_data`).
 #[tauri::command]
 pub fn read_data_file(path: String, state: State<'_, crate::AppState>) -> Result<String, String> {
-    let p = resolve_under(&state.agent_dir, &path)?;
+    read_file_under(&state.agent_dir, &path)
+}
+
+/// Free body of `read_data_file`, shared with the native agent's `read_file`
+/// tool so both call sites stay byte-identical.
+pub fn read_file_under(root: &Path, rel: &str) -> Result<String, String> {
+    let p = resolve_under(root, rel)?;
     std::fs::read_to_string(&p).map_err(|e| format!("read {}: {}", p.display(), e))
 }
 
@@ -279,7 +285,13 @@ pub fn write_data_file(
     content: String,
     state: State<'_, crate::AppState>,
 ) -> Result<(), String> {
-    let p = resolve_under(&state.agent_dir, &path)?;
+    write_file_under(&state.agent_dir, &path, &content)
+}
+
+/// Free body of `write_data_file`, shared with the native agent's
+/// `write_file` tool.
+pub fn write_file_under(root: &Path, rel: &str, content: &str) -> Result<(), String> {
+    let p = resolve_under(root, rel)?;
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
@@ -302,11 +314,23 @@ pub fn edit_data_file(
     replace_all: Option<bool>,
     state: State<'_, crate::AppState>,
 ) -> Result<EditResult, String> {
-    let p = resolve_under(&state.agent_dir, &path)?;
+    edit_file_under(&state.agent_dir, &path, &old_string, &new_string, replace_all)
+}
+
+/// Free body of `edit_data_file`, shared with the native agent's
+/// `edit_file` tool.
+pub fn edit_file_under(
+    root: &Path,
+    rel: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: Option<bool>,
+) -> Result<EditResult, String> {
+    let p = resolve_under(root, rel)?;
     let content =
         std::fs::read_to_string(&p).map_err(|e| format!("read {}: {}", p.display(), e))?;
 
-    let count = content.matches(&old_string).count();
+    let count = content.matches(old_string).count();
     if count == 0 {
         return Err(format!(
             "edit {}: old_string not found in file",
@@ -323,15 +347,15 @@ pub fn edit_data_file(
     }
 
     let new_content = if replace_all {
-        content.replace(&old_string, &new_string)
+        content.replace(old_string, new_string)
     } else {
-        content.replacen(&old_string, &new_string, 1)
+        content.replacen(old_string, new_string, 1)
     };
 
     std::fs::write(&p, &new_content).map_err(|e| format!("write {}: {}", p.display(), e))?;
 
     Ok(EditResult {
-        path,
+        path: rel.to_string(),
         replacements: if replace_all { count } else { 1 },
         bytes: new_content.len(),
     })
@@ -344,7 +368,13 @@ pub fn list_data_files(
     path: String,
     state: State<'_, crate::AppState>,
 ) -> Result<Vec<crate::FileEntry>, String> {
-    let p = resolve_under(&state.agent_dir, &path)?;
+    list_entries_under(&state.agent_dir, &path)
+}
+
+/// Free body of `list_data_files`, shared with the native agent's
+/// `list_files` tool.
+pub fn list_entries_under(root: &Path, rel: &str) -> Result<Vec<crate::FileEntry>, String> {
+    let p = resolve_under(root, rel)?;
     if !p.exists() {
         return Ok(Vec::new());
     }
@@ -360,7 +390,7 @@ pub fn list_data_files(
         let entry_path = entry.path();
         // Relative-to-agent_dir path for the frontend.
         let rel = entry_path
-            .strip_prefix(&state.agent_dir)
+            .strip_prefix(root)
             .map(|p| p.to_string_lossy().replace('\\', "/"))
             .unwrap_or_else(|_| entry_path.to_string_lossy().to_string());
 
