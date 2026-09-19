@@ -1,282 +1,166 @@
 /**
- * Agent runtime: custom ChatTransport that calls OpenRouter (or any
- * OpenAI-compatible endpoint) directly from the browser via streamText.
+ * Agent transport: a thin proxy onto the native Rust agent loop.
  *
- * Tauri apps don't have API routes, so we can't use the default
- * `DefaultChatTransport`. Instead we implement `ChatTransport` ourselves
- * and pass the user's API key + model from settings.
- */
-
-import {
-  streamText,
-  isLoopFinished,
-  convertToModelMessages,
-  type UIMessage,
-  type ChatTransport,
-  type ToolSet,
-} from "ai";
-import { createOpenAI } from "@ai-sdk/openai";
-import { createOpenRouter } from "@openrouter/ai-sdk-provider";
-
-import type { AgentSettings, AgentName, ProviderName } from "./types";
-import { MAIN_AGENT_TOOLS } from "./tools";
-import { buildSpawnAgentTool } from "./subagents";
-import { emitAgentEvent, normalizeUsage, type AgentRole } from "./agent-events";
-import {
-  getCompaction,
-  liveMessagesForModel,
-  systemPromptWithSummary,
-} from "./compaction";
-import { contextCharsOf } from "./contextUsage";
-
-/**
- * Report token usage for an agent role to the UI event bus.
+ * Since Stage 3a the whole agent loop (provider config, system prompt
+ * composition, tool execution, subagents, compaction, persistence) runs
+ * natively under `src-tauri/src/agent/`. This module is all that remains
+ * client-side: a `ChatTransport` that forwards `useChat` sends to the
+ * `agent_run` Tauri command and streams the AI-SDK-shaped UIMessage chunks
+ * the backend emits over its IPC `Channel` back into the SDK.
  *
- * The AI SDK exposes usage per finished step; we normalize it (handling both
- * v5 and v6 field names, plus cache-hit counts and — on OpenRouter — the
- * per-call charge, see `normalizeUsage`) and emit one event per step. For the
- * main agent the prompt tokens of a step are the *actual context size at that
- * moment* — the value the context meter is anchored on (see `contextUsage.ts`).
- * Deliberately NOT the stream's cumulative `totalUsage`: the tool loop re-sends
- * the whole context every step, so summing across steps would over-count and
- * make the meter overshoot. Failures are ignored — usage is informational,
- * never load-bearing.
+ * Lifecycle of one send:
+ *
+ *   1. `sendMessages` opens a `ReadableStream<UIMessageChunk>` and a
+ *      `Channel`, then invokes `agent_run { chatId, messages, onChunk }`.
+ *   2. Backend chunks (`start`, `start-step`, `text-*`,
+ *      `tool-*-available`, `finish-step`, `finish` | `error` | `abort`)
+ *      arrive on the channel and are enqueued verbatim — the runner's
+ *      chunk sequencer guarantees SDK-valid parts, so no remapping here.
+ *   3. A terminal part (`finish` / `error` / `abort`) closes the stream.
+ *      The `agent_run` promise resolution is a safety-net close (delayed
+ *      one macrotask so already-queued channel callbacks flush first).
+ *
+ * Notes:
+ *  - `agent_run` never rejects mid-run: hard failures arrive as an `error`
+ *    part (and `RunInfo.error`). Only infra-level failures (runtime not
+ *    initialised, argument serialization) reject the invoke — those are
+ *    converted into an `error` part so the UI's error banner still works.
+ *  - Single-flight: if another turn is in flight, the backend queues this
+ *    run FIFO. The stream simply stays silent until the ticket frees
+ *    (the UI shows "Waiting…"); the invoke does not reject on wait.
+ *  - Abort: the SDK's `abortSignal` (the Stop button) is wired to
+ *    `agent_abort`, which cancels the app-wide in-flight turn — the run
+ *    then ends with an `abort` part. Queued runs are NOT cleared.
+ *  - The backend persists the transcript itself (up-front + after every
+ *    step) and emits usage/subagent events on the `agent-event` Tauri
+ *    event (see `agent-events.ts`) — this transport does neither.
  */
-function reportUsage(
-  role: AgentRole,
-  usage: unknown,
-  opts?: {
-    contextChars?: number;
-    chatId?: string;
-    /** Step provider metadata — OpenRouter's exact charge lives here. */
-    providerMetadata?: unknown;
-  },
-) {
-  try {
-    emitAgentEvent({
-      type: "usage",
-      role,
-      ts: Date.now(),
-      usage: normalizeUsage(usage, opts?.providerMetadata),
-      contextChars: opts?.contextChars,
-      chatId: opts?.chatId,
-    });
-  } catch (e) {
-    console.warn("[agent] usage report failed:", e);
-  }
-}
 
-/** Endpoint URLs per provider (used by the OpenAI provider only). */
-const PROVIDER_BASE_URL: Record<ProviderName, string> = {
-  openrouter: "https://openrouter.ai/api/v1",
-  openai: "https://api.openai.com/v1",
-};
+import { invoke, Channel } from "@tauri-apps/api/core";
+import type { ChatTransport, UIMessage, UIMessageChunk } from "ai";
 
-/**
- * Build a configured provider client for the given agent.
- * Uses the official OpenRouter provider for OpenRouter and the OpenAI
- * provider for OpenAI. Returns null if the API key is missing.
- */
-export function getProvider(settings: AgentSettings, agent: AgentName) {
-  const cfg = settings.agents[agent];
-  const apiKey = settings.apiKeys[cfg.provider];
-  if (!apiKey) return null;
-
-  if (cfg.provider === "openrouter") {
-    const provider = createOpenRouter({ apiKey });
-    return {
-      provider,
-      model: cfg.model,
-      modelSettings: cfg.reasoningEffort
-        ? { includeReasoning: true }
-        : undefined,
-    };
-  }
-
-  const baseURL = PROVIDER_BASE_URL[cfg.provider];
-  const provider = createOpenAI({ baseURL, apiKey });
-  return { provider, model: cfg.model, modelSettings: undefined };
+/** Outcome of one `agent_run` invocation (mirrors Rust `RunInfo`). */
+interface AgentRunInfo {
+  /** The run completed its loop without a hard error. */
+  ok: boolean;
+  /** True when the run was cancelled via `agent_abort`. */
+  aborted: boolean;
+  /** Model-call steps executed. */
+  steps: number;
+  /** First hard error, if any. */
+  error?: string;
 }
 
 /**
- * Build `providerOptions` for the AI SDK's streamText/generateText calls.
- * If the agent has a `reasoningEffort` configured:
- * - OpenRouter: passes `reasoning.effort` via the `openrouter` provider key
- * - OpenAI: passes `reasoningEffort` + `forceReasoning` via the `openai` key
+ * Chunk types that end a run's stream. The backend sends exactly one per
+ * run, always last (see `src-tauri/src/agent/chunks.rs`).
  */
-export function buildProviderOptions(
-  settings: AgentSettings,
-  agent: AgentName,
-) {
-  const effort = settings.agents[agent].reasoningEffort;
-  if (!effort) return undefined;
+function isTerminalChunk(type: string): boolean {
+  return type === "finish" || type === "error" || type === "abort";
+}
 
-  if (settings.agents[agent].provider === "openrouter") {
-    return {
-      openrouter: {
-        reasoning: { effort },
-      },
-    };
-  }
-
+/**
+ * Create the main agent transport. Takes no configuration: the backend
+ * reads settings and builds prompts itself, and the transport is created
+ * exactly once for the app lifetime (`useChat` only captures the transport
+ * at Chat-instance creation time), so there is nothing to re-read per send.
+ */
+export function createMainAgentTransport(): ChatTransport<UIMessage> {
   return {
-    openai: {
-      reasoningEffort: effort,
-      forceReasoning: true,
-    },
-  };
-}
+    async sendMessages({ messages, chatId, abortSignal }) {
+      let closed = false;
+      let controller: ReadableStreamDefaultController<UIMessageChunk> | null =
+        null;
 
-/**
- * Build the main agent's toolset. Includes the base tools (bash, files,
- * validate_files, ask_question) plus the `spawn_agent` subagent tool. The
- * spawn tool is rebuilt whenever `settings` change because it captures
- * the settings for the spawned LLM call.
- */
-export function buildMainAgentTools(settings: AgentSettings): ToolSet {
-  return {
-    ...MAIN_AGENT_TOOLS,
-    spawn_agent: buildSpawnAgentTool(settings),
-  };
-}
-
-/**
- * TransformStream that removes reasoning events from the UIMessage stream
- * so the model's thinking is never shown in the UI. Reasoning text is
- * logged to the browser console for debugging instead.
- */
-function stripReasoningFromStream() {
-  let reasoningText = "";
-  return new TransformStream({
-    transform(
-      chunk: Record<string, unknown>,
-      controller: TransformStreamDefaultController,
-    ) {
-      const type = chunk.type as string;
-      if (
-        type === "reasoning-start" ||
-        type === "reasoning-delta" ||
-        type === "reasoning-end"
-      ) {
-        if (type === "reasoning-delta") {
-          reasoningText += (chunk as { delta?: string }).delta ?? "";
+      const close = () => {
+        if (closed) return;
+        closed = true;
+        try {
+          controller?.close();
+        } catch {
+          // Already closed (e.g. a terminal chunk raced us) — fine.
         }
-        if (type === "reasoning-end") {
-          if (reasoningText) {
-            console.log(
-              "%c[main] 💭 reasoning",
-              "color: #888",
-              reasoningText.length > 200
-                ? reasoningText.slice(0, 200) + "…"
-                : reasoningText,
-            );
-          }
-          reasoningText = "";
+      };
+
+      const enqueue = (chunk: UIMessageChunk) => {
+        if (closed || !controller) return;
+        try {
+          controller.enqueue(chunk);
+        } catch {
+          // Stream already closed/cancelled — stop feeding it.
+          closed = true;
         }
-        // Drop the chunk so reasoning never reaches the UI.
-        return;
-      }
-      controller.enqueue(chunk);
-    },
-  });
-}
+      };
 
-/**
- * Create a custom `ChatTransport` that streams from the main agent.
- *
- * IMPORTANT — live values via getters: `useChat` in `@ai-sdk/react` captures
- * its `transport` only at Chat-instance creation time and only recreates the
- * Chat when the `id` option changes — NOT when `transport` changes. If we
- * closed over `settings`/`systemPrompt` and built a fresh transport object on
- * each settings change (the old design), `useChat` would keep using the stale
- * transport, routing sends through an outdated model/API key/endpoint — one of
- * the causes of "message sent but agent never responds".
- *
- * So this transport is created ONCE for the app lifetime and reads the current
- * settings + system prompt + compaction state through the getters each call.
- * That guarantees every send uses the latest configuration without ever
- * remounting the chat (which would interrupt in-flight generations).
- *
- * Compaction: per-call, the summarized prefix is dropped from what we send and
- * replaced by the summary injected into the system prompt (see
- * `liveMessagesForModel` / `systemPromptWithSummary`). The UI `messages` array
- * is never mutated here — it keeps the full transcript for display.
- *
- * Note: we ignore `trigger`/`messageId` because we re-derive everything from
- * `messages`.
- */
-export function createMainAgentTransport(opts: {
-  /** Read the current settings (model, API keys, provider). */
-  getSettings: () => AgentSettings;
-  /** Read the current (unsummarized) base system prompt. */
-  getSystemPrompt: () => string;
-}): ChatTransport<UIMessage> {
-  return {
-    async sendMessages({ messages, body, abortSignal, chatId }) {
-      // Read the latest configuration on every call.
-      const settings = opts.getSettings();
-      const baseSystemPrompt = opts.getSystemPrompt();
-
-      const bodyObj = (body ?? {}) as Record<string, unknown>;
-      const agent = (bodyObj.agent as AgentName | undefined) ?? "main";
-      const cfg = getProvider(settings, agent);
-      if (!cfg) {
-        throw new Error(
-          `No API key configured for provider "${settings.agents[agent].provider}". ` +
-            "Open Settings and add your API key.",
-        );
-      }
-
-      // Apply compaction: drop the summarized prefix from what the model sees,
-      // and fold the summary into the system prompt. `chatId` from the SDK
-      // (which equals the useChat `id` = activeChatId) keys the compaction
-      // state. Fall back to the full array if no compaction state exists.
-      const compaction = chatId ? getCompaction(chatId) : null;
-      const liveMessages = liveMessagesForModel(messages, compaction);
-      const systemPrompt = systemPromptWithSummary(baseSystemPrompt, compaction);
-
-      // Char size of what we're sending — attached to usage events so the UI
-      // can calibrate its char→token estimate between step reports.
-      const contextChars = contextCharsOf(liveMessages, systemPrompt);
-
-      const modelMessages = await convertToModelMessages(liveMessages);
-
-      // Rebuild tools from current settings each call (the spawn_agent tool
-      // captures settings).
-      const tools = buildMainAgentTools(settings);
-
-      // Use `.chat()` to force the Chat Completions API (/chat/completions).
-      // The default `provider(modelId)` call uses OpenAI's Responses API
-      // (/responses), which uses `item_reference` / `function_call_output`
-      // item types that OpenRouter and most other OpenAI-compatible
-      // providers do not understand. Without `.chat()`, prior assistant
-      // text, tool calls, and tool results are silently dropped, causing
-      // the agent to appear to "forget" everything after a tool call.
-      const result = streamText({
-        model: cfg.provider.chat(cfg.model, cfg.modelSettings),
-        system: systemPrompt,
-        messages: modelMessages,
-        tools,
-        stopWhen: isLoopFinished(),
-        abortSignal,
-        providerOptions: buildProviderOptions(settings, agent) as Parameters<
-          typeof streamText
-        >[0]["providerOptions"],
-        // Report usage per step (LLM call). A step's prompt tokens ARE the
-        // current context size, so the meter advances after each tool round
-        // of a long turn instead of only when the whole turn settles.
-        onStepFinish: ({ usage, providerMetadata }) =>
-          reportUsage("main", usage, {
-            contextChars,
-            chatId: chatId ?? undefined,
-            providerMetadata,
-          }),
+      // Feed backend channel messages straight into the stream. The runner
+      // emits SDK-valid parts (strictObject schemas, verified against
+      // ai@6's uiMessageChunkSchema), so parts pass through unmodified.
+      const channel = new Channel<unknown>((part) => {
+        const chunk = part as UIMessageChunk;
+        if (!chunk || typeof chunk.type !== "string") return;
+        enqueue(chunk);
+        if (isTerminalChunk(chunk.type)) close();
       });
 
-      return result.toUIMessageStream().pipeThrough(stripReasoningFromStream());
+      const stream = new ReadableStream<UIMessageChunk>({
+        start(c) {
+          controller = c;
+        },
+        cancel() {
+          close();
+        },
+      });
+
+      // Stop button: cancel the in-flight turn app-wide. The backend ends
+      // the run with an `abort` part, which closes the stream above.
+      const onAbort = () => {
+        void invoke("agent_abort").catch((e) =>
+          console.warn("[agent] abort failed:", e),
+        );
+      };
+      if (abortSignal) {
+        if (abortSignal.aborted) onAbort();
+        else abortSignal.addEventListener("abort", onAbort, { once: true });
+      }
+
+      // Kick off the run. May block in the backend FIFO gate while another
+      // turn finishes — the stream simply doesn't emit until then.
+      void invoke<AgentRunInfo>("agent_run", {
+        chatId,
+        messages,
+        onChunk: channel,
+      })
+        .then((info) => {
+          // Defensive: the runner always sends an `error` part before
+          // returning a failed RunInfo — but if one somehow didn't make it
+          // over IPC, surface the failure the same way so the UI can show it.
+          if (info?.error && !closed) {
+            enqueue({ type: "error", errorText: info.error });
+          }
+          // The promise can resolve a tick before the last channel message
+          // is delivered over IPC — defer the safety-net close by one
+          // macrotask so queued callbacks flush first.
+          setTimeout(close, 0);
+        })
+        .catch((e) => {
+          // Infra-level failure (runtime not initialised, bad args):
+          // convert to the error part the UI already knows how to render.
+          enqueue({
+            type: "error",
+            errorText: typeof e === "string" ? e : String(e),
+          });
+          close();
+        })
+        .finally(() => {
+          abortSignal?.removeEventListener("abort", onAbort);
+        });
+
+      return stream;
     },
 
-    // Reconnection is not supported for client-side streaming.
+    // Reconnection is not supported: runs live in the backend process and
+    // there is nothing to resume after a webview restart. (The backend's
+    // persisted transcript covers recovery.)
     reconnectToStream: async () => null,
   };
 }

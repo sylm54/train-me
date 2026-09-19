@@ -30,7 +30,6 @@ import { useSyncExternalStore, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { nanoid } from "nanoid";
 import type { UIMessage } from "ai";
-import { clearCompaction, clearAllCompaction } from "./compaction";
 import {
   clearContextAnchor,
   clearAllContextAnchors,
@@ -293,24 +292,24 @@ export function deleteChatPermanently(id: string) {
     emit();
   }
   void invokeAfterHydration("chats_delete_permanently", { id }).catch(warnWrite);
-  // Also drop any compaction state + context-size anchor for this chat.
-  clearCompaction(id);
+  // Drop the chat's persisted context-size anchor. (Compaction sidecars are
+  // backend files now — the backend owns their lifecycle, so nothing to
+  // clear here for them.)
   clearContextAnchor(id);
 }
 
 /**
- * Wipe every chat: metadata, all per-chat transcripts, and compaction state.
- * Used by the Settings "reset all app data" action (the backend's
- * `reset_app_data` wipes the same store — this also clears the frontend
- * cache and the localStorage-backed compaction/anchor state). Emits once so
- * subscribers re-render.
+ * Wipe every chat: metadata and all per-chat transcripts. Used by the
+ * Settings "reset all app data" action (the backend's `reset_app_data` wipes
+ * the same store). Emits once so subscribers re-render. (Compaction sidecars
+ * are backend files — the backend owns their lifecycle; the frontend only
+ * clears the localStorage context anchors.)
  */
 export function clearAllChats() {
   metaCache = [];
   rebuildSnapshot();
   emit();
   void invokeAfterHydration("chats_clear_all").catch(warnWrite);
-  clearAllCompaction();
   clearAllContextAnchors();
 }
 

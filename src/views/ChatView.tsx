@@ -1,28 +1,34 @@
 /**
  * Chat view: the main agent interface.
  *
- * Loads the system prompt on mount (from `prompts/main_agent.md`),
- * reloads it whenever the backend reports that prompt inputs changed
- * (onboarding answers → `agent_data/USER.md`, framework installs → the
- * prompt store), wires the custom OpenRouter transport to `useChat`, and
- * renders a streaming message list.
+ * Wires the native Rust agent loop to `useChat` through a proxy transport
+ * (`lib/agent.ts` → the `agent_run` Tauri command) and renders a streaming
+ * message list. The backend owns the loop: settings/provider config, system
+ * prompt composition (rebuilt when its inputs change — onboarding answers,
+ * framework installs), tool execution, subagents, per-step usage events
+ * (the `agent-event` Tauri event, see `lib/agent-events.ts`), and transcript
+ * persistence (saved up-front and after every step, so the UI does not
+ * double-write it). The UI still mirrors the finished transcript to the
+ * agent's disk (`chats/<id>.xml`) so the agent can read its own history
+ * via `read_file`.
  *
  * Multi-chat: the app owns the active chat id. Switching it spins up a fresh
- * `useChat` instance (the SDK keys off `id`), whose messages we rehydrate from
- * the chat store. Clearing a chat archives it (transcript kept + saved to
- * `chats/<id>.xml` on the agent's disk) rather than destroying it; a true
+ * `useChat` instance (the SDK keys off `id`), whose messages we rehydrate
+ * from the chat store. Clearing a chat archives it (transcript kept + saved
+ * to `chats/<id>.xml` on the agent's disk) rather than destroying it; a true
  * delete is only available from the archive list.
  *
  * Context meter: the footer shows how full the model's context window is,
- * as a continuous estimate anchored on the last actual per-step usage report
- * (see `lib/contextUsage.ts`) — so the bar keeps moving during long turns
- * instead of jumping once per completed call. A notch on the bar marks the
+ * as a continuous estimate anchored on the last backend usage report (which
+ * carries the exact context size the model was sent — see
+ * `lib/contextUsage.ts`) — so the bar keeps moving during long turns instead
+ * of jumping once per completed call. A notch on the bar marks the
  * auto-compact threshold (% of the window, from Settings). When the estimate
  * crosses it, a BLOCKING modal opens ("Compacting conversation…") while the
- * older turns are SUMMARIZED by the model, then shows the summary: it's
- * injected into the system prompt and the summarized prefix is dropped from
- * what's sent — but the full transcript is never removed from the UI or disk.
- * (See `lib/compaction.ts`.)
+ * backend summarizes the older turns, then shows the summary: it's injected
+ * into the system prompt backend-side and the summarized prefix is dropped
+ * from what the loop sends — but the full transcript is never removed from
+ * the UI or disk. (See `lib/compaction.ts`.)
  *
  * Design: the UI shows *progress*, not internals. Tool calls render as
  * compact one-liners (e.g. "Edited file · path/foo.ts"); reasoning just
@@ -37,29 +43,26 @@
  * model" (request sent, no token yet), "thinking" (reasoning streaming),
  * and "working" (text/tools streaming), and warns when no chunk has arrived
  * for a while — so a stuck stream is distinguishable from slow thinking.
+ * (A queued turn — the backend runs one app-wide — looks like a long
+ * "waiting" phase; the run streams once its ticket frees.)
  *
  * Failure recovery: if a generation finishes without producing any assistant
  * content (the "message sent but nothing happened" symptom), an inline
- * "Retry" affordance re-requests the last user message instead of leaving the
- * user staring at silence.
+ * "Retry" affordance re-requests the last user message instead of leaving
+ * the user staring at silence.
  *
- * Implementation note: we split this into an outer loader (ChatView)
- * and an inner chat (ChatViewInner). `useChat` in `@ai-sdk/react`
- * captures its `transport` only at Chat-instance creation time and only
- * recreates the Chat when the `chat` or `id` option changes — not when
- * `transport` changes. So the outer component builds ONE stable transport
- * (via getters that read live settings/prompt from refs) and never
- * recreates it: every send reads the latest configuration without
- * remounting the chat, which both avoids the stale-transport bug and
- * guarantees in-flight generations are never interrupted by a settings
- * edit. The inner component still mounts only once the prompt is ready.
+ * Implementation note: `useChat` in `@ai-sdk/react` captures its `transport`
+ * only at Chat-instance creation time and only recreates the Chat when the
+ * `chat` or `id` option changes — not when `transport` changes. The
+ * transport is therefore built ONCE for the app lifetime. It needs no
+ * configuration (the backend reads settings and builds prompts), so the
+ * outer component mounts the inner chat immediately.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type React from "react";
 import { useChat } from "@ai-sdk/react";
 import type { UIMessage } from "ai";
-import { listen } from "@tauri-apps/api/event";
 import {
   AlertCircle,
   Archive,
@@ -85,10 +88,6 @@ import {
 
 import { useSettings } from "@/lib/settings";
 import { playCompletionSound } from "@/lib/completionSound";
-import {
-  loadPrompt,
-  resetIncludeSnapshots,
-} from "@/lib/prompts";
 import { createMainAgentTransport } from "@/lib/agent";
 import type { AgentSettings } from "@/lib/types";
 import { useAgentEvents, useSessionUsage, type AgentEvent } from "@/lib/agent-events";
@@ -107,11 +106,7 @@ import {
 } from "@/lib/chatStore";
 import { writeChatXml } from "@/lib/chatExport";
 import {
-  findCompactionBoundary,
-  getCompaction,
-  liveMessagesForModel,
   runCompaction,
-  systemPromptWithSummary,
   type CompactionState,
 } from "@/lib/compaction";
 import {
@@ -185,100 +180,15 @@ export function ChatView({
 }: ChatViewProps) {
   const { settings } = useSettings();
 
-  // Load (and reload) the system prompt.
-  const [systemPrompt, setSystemPrompt] = useState<string>("");
-  const [promptLoading, setPromptLoading] = useState(true);
-  const [promptError, setPromptError] = useState<string | null>(null);
+  // The transport is built exactly ONCE for the app lifetime and needs no
+  // configuration: the backend reads settings and builds the system prompt
+  // itself, per run. (`useChat` only captures the transport at Chat-instance
+  // creation time and never re-reads it, so stability is what matters.)
+  const transport = useMemo(() => createMainAgentTransport(), []);
 
-  // Stable identity: run on mount and re-run whenever the backend reports
-  // that prompt inputs changed (see the listener effect below).
-  const refreshPrompt = useCallback(async () => {
-    setPromptLoading(true);
-    setPromptError(null);
-    // Start a fresh include snapshot window for this session: any
-    // `{{include './...'}}` directive in the prompt will read from disk on
-    // first reference and lock that content for the life of the session.
-    resetIncludeSnapshots();
-    try {
-      const content = await loadPrompt("main_agent.md");
-      setSystemPrompt(content);
-    } catch (e) {
-      setPromptError(String(e));
-      setSystemPrompt("");
-    } finally {
-      setPromptLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    void refreshPrompt();
-  }, [refreshPrompt]);
-
-  // Rebuild the system prompt when its inputs change on disk. The prompt
-  // and its `{{include}}` snapshots are cached for the session and this
-  // component never remounts, so without this the agent would keep a
-  // stale prompt after onboarding answers rewrite `agent_data/USER.md` (or
-  // after a framework update rewrites the prompt store) until a restart.
-  // Mid-generation sends are unaffected: the transport reads the prompt
-  // per send, so the fresh one applies from the next turn on.
-  useEffect(() => {
-    const un = listen("prompt-inputs-changed", () => {
-      void refreshPrompt();
-    });
-    return () => {
-      void un.then((f) => f());
-    };
-  }, [refreshPrompt]);
-
-  // Keep the latest settings + system prompt in refs so the transport's
-  // getters can read them on every call. This lets us build the transport
-  // exactly ONCE for the app lifetime — so `useChat` (which only captures the
-  // transport at Chat-instance creation) always uses a transport that reads
-  // current values, instead of a stale snapshot. Changing model/provider in
-  // Settings now takes effect on the next send without remounting the chat.
-  const settingsRef = useRef(settings);
-  settingsRef.current = settings;
-  const systemPromptRef = useRef(systemPrompt);
-  systemPromptRef.current = systemPrompt;
-
-  // The transport is stable: it consults the refs above per call. Created
-  // once the prompt has loaded (so the first prompt isn't empty), and never
-  // recreated — identity stays the same for the rest of the session.
-  const transport = useMemo(() => {
-    if (!systemPrompt) return null;
-    return createMainAgentTransport({
-      getSettings: () => settingsRef.current,
-      getSystemPrompt: () => systemPromptRef.current,
-    });
-    // Deliberately empty deps: build once when the prompt is first ready,
-    // then keep it forever. The getters read live values via refs.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [systemPrompt]);
-
-  // The chat needs an API key for the configured provider.
-  const apiKeyMissing =
-    !settings.apiKeys[settings.agents.main.provider] && !!transport;
-
-  // CRITICAL: do not mount ChatViewInner (which calls `useChat`) until the
-  // transport is ready. `useChat` captures its `transport` only at Chat-instance
-  // creation time and never re-reads it (only an `id` change recreates the
-  // Chat). If we passed `transport: undefined` on first mount — e.g. while the
-  // system prompt is still loading right after onboarding — the SDK would fall
-  // back to its built-in `DefaultChatTransport`, which POSTs to `/api/chat`.
-  // This is a Tauri app with no such server route, so the very first send after
-  // onboarding fails with a 404 until the user "Clear"s (which remounts with a
-  // new key, by which time the transport is ready). Mounting only once the
-  // transport exists guarantees `useChat` captures the real transport.
-  if (!transport) {
-    return (
-      <div className="flex flex-col h-full">
-        <div className="m-3 px-3 py-2 rounded-md bg-[var(--color-surface-muted)] border border-[var(--color-border)] text-xs text-[var(--color-muted-foreground)] flex items-center gap-2">
-          <Loader2 size={12} className="animate-spin" />
-          {promptError ? "Prompt load error — see Settings." : "Loading main agent prompt…"}
-        </div>
-      </div>
-    );
-  }
+  // The chat needs an API key for the configured provider (the backend
+  // surfaces a clear error without one, but we can warn before sending).
+  const apiKeyMissing = !settings.apiKeys[settings.agents.main.provider];
 
   return (
     <ChatViewInner
@@ -287,9 +197,6 @@ export function ChatView({
       onActiveChatChange={onActiveChatChange}
       transport={transport}
       settings={settings}
-      systemPrompt={systemPrompt}
-      promptLoading={promptLoading}
-      promptError={promptError}
       apiKeyMissing={apiKeyMissing}
       onOpenSettings={onOpenSettings}
     />
@@ -299,12 +206,8 @@ export function ChatView({
 interface ChatViewInnerProps {
   activeChatId: string;
   onActiveChatChange: (id: string) => void;
-  // Non-null: ChatView only renders ChatViewInner once the transport is built.
   transport: ReturnType<typeof createMainAgentTransport>;
   settings: AgentSettings;
-  systemPrompt: string;
-  promptLoading: boolean;
-  promptError: string | null;
   apiKeyMissing: boolean;
   onOpenSettings?: () => void;
 }
@@ -314,18 +217,14 @@ function ChatViewInner({
   onActiveChatChange,
   transport,
   settings,
-  systemPrompt,
-  promptLoading,
-  promptError,
   apiKeyMissing,
   onOpenSettings,
 }: ChatViewInnerProps) {
   // useChat only captures the transport at Chat-instance creation time.
-  // The outer component builds a STABLE transport (via getters that read
-  // live settings/prompt from refs), so there is no stale-transport problem:
-  // every send reads the latest configuration without remounting the chat.
-  // Switching `activeChatId` still remounts this component (key=activeChatId),
-  // so each chat gets its own useChat instance + clean event window.
+  // The outer component builds a STABLE transport, so there is no
+  // stale-transport problem. Switching `activeChatId` still remounts this
+  // component (key=activeChatId), so each chat gets its own useChat
+  // instance + clean event window.
   const { messages, sendMessage, regenerate, status, error, setMessages, stop } =
     useChat({
       id: activeChatId,
@@ -350,9 +249,7 @@ function ChatViewInner({
   // We therefore only load from disk when the SDK starts empty — i.e. a
   // fresh hook instance with no retained messages. This keeps a live chat's
   // state intact across navigation while still recovering after a restart.
-  const didRehydrate = useRef(false);
   useEffect(() => {
-    didRehydrate.current = true;
     if (messages.length > 0) return; // SDK already has messages for this id
     // loadMessages is async (transcripts live in the Rust backend now);
     // guard against unmount/switch racing the round-trip.
@@ -366,38 +263,22 @@ function ChatViewInner({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ── Persist messages (debounced) + bump chat activity ──────────────
-  // Save on every change so a refresh/crash never loses the transcript,
-  // but debounce the backend write so streaming doesn't thrash it.
-  const saveTimer = useRef<number | null>(null);
-  useEffect(() => {
-    if (!didRehydrate.current) return; // skip the initial empty/mount pass
-    if (messages.length === 0) return;
-    if (saveTimer.current) window.clearTimeout(saveTimer.current);
-    saveTimer.current = window.setTimeout(() => {
-      saveMessages(activeChatId, messages);
-    }, 400);
-    return () => {
-      if (saveTimer.current) window.clearTimeout(saveTimer.current);
-    };
-  }, [messages, activeChatId]);
-
-  // Also persist immediately when generation finishes (so the transcript is
-  // on disk even if the user closes the window right after). This is also
-  // where we detect the "agent never responded" failure mode: the stream
-  // finished (status left `submitted`/`streaming`) but produced no assistant
-  // message — the trailing message is still the user's, or the last assistant
-  // message is empty. In that case we surface a Retry affordance instead of
-  // leaving the user staring at silence.
+  // ── Transcript persistence ─────────────────────────────────────────
+  // The backend persists the transcript itself (the incoming array is saved
+  // up-front, then rewritten after every step — see the runner's
+  // persistence contract), so the UI must NOT auto-save stream output:
+  // a stale full-array rewrite from here would fight the runner's own
+  // writes. User-initiated mutations (archive, delete, rename) still go
+  // through the chat store commands. What remains here is the mirror to
+  // the agent's disk (`chats/<id>.xml`, so the agent can read its own
+  // history via read_file), written when a generation finishes.
   const isGenerating = status === "submitted" || status === "streaming";
   const wasGenerating = useRef(false);
   const [emptyResponse, setEmptyResponse] = useState(false);
   const completionSoundEnabled = settings.chat.completionSound;
   useEffect(() => {
     if (wasGenerating.current && !isGenerating && messages.length > 0) {
-      saveMessages(activeChatId, messages);
-      // Write the simplified transcript to the agent's disk so the agent
-      // (and auto-compact) can recover full history via read_file.
+      // Mirror the finished transcript to the agent's disk.
       writeChatXml(messages, activeChatId);
       touchChat(activeChatId, messages.find((m) => m.role === "user") ?? null);
 
@@ -505,15 +386,16 @@ function ChatViewInner({
   }, [activeChatId, messages, onActiveChatChange]);
 
   // ── Context meter + auto-compact ────────────────────────────────────
-  // The meter anchors on the last actual per-step usage report and advances
-  // continuously between reports (char growth → estimated tokens, see
-  // lib/contextUsage.ts). The threshold is a % of the model's context window
-  // (resolved live from OpenRouter / presets / manual override). Crossing it
-  // at turn end opens the blocking CompactionModal — visible over any view,
-  // since ChatView stays mounted — while one summarization pass runs; the
-  // next send then reports a small context again, which re-arms the latch.
+  // The meter anchors on the last backend usage report (which carries the
+  // exact char size of what the loop sent) and advances continuously between
+  // reports (char growth → estimated tokens, see lib/contextUsage.ts). The
+  // threshold is a % of the model's context window (resolved live from
+  // OpenRouter / presets / manual override). Crossing it at turn end opens
+  // the blocking CompactionModal — visible over any view, since ChatView
+  // stays mounted — while the backend runs one summarization pass; the next
+  // send then reports a small context again, which re-arms the latch.
   // The UI `messages` array is NEVER truncated — the full history stays
-  // visible (and on disk at chats/<id>.xml).
+  // visible (and on disk).
   const { compactThresholdPct, compactKeepTurns } = settings.chat;
   const contextWindow = useContextWindow(
     settings.agents.main,
@@ -526,7 +408,6 @@ function ChatViewInner({
   const { tokens: contextTokens, anchor } = useContextUsage(
     events,
     messages,
-    systemPrompt,
     activeChatId,
     anchorResetAt,
   );
@@ -538,17 +419,12 @@ function ChatViewInner({
     null,
   );
 
-  // Keep latest settings in a ref so the async summarize callback reads
-  // current values rather than a stale snapshot from when the effect ran.
-  const settingsRef = useRef(settings);
-  settingsRef.current = settings;
-
   useEffect(() => {
     if (compactedRef.current || compactingRef.current) return;
     if (contextTokens < thresholdTokens) return;
     if (messages.length === 0) return;
     if (isGenerating) return; // don't summarize mid-stream
-    if (apiKeyMissing) return; // need the key to call the summarizer
+    if (apiKeyMissing) return; // the backend's summarizer needs the key too
     // After a failure, wait out the cooldown instead of re-opening the
     // blocking modal (and re-calling the summarizer) on every update.
     if (
@@ -557,9 +433,14 @@ function ChatViewInner({
     ) {
       return;
     }
-    // Nothing can be compacted (the keep-turns window already reaches the
-    // start of the conversation) — latch so we don't re-check forever.
-    if (findCompactionBoundary(messages, compactKeepTurns) === 0) {
+    // Cheap pre-check for the common "nothing can be compacted" case (the
+    // keep-turns window already reaches the start of the conversation), so
+    // the blocking modal doesn't flash: the backend owns the real boundary
+    // decision and re-checks it anyway.
+    const conversational = messages.filter(
+      (m) => m.role === "user" || m.role === "assistant",
+    ).length;
+    if (conversational <= compactKeepTurns) {
       compactedRef.current = true;
       return;
     }
@@ -568,8 +449,9 @@ function ChatViewInner({
     setCompactionUi({ phase: "running" });
     (async () => {
       try {
+        // One compaction pass on the backend: boundary selection, the
+        // summarizer call, and sidecar persistence all live there now.
         const state = await runCompaction(
-          settingsRef.current,
           activeChatId,
           messages,
           compactKeepTurns,
@@ -587,13 +469,16 @@ function ChatViewInner({
               `(${state.lastSummarizedId}) — ${messages.length} messages still fully visible`,
           );
         } else {
-          // Summarization genuinely failed (runCompaction already fell back
-          // to keeping the old context). Tell the user briefly, then retry
-          // automatically after the cooldown.
-          lastCompactFailRef.current = Date.now();
-          setCompactionUi({ phase: "failed" });
-          window.setTimeout(() => setCompactionUi(null), 2500);
+          // Nothing compactable after all (backend verdict) — latch quietly.
+          compactedRef.current = true;
+          setCompactionUi(null);
         }
+      } catch {
+        // The command itself failed (persistence error, runtime down).
+        // Tell the user briefly, then retry automatically after the cooldown.
+        lastCompactFailRef.current = Date.now();
+        setCompactionUi({ phase: "failed" });
+        window.setTimeout(() => setCompactionUi(null), 2500);
       } finally {
         compactingRef.current = false;
       }
@@ -666,15 +551,10 @@ function ChatViewInner({
       />
 
       {/* ── Errors ─────────────────────────────────────────────── */}
-      {(promptError || error) && (
+      {error && (
         <div className="m-3 px-3 py-2 rounded-md bg-[var(--color-pink-100)] border border-[var(--color-danger)] text-[var(--color-danger)] text-xs flex items-start gap-2">
           <AlertCircle size={14} className="mt-0.5 shrink-0" />
           <div>
-            {promptError && (
-              <p>
-                <strong>Prompt load error:</strong> {promptError}
-              </p>
-            )}
             {error && (
               <p>
                 <strong>Agent error:</strong> {error.message}
@@ -705,18 +585,10 @@ function ChatViewInner({
         </div>
       )}
 
-      {/* ── Banner: prompt not yet loaded ──────────────────────── */}
-      {promptLoading && (
-        <div className="m-3 px-3 py-2 rounded-md bg-[var(--color-surface-muted)] border border-[var(--color-border)] text-xs text-[var(--color-muted-foreground)] flex items-center gap-2">
-          <Loader2 size={12} className="animate-spin" />
-          Loading main agent prompt…
-        </div>
-      )}
-
       {/* ── Conversation ───────────────────────────────────────── */}
       <Conversation>
         <ConversationContent className="px-4 py-6 gap-4">
-          {messages.length === 0 && !promptLoading && (
+          {messages.length === 0 && (
             <ConversationEmptyState>
               <div className="mx-auto size-16 rounded-2xl bg-gradient-to-br from-[var(--color-pink-200)] to-[var(--color-pink-400)] grid place-items-center text-white shadow-sm">
                 <span className="text-2xl font-bold">T</span>
@@ -724,12 +596,6 @@ function ChatViewInner({
               <h3 className="text-lg font-semibold tracking-tight">
                 Welcome to Train-Me
               </h3>
-              {!systemPrompt && (
-                <p className="text-xs text-[var(--color-warning)] mt-2">
-                  <code className="font-mono">prompts/main_agent.md</code> not
-                  found — create it to give the agent a personality.
-                </p>
-              )}
             </ConversationEmptyState>
           )}
 
@@ -786,7 +652,7 @@ function ChatViewInner({
             value={input}
             onChange={(e) => setInput(e.target.value)}
             placeholder={
-              !transport
+              apiKeyMissing
                 ? "Configure API key in Settings to begin…"
                 : "Message the agent… (Shift+Enter for newline)"
             }
@@ -797,7 +663,7 @@ function ChatViewInner({
           <PromptInputSubmit
             status={status}
             onStop={stop}
-            disabled={!transport || (!isGenerating && !input.trim())}
+            disabled={!isGenerating && !input.trim()}
           />
         </PromptInputFooter>
       </PromptInput>
@@ -860,12 +726,20 @@ const COMPACT_FAIL_COOLDOWN_MS = 30_000;
  * Track the CURRENT context size continuously.
  *
  * The anchor is the most recent main-agent usage report for THIS chat (its
- * prompt+completion tokens are the actual context size at that step; events
- * from other chats are ignored, and a persisted anchor restores the meter
- * after a chat switch or restart). Between anchors the estimate advances with
- * the visible char growth of what the model sees — recomputed on every
- * `messages` change, i.e. every stream chunk — converted at a ratio
- * calibrated from the anchor itself (see `lib/contextUsage.ts`).
+ * prompt+completion tokens are the actual context size at that moment; the
+ * backend attaches the exact char size of what it sent — system prompt incl.
+ * summary + live messages — so events from other chats are ignored and a
+ * persisted anchor restores the meter after a chat switch or restart).
+ *
+ * Between anchors the estimate advances with visible char growth converted
+ * at a ratio calibrated from the anchor itself (see `lib/contextUsage.ts`).
+ * The rendered system prompt is backend-side now, so the frontend can only
+ * count message chars; growth is therefore measured against the message char
+ * count captured when each anchor arrived — the prompt is constant between
+ * compactions, so its chars cancel out of the delta. (`anchor.chars` holds
+ * that captured baseline; the anchor's own `contextChars` is only used for
+ * validation.) The baseline is also persisted per chat, so the meter
+ * survives chat switches and restarts instead of resetting to 0.
  *
  * This is deliberately NOT a cumulative lifetime sum: the meter must reflect
  * how full the window is *right now*. `resetAt` (set when a compaction
@@ -876,7 +750,6 @@ const COMPACT_FAIL_COOLDOWN_MS = 30_000;
 function useContextUsage(
   events: AgentEvent[],
   messages: UIMessage[],
-  systemPrompt: string,
   chatId: string,
   resetAt: number,
 ): { tokens: number; anchor: ContextAnchor | null } {
@@ -891,23 +764,49 @@ function useContextUsage(
     return last;
   }, [events, chatId]);
 
+  // Visible char size of the transcript as the UI sees it (no system prompt
+  // — the loop composes that backend-side; see the growth-baseline note
+  // above). Recomputed on every `messages` change, i.e. every stream chunk.
+  const liveChars = useMemo(() => contextCharsOf(messages, ""), [messages]);
+
+  // Message char count at the moment the latest anchor arrived — the
+  // baseline the growth delta is measured against. Captured on the render
+  // where the anchor first appears (its `messages` snapshot already includes
+  // everything streamed up to that step).
+  const anchorBaselineRef = useRef<{ ts: number; chars: number } | null>(null);
+  if (
+    anchorEvent &&
+    typeof anchorEvent.contextChars === "number" &&
+    anchorEvent.contextChars > 0 &&
+    anchorBaselineRef.current?.ts !== anchorEvent.ts
+  ) {
+    anchorBaselineRef.current = { ts: anchorEvent.ts, chars: liveChars };
+  }
+
   const anchor = useMemo<ContextAnchor | null>(() => {
-    if (anchorEvent && anchorEvent.ts > resetAt) {
-      const chars = anchorEvent.contextChars;
-      if (typeof chars === "number" && chars > 0) {
-        return {
-          tokens:
-            anchorEvent.usage.promptTokens +
-            anchorEvent.usage.completionTokens,
-          chars,
-          updatedAt: anchorEvent.ts,
-        };
-      }
+    if (
+      anchorEvent &&
+      anchorEvent.ts > resetAt &&
+      typeof anchorEvent.contextChars === "number" &&
+      anchorEvent.contextChars > 0
+    ) {
+      return {
+        tokens:
+          anchorEvent.usage.promptTokens +
+          anchorEvent.usage.completionTokens,
+        chars: anchorBaselineRef.current?.chars ?? liveChars,
+        updatedAt: anchorEvent.ts,
+      };
     }
     // Fall back to the persisted anchor (chat switch / app restart), unless
-    // it predates a compaction reset.
+    // it predates a compaction reset. (Its `chars` is the backend's
+    // prompt+messages count, so growth reads low until the next fresh
+    // report floors the estimate at the anchor level — harmless.)
     const persisted = getContextAnchor(chatId);
     return persisted && persisted.updatedAt > resetAt ? persisted : null;
+    // `liveChars` is intentionally not a dep: the baseline ref must not move
+    // while the anchor event is unchanged.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [anchorEvent, chatId, resetAt]);
 
   // Persist the anchor so the meter survives chat switches and restarts.
@@ -915,18 +814,7 @@ function useContextUsage(
     if (anchor) saveContextAnchor(chatId, anchor);
   }, [anchor, chatId]);
 
-  // Live char size of what the model sees: summary-injected system prompt +
-  // live messages (summarized prefix dropped). Re-reads compaction state on
-  // every recompute so a just-finished compaction is reflected promptly.
-  const charsNow = useMemo(() => {
-    const compaction = getCompaction(chatId);
-    return contextCharsOf(
-      liveMessagesForModel(messages, compaction),
-      systemPromptWithSummary(systemPrompt, compaction),
-    );
-  }, [messages, systemPrompt, chatId, anchor]);
-
-  return { tokens: estimateContextTokens(anchor, charsNow), anchor };
+  return { tokens: estimateContextTokens(anchor, liveChars), anchor };
 }
 
 // ── Chat header ───────────────────────────────────────────────────────
