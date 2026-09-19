@@ -102,6 +102,14 @@ bashkit = { version = "0.9", features = ["realfs", "sqlite"] }
 # Async runtime required by bashkit
 tokio = { version = "1", features = ["full"] }
 
+# LLM agent runtime (Stage 3a): providers + multi-turn tool loop for the
+# native agent. rustls-based TLS only — no openssl in the Android graph.
+rig-core = "0.42"
+# Stream combinators for driving rig's `StreamingCompletionResponse` (which
+# implements `futures::Stream`). Same 0.3 line rig-core uses, so the crate is
+# shared, not duplicated.
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+
 # ZIP archive support for package imports
 zip = "2"
 
