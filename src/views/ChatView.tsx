@@ -354,14 +354,21 @@ function ChatViewInner({
   useEffect(() => {
     didRehydrate.current = true;
     if (messages.length > 0) return; // SDK already has messages for this id
-    const saved = loadMessages(activeChatId);
-    if (saved.length > 0) setMessages(saved);
+    // loadMessages is async (transcripts live in the Rust backend now);
+    // guard against unmount/switch racing the round-trip.
+    let cancelled = false;
+    void loadMessages(activeChatId).then((saved) => {
+      if (!cancelled && saved.length > 0) setMessages(saved);
+    });
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // ── Persist messages (debounced) + bump chat activity ──────────────
   // Save on every change so a refresh/crash never loses the transcript,
-  // but debounce the localStorage write so streaming doesn't thrash it.
+  // but debounce the backend write so streaming doesn't thrash it.
   const saveTimer = useRef<number | null>(null);
   useEffect(() => {
     if (!didRehydrate.current) return; // skip the initial empty/mount pass

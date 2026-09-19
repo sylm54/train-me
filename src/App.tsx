@@ -22,7 +22,7 @@ import { useRoutineNotifier } from "@/lib/use-routine-notifier";
 import { useAppForeground } from "@/lib/appFocus";
 import { useJinglePlayer } from "@/lib/jinglePlayer";
 import type { SessionRequest } from "@/lib/v2";
-import { createChat, ensureActiveChat } from "@/lib/chatStore";
+import { createChat, ensureActiveChat, setActiveChat } from "@/lib/chatStore";
 import { useIdleChatSweeper } from "@/hooks/useIdleChatSweeper";
 import type { View } from "@/lib/views";
 
@@ -32,10 +32,30 @@ export default function App() {
 
   // The active chat id is owned here so it survives view switches (the
   // ChatView is kept mounted; only its `key` changes when the chat does).
-  // Lazily pick the newest active chat, creating one if none exists.
-  const [activeChatId, setActiveChatId] = useState<string>(
-    () => ensureActiveChat().id,
-  );
+  // Resolved from the backend's persisted index once on mount — the
+  // working-chat pointer, falling back to the newest active chat, creating
+  // one if none exists (see chatStore.ensureActiveChat). ChatView mounts
+  // once the id lands.
+  const [activeChatId, setActiveChatId] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    void ensureActiveChat()
+      .then((c) => {
+        if (!cancelled) setActiveChatId(c.id);
+      })
+      .catch((e) => console.warn("[app] failed to resolve active chat:", e));
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Switch the active chat AND keep the backend's persisted working-chat
+  // pointer in sync (chatStore.createChat points it at its own chat; this
+  // covers switcher picks and restores).
+  const changeActiveChat = useCallback((id: string) => {
+    setActiveChatId(id);
+    setActiveChat(id);
+  }, []);
 
   // Stable navigate callback used to switch views (sidebar + the
   // global in-app link interceptor below).
@@ -136,11 +156,13 @@ export default function App() {
           when active preserves the original layout (ChatView behaves as a
           direct child of <main>). */}
       <div className={view === "chat" ? "contents" : "hidden"}>
-        <ChatView
-          activeChatId={activeChatId}
-          onActiveChatChange={setActiveChatId}
-          onOpenSettings={() => setView("settings")}
-        />
+        {activeChatId !== null && (
+          <ChatView
+            activeChatId={activeChatId}
+            onActiveChatChange={changeActiveChat}
+            onOpenSettings={() => setView("settings")}
+          />
+        )}
       </div>
       {view !== "chat" && body}
       <NoticeToasts isForeground={isForeground} />

@@ -28,11 +28,14 @@ export function useIdleChatSweeper(
     const idleMs = idleClearMinutes * 60_000;
 
     const sweep = () => {
-      const stale = pruneIdleChats(idleMs);
-      for (const id of stale) {
-        archiveChat(id, "idle");
-        if (id === activeChatId) onActiveCleared(id);
-      }
+      // Async round-trip to the backend (authoritative index); the promise
+      // never rejects (prune failures resolve to []).
+      void pruneIdleChats(idleMs).then((stale) => {
+        for (const id of stale) {
+          archiveChat(id, "idle");
+          if (id === activeChatId) onActiveCleared(id);
+        }
+      });
     };
 
     // Run once immediately (in case the app was closed past the threshold)

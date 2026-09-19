@@ -13,6 +13,7 @@ mod audio_renderer;
 mod audio_server;
 mod bash;
 mod chastity;
+mod chats;
 mod cond;
 mod debug_time;
 mod economy;
@@ -478,6 +479,7 @@ pub struct ResetReport {
     pub activity: bool,
     pub inventory: bool,
     pub chastity: bool,
+    pub chats: bool,
     pub tracks: bool,
 }
 
@@ -492,6 +494,7 @@ pub struct ResetReport {
 /// - `activity.db` — the activity log is emptied (autoincrement reset)
 /// - `inventory.db` — items + wishlist rows deleted (autoincrement left as-is)
 /// - `chastity.json` — lock state reset to defaults
+/// - `chats/`      — chat transcripts wiped (see `chats.rs`)
 /// - `tracks/`     — rendered TTS audio removed
 ///
 /// The TTS model directory and `<data_dir>/settings.json` are intentionally
@@ -525,6 +528,12 @@ async fn reset_app_data(state: State<'_, AppState>) -> Result<ResetReport, Strin
     // 3. Chastity — reset to the default (unlocked, no countdown) state.
     chastity::ChastityState::default().save(&state.state_dir.join("chastity.json"))?;
     report.chastity = true;
+
+    // 3b. Chats — wipe the Rust-owned transcript store (index.json + per-chat
+    //     .jsonl files). Chats are user data, so like every other category
+    //     they do not survive a reset (settings.json is the exception).
+    chats::clear_all()?;
+    report.chats = true;
 
     // 4. Inventory — wipe via rusqlite. The DB is at state_dir/inventory.db.
     {
@@ -1390,19 +1399,19 @@ struct ArchiveRoot {
 /// - `agent_data/`         — agent scratch: journal, scripts, conditioning,
 ///                           routines, rules, voice, `activity.db`, …
 /// - `state/`              — `inventory.db`, `chastity.json`
+/// - `chats/`              — chat transcripts: `index.json` + per-chat
+///                           `.jsonl` files (`chats.rs`)
 /// - `tracks/`             — rendered TTS audio
 /// - `settings.json`       — frontend settings (incl. API keys), read back
 ///                           from `<data_dir>/settings.json` via get_settings
-/// - `chat-history.json`   — the saved chat transcript from localStorage
 ///
-/// `settings_json` / `chat_history_json` are the raw JSON strings the
-/// frontend passes in (they may be `None` if nothing is stored yet). The TTS
-/// model in `model/` is intentionally excluded.
+/// `settings_json` is the raw JSON string the frontend passes in (it may be
+/// `None` if nothing is stored yet). The TTS model in `model/` is
+/// intentionally excluded.
 #[tauri::command]
 async fn export_all_zip(
     out_path: Option<String>,
     settings_json: Option<String>,
-    chat_history_json: Option<String>,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ExportResult, String> {
@@ -1410,6 +1419,7 @@ async fn export_all_zip(
     let prompts_dir = state.data_dir.join("prompts");
     let agent_dir = state.agent_dir.clone();
     let state_dir = state.state_dir.clone();
+    let chats_dir = state.data_dir.join("chats");
     let tracks_dir = state.tracks_dir.clone();
 
     let roots = vec![
@@ -1426,13 +1436,17 @@ async fn export_all_zip(
             prefix: "state",
         },
         ArchiveRoot {
+            source: chats_dir,
+            prefix: "chats",
+        },
+        ArchiveRoot {
             source: tracks_dir,
             prefix: "tracks",
         },
     ];
 
     let zip_bytes = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
-        gather_full_zip(roots, settings_json, chat_history_json)
+        gather_full_zip(roots, settings_json)
     })
     .await
     .map_err(|e| format!("Export task failed: {}", e))??;
@@ -1457,17 +1471,13 @@ async fn export_all_zip(
 }
 
 /// Walk every `ArchiveRoot` recursively and write the whole tree into a fresh
-/// in-memory ZIP. `settings_json` and `chat_history_json` (if present) are
-/// added as top-level `settings.json` / `chat-history.json` entries.
+/// in-memory ZIP. `settings_json` (if present) is added as a top-level
+/// `settings.json` entry.
 ///
 /// Files are stored under their `prefix/` + source-relative, forward-slash
 /// names so unzipping reproduces the on-disk layout. Unreadable files are
 /// skipped with a non-fatal warning rather than aborting the whole backup.
-fn gather_full_zip(
-    roots: Vec<ArchiveRoot>,
-    settings_json: Option<String>,
-    chat_history_json: Option<String>,
-) -> Result<Vec<u8>, String> {
+fn gather_full_zip(roots: Vec<ArchiveRoot>, settings_json: Option<String>) -> Result<Vec<u8>, String> {
     let mut warnings: Vec<String> = Vec::new();
 
     // Collect (archive_name, bytes) entries. We buffer file bytes eagerly so
@@ -1528,9 +1538,6 @@ fn gather_full_zip(
 
     if let Some(s) = settings_json {
         entries.push(("settings.json".to_string(), s.into_bytes()));
-    }
-    if let Some(c) = chat_history_json {
-        entries.push(("chat-history.json".to_string(), c.into_bytes()));
     }
 
     // Build the ZIP.
@@ -1713,6 +1720,12 @@ pub fn run() {
             // Ensure agent_data/ exists with conventional subdirs.
             bash::ensure_agent_dir(&data_dir).ok();
 
+            // Ensure chats/ exists (chat transcripts: index.json + per-chat
+            // .jsonl) and bind the process-wide chat store BEFORE any command
+            // can fire. See `chats.rs`.
+            std::fs::create_dir_all(data_dir.join("chats")).ok();
+            chats::init(&data_dir);
+
             // Bootstrap the SQLite DB schemas.
             //
             // activity.db lives inside the agent sandbox (agent_dir/) so
@@ -1881,6 +1894,24 @@ pub fn run() {
             // App settings (settings.json — API keys, agent models, UI prefs)
             settings::get_settings,
             settings::set_settings,
+            // Chat persistence (chats/ dir — index.json + per-chat JSONL)
+            chats::chats_list,
+            chats::chats_create,
+            chats::chats_save_messages,
+            chats::chats_get_messages,
+            chats::chats_append_message,
+            chats::chats_archive,
+            chats::chats_restore,
+            chats::chats_rename,
+            chats::chats_touch,
+            chats::chats_delete_permanently,
+            chats::chats_delete_messages,
+            chats::chats_clear_all,
+            chats::chats_prune_idle,
+            chats::chats_ensure_active,
+            chats::chats_get_active_chat,
+            chats::chats_set_active_chat,
+            chats::chats_replace_meta,
             // v2 engine: economy + schedule (FORMAT.md)
             economy::economy_summary,
             economy::economy_dismiss_pending,

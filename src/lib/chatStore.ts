@@ -1,25 +1,33 @@
 /**
  * Multi-chat persistence layer.
  *
- * Replaces the old single `localStorage["chat-history"]` slot with a
- * collection of chats, each with metadata (title, timestamps, archive state)
- * and its own message array. Two localStorage keys back this:
+ * Chats are stored by the Rust backend under `<app_data>/chats/`:
  *
- *   - `STORE_KEY`     → `{ chats: ChatMeta[], version: 1 }`
- *   - `MSG_PREFIX<id>` → `JSON.stringify(UIMessage[])` for one chat
+ *   - `index.json`  → `{ version, activeChatId, chats: ChatMeta[] }`
+ *   - `<id>.jsonl`  → one JSON message per line, for one chat
  *
- * Reactivity: a tiny pub/sub drives a `useSyncExternalStore` hook so every
- * subscriber (ChatView header, switcher, footer) re-renders together when
- * metadata changes. Message arrays are large and change on every token, so
- * they are read/written imperatively by ChatView (not through the store) to
- * avoid re-rendering the whole tree on each streamed delta.
+ * The backend owns the bytes (see `src-tauri/src/chats.rs`); this module is
+ * the frontend's view of it. Metadata is cached in memory (hydrated once
+ * from `chats_list` at startup) so `useSyncExternalStore` keeps its
+ * synchronous-snapshot contract; every mutation updates that cache
+ * optimistically and writes through to the backend commands, which are the
+ * source of truth on disk. Message arrays are large and change on every
+ * token, so they are read/written imperatively by ChatView (not through the
+ * reactive store) to avoid re-rendering the whole tree on each streamed
+ * delta — `saveMessages` stays fire-and-forget, while `loadMessages` is now
+ * async (its callers await it).
  *
- * On first load, a legacy `chat-history` entry (the pre-multi-chat single
- * transcript) is imported as one active chat so existing users keep their
- * history.
+ * The index also carries a persisted `activeChatId` pointer (the working
+ * chat): `ensureActiveChat` resolves it on startup and the UI keeps it in
+ * sync on create/switch, so the backend's future headless agent runner can
+ * find the working transcript without any webview running.
+ *
+ * There is deliberately NO migration from the old webview localStorage
+ * store — that data is abandoned.
  */
 
 import { useSyncExternalStore, useCallback } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { nanoid } from "nanoid";
 import type { UIMessage } from "ai";
 import { clearCompaction, clearAllCompaction } from "./compaction";
@@ -28,15 +36,12 @@ import {
   clearAllContextAnchors,
 } from "./contextUsage";
 
-/** localStorage key holding the chat metadata array. */
-const STORE_KEY = "train-me.chats.v1";
-/** localStorage key prefix holding one chat's serialized UIMessage[]. */
-const MSG_PREFIX = "train-me.chat.msgs.";
-/** The pre-multi-chat single-transcript key, migrated on first load. */
-const LEGACY_KEY = "chat-history";
-
 /** Why a chat was moved to the archive. */
 export type ArchiveReason = "cleared" | "idle" | "compact-reset";
+
+/** Where a chat came from. The backend defaults to "user"; later stages set
+ * "agent-action" / "cron" for headlessly-created chats. */
+export type ChatOrigin = "user" | "agent-action" | "cron";
 
 /** Metadata for one chat (active or archived). */
 export interface ChatMeta {
@@ -52,19 +57,95 @@ export interface ChatMeta {
   archivedAt: number | null;
   /** Why it was archived, if it was. */
   archivedReason?: ArchiveReason;
+  /** Where the chat came from ("user" default). */
+  origin?: ChatOrigin;
 }
 
-interface StoredShape {
-  chats: ChatMeta[];
-  version: number;
+// ── metadata cache (hydrated from the backend) ──────────────────────────
+//
+// The cache mirrors the backend's index.json. All writes go through the
+// backend commands (write-through); mutations ALSO update the cache
+// optimistically so the reactive hooks stay synchronous. Because mutations
+// are deferred until hydration settles (see `invokeAfterHydration`), the one
+// initial read can never clobber a concurrent local write — and any command
+// that returns authoritative state re-upserts it on resolution.
+
+/** Cached metadata in index (creation) order — mirrors the backend's array. */
+let metaCache: ChatMeta[] = [];
+/** Referentially-stable, sorted view for useSyncExternalStore. */
+let metaSnapshot: ChatMeta[] = [];
+
+let hydrationStarted = false;
+let hydration: Promise<void> = Promise.resolve();
+
+function rebuildSnapshot() {
+  metaSnapshot = [...metaCache].sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+/**
+ * Hydrate the metadata cache from the backend once per session. Like the old
+ * legacy migration, this runs at module load; the returned promise resolves
+ * after the cache is populated (or after a failure logged and swallowed —
+ * the app still works, the switcher is just empty).
+ */
+function ensureHydrated(): Promise<void> {
+  if (!hydrationStarted && typeof window !== "undefined") {
+    hydrationStarted = true;
+    hydration = invoke<ChatMeta[]>("chats_list")
+      .then((chats) => {
+        metaCache = Array.isArray(chats) ? chats : [];
+      })
+      .then(rebuildSnapshot)
+      .then(emit)
+      .catch((e) => {
+        console.warn("[chatStore] failed to load chat metadata:", e);
+      });
+  }
+  return hydration;
+}
+
+if (typeof window !== "undefined") {
+  ensureHydrated();
+}
+
+/** Invoke a mutating command only after the initial load has settled, so a
+ * write can never be serialized ahead of the read that hydrates the cache. */
+function invokeAfterHydration<T>(
+  cmd: string,
+  args?: Record<string, unknown>,
+): Promise<T> {
+  return ensureHydrated().then(() => invoke<T>(cmd, args));
+}
+
+/** Log a failed backend write (best-effort, like the old quota handler). */
+function warnWrite(e: unknown) {
+  console.warn("[chatStore] backend write failed:", e);
+}
+
+/** Insert or replace one chat in the cache (no emit). */
+function upsertLocalMeta(meta: ChatMeta) {
+  const i = metaCache.findIndex((c) => c.id === meta.id);
+  if (i >= 0) metaCache[i] = meta;
+  else metaCache = [...metaCache, meta];
+}
+
+/** Patch one cached chat in place; returns false if it isn't cached. */
+function patchLocalMeta(id: string, patch: (m: ChatMeta) => ChatMeta): boolean {
+  const i = metaCache.findIndex((c) => c.id === id);
+  if (i < 0) return false;
+  const next = [...metaCache];
+  next[i] = patch(next[i]);
+  metaCache = next;
+  return true;
 }
 
 // ── pub/sub ─────────────────────────────────────────────────────────────
 //
 // Module-level listener set + emit helper. Subscriptions fire on metadata
-// mutations only (create/archive/rename/delete + touch). Message saves go
-// through `saveMessages` which does NOT emit — ChatView owns message state in
-// React and persists via a debounced effect; the store just stores bytes.
+// changes only (hydration, create/archive/rename/delete + touch). Message
+// saves go through `saveMessages` which does NOT emit — ChatView owns
+// message state in React and persists via a debounced effect; the store just
+// ships bytes to the backend.
 
 const listeners = new Set<() => void>();
 
@@ -85,151 +166,64 @@ function subscribe(cb: () => void): () => void {
   };
 }
 
-// Keep this store in sync across tabs/windows via the storage event.
-if (typeof window !== "undefined") {
-  window.addEventListener("storage", (e) => {
-    if (e.key === STORE_KEY) emit();
-  });
-}
-
-// ── migration ───────────────────────────────────────────────────────────
-
-/**
- * Import a legacy single `chat-history` transcript as one active chat, once.
- * Runs at module load. If the new store already exists, the legacy key is
- * left untouched (it may still be read by older code paths during a deploy).
- */
-function migrateLegacy() {
-  try {
-    if (localStorage.getItem(STORE_KEY)) return; // already migrated
-    const legacy = localStorage.getItem(LEGACY_KEY);
-    if (!legacy) return;
-    const messages = JSON.parse(legacy) as UIMessage[];
-    if (!Array.isArray(messages) || messages.length === 0) return;
-    const id = nanoid();
-    const now = Date.now();
-    const firstUser = messages.find((m) => m.role === "user");
-    const title = deriveTitle(firstUser);
-    const shape: StoredShape = {
-      version: 1,
-      chats: [
-        {
-          id,
-          title,
-          createdAt: now,
-          updatedAt: now,
-          archivedAt: null,
-        },
-      ],
-    };
-    localStorage.setItem(STORE_KEY, JSON.stringify(shape));
-    localStorage.setItem(MSG_PREFIX + id, JSON.stringify(messages));
-    // Drop the legacy key so it isn't double-counted by the export card.
-    localStorage.removeItem(LEGACY_KEY);
-  } catch (e) {
-    console.warn("[chatStore] legacy migration failed:", e);
-  }
-}
-
-if (typeof window !== "undefined") {
-  migrateLegacy();
-}
-
 // ── metadata read/write ─────────────────────────────────────────────────
 
-function readShape(): StoredShape {
-  try {
-    const raw = localStorage.getItem(STORE_KEY);
-    if (!raw) return { chats: [], version: 1 };
-    const parsed = JSON.parse(raw) as StoredShape;
-    if (!parsed || !Array.isArray(parsed.chats)) {
-      return { chats: [], version: 1 };
-    }
-    return parsed;
-  } catch {
-    return { chats: [], version: 1 };
-  }
-}
-
-function writeShape(shape: StoredShape) {
-  try {
-    localStorage.setItem(STORE_KEY, JSON.stringify(shape));
-  } catch (e) {
-    console.warn("[chatStore] failed to persist chat metadata:", e);
-  }
-  emit();
-}
-
-/** Read all chat metadata (active + archived), newest activity first. */
+/** Read all chat metadata (active + archived), newest activity first.
+ * Synchronous over the cache; empty until hydration settles. */
 export function loadMeta(): ChatMeta[] {
-  return [...readShape().chats].sort((a, b) => b.updatedAt - a.updatedAt);
+  return [...metaCache].sort((a, b) => b.updatedAt - a.updatedAt);
 }
-
-// ── cached snapshot for useSyncExternalStore ─────────────────────────────
-//
-// useSyncExternalStore requires getSnapshot to return a referentially-stable
-// value: it must hand back the *same* array reference when nothing changed,
-// or React sees an ever-changing snapshot and loops forever ("Maximum update
-// depth exceeded" / "getSnapshot should be cached"). loadMeta() builds a fresh
-// sorted array on every call, so we memoize it against the raw localStorage
-// string. Any write — ours, the legacy migration, or another tab's `storage`
-// event — changes that string and busts the cache here in one place.
-let metaCacheRaw: string | null | undefined; // undefined = never read
-let metaCache: ChatMeta[] = [];
 
 /** Referentially-stable view of the metadata, for useSyncExternalStore. */
 function getMetaSnapshot(): ChatMeta[] {
-  let raw: string | null;
-  try {
-    raw = localStorage.getItem(STORE_KEY);
-  } catch {
-    raw = null;
-  }
-  if (raw === metaCacheRaw) return metaCache;
-  metaCacheRaw = raw;
-  metaCache = loadMeta();
-  return metaCache;
+  return metaSnapshot;
 }
 
-/** Write the full metadata array (replaces existing). */
+/** Write the full metadata array (replaces existing on the backend too). */
 export function saveMeta(chats: ChatMeta[]) {
-  writeShape({ version: 1, chats });
+  metaCache = [...chats];
+  rebuildSnapshot();
+  emit();
+  void invokeAfterHydration("chats_replace_meta", { chats }).catch(warnWrite);
 }
 
 // ── messages read/write ─────────────────────────────────────────────────
 
-/** Load one chat's message array (empty if absent). */
-export function loadMessages(id: string): UIMessage[] {
+/**
+ * Load one chat's message array (empty if absent). Async — the transcript
+ * lives in the backend's `<id>.jsonl`; callers await it.
+ */
+export async function loadMessages(id: string): Promise<UIMessage[]> {
   try {
-    const raw = localStorage.getItem(MSG_PREFIX + id);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as UIMessage[]) : [];
-  } catch {
+    const msgs = await invoke<unknown>("chats_get_messages", { id });
+    return Array.isArray(msgs) ? (msgs as UIMessage[]) : [];
+  } catch (e) {
+    console.warn(`[chatStore] failed to load messages for ${id}:`, e);
     return [];
   }
 }
 
 /**
  * Persist one chat's message array. Does NOT emit — callers manage React
- * state; this just writes bytes. Best-effort on quota errors.
+ * state; this just ships bytes to the backend (which rewrites the chat's
+ * `.jsonl` atomically). Fire-and-forget.
  */
 export function saveMessages(id: string, messages: UIMessage[]) {
-  try {
-    localStorage.setItem(MSG_PREFIX + id, JSON.stringify(messages));
-  } catch (e) {
-    console.warn(`[chatStore] failed to save messages for ${id}:`, e);
-  }
+  invoke("chats_save_messages", { id, messages }).catch((e) =>
+    console.warn(`[chatStore] failed to save messages for ${id}:`, e),
+  );
 }
 
-/** Delete one chat's message array (metadata is removed separately). */
+/** Delete one chat's message file (metadata is removed separately). */
 export function deleteMessages(id: string) {
-  localStorage.removeItem(MSG_PREFIX + id);
+  invoke("chats_delete_messages", { id }).catch(warnWrite);
 }
 
 // ── mutations ───────────────────────────────────────────────────────────
 
-/** Create a new active chat and return its metadata. */
+/** Create a new active chat and return its metadata. Synchronous over an
+ * optimistic cache update; the backend write happens behind it and also
+ * points the persisted working-chat pointer at the new chat. */
 export function createChat(title = "New chat"): ChatMeta {
   const now = Date.now();
   const meta: ChatMeta = {
@@ -238,10 +232,27 @@ export function createChat(title = "New chat"): ChatMeta {
     createdAt: now,
     updatedAt: now,
     archivedAt: null,
+    origin: "user",
   };
-  const chats = readShape().chats;
-  chats.push(meta);
-  writeShape({ version: 1, chats });
+  upsertLocalMeta(meta);
+  rebuildSnapshot();
+  emit();
+  void invokeAfterHydration<ChatMeta>("chats_create", {
+    id: meta.id,
+    title: meta.title,
+    origin: meta.origin,
+  })
+    .then((saved) => {
+      // Reconcile with the backend's authoritative copy (idempotent unless
+      // hydration raced this create and replaced the cache).
+      if (saved) {
+        upsertLocalMeta(saved);
+        rebuildSnapshot();
+        emit();
+      }
+    })
+    .then(() => invoke("chats_set_active_chat", { id: meta.id }))
+    .catch(warnWrite);
   return meta;
 }
 
@@ -250,84 +261,67 @@ export function createChat(title = "New chat"): ChatMeta {
  * or read back; only the metadata flag flips.
  */
 export function archiveChat(id: string, reason: ArchiveReason) {
-  const chats = readShape().chats;
-  const idx = chats.findIndex((c) => c.id === id);
-  if (idx < 0) return;
-  chats[idx] = {
-    ...chats[idx],
-    archivedAt: Date.now(),
-    archivedReason: reason,
-  };
-  writeShape({ version: 1, chats });
+  if (patchLocalMeta(id, (m) => ({ ...m, archivedAt: Date.now(), archivedReason: reason }))) {
+    rebuildSnapshot();
+    emit();
+  }
+  void invokeAfterHydration("chats_archive", { id, reason }).catch(warnWrite);
 }
 
 /** Restore an archived chat back to active. */
 export function restoreChat(id: string) {
-  const chats = readShape().chats;
-  const idx = chats.findIndex((c) => c.id === id);
-  if (idx < 0) return;
-  chats[idx] = {
-    ...chats[idx],
-    archivedAt: null,
-    archivedReason: undefined,
-    updatedAt: Date.now(),
-  };
-  writeShape({ version: 1, chats });
+  if (
+    patchLocalMeta(id, (m) => ({
+      ...m,
+      archivedAt: null,
+      archivedReason: undefined,
+      updatedAt: Date.now(),
+    }))
+  ) {
+    rebuildSnapshot();
+    emit();
+  }
+  void invokeAfterHydration("chats_restore", { id }).catch(warnWrite);
 }
 
 /** Permanently delete an archived chat and its messages. */
 export function deleteChatPermanently(id: string) {
-  const chats = readShape().chats.filter((c) => c.id !== id);
-  writeShape({ version: 1, chats });
-  deleteMessages(id);
+  const before = metaCache.length;
+  metaCache = metaCache.filter((c) => c.id !== id);
+  if (metaCache.length !== before) {
+    rebuildSnapshot();
+    emit();
+  }
+  void invokeAfterHydration("chats_delete_permanently", { id }).catch(warnWrite);
   // Also drop any compaction state + context-size anchor for this chat.
   clearCompaction(id);
   clearContextAnchor(id);
 }
 
 /**
- * Wipe every chat: metadata, all per-chat message arrays, and compaction
- * state. Also clears the legacy single-transcript key. Used by the Settings
- * "reset all app data" action so a reset leaves the user with no chat history
- * (active or archived). Emits once so subscribers re-render.
- *
- * The metadata scan alone misses orphaned keys — messages/compaction entries
- * for chats that were already deleted (their metadata is gone but their
- * per-chat localStorage slots lingered). So we also walk every localStorage
- * key and drop anything under our prefixes, guaranteeing a complete wipe.
+ * Wipe every chat: metadata, all per-chat transcripts, and compaction state.
+ * Used by the Settings "reset all app data" action (the backend's
+ * `reset_app_data` wipes the same store — this also clears the frontend
+ * cache and the localStorage-backed compaction/anchor state). Emits once so
+ * subscribers re-render.
  */
 export function clearAllChats() {
-  try {
-    // Walk all keys so orphaned per-chat slots (messages + compaction) for
-    // already-deleted chats are removed too — not just current metadata.
-    const toRemove: string[] = [];
-    for (let i = 0; i < localStorage.length; i++) {
-      const key = localStorage.key(i);
-      if (
-        key &&
-        (key.startsWith(MSG_PREFIX) ||
-          key === STORE_KEY ||
-          key === LEGACY_KEY)
-      ) {
-        toRemove.push(key);
-      }
-    }
-    for (const key of toRemove) localStorage.removeItem(key);
-    clearAllCompaction();
-    clearAllContextAnchors();
-  } catch (e) {
-    console.warn("[chatStore] failed to clear chats:", e);
-  }
+  metaCache = [];
+  rebuildSnapshot();
   emit();
+  void invokeAfterHydration("chats_clear_all").catch(warnWrite);
+  clearAllCompaction();
+  clearAllContextAnchors();
 }
 
 /** Rename a chat (active or archived). */
 export function renameChat(id: string, title: string) {
-  const chats = readShape().chats;
-  const idx = chats.findIndex((c) => c.id === id);
-  if (idx < 0) return;
-  chats[idx] = { ...chats[idx], title: title.trim() || "Untitled" };
-  writeShape({ version: 1, chats });
+  const clean = title.trim() || "Untitled";
+  if (patchLocalMeta(id, (m) => ({ ...m, title: clean }))) {
+    rebuildSnapshot();
+    emit();
+  }
+  void invokeAfterHydration("chats_rename", { id, title: clean }).catch(warnWrite);
 }
 
 /**
@@ -335,38 +329,56 @@ export function renameChat(id: string, title: string) {
  * rename it from the first user message if it still has the default title.
  */
 export function touchChat(id: string, firstUserMessage?: UIMessage | null) {
-  const chats = readShape().chats;
-  const idx = chats.findIndex((c) => c.id === id);
-  if (idx < 0) return;
+  const meta = metaCache.find((c) => c.id === id);
+  if (!meta) return;
   const now = Date.now();
-  let title = chats[idx].title;
-  if ((title === "New chat" || !title) && firstUserMessage) {
+  let title: string | null = null;
+  if ((meta.title === "New chat" || !meta.title) && firstUserMessage) {
     title = deriveTitle(firstUserMessage);
   }
-  chats[idx] = { ...chats[idx], updatedAt: now, title };
-  writeShape({ version: 1, chats });
+  patchLocalMeta(id, (m) => ({ ...m, updatedAt: now, title: title ?? m.title }));
+  rebuildSnapshot();
+  emit();
+  void invokeAfterHydration("chats_touch", { id, title }).catch(warnWrite);
 }
 
 /**
  * Return ids of active chats whose `updatedAt` is older than `now - idleMs`.
- * Used by the idle sweeper; the caller archives them.
+ * Used by the idle sweeper; the caller archives them. Async — reads the
+ * backend's authoritative index.
  */
-export function pruneIdleChats(idleMs: number, now = Date.now()): string[] {
-  if (idleMs <= 0) return [];
-  const cutoff = now - idleMs;
-  return readShape()
-    .chats.filter((c) => c.archivedAt === null && c.updatedAt < cutoff)
-    .map((c) => c.id);
+export function pruneIdleChats(idleMs: number, now = Date.now()): Promise<string[]> {
+  if (idleMs <= 0) return Promise.resolve([]);
+  return invokeAfterHydration<string[]>("chats_prune_idle", { idleMs, now }).catch(
+    (e) => {
+      console.warn("[chatStore] prune failed:", e);
+      return [];
+    },
+  );
 }
 
-/** Ensure at least one active chat exists; create one if needed. Returns it. */
-export function ensureActiveChat(): ChatMeta {
-  const active = readShape().chats.filter((c) => c.archivedAt === null);
-  if (active.length > 0) {
-    // newest active
-    return active.sort((a, b) => b.updatedAt - a.updatedAt)[0];
-  }
-  return createChat();
+/**
+ * Ensure at least one active chat exists; create one if needed. Returns it.
+ * Resolves the persisted working-chat pointer (falling back to the newest
+ * active chat, then to a fresh chat) and keeps the pointer aimed at the
+ * result. Async — reads the backend's authoritative index.
+ */
+export async function ensureActiveChat(): Promise<ChatMeta> {
+  await ensureHydrated();
+  const meta = await invoke<ChatMeta>("chats_ensure_active");
+  upsertLocalMeta(meta);
+  rebuildSnapshot();
+  emit();
+  return meta;
+}
+
+/**
+ * Point the persisted working-chat pointer at `id`. The UI calls this on
+ * every active-chat switch so the backend (and a later headless runner) knows
+ * which transcript the user is working in. Fire-and-forget.
+ */
+export function setActiveChat(id: string) {
+  void invokeAfterHydration("chats_set_active_chat", { id }).catch(warnWrite);
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────
@@ -392,14 +404,14 @@ export function deriveTitle(firstUser?: UIMessage | null): string {
 
 /**
  * Reactive view of all chat metadata. Re-renders subscribers on any metadata
- * mutation. Returns chats sorted newest-activity-first.
+ * mutation (and once when the initial backend load settles). Returns chats
+ * sorted newest-activity-first.
  */
 export function useChats(): ChatMeta[] {
   return useSyncExternalStore(
     subscribe,
     getMetaSnapshot,
-    () => loadMeta(), // SSR snapshot (unused in Tauri, but a stable ref isn't
-    // required there and loadMeta is fine — React doesn't loop on the server).
+    () => metaSnapshot, // SSR snapshot (unused in Tauri); stable ref not required there
   );
 }
 
