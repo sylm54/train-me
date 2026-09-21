@@ -93,11 +93,32 @@ pub fn runtime_up() -> bool {
 static RUNTIME: OnceLock<Arc<AgentRuntime>> = OnceLock::new();
 
 /// Bind the process-wide agent runtime. Called once from `run()` setup,
-/// before any command can fire.
+/// before any command can fire. Also registers the schedule engine's
+/// `agent`-action wake hook (schedule must not statically reference this
+/// module — see `crate::schedule::AGENT_WAKE`).
 pub fn init(app: &tauri::App) {
     let rt = Arc::new(AgentRuntime::new(app.handle().clone()));
     let _ = RUNTIME.set(rt);
+    crate::schedule::register_agent_wake(wake_from_action);
     set_runtime_up(true);
+}
+
+/// The `agent` action's wake, called from the schedule executor via the
+/// registered hook. Enqueue-and-detach: the reconcile path runs inside a
+/// blocking section and must never wait on a model turn; the FIFO gate
+/// serializes the queued turn behind whatever is in flight. Failures log —
+/// they must never fail the reconcile.
+fn wake_from_action(message: &str) {
+    let Some(rt) = RUNTIME.get() else {
+        log::warn!("[agent] action wake skipped: runtime not initialised");
+        return;
+    };
+    let rt = Arc::clone(rt);
+    let message = message.to_string();
+    tauri::async_runtime::spawn(async move {
+        rt.enqueue_seed(crate::schedule::AGENT_ACTION_ORIGIN, message)
+            .await;
+    });
 }
 
 /// The bound runtime, or an error for callers that raced ahead of `init`

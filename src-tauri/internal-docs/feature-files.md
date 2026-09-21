@@ -30,3 +30,10 @@ description: Feature-file grammar — front-matter, the page model, and feature 
 
 - `points` (delta), `task` (template name → assigns an instance), `exemption` (duration + scope habits|routines|tasks|all — suspends failure actions AND protects streaks; `all` is the blanket pause), `roulette` (weighted outcomes, `weight: 0` disables an outcome).
 - `script` and `notification` give events immediate audio/visual feedback — see `docs/internal/feedback.md` for their semantics before using them.
+- `agent` wakes you (the agent) with a `message` — the ONLY way an engine failure reaches you; nothing wakes you unless a feature file asks. Put it in `failure`/`timeouts` slots you should react to, with a message that says what failed and what to do:
+
+  ```yaml
+  failure: { "type": "agent", "message": "Evening drill lapsed — check the streak in activity.db, then reschedule or check in with the user." }
+  ```
+
+  Semantics: fires at the reconcile that resolves that block's failure/timeout, exactly once per occurrence (mark-before-fire ledger gating); the message lands as an invocation note in the working chat (origin `agent-action`) and a turn is queued FIFO behind whatever conversation is in flight (single-flight, one turn app-wide); enqueuing never blocks the engine.

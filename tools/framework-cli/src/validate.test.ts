@@ -36,3 +36,18 @@ test("mid-line markers error clearly", () => {
     "`{{#else}}` must be on its own line",
   );
 });
+
+test("agent action validates its message", () => {
+  const withFailure = (failure: string): Diag[] => {
+    const diags: Diag[] = [];
+    validateRoutine(`---\nformat: 2\ntitle: T\nschedule: 0 8 * * *\n${failure}\n---\n\nbody`, diags);
+    return diags;
+  };
+  expect(errors(withFailure('failure: { "type": "agent", "message": "check in" }'))).toEqual([]);
+  expect(errors(withFailure('failure: { "type": "agent" }')).join("\n")).toContain(
+    "`message` is required",
+  );
+  expect(errors(withFailure('failure: { "type": "agent", "message": "   " }')).join("\n")).toContain(
+    "`message` is required",
+  );
+});

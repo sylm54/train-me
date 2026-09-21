@@ -230,6 +230,14 @@ function parseAction(v: FValue, ctx: string, diags: Diag[], depth: number): Acti
       warnUnknown(m, ["type", "text"], sub, diags);
       return empty;
     }
+    case "agent": {
+      if (!getStr(m, "message")) {
+        diags.push({ severity: "error", message: `${sub}: \`message\` is required` });
+        return null;
+      }
+      warnUnknown(m, ["type", "message"], sub, diags);
+      return empty;
+    }
     case "exemption": {
       const dur = getStr(m, "duration");
       if (!dur || parseDuration(dur) === null) {
@@ -287,7 +295,7 @@ function parseAction(v: FValue, ctx: string, diags: Diag[], depth: number): Acti
     default:
       diags.push({
         severity: "error",
-        message: `${ctx}: unknown action type \`${type}\` — use points, task, script, notification, exemption, roulette`,
+        message: `${ctx}: unknown action type \`${type}\` — use points, task, script, notification, exemption, roulette, agent`,
       });
       return null;
   }

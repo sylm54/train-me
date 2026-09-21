@@ -48,6 +48,7 @@ export type Action =
   | { type: "script"; src: string }
   | { type: "notification"; text: string }
   | { type: "exemption"; duration_secs: number; scope: Scope }
+  | { type: "agent"; message: string }
   | { type: "roulette"; outcomes: { weight: number; action: Action }[] };
 
 export interface Limit {
@@ -349,6 +350,8 @@ export function describeAction(a: Action): string {
       return `notifies: ${a.text}`;
     case "exemption":
       return `exemption (${a.scope}) for ${humanDuration(a.duration_secs)}`;
+    case "agent":
+      return `wakes the agent: ${a.message}`;
     case "roulette":
       return `roulette: ${a.outcomes
         .map((o) => `${describeAction(o.action)} (${o.weight || "off"})`)
