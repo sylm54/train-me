@@ -801,9 +801,19 @@ export function validateHabit(content: string, diags: Diag[]): ParsedContainer |
   if (count !== undefined && (typeof count !== "number" || count < 0)) {
     diags.push({ severity: "error", message: "habit `count` must be ≥ 0" });
   }
+  const minutes = m["minutes"];
+  if (minutes !== undefined && (typeof minutes !== "number" || minutes < 0)) {
+    diags.push({ severity: "error", message: "habit `minutes` must be ≥ 0" });
+  }
+  if (count !== undefined && minutes !== undefined) {
+    diags.push({
+      severity: "error",
+      message: "habit `count` and `minutes` are mutually exclusive — pick one unit",
+    });
+  }
   const success = parseActions(m["success"], "`success`", diags);
   const failure = parseActions(m["failure"], "`failure`", diags);
-  warnUnknown(m, ["format", "title", "type", "count", "success", "failure"], "habit", diags);
+  warnUnknown(m, ["format", "title", "type", "count", "minutes", "success", "failure"], "habit", diags);
   return {
     scripts: [...success.flatMap((a) => a.scripts), ...failure.flatMap((a) => a.scripts)],
     templates: [...success.flatMap((a) => a.templates), ...failure.flatMap((a) => a.templates)],

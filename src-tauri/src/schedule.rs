@@ -529,7 +529,7 @@ pub fn reconcile_blocking(
             );
             continue;
         };
-        let limit = habit.count as i64;
+        let limit = habit.limit() as i64;
         let success = match habit.htype {
             format::HabitType::Max => count <= limit,
             format::HabitType::Min => count >= limit,
@@ -1380,11 +1380,13 @@ fn as_task_instance(sched: &Connection, run_id: &str) -> Option<(String, String)
 // Habits + store commands
 // ============================================================================
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct HabitLogResult {
     pub count: i64,
     pub limit: i64,
     pub htype: String,
+    /// `count` habits tick one per log; `minutes` habits log an amount.
+    pub unit: String,
     pub status: String,
     pub title: String,
     pub lines: Vec<String>,
@@ -1394,6 +1396,7 @@ pub struct HabitLogResult {
 #[tauri::command]
 pub async fn v2_habit_log(
     habit_ref: String,
+    minutes: Option<i64>,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<HabitLogResult, String> {
@@ -1402,77 +1405,115 @@ pub async fn v2_habit_log(
     tauri::async_runtime::spawn_blocking(move || {
         let sched = open(&state_dir.join("schedule.db"))?;
         let econ = open(&state_dir.join("economy.db"))?;
-        let full = crate::bash::resolve_under(&agent_dir, &habit_ref)?;
-        let content = std::fs::read_to_string(&full).map_err(|e| e.to_string())?;
-        let (habit, diags) = format::parse_habit(&content);
-        if let Some(e) = parse_errors(&diags) {
-            return Err(format!("habit invalid: {e}"));
-        }
-        let habit = habit.ok_or("habit parse failed")?;
-
-        let today = local_day(utc_now());
-        sched.execute(
-            "INSERT OR IGNORE INTO habit_days (habit, day, count, status) VALUES (?1, ?2, 0, 'open')",
-            rusqlite::params![habit_ref, today],
-        ).map_err(|e| e.to_string())?;
-        sched.execute(
-            "UPDATE habit_days SET count = count + 1 WHERE habit = ?1 AND day = ?2",
-            rusqlite::params![habit_ref, today],
-        ).map_err(|e| e.to_string())?;
-        let (count, status): (i64, String) = sched.query_row(
-            "SELECT count, status FROM habit_days WHERE habit = ?1 AND day = ?2",
-            rusqlite::params![habit_ref, today],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).map_err(|e| e.to_string())?;
-
-        log_activity(&agent_dir, "habit", "log", &habit_ref);
-
-        // Immediate consequences at the moment of logging.
-        let limit = habit.count as i64;
-        let mut lines = Vec::new();
-        let mut report = ReconcileReport::default();
-        if status == "open" {
-            let resolved = match habit.htype {
-                // Any action beyond the limit fails immediately.
-                format::HabitType::Max if count > limit => {
-                    Some(habit_day_resolve(&sched, &econ, Some(&app), &agent_dir, &habit_ref, &today, &habit, false, &mut report))
-                }
-                // Success the moment the count is reached.
-                format::HabitType::Min if count >= limit => {
-                    let r = habit_day_resolve(&sched, &econ, Some(&app), &agent_dir, &habit_ref, &today, &habit, true, &mut report);
-                    if r {
-                        lines.push("goal reached — success fired".to_string());
-                    }
-                    Some(r)
-                }
-                _ => None,
-            };
-            if resolved == Some(true) && matches!(habit.htype, format::HabitType::Max) {
-                lines.push(format!("limit exceeded ({count}/{limit}) — failure fired"));
-            }
-        }
-        lines.extend(report.lines);
-
-        let (count, status): (i64, String) = sched.query_row(
-            "SELECT count, status FROM habit_days WHERE habit = ?1 AND day = ?2",
-            rusqlite::params![habit_ref, today],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).map_err(|e| e.to_string())?;
-        Ok(HabitLogResult {
-            count,
-            limit,
-            htype: match habit.htype {
-                format::HabitType::Max => "max".into(),
-                format::HabitType::Min => "min".into(),
-            },
-            status,
-            title: habit.title,
-            lines,
-            balance: economy::balance(&econ)?,
-        })
+        habit_log_inner(&sched, &econ, Some(&app), &agent_dir, &habit_ref, minutes)
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Core of `v2_habit_log`, split out so tests can drive it without a Tauri
+/// runtime. Count habits tick one per call; time habits add `minutes`
+/// (1–1440 per call) to the day's total.
+fn habit_log_inner(
+    sched: &Connection,
+    econ: &Connection,
+    app: Option<&tauri::AppHandle>,
+    agent_dir: &Path,
+    habit_ref: &str,
+    minutes: Option<i64>,
+) -> Result<HabitLogResult, String> {
+    let full = crate::bash::resolve_under(agent_dir, habit_ref)?;
+    let content = std::fs::read_to_string(&full).map_err(|e| e.to_string())?;
+    let (habit, diags) = format::parse_habit(&content);
+    if let Some(e) = parse_errors(&diags) {
+        return Err(format!("habit invalid: {e}"));
+    }
+    let habit = habit.ok_or("habit parse failed")?;
+
+    // Unit contract: a `minutes` habit takes an amount, a count habit
+    // doesn't (one tap = one occurrence).
+    let amount = match (habit.is_time(), minutes) {
+        (true, Some(m)) if (1..=24 * 60).contains(&m) => m,
+        (true, Some(m)) => {
+            return Err(format!("minutes must be between 1 and 1440 per log (got {m})"))
+        }
+        (true, None) => {
+            return Err("this habit logs minutes — pass an amount with each log".into())
+        }
+        (false, Some(_)) => {
+            return Err("this habit logs counts, one per log — no amount expected".into())
+        }
+        (false, None) => 1,
+    };
+
+    let today = local_day(utc_now());
+    sched.execute(
+        "INSERT OR IGNORE INTO habit_days (habit, day, count, status) VALUES (?1, ?2, 0, 'open')",
+        rusqlite::params![habit_ref, today],
+    ).map_err(|e| e.to_string())?;
+    sched.execute(
+        "UPDATE habit_days SET count = count + ?3 WHERE habit = ?1 AND day = ?2",
+        rusqlite::params![habit_ref, today, amount],
+    ).map_err(|e| e.to_string())?;
+    let (count, status): (i64, String) = sched.query_row(
+        "SELECT count, status FROM habit_days WHERE habit = ?1 AND day = ?2",
+        rusqlite::params![habit_ref, today],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ).map_err(|e| e.to_string())?;
+
+    // Time logs carry their magnitude so the activity log shows what the
+    // minutes went to; count logs keep the bare habit path.
+    if habit.is_time() {
+        log_activity(agent_dir, "habit", "log", &format!("{habit_ref} +{amount}m"));
+    } else {
+        log_activity(agent_dir, "habit", "log", habit_ref);
+    }
+
+    // Immediate consequences at the moment of logging.
+    let limit = habit.limit() as i64;
+    let mut lines = Vec::new();
+    let mut report = ReconcileReport::default();
+    if status == "open" {
+        let resolved = match habit.htype {
+            // Any action beyond the limit fails immediately.
+            format::HabitType::Max if count > limit => {
+                Some(habit_day_resolve(sched, econ, app, agent_dir, habit_ref, &today, &habit, false, &mut report))
+            }
+            // Success the moment the count is reached.
+            format::HabitType::Min if count >= limit => {
+                let r = habit_day_resolve(sched, econ, app, agent_dir, habit_ref, &today, &habit, true, &mut report);
+                if r {
+                    lines.push("goal reached — success fired".to_string());
+                }
+                Some(r)
+            }
+            _ => None,
+        };
+        if resolved == Some(true) && matches!(habit.htype, format::HabitType::Max) {
+            lines.push(format!("limit exceeded ({count}/{limit}) — failure fired"));
+        }
+    }
+    lines.extend(report.lines);
+
+    let (count, status): (i64, String) = sched.query_row(
+        "SELECT count, status FROM habit_days WHERE habit = ?1 AND day = ?2",
+        rusqlite::params![habit_ref, today],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ).map_err(|e| e.to_string())?;
+    let unit = if habit.is_time() { "minutes" } else { "count" };
+    Ok(HabitLogResult {
+        count,
+        limit,
+        htype: match habit.htype {
+            format::HabitType::Max => "max".into(),
+            format::HabitType::Min => "min".into(),
+        },
+        unit: unit.into(),
+        status,
+        title: habit.title,
+        lines,
+        balance: economy::balance(econ)?,
+    })
 }
 
 #[derive(Serialize)]
@@ -1616,6 +1657,8 @@ pub struct HabitCard {
     pub path: String,
     pub title: String,
     pub htype: String,
+    /// `count` habits tick one per log; `minutes` habits log an amount.
+    pub unit: String,
     pub limit: i64,
     pub today_count: i64,
     pub status: String,
@@ -1800,6 +1843,9 @@ pub async fn v2_summary(state: State<'_, AppState>) -> Result<V2Summary, String>
                 rusqlite::params![rel, today],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             ).map_err(|e| e.to_string())?;
+            // Derived before the literal: `habit.title` moves out of `habit`.
+            let unit = if habit.is_time() { "minutes" } else { "count" };
+            let limit = habit.limit() as i64;
             habits.push(HabitCard {
                 path: rel,
                 title: habit.title,
@@ -1807,7 +1853,8 @@ pub async fn v2_summary(state: State<'_, AppState>) -> Result<V2Summary, String>
                     format::HabitType::Max => "max".into(),
                     format::HabitType::Min => "min".into(),
                 },
-                limit: habit.count as i64,
+                unit: unit.into(),
+                limit,
                 today_count,
                 status,
                 audio: container_audio(&[], &[&habit.success, &habit.failure]),
@@ -2160,6 +2207,10 @@ mod tests {
         "---\ntitle: No X\ntype: max\ncount: 0\nsuccess: { \"type\": \"points\", \"delta\": 5 }\nfailure: { \"type\": \"points\", \"delta\": -10 }\n---\npositive case\n".to_string()
     }
 
+    fn time_habit() -> String {
+        "---\ntitle: Practice\ntype: min\nminutes: 40\nsuccess: { \"type\": \"points\", \"delta\": 5 }\nfailure: { \"type\": \"points\", \"delta\": -10 }\n---\npositive case\n".to_string()
+    }
+
     #[test]
     fn reconcile_materializes_and_lapses_routines() {
         // Schedule: every minute, 1-minute window → guarantees a lapsed
@@ -2285,6 +2336,86 @@ mod tests {
         reconcile_blocking(&agent, &state, None);
         let econ = open(&state.join("economy.db")).unwrap();
         assert_eq!(economy::balance(&econ).unwrap(), 5);
+        let _ = tmp;
+    }
+
+    #[test]
+    fn habit_time_log_reaches_goal_and_fires_success() {
+        let (tmp, agent, state) = env(&[("habits/practice.md", &time_habit())]);
+        let sched = open(&state.join("schedule.db")).unwrap();
+        let econ = open(&state.join("economy.db")).unwrap();
+        // 25 minutes: under the goal, day stays open, nothing fires.
+        let res = habit_log_inner(&sched, &econ, None, &agent, "habits/practice.md", Some(25))
+            .unwrap();
+        assert_eq!(res.count, 25);
+        assert_eq!(res.limit, 40);
+        assert_eq!(res.unit, "minutes");
+        assert_eq!(res.status, "open");
+        assert_eq!(economy::balance(&econ).unwrap(), 0);
+        // +15 more reaches 40 — success fires exactly once.
+        let res = habit_log_inner(&sched, &econ, None, &agent, "habits/practice.md", Some(15))
+            .unwrap();
+        assert_eq!(res.count, 40);
+        assert_eq!(res.status, "success");
+        assert_eq!(economy::balance(&econ).unwrap(), 5);
+        // Logs past a resolved day change nothing.
+        let res = habit_log_inner(&sched, &econ, None, &agent, "habits/practice.md", Some(10))
+            .unwrap();
+        assert_eq!(res.count, 50);
+        assert_eq!(economy::balance(&econ).unwrap(), 5);
+        let _ = tmp;
+    }
+
+    #[test]
+    fn habit_time_log_validates_amount() {
+        let (tmp, agent, state) = env(&[("habits/practice.md", &time_habit())]);
+        let sched = open(&state.join("schedule.db")).unwrap();
+        let econ = open(&state.join("economy.db")).unwrap();
+        let err = habit_log_inner(&sched, &econ, None, &agent, "habits/practice.md", None)
+            .unwrap_err();
+        assert!(err.contains("logs minutes"), "{err}");
+        assert!(habit_log_inner(&sched, &econ, None, &agent, "habits/practice.md", Some(0)).is_err());
+        assert!(habit_log_inner(&sched, &econ, None, &agent, "habits/practice.md", Some(2000)).is_err());
+        // Nothing was logged.
+        let (count,): (i64,) = sched
+            .query_row(
+                "SELECT COALESCE(SUM(count), 0) FROM habit_days WHERE habit = 'habits/practice.md'",
+                [],
+                |r| Ok((r.get(0)?,)),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        let _ = tmp;
+    }
+
+    #[test]
+    fn habit_count_log_rejects_amount() {
+        let (tmp, agent, state) = env(&[("habits/nox.md", &habit())]);
+        let sched = open(&state.join("schedule.db")).unwrap();
+        let econ = open(&state.join("economy.db")).unwrap();
+        let err = habit_log_inner(&sched, &econ, None, &agent, "habits/nox.md", Some(5))
+            .unwrap_err();
+        assert!(err.contains("no amount expected"), "{err}");
+        let _ = tmp;
+    }
+
+    #[test]
+    fn habit_time_past_day_under_goal_fails() {
+        let (tmp, agent, state) = env(&[("habits/practice.md", &time_habit())]);
+        let sched = open(&state.join("schedule.db")).unwrap();
+        let yesterday = local_day(utc_now() - chrono::Duration::days(1));
+        // 25 of 40 minutes — fails at day-end like an unreached `min`.
+        sched
+            .execute(
+                "INSERT INTO habit_days (habit, day, count, status) VALUES ('habits/practice.md', ?1, 25, 'open')",
+                [&yesterday],
+            )
+            .unwrap();
+        drop(sched);
+        let report = reconcile_blocking(&agent, &state, None);
+        assert!(report.habit_days_evaluated >= 1);
+        let econ = open(&state.join("economy.db")).unwrap();
+        assert_eq!(economy::balance(&econ).unwrap(), -10, "25/40 min fails at day end");
         let _ = tmp;
     }
 

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { validateRoutine, type Diag } from "./validate";
+import { validateHabit, validateRoutine, type Diag } from "./validate";
 
 function diagsFor(body: string): Diag[] {
   const content = `---\nformat: 2\ntitle: T\nschedule: 0 8 * * *\n---\n\n${body}`;
@@ -50,4 +50,22 @@ test("agent action validates its message", () => {
   expect(errors(withFailure('failure: { "type": "agent", "message": "   " }')).join("\n")).toContain(
     "`message` is required",
   );
+});
+
+test("habit minutes mode mirrors the engine's unit rules", () => {
+  const habitDiags = (frontmatter: string): Diag[] => {
+    const diags: Diag[] = [];
+    validateHabit(`---\n${frontmatter}\n---\nbody`, diags);
+    return diags;
+  };
+  // A time habit parses clean.
+  expect(errors(habitDiags('title: P\ntype: min\nminutes: 40'))).toEqual([]);
+  // Both units is an authoring mistake.
+  expect(
+    errors(habitDiags('title: Q\ntype: min\ncount: 2\nminutes: 40')).join("\n"),
+  ).toContain("mutually exclusive");
+  // Negative minutes is rejected.
+  expect(
+    errors(habitDiags("title: R\ntype: max\nminutes: -5")).join("\n"),
+  ).toContain("`minutes` must be ≥ 0");
 });

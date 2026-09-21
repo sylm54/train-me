@@ -532,6 +532,10 @@ fn seed_examples(agent_dir: &Path) -> std::io::Result<()> {
             contents: include_str!("../../examples/habit.md"),
         },
         BundledExample {
+            rel: "examples/habit-time.md",
+            contents: include_str!("../../examples/habit-time.md"),
+        },
+        BundledExample {
             rel: "examples/task.md",
             contents: include_str!("../../examples/task.md"),
         },
