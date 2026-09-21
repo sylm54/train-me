@@ -1962,6 +1962,10 @@ pub async fn reconcile_schedule(
     .await
     .map_err(|e| e.to_string())?;
     let _ = app.emit("v2-reconciled", &report);
+    // Re-arm the Stage 5b agent wake-ups too: reconcile is the natural
+    // heartbeat for it (the agent may have edited agent_wakes.json through
+    // a fired action since the last pass). Best-effort, never fatal.
+    crate::agent_wakes::reschedule(&app);
     Ok(report)
 }
 
@@ -1980,6 +1984,8 @@ pub fn spawn_reconcile(app: tauri::AppHandle) {
         if let Ok(report) = report {
             let _ = app.emit("v2-reconciled", &report);
         }
+        // Re-arm the Stage 5b agent wake-ups (see reconcile_schedule).
+        crate::agent_wakes::reschedule(&app);
     });
 }
 

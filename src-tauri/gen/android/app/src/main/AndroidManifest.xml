@@ -7,6 +7,14 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
+    <!-- Stage 5b agent wake-ups: receive BOOT_COMPLETED so the alarm schedule
+         can be re-armed after a reboot (alarms don't survive reboots). -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Exact alarms for the wake schedule. Default-DENIED for apps targeting
+         API 33+; Settings → Agent wake-ups offers the grant intent, and the
+         scheduler degrades to a logged skip while ungranted. -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+
     <!-- AndroidTV support -->
     <uses-feature android:name="android.software.leanback" android:required="false" />
 
@@ -40,6 +48,20 @@
             android:name=".AgentService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!-- Stage 5b agent wake-ups: exact-alarm fires + BOOT_COMPLETED →
+             AgentService (see WakeReceiver.kt for the exported="true"
+             rationale — BOOT_COMPLETED filters require it, and the custom
+             alarm action is deliberately kept OUT of the intent-filter so
+             implicit spoofs are not delivered; our own alarms target the
+             component explicitly). -->
+        <receiver
+            android:name=".WakeReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
 
         <provider
           android:name="androidx.core.content.FileProvider"

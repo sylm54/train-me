@@ -12,6 +12,9 @@ mod activity_db;
 // Native agent runtime (Stage 3a): the headless agent loop on rig. Public
 // only for its doctests-free command surface — see the module docs.
 pub mod agent;
+// Scheduled agent wake-ups (Stage 5b): cron config in the agent sandbox +
+// rate-capped cold-start wakes over the Android foreground service.
+pub mod agent_wakes;
 // Android foreground-service bridge for agent turns (see the module docs).
 mod agent_service;
 mod audio_renderer;
@@ -1830,6 +1833,12 @@ pub fn run() {
             // expected occurrences and resolve anything that lapsed while
             // the app was closed (see schedule.rs module docs).
 
+            // (Re)schedule the agent wake-ups from <agent_dir>/agent_wakes.json
+            // (Stage 5b). Must run AFTER manage(AppState): it reads the state's
+            // agent_dir. Also runs after every reconcile pass and when a run
+            // settles — the agent can edit its own wake config mid-run. A
+            // reboot drops all alarms, so each app start re-arms them here.
+            agent_wakes::reschedule(app.handle());
 
             Ok(())
         })
@@ -1918,6 +1927,9 @@ pub fn run() {
             agent::list_pending_questions,
             agent::agent_compact,
             agent::agent_compaction_state,
+            // Scheduled agent wake-ups (Stage 5b — see agent_wakes.rs)
+            agent_wakes::agent_wakes_state,
+            agent_wakes::request_exact_alarm_permission,
             // Chat persistence (chats/ dir — index.json + per-chat JSONL)
             chats::chats_list,
             chats::chats_create,

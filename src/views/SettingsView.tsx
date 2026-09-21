@@ -9,6 +9,7 @@ import { save } from "@tauri-apps/plugin-dialog";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   Activity as ActivityIcon,
+  AlarmClock,
   AlertCircle,
   AlertTriangle,
   CheckCircle2,
@@ -753,6 +754,14 @@ export function SettingsView({
               )}
             </div>
           </div>
+        </section>
+
+        {/* ── Agent wake-ups (Stage 5b) ───────────────────────────── */}
+        <section className="space-y-4">
+          <h2 className="text-sm uppercase tracking-wider text-[var(--color-muted-foreground)]">
+            Agent wake-ups
+          </h2>
+          <AgentWakesCard />
         </section>
 
         {/* ── Diagnostics: event + render round-trip tests ─────── */}
@@ -2009,6 +2018,228 @@ function EventTestCard() {
             </li>
           ))}
         </ul>
+      )}
+    </div>
+  );
+}
+
+// Agent wake-ups (Stage 5b): cron config + cold-start wake status
+// ──────────────────────────────────────────────────────────────────────────
+
+/** One validated entry of `agent_wakes.json` (backend `ParsedWake`). */
+interface AgentWakeEntry {
+  cron: string;
+  message: string;
+  nextFireMs?: number;
+}
+
+/** Payload of the backend `agent_wakes_state` command. */
+interface AgentWakesState {
+  canScheduleExact: boolean;
+  entries: AgentWakeEntry[];
+  errors: string[];
+  recentFires: number[];
+  maxFiresPer24h: number;
+}
+
+/**
+ * Scheduled agent wake-ups: shows the entries of the agent-editable
+ * `<agent_data>/agent_wakes.json` (with each entry's next fire and any
+ * validation errors), whether exact alarms are granted (with the grant
+ * intent button when not), and a "Wake now" debug button that drives the
+ * same seed path a scheduled wake uses.
+ */
+function AgentWakesCard() {
+  const [state, setState] = useState<AgentWakesState | null>(null);
+  const [wakeMessage, setWakeMessage] = useState(
+    "Scheduled wake-up test from Settings",
+  );
+  const [waking, setWaking] = useState(false);
+  const [wakeNote, setWakeNote] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = async () => {
+    setError(null);
+    try {
+      const s = await invoke<AgentWakesState>("agent_wakes_state");
+      setState(s);
+    } catch (e) {
+      setError(tauriErrorToString(e));
+    }
+  };
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  const grant = async () => {
+    setError(null);
+    try {
+      await invoke("request_exact_alarm_permission");
+      setWakeNote(
+        "Toggle “Allow setting alarms and reminders” in the screen that just opened, then press Refresh.",
+      );
+    } catch (e) {
+      setError(tauriErrorToString(e));
+    }
+  };
+
+  const wakeNow = async () => {
+    setError(null);
+    setWakeNote(null);
+    setWaking(true);
+    try {
+      await invoke("agent_wake_now", { message: wakeMessage });
+      setWakeNote("Wake queued — the run streams into the active chat.");
+    } catch (e) {
+      setError(tauriErrorToString(e));
+    } finally {
+      setWaking(false);
+    }
+  };
+
+  return (
+    <div className="border border-[var(--color-border)] rounded-lg p-4 bg-[var(--color-surface)] space-y-3">
+      <div className="flex items-baseline justify-between gap-3">
+        <div className="text-sm font-medium">Scheduled wake-ups</div>
+        <div className="flex items-center gap-2 text-xs text-[var(--color-muted-foreground)]">
+          <StatusDot on={!!state?.canScheduleExact} />
+          {state?.canScheduleExact
+            ? "exact alarms granted"
+            : "exact alarms not granted"}
+        </div>
+      </div>
+      <p className="text-xs text-[var(--color-muted-foreground)]">
+        The agent wakes itself on the cron schedules below — even from a
+        closed app. Config lives in{" "}
+        <code className="font-mono">agent_data/agent_wakes.json</code> (an
+        array of <code className="font-mono">{`{"cron", "message"}`}</code>{" "}
+        objects the agent can edit itself). Rate-capped at{" "}
+        {state?.maxFiresPer24h ?? 2} fires per rolling 24 h.
+      </p>
+
+      {state && state.entries.length === 0 && (
+        <p className="text-xs italic text-[var(--color-muted-foreground)]">
+          No wake-ups configured. Create{" "}
+          <code className="font-mono">agent_wakes.json</code> in the agent
+          sandbox, e.g.{" "}
+          <code className="font-mono break-all">
+            [&#123;&quot;cron&quot;: &quot;0 30 8 * * *&quot;, &quot;message&quot;:
+            &quot;Morning check-in&quot;&#125;]
+          </code>
+          .
+        </p>
+      )}
+
+      {state && state.entries.length > 0 && (
+        <ul className="space-y-2">
+          {state.entries.map((e, i) => (
+            <li
+              key={`${e.cron}-${i}`}
+              className="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-3 py-2 space-y-1"
+            >
+              <div className="flex items-center gap-2 text-xs">
+                <Timer
+                  size={12}
+                  className="shrink-0 text-[var(--color-muted-foreground)]"
+                />
+                <code className="font-mono text-[var(--color-foreground)]">
+                  {e.cron}
+                </code>
+                {e.nextFireMs != null && (
+                  <span className="ml-auto shrink-0 text-[var(--color-muted-foreground)]">
+                    next: {new Date(e.nextFireMs).toLocaleString()}
+                  </span>
+                )}
+              </div>
+              <p className="text-xs text-[var(--color-muted-foreground)] line-clamp-2">
+                {e.message}
+              </p>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {state && state.errors.length > 0 && (
+        <ul className="space-y-1 text-xs text-[var(--color-danger)]">
+          {state.errors.map((e, i) => (
+            <li key={i} className="flex items-start gap-1.5">
+              <AlertCircle size={12} className="mt-0.5 shrink-0" />
+              <span className="break-words">{e}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {state && state.recentFires.length > 0 && (
+        <p className="text-xs text-[var(--color-muted-foreground)]">
+          {state.recentFires.length}/{state.maxFiresPer24h} wakes in the last
+          24 h (last:{" "}
+          {new Date(
+            state.recentFires[state.recentFires.length - 1],
+          ).toLocaleString()}
+          )
+        </p>
+      )}
+
+      <div className="flex flex-wrap items-center gap-2">
+        {!state?.canScheduleExact && (
+          <button
+            onClick={grant}
+            className="px-3 py-2 text-sm rounded-md bg-[var(--color-pink-400)] text-[var(--color-primary-foreground)] hover:bg-[var(--color-pink-500)] inline-flex items-center gap-2"
+          >
+            <AlarmClock size={14} />
+            Grant exact alarms
+          </button>
+        )}
+        <button
+          onClick={load}
+          className="px-2.5 py-2 text-xs rounded-md border border-[var(--color-border)] hover:bg-[var(--color-pink-50)] inline-flex items-center gap-1.5"
+        >
+          <RefreshCw size={12} />
+          Refresh
+        </button>
+      </div>
+
+      <div className="pt-2 border-t border-[var(--color-border)] space-y-2">
+        <p className="text-xs text-[var(--color-muted-foreground)]">
+          Debug: seed the working chat and queue a run right now — the same
+          path a scheduled wake takes (minus the rate cap).
+        </p>
+        <div className="flex flex-wrap items-center gap-2">
+          <input
+            value={wakeMessage}
+            onChange={(e) => setWakeMessage(e.target.value)}
+            className="flex-1 min-w-48 px-2.5 py-2 text-sm rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] text-[var(--color-foreground)]"
+            placeholder="Wake instruction"
+          />
+          <button
+            onClick={wakeNow}
+            disabled={waking || !wakeMessage.trim()}
+            className="px-3 py-2 text-sm rounded-md border border-[var(--color-border)] hover:bg-[var(--color-pink-50)] disabled:opacity-50 inline-flex items-center gap-2"
+          >
+            {waking ? (
+              <Loader2 size={14} className="animate-spin" />
+            ) : (
+              <Send size={14} />
+            )}
+            Wake now
+          </button>
+        </div>
+      </div>
+
+      {wakeNote && (
+        <p className="text-xs text-[var(--color-success)] flex items-start gap-1.5">
+          <CheckCircle2 size={14} className="mt-0.5 shrink-0" />
+          <span className="break-words">{wakeNote}</span>
+        </p>
+      )}
+
+      {error && (
+        <p className="text-xs text-[var(--color-danger)] flex items-start gap-1.5">
+          <AlertCircle size={14} className="mt-0.5 shrink-0" />
+          <span className="break-words">{error}</span>
+        </p>
       )}
     </div>
   );
