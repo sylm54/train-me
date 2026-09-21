@@ -1716,10 +1716,25 @@ pub struct Habit {
     pub title: String,
     pub htype: HabitType,
     pub count: u64,
+    /// Time habits log minutes instead of occurrences: `minutes` replaces
+    /// `count` as the daily goal/limit (the two are mutually exclusive).
+    pub minutes: Option<u64>,
     pub success: Vec<Action>,
     pub failure: Vec<Action>,
     /// Markdown body below the front-matter (shown in the habit inspector).
     pub body: String,
+}
+
+impl Habit {
+    /// The daily goal/limit, in the habit's unit (occurrences, or minutes).
+    pub fn limit(&self) -> u64 {
+        self.minutes.unwrap_or(self.count)
+    }
+
+    /// True when the habit logs minutes (`minutes:` set) rather than counts.
+    pub fn is_time(&self) -> bool {
+        self.minutes.is_some()
+    }
 }
 
 /// Parse a `habits/*.md` file. Habits are always v2; a `format:` key is
@@ -1767,11 +1782,30 @@ pub fn parse_habit(content: &str) -> (Option<Habit>, Vec<Diag>) {
         }
         None => 1,
     };
+    // Time habits log minutes (`minutes: 40` = "do X for 40 min a day")
+    // instead of occurrences; the two units are mutually exclusive.
+    let minutes = match get_int(&map, "minutes", "habit", &mut diags) {
+        Some(m) if m >= 0 => Some(m as u64),
+        Some(m) => {
+            diags.push(error_at(
+                None,
+                format!("habit `minutes` must be ≥ 0 (got {m})"),
+            ));
+            Some(0)
+        }
+        None => None,
+    };
+    if minutes.is_some() && map.has("count") {
+        diags.push(error_at(
+            None,
+            "habit `count` and `minutes` are mutually exclusive — pick one unit",
+        ));
+    }
     let success = get_actions(&map, "success", &mut diags);
     let failure = get_actions(&map, "failure", &mut diags);
     warn_unknown_keys(
         &map,
-        &["format", "title", "type", "count", "success", "failure"],
+        &["format", "title", "type", "count", "minutes", "success", "failure"],
         "habit",
         &mut diags,
     );
@@ -1781,6 +1815,7 @@ pub fn parse_habit(content: &str) -> (Option<Habit>, Vec<Diag>) {
             title,
             htype,
             count,
+            minutes,
             success,
             failure,
             body: body.trim().to_string(),
@@ -2444,6 +2479,23 @@ mod tests {
     }
 
     #[test]
+    fn habit_minutes_mode() {
+        let (h, d) = parse_habit("---\ntitle: Practice\ntype: min\nminutes: 40\n---\n");
+        assert!(errs(&d).is_empty(), "{d:?}");
+        let h = h.expect("parsed");
+        assert_eq!(h.minutes, Some(40));
+        assert_eq!(h.limit(), 40);
+        assert!(h.is_time());
+
+        // Both units is an authoring mistake.
+        let (_, d2) = parse_habit("---\ntitle: Q\ntype: min\ncount: 2\nminutes: 40\n---\n");
+        assert!(errs(&d2).iter().any(|m| m.contains("mutually exclusive")), "{d2:?}");
+
+        let (_, d3) = parse_habit("---\ntitle: R\ntype: max\nminutes: -5\n---\n");
+        assert!(errs(&d3).iter().any(|m| m.contains("`minutes` must be ≥ 0")), "{d3:?}");
+    }
+
+    #[test]
     fn task_timeouts_order_warning() {
         let good = "---\ntitle: T\ntimeouts: [{ \"after\": \"30m\", \"action\": { \"type\": \"points\", \"delta\": -5 } }, \
                     { \"after\": \"1h\", \"action\": { \"type\": \"notification\", \"text\": \"x\" } }]\n---\nbody\n";
@@ -2549,6 +2601,12 @@ mod tests {
         let (_, hd) = parse_habit(habit);
         assert!(errs(&hd).is_empty(), "habit.md: {hd:?}");
         assert!(warns(&hd).is_empty(), "habit.md: {hd:?}");
+
+        let habit_time = include_str!("../../examples/habit-time.md");
+        let (ht, htd) = parse_habit(habit_time);
+        assert!(errs(&htd).is_empty(), "habit-time.md: {htd:?}");
+        assert!(warns(&htd).is_empty(), "habit-time.md: {htd:?}");
+        assert_eq!(ht.expect("parses").minutes, Some(40));
 
         let task = include_str!("../../examples/task.md");
         let (_, td) = parse_task(task);

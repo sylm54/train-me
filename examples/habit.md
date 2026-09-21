@@ -14,3 +14,7 @@ A v1 rule is `type: max, count: 0`.
 
 `type: min` — the inverse: success fires the moment `count` is reached,
 failure at day-end if it wasn't.
+
+To log time instead of occurrences, set `minutes:` instead of `count`
+(see `habit-time.md`): the day's total is minutes, and every log carries
+an amount.

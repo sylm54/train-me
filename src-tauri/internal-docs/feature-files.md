@@ -13,9 +13,10 @@ description: Feature-file grammar — front-matter, the page model, and feature 
 
 ## Habits (`habits/*.md`)
 
-- Front-matter: `title`, `type: max|min`, `count` (default 1), `success`/`failure` actions. Body: the positive-case description.
-- `max`: the daily logged count must stay at or under `count`; the first log over the limit fires the failure actions immediately and breaks the streak. A prohibition ("no X") is `type: max, count: 0`.
-- `min`: success fires the moment `count` is reached; failure at day-end if it wasn't.
+- Front-matter: `title`, `type: max|min`, `count` (default 1) or `minutes`, `success`/`failure` actions. Body: the positive-case description.
+- `max`: the daily logged amount must stay at or under the goal; the first log over the limit fires the failure actions immediately and breaks the streak. A prohibition ("no X") is `type: max, count: 0`.
+- `min`: success fires the moment the goal is reached; failure at day-end if it wasn't.
+- Time habits: set `minutes` instead of `count` (mutually exclusive) — e.g. `type: min, minutes: 40` = "practice 40 min today". Each log then carries an amount in minutes instead of ticking one occurrence.
 
 ## Task templates (`tasks/*.md`)
 

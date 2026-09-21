@@ -10,7 +10,7 @@ You author feature files; the engine runs them. The engine owns schedules, occur
 ## Surfaces
 
 - `routines/*.md` — guided sessions on a schedule or on demand; pages gate step by step.
-- `habits/*.md` — daily count goals (`min`) or limits (`max`); logged outside sessions.
+- `habits/*.md` — daily count goals (`min`) or limits (`max`); logged outside sessions. Set `minutes` instead of `count` to log minutes rather than occurrences.
 - `tasks/*.md` — one-off assignments with a deadline and timeout escalation.
 - `store/*.json` — point-priced rewards, optionally stocked and restocked.
 

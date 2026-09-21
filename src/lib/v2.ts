@@ -99,6 +99,8 @@ export interface HabitLogResult {
   count: number;
   limit: number;
   htype: "max" | "min";
+  /** `count` habits tick one per log; `minutes` habits log an amount. */
+  unit: "count" | "minutes";
   status: string;
   title: string;
   lines: string[];
@@ -128,6 +130,8 @@ export interface HabitCard {
   path: string;
   title: string;
   htype: "max" | "min";
+  /** `count` habits tick one per log; `minutes` habits log an amount. */
+  unit: "count" | "minutes";
   limit: number;
   today_count: number;
   status: string;
@@ -195,6 +199,8 @@ export interface Habit {
   title: string;
   htype: "max" | "min";
   count: number;
+  /** Set (instead of `count`) when the habit logs minutes. */
+  minutes: number | null;
   success: Action[];
   failure: Action[];
   /** Markdown body below the front-matter (rendered in the inspector). */
@@ -256,8 +262,10 @@ export function failRun(runId: string): Promise<RunOutcome> {
   return invoke("v2_fail_run", { runId });
 }
 
-export function habitLog(habitRef: string): Promise<HabitLogResult> {
-  return invoke("v2_habit_log", { habitRef });
+/** Log a habit: one tick for count habits, `minutes` of time for
+ * minutes habits (required there, rejected for count habits). */
+export function habitLog(habitRef: string, minutes?: number): Promise<HabitLogResult> {
+  return invoke("v2_habit_log", { habitRef, minutes: minutes ?? null });
 }
 
 export function purchase(entry: string): Promise<RunOutcome> {

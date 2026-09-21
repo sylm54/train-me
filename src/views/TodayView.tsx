@@ -23,6 +23,14 @@ import {
   Volume2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import { AudioPlayerOverlay } from "@/components/AudioPlayerOverlay";
 import { DayTimeline } from "@/components/DayTimeline";
 import { MarkdownBody } from "@/components/MarkdownBody";
@@ -43,6 +51,7 @@ import {
   startRun,
   templateToPath,
   type DebugTimeState,
+  type HabitCard,
   type HabitDetail,
   type TimelineItem,
   type V2Summary,
@@ -70,6 +79,9 @@ export function TodayView({ onRequestSession }: Props) {
   const [habitDetail, setHabitDetail] = useState<HabitDetail | null>(null);
   const [habitPath, setHabitPath] = useState<string | null>(null);
   const [habitBusy, setHabitBusy] = useState(false);
+  // Minutes-habit log prompt (null = closed; count habits log one per tap).
+  const [logTarget, setLogTarget] = useState<HabitCard | null>(null);
+  const [logMinutes, setLogMinutes] = useState("10");
   // Prerender target in flight ("all" or a container path).
   const [prerendering, setPrerendering] = useState<string | null>(null);
   // Debug time machine (debug builds only; null = unavailable/release).
@@ -178,6 +190,21 @@ export function TodayView({ onRequestSession }: Props) {
   const closeHabit = () => {
     setHabitDetail(null);
     setHabitPath(null);
+  };
+
+  // ── Minutes-habit log prompt ─────────────────────────────────────────
+
+  const submitMinutesLog = async () => {
+    if (!logTarget) return;
+    const m = Math.round(Number(logMinutes));
+    if (!Number.isFinite(m) || m < 1 || m > 1440) return;
+    try {
+      const res = await habitLog(logTarget.path, m);
+      setLogTarget(null);
+      showLines(res.lines);
+    } catch (e) {
+      showLines([String(e)]);
+    }
   };
 
   // ── Prerender (per-item + full sandbox sweep) ────────────────────────
@@ -449,7 +476,9 @@ export function TodayView({ onRequestSession }: Props) {
                 <div className="flex-1 min-w-0">
                   <div className="text-sm font-medium truncate">{h.title}</div>
                   <div className="text-xs text-muted-foreground">
-                    {h.htype === "max" ? "stay under" : "reach"} {h.limit} · today {h.today_count}
+                    {h.htype === "max" ? "stay under" : "reach"} {h.limit}
+                    {h.unit === "minutes" && " min"} · today {h.today_count}
+                    {h.unit === "minutes" && " min"}
                     {h.status === "failed" && " · broke"}
                     {h.status === "success" && " · reached"}
                   </div>
@@ -462,10 +491,15 @@ export function TodayView({ onRequestSession }: Props) {
                   disabled={h.status !== "open"}
                   onClick={(e) => {
                     e.stopPropagation();
-                    void habitLog(h.path).then((res) => showLines(res.lines));
+                    if (h.unit === "minutes") {
+                      setLogMinutes("10");
+                      setLogTarget(h);
+                    } else {
+                      void habitLog(h.path).then((res) => showLines(res.lines));
+                    }
                   }}
                 >
-                  Log
+                  {h.unit === "minutes" ? "Log time" : "Log"}
                 </Button>
               </div>
             ))}
@@ -602,7 +636,8 @@ export function TodayView({ onRequestSession }: Props) {
                   <div className="flex flex-wrap gap-2 text-xs">
                     <span className="rounded-full border border-[var(--color-border)] px-3 py-1">
                       {habitDetail.habit.htype === "max" ? "stay under" : "reach"}{" "}
-                      {habitDetail.habit.count}
+                      {habitDetail.habit.minutes ?? habitDetail.habit.count}
+                      {habitDetail.habit.minutes != null && " min"}
                     </span>
                     {(() => {
                       const card = summary.habits.find((h) => h.path === habitPath);
@@ -669,7 +704,8 @@ export function TodayView({ onRequestSession }: Props) {
                         <div key={d.day} className="flex items-center gap-3 px-3 py-2">
                           <span className="flex-1 tabular-nums">{d.day}</span>
                           <span className="text-muted-foreground tabular-nums">
-                            {d.count}×
+                            {d.count}
+                            {habitDetail.habit.minutes != null ? "m" : "×"}
                           </span>
                           <span
                             className={`text-xs w-16 text-right ${
@@ -696,6 +732,41 @@ export function TodayView({ onRequestSession }: Props) {
           </div>
         </div>
       )}
+
+      {/* Minutes-habit log prompt: the amount is the whole point of a
+          time habit, so ask instead of ticking one per tap. */}
+      <Dialog
+        open={logTarget !== null}
+        onOpenChange={(o) => {
+          if (!o) setLogTarget(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-sm">
+          <DialogTitle>Log minutes</DialogTitle>
+          <DialogDescription>
+            {logTarget?.title} — today {logTarget?.today_count ?? 0} / {logTarget?.limit ?? 0} min
+          </DialogDescription>
+          <Input
+            type="number"
+            min={1}
+            max={1440}
+            value={logMinutes}
+            autoFocus
+            onChange={(e) => setLogMinutes(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void submitMinutesLog();
+            }}
+          />
+          <DialogFooter>
+            <Button variant="ghost" size="sm" onClick={() => setLogTarget(null)}>
+              Cancel
+            </Button>
+            <Button size="sm" disabled={!(Number(logMinutes) >= 1)} onClick={() => void submitMinutesLog()}>
+              Log
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {playing && (
         <AudioPlayerOverlay src={playing} onClose={() => setPlaying(null)} />
