@@ -515,7 +515,12 @@ async fn ask_question(ctx: &ToolCtx<'_>, args: &Value) -> Result<Value, String> 
         }));
     }
 
+    // Block until answered. Flip the service notification to "Waiting for
+    // your answer" for the wait and back to "Working…" after — a run can ask
+    // several questions per turn, so the transition goes both ways.
+    crate::agent_service::update_phase("waiting-for-answer", None);
     let result = questions::pose(ctx.app, ctx.chat_id, kind, question, choices, hint, ctx.cancel).await;
+    crate::agent_service::update_phase("running", None);
     serde_json::to_value(result).map_err(|e| e.to_string())
 }
 
