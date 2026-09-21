@@ -16,7 +16,7 @@ You author feature files; the engine runs them. The engine owns schedules, occur
 
 ## Actions (usable in success/failure/timeouts/store)
 
-`points` (delta) · `task` (assign an instance) · `script` (audio) · `notification` (message) · `exemption` (pause failures + protect streaks) · `roulette` (weighted outcomes).
+`points` (delta) · `task` (assign an instance) · `script` (audio) · `notification` (message) · `exemption` (pause failures + protect streaks) · `roulette` (weighted outcomes) · `agent` (wake the agent with a message — failure/timeout self-alerting, opt-in).
 
 ## Data you can inspect
 

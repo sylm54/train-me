@@ -1722,4 +1722,45 @@ x
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].status, "ok", "{:?}", reports[0].problems);
     }
+
+    #[test]
+    fn v2_store_entry_agent_action_is_clean() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reports = validate_store_entry(
+            "store/pass.json",
+            "{ \"title\": \"P\", \"price\": 5, \"action\": { \"type\": \"agent\", \"message\": \"check in\" } }",
+            dir.path(),
+        );
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].status, "ok", "{:?}", reports[0].problems);
+    }
+
+    #[test]
+    fn v2_agent_action_message_is_linted() {
+        // The `agent` action's `message` must be a non-empty string — the
+        // parser's required-string check is the lint, surfaced here as
+        // validator errors.
+        let dir = agent_dir_with(&[]);
+        let routine_with = |failure: &str| {
+            let content = format!("---\nformat: 2\ntitle: X\nfailure: {failure}\n---\nbody\n");
+            validate_routine_v2("routines/x.md", &content, dir.path())
+        };
+        for failure in [
+            "{ \"type\": \"agent\" }",
+            "{ \"type\": \"agent\", \"message\": \"   \" }",
+            "{ \"type\": \"agent\", \"message\": 5 }",
+        ] {
+            let reports = routine_with(failure);
+            assert_eq!(reports[0].status, "error", "{failure}");
+            assert!(
+                problems_for(&reports[0])
+                    .iter()
+                    .any(|m| m.contains("`message`")),
+                "{failure}: {:?}",
+                reports[0].problems
+            );
+        }
+        let ok = routine_with("{ \"type\": \"agent\", \"message\": \"Drill lapsed\" }");
+        assert_eq!(ok[0].status, "ok", "{:?}", ok[0].problems);
+    }
 }

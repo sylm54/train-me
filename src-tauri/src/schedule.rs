@@ -190,6 +190,29 @@ pub fn list_v2_files(agent_dir: &Path, dir: &str, ext: &str) -> Vec<(String, Str
 // Action executor
 // ============================================================================
 
+/// The `origin` tag stamped on the wake chat's seed metadata when an
+/// `agent` action fires (distinguishes these turns in the chat index from
+/// `debug` and user chats).
+pub const AGENT_ACTION_ORIGIN: &str = "agent-action";
+
+/// The agent wake hook, registered by `agent::init` during app setup (see
+/// [`register_agent_wake`]). The indirection is deliberate: a static call
+/// from this module into the agent run loop (`enqueue_seed` → providers →
+/// HTTP stack) changes the Windows test binary's import table and it stops
+/// loading with STATUS_ENTRYPOINT_NOT_FOUND — the same constraint that
+/// keeps [`notify`] emitting an event instead of calling the notification
+/// plugin. In the app the hook is always present before any reconcile can
+/// run (setup registers it before `spawn_reconcile`); unit tests leave it
+/// unset, so the action degrades to a log line.
+type AgentWakeFn = fn(&str);
+static AGENT_WAKE: std::sync::OnceLock<AgentWakeFn> = std::sync::OnceLock::new();
+
+/// Bind the `agent`-action wake. Called once from `agent::init` (setup),
+/// before any command or reconcile can fire.
+pub fn register_agent_wake(wake: AgentWakeFn) {
+    let _ = AGENT_WAKE.set(wake);
+}
+
 /// Execute a list of actions idempotently. `source_prefix` must be unique
 /// per triggering event (occurrence / instance / purchase id) — each
 /// action's source is `<prefix>:<index>`, and the economy ledger's
@@ -252,6 +275,29 @@ fn execute_action(
         Action::Notification { text } => {
             notify_kind(app, "Notice", text, "alert");
             format!("notified: {text}")
+        }
+        Action::Agent { message } => {
+            // Wake the agent (opt-in self-alerting): the message becomes an
+            // invocation note in the working chat and a FIFO turn is queued
+            // (single-flight — the runner serializes turns app-wide). The
+            // hook enqueues and DETACHES (spawn on the async runtime), so
+            // reconcile never waits on a model turn. Exactly-once is
+            // inherited from the caller — failure/timeout actions only run
+            // after the triggering occurrence/instance/day was marked in the
+            // ledger (mark-before-fire), so a re-reconcile never reaches
+            // this arm a second time for the same event.
+            match AGENT_WAKE.get() {
+                Some(wake) => {
+                    wake(message);
+                    format!("agent wake queued: {message}")
+                }
+                // Hook unbound — only possible outside the app (unit tests).
+                None => {
+                    let e = "agent runtime not initialised";
+                    log::warn!("[schedule] agent action skipped: {e}");
+                    format!("agent wake skipped: {e}")
+                }
+            }
         }
         Action::Exemption {
             duration_secs,
@@ -2292,6 +2338,66 @@ mod tests {
         assert!(report.lines.iter().any(|l| l.contains("exempt")));
         let econ = open(&state.join("economy.db")).unwrap();
         assert_eq!(economy::balance(&econ).unwrap(), 0, "failure suppressed");
+        let _ = tmp;
+    }
+
+    #[test]
+    fn agent_action_skips_gracefully_without_runtime() {
+        // No Tauri runtime in unit tests (`agent::runtime()` is unbound) —
+        // the action must degrade to a log line, never fail the executor.
+        let line = execute_action(
+            &Connection::open_in_memory().unwrap(),
+            &Connection::open_in_memory().unwrap(),
+            None,
+            Path::new("/nonexistent"),
+            &Action::Agent {
+                message: "follow up".into(),
+            },
+            "test:source:0",
+        );
+        assert!(line.contains("agent wake skipped"), "{line}");
+    }
+
+    #[test]
+    fn agent_action_fires_once_per_occurrence() {
+        // A routine whose failure wakes the agent: the wake must fire exactly
+        // once for the lapsed occurrence, and a re-reconcile must not repeat
+        // it (mark-before-fire gating — same guarantee class as `notification`).
+        let routine = "---\nformat: 2\ntitle: Drill\nschedule: @daily\ntimeframe: 1h\n\
+                       failure: { \"type\": \"agent\", \"message\": \"Drill lapsed — follow up with the user.\" }\n---\nintro\n";
+        let (tmp, agent, state) = env(&[("routines/drill.md", routine)]);
+        // One occurrence whose window already closed.
+        {
+            let sched = open(&state.join("schedule.db")).unwrap();
+            let past = ts(utc_now() - chrono::Duration::hours(2));
+            sched
+                .execute(
+                    "INSERT INTO occurrences (id, kind, container, due, window_end, status, created) \
+                     VALUES (?1, 'routine', 'routines/drill.md', ?2, ?2, 'pending', ?2)",
+                    rusqlite::params!["routine:routines/drill.md:past", past],
+                )
+                .unwrap();
+        }
+        let report = reconcile_blocking(&agent, &state, None);
+        assert_eq!(report.lapsed, 1, "{report:?}");
+        let wakes: Vec<&String> = report
+            .lines
+            .iter()
+            .filter(|l| l.contains("agent wake"))
+            .collect();
+        assert_eq!(wakes.len(), 1, "exactly one wake per occurrence: {report:?}");
+        assert!(wakes[0].contains("skipped"), "no runtime in tests: {wakes:?}");
+
+        // Re-reconcile: the occurrence is marked lapsed — no second wake.
+        let report2 = reconcile_blocking(&agent, &state, None);
+        assert_eq!(report2.lapsed, 0, "{report2:?}");
+        assert!(
+            !report2
+                .lines
+                .iter()
+                .any(|l| l.contains("agent wake")),
+            "no repeat wake: {report2:?}"
+        );
         let _ = tmp;
     }
 }

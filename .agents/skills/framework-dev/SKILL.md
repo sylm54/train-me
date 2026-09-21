@@ -11,7 +11,7 @@ A **framework** is a ZIP that supplies everything user-facing in train-me: the a
 
 - train-me is a Tauri app (mobile-first) with a built-in LLM agent. The agent runs from **prompts** your framework installs; it has full bash/read/write access to a **sandbox** (`agent_data/`) your framework populates.
 - Everything interactive is expressed as **feature files** the agent authors and the **engine** runs: routines (scheduled or on-demand sessions), habits (daily count goals/limits), task templates (assignable one-offs), and store entries (point-priced rewards). The user plays everything from the **Today** view in a gated, page-by-page session runner.
-- The engine owns correctness: an append-only **points ledger**, scheduled **occurrences** reconciled lazily (missed windows fire failure actions), **exemptions** that suspend failures and protect streaks, and **idempotent actions** (`points`, `task`, `script`, `notification`, `exemption`, `roulette`).
+- The engine owns correctness: an append-only **points ledger**, scheduled **occurrences** reconciled lazily (missed windows fire failure actions), **exemptions** that suspend failures and protect streaks, and **idempotent actions** (`points`, `task`, `script`, `notification`, `exemption`, `roulette`, `agent`).
 - **Onboarding flow**: your framework may ship `onboarding.json`; the user answers it right after install (deterministic, conditional questions). Answers land in `agent_data/USER.md` — or the sandbox-relative `output` path your flow declares — plain data the framework consumes via `{{include}}` in its own prompts. Nothing is auto-added to any system prompt.
 - **Audio**: TTS XML scripts (spoken word, sound effects, loops, interactive `<choice>`/`<until>` prompts) render to audio and play in a full player. Every script in the sandbox pre-renders in the background after startup (toggleable in Settings; referenced scripts render first); `<include>` targets render as linked sub-manifests — a shared subscript is synthesized once — and a glob include (`dir/*.xml`) picks a random match per playback. Playbacks and decisions log under feature `script`.
 - The agent inspects state through bash builtins (`points`, `chastity`, `inventory`) and the `activity.db` SQLite log it can query read-only.
@@ -59,7 +59,7 @@ Full spec: FORMAT.md in the train-me repo. Worked examples: `examples/` seeded i
 
 **Store** — `store/*.json`: `title`, `price`, optional `stock` + `restock` cron, `action`. Users buy with points; stock restocks lazily.
 
-**Actions** (everywhere): `points {delta}`, `task {template}`, `script {src}`, `notification {text}`, `exemption {duration, scope: habits|routines|tasks|all}`, `roulette {outcomes: [{weight, action}]}` (weight 0 disables; ≥2 outcomes).
+**Actions** (everywhere): `points {delta}`, `task {template}`, `script {src}`, `notification {text}`, `exemption {duration, scope: habits|routines|tasks|all}`, `roulette {outcomes: [{weight, action}]}` (weight 0 disables; ≥2 outcomes), `agent {message}` — wakes the agent with `message` as its instruction (fires on that block's failure/timeout at the resolving reconcile, exactly once per occurrence; FIFO + single-flight turn queue). This is the only way an engine failure reaches the agent — use it on failure/timeout slots the agent should react to.
 
 **TTS XML scripts** — the full tag reference (all tags, attributes, sound/tone/effect values, the `@` expression language, and a worked example) lives in [tts-tags.md](tts-tags.md) next to this file. Read it when authoring or editing `.xml` audio scripts.
 

@@ -1311,6 +1311,11 @@ pub enum Action {
     Notification { text: String },
     Exemption { duration_secs: u64, scope: Scope },
     Roulette { outcomes: Vec<WeightedOutcome> },
+    /// Wake the agent: the message becomes an invocation note in the working
+    /// chat and a turn is queued (FIFO, single-flight). Opt-in self-alerting
+    /// for framework authors — nothing wakes the agent unless a feature file
+    /// asks for it.
+    Agent { message: String },
 }
 
 const MAX_ROULETTE_DEPTH: usize = 3;
@@ -1358,7 +1363,7 @@ fn parse_action(v: &FValue, ctx: &str, depth: usize, diags: &mut Vec<Diag>) -> O
         _ => {
             diags.push(error_at(
                 None,
-                format!("{ctx} is missing a string `type` (points, task, script, notification, exemption, roulette)"),
+                format!("{ctx} is missing a string `type` (points, task, script, notification, exemption, roulette, agent)"),
             ));
             return None;
         }
@@ -1398,6 +1403,11 @@ fn parse_action(v: &FValue, ctx: &str, depth: usize, diags: &mut Vec<Diag>) -> O
             let text = req_str(map, "text", &sub_ctx, diags)?;
             warn_unknown_keys(map, &["type", "text"], &sub_ctx, diags);
             Some(Action::Notification { text })
+        }
+        "agent" => {
+            let message = req_str(map, "message", &sub_ctx, diags)?;
+            warn_unknown_keys(map, &["type", "message"], &sub_ctx, diags);
+            Some(Action::Agent { message })
         }
         "exemption" => {
             let duration_secs = req_duration(map, "duration", &sub_ctx, diags)?;
@@ -1503,7 +1513,7 @@ fn parse_action(v: &FValue, ctx: &str, depth: usize, diags: &mut Vec<Diag>) -> O
                 None,
                 format!(
                     "{ctx}: unknown action type `{other}` — use points, task, script, \
-                     notification, exemption, or roulette"
+                     notification, exemption, roulette, or agent"
                 ),
             ));
             None
@@ -1779,7 +1789,7 @@ pub fn parse_habit(content: &str) -> (Option<Habit>, Vec<Diag>) {
     )
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TimeoutRule {
     pub after_secs: u64,
     pub actions: Vec<Action>,
@@ -2320,6 +2330,60 @@ mod tests {
         assert!(errs(&actions_from(zero))
             .iter()
             .any(|m| m.contains("total weight is 0")));
+    }
+
+    #[test]
+    fn agent_action_message_validation() {
+        // Valid: any non-empty string, flow-JSON or dotted form.
+        assert!(errs(&actions_from(
+            "success: { \"type\": \"agent\", \"message\": \"Routine lapsed — follow up.\" }"
+        ))
+        .is_empty());
+        assert!(errs(&actions_from("success.type: agent\nsuccess.message: check in"))
+            .is_empty());
+        assert!(errs(&actions_from(
+            "success: { \"type\": \"roulette\", \"outcomes\": [\
+              { \"weight\": 1, \"action\": { \"type\": \"agent\", \"message\": \"a\" } }, \
+              { \"weight\": 1, \"action\": { \"type\": \"points\", \"delta\": 1 } }] }"
+        ))
+        .is_empty());
+
+        // Missing / empty / non-string message is an error.
+        assert!(errs(&actions_from("success: { \"type\": \"agent\" }"))
+            .iter()
+            .any(|m| m.contains("`message` is required")));
+        assert!(errs(&actions_from(
+            "success: { \"type\": \"agent\", \"message\": \"   \" }"
+        ))
+        .iter()
+        .any(|m| m.contains("`message` must not be empty")));
+        assert!(errs(&actions_from(
+            "success: { \"type\": \"agent\", \"message\": 5 }"
+        ))
+        .iter()
+        .any(|m| m.contains("`message` must be a string")));
+        // Unknown keys warn (forward compatibility).
+        assert!(warns(&actions_from(
+            "success: { \"type\": \"agent\", \"message\": \"x\", \"bogus\": 1 }"
+        ))
+        .iter()
+        .any(|m| m.contains("unknown key `bogus`")));
+    }
+
+    #[test]
+    fn agent_action_serde_round_trip() {
+        // Timeout rules are persisted as JSON (`task_instances.timeouts_json`)
+        // and re-parsed with serde — the agent action must round-trip there.
+        let rule = TimeoutRule {
+            after_secs: 60,
+            actions: vec![Action::Agent {
+                message: "task timed out".into(),
+            }],
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        assert!(json.contains("\"type\":\"agent\""), "{json}");
+        let back: TimeoutRule = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, rule);
     }
 
     // ── containers ─────────────────────────────────────────────────────
