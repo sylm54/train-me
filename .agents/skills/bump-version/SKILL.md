@@ -5,7 +5,7 @@ description: How to cut a new release of train-me. Use whenever the user asks to
 
 # Bump Version
 
-Cut a new release of train-me by bumping the version, tagging the commit, and pushing the tag. Pushing a `v*` tag triggers `.github/workflows/release.yml`, which builds Windows (MSI) and Android packages and creates a **draft** GitHub release named `train-me v<version>`.
+Cut a new release of train-me by bumping the version, tagging the commit, and pushing the tag. Pushing a `v*` tag triggers `.github/workflows/release.yml`, which builds Windows (MSI) and Android packages and **publishes** the GitHub release `train-me v<version>` with the binaries attached — there is no draft stage and no manual publish step.
 
 ## The four version locations
 
@@ -72,7 +72,7 @@ git tag "v<version>"
 git push origin master "v<version>"
 ```
 
-**The push is the release trigger — confirm with the user before running it** unless they've already said to release. Pushing the tag kicks off the build workflow, which creates a draft GitHub release with binary assets.
+**The push is the release trigger — confirm with the user before running it** unless they've already said to release. Pushing the tag kicks off the build workflow, and a green build publishes the release with binary assets immediately — there is no draft to review first, so this confirmation is the last gate before the release is public.
 
 ### 5. Verify the release
 
@@ -82,7 +82,13 @@ After pushing, give CI a moment and check the workflow run:
 gh run watch
 ```
 
-Or open the Actions tab: `https://github.com/sylm54/train-me/actions`. The release appears as a **draft** at `https://github.com/sylm54/train-me/releases` — it still needs to be published (or discarded) by hand once the builds finish. A published release is outward-facing and hard to undo, so surface that step to the user rather than auto-publishing.
+Or open the Actions tab: `https://github.com/sylm54/train-me/actions`. When the run goes green, CI publishes the release automatically — there is no draft step (the workflow builds with `releaseDraft: false` and creates releases via the `gh` CLI without `--draft`). Confirm the release is live with both assets attached:
+
+```bash
+gh release view "v<version>" --json isDraft,assets --jq '{isDraft, assets: [.assets[] | .name]}'
+```
+
+Expect `isDraft: false` and both the APK and the MSI in `assets`.
 
 ## Notes & gotchas
 
