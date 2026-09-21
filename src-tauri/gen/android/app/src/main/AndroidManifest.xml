@@ -2,7 +2,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
 
-    <!-- Foreground service hosting audio/TTS rendering (RenderService). -->
+    <!-- Foreground services hosting audio/TTS rendering (RenderService) and
+         active agent turns (AgentService). -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
@@ -30,6 +31,13 @@
 
         <service
             android:name=".RenderService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- Pins the process while a native agent turn runs (see
+             src-tauri/src/agent_service.rs). -->
+        <service
+            android:name=".AgentService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 

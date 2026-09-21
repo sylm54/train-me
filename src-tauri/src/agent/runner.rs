@@ -327,6 +327,11 @@ impl AgentRuntime {
         channel: tauri::ipc::Channel<Value>,
     ) -> RunInfo {
         self.gate.acquire().await;
+        // Pin the foreground service for the run's whole lifetime; the guard
+        // releases on every exit path (panics included). run_turn sets the
+        // notification body (Working… / Waiting for your answer); idle and
+        // finished need none — release removes the whole entry.
+        let _slot = crate::agent_service::AgentHold::hold(&self.app);
         let cancel = CancelHandle::new();
         *self.current_cancel.lock() = Some(cancel.clone());
         let info = self.run_turn(&chat_id, Some(messages), Some(&channel), &cancel).await;
@@ -360,9 +365,16 @@ impl AgentRuntime {
             log::warn!("[agent] wake ({origin}): appending seed failed: {e}");
         }
         let _ = crate::chats::touch(&chat_id, None);
+        // Pin the foreground service NOW, before queuing: the seed may wait
+        // a long turn behind the FIFO gate, and a process frozen while
+        // waiting would never reach its ticket. The guard moves into the
+        // spawned task, so the slot is held until the run settles (release
+        // on every exit path, panics included).
+        let _slot = crate::agent_service::AgentHold::hold(&self.app);
         let this = self.clone();
         tauri::async_runtime::spawn(async move {
             this.run_background(chat_id).await;
+            drop(_slot);
         });
     }
 
@@ -453,6 +465,9 @@ impl AgentRuntime {
         channel: Option<&tauri::ipc::Channel<Value>>,
         cancel: &CancelHandle,
     ) -> RunInfo {
+        // The service slot is already held by the caller's guard; mirror the
+        // phase on its notification (shared by interactive + background runs).
+        crate::agent_service::update_phase("running", None);
         let data_dir = self.data_dir();
         let state = self.app.state::<crate::AppState>();
         let agent_dir = state.agent_dir.clone();
@@ -722,6 +737,11 @@ impl AgentRuntime {
 
         let _ = crate::chats::touch(chat_id, None);
         self.activity(chat_id, "end", None);
+        // Terminal phase, just before the caller's guard releases the
+        // service slot: idle/finished map to no body update (release removes
+        // the whole notification) — this call documents the transition and
+        // is the hook point if that ever changes.
+        crate::agent_service::update_phase("finished", None);
         info
     }
 

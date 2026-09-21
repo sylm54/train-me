@@ -12,6 +12,8 @@ mod activity_db;
 // Native agent runtime (Stage 3a): the headless agent loop on rig. Public
 // only for its doctests-free command surface — see the module docs.
 pub mod agent;
+// Android foreground-service bridge for agent turns (see the module docs).
+mod agent_service;
 mod audio_renderer;
 mod audio_server;
 mod bash;
@@ -1735,6 +1737,10 @@ pub fn run() {
             // them via the restart path and the UI can re-render them.
             agent::init(app);
             agent::questions::restore(&data_dir);
+
+            // Bind the agent foreground-service bridge's dispatch target
+            // (the AppHandle update_phase hops through — see agent_service.rs).
+            agent_service::init(app.handle());
 
             // Bootstrap the SQLite DB schemas.
             //
