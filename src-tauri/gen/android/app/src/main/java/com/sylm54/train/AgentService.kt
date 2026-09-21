@@ -14,6 +14,7 @@ import android.util.Log
 import androidx.annotation.Keep
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import org.json.JSONObject
 
 /**
  * Foreground service that pins the process while a native agent turn runs.
@@ -29,6 +30,20 @@ import androidx.core.app.ServiceCompat
  * `start` when the first run (or queued seed) acquires a slot,
  * `updateText` on throttled phase changes, `stop` when the last slot is
  * released.
+ *
+ * Stage 5b (scheduled agent wake-ups): the service is ALSO started cold by
+ * [WakeReceiver] — from an exact alarm or from BOOT_COMPLETED, both
+ * documented background-start exemptions — with an [ACTION_AGENT_WAKE] or
+ * [ACTION_BOOT_RESCHEDULE] intent. The contract stays the same: promote to
+ * foreground in `onCreate`/`onStartCommand` FIRST (the
+ * startForegroundService requirement), then run the native call on a worker
+ * thread, never the main thread, and never let a native failure crash the
+ * process. `agentWake` blocks until the seeded turn settles and answers
+ * with `{skipped, reason?, stillActive, summary?}`; the completion
+ * notification posts on the "agent-done" channel when a run actually
+ * happened, and the service stops itself only when Rust says nothing else
+ * holds the pin (`stillActive == false`) AND the live runtime never pinned
+ * it (`pinnedByRuntime` — that path stops the service itself via `stop`).
  *
  * The class is only referenced by name from Rust, so @Keep is required to
  * survive R8 in release builds.
@@ -47,6 +62,27 @@ class AgentService : Service() {
          *  (RenderService owns 7777/7778; agent owns 7779). */
         const val NOTIF_ID = 7779
 
+        /** One-shot completion notifications after a scheduled wake's run
+         *  actually happened (never on skips). Paired with the "agent-done"
+         *  channel; 7780 keeps the numbering scheme (render 7777/7778,
+         *  agent ongoing 7779). */
+        const val DONE_CHANNEL_ID = "agent-done"
+        const val DONE_NOTIF_ID = 7780
+
+        /** Intent actions carried by [WakeReceiver]-forwarded starts. */
+        const val ACTION_AGENT_WAKE = "com.sylm54.train.AGENT_WAKE"
+        const val ACTION_BOOT_RESCHEDULE = "com.sylm54.train.BOOT_RESCHEDULE"
+
+        init {
+            // Cold starts load the library here — no WebView/activity ever
+            // ran in that process to do it. Safe to call repeatedly.
+            try {
+                System.loadLibrary("train_me_lib")
+            } catch (t: Throwable) {
+                Log.w(TAG, "loadLibrary(train_me_lib) failed: $t")
+            }
+        }
+
         fun ensureChannels(context: Context) {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
                 return
@@ -61,6 +97,15 @@ class AgentService : Service() {
                 setShowBadge(false)
             }
             mgr.createNotificationChannel(channel)
+            val done = NotificationChannel(
+                DONE_CHANNEL_ID,
+                "Agent wake results",
+                NotificationManager.IMPORTANCE_DEFAULT,
+            ).apply {
+                description = "Shown when a scheduled agent wake finishes its run"
+                setShowBadge(true)
+            }
+            mgr.createNotificationChannel(done)
         }
 
         private fun contentIntent(context: Context): PendingIntent {
@@ -130,10 +175,53 @@ class AgentService : Service() {
         }
     }
 
+    // ── Native entry points (Stage 5b) ──────────────────────────────────
+
+    /**
+     * Run one scheduled agent wake (BLOCKING — call off the main thread).
+     * `payloadJson`: `{"index": N, "message": "…", "token": "…",
+     * "dataDirPath": "…"}`. Returns
+     * `{skipped: bool, reason?: string, stillActive: bool, summary?: string}`.
+     *
+     * Declared as a plain INSTANCE `external fun` on purpose: a companion
+     * `external fun` without @JvmStatic declares its native method on the
+     * Companion class (symbol `…AgentService_Companion_agentWake`), which
+     * would never link against the Rust export. The instance form generates
+     * exactly `Java_com_sylm54_train_AgentService_agentWake`, and the
+     * implicit receiver arrives as the JNI function's second argument — the
+     * Rust side treats it as an opaque jobject (and uses it as the
+     * `Context` for the cold reschedule's AlarmManager calls).
+     */
+    private external fun agentWake(payloadJson: String): String
+
+    /** Cold-start reschedule (BLOCKING — call off the main thread). Payload
+     *  is the raw `dataDir` path; returns a summary JSON. Same symbol-naming
+     *  rationale as [agentWake]. */
+    private external fun agentReschedule(dataDirPath: String): String
+
+    /**
+     * True once a start WITHOUT a wake action arrived — i.e. the live
+     * runtime pinned the service (its slot counting starts/stops it via the
+     * `start`/`stop` statics). A finishing wake thread must then never
+     * stopSelf: the runtime owns the service lifecycle in that overlap.
+     * Reset in onDestroy (the runtime's `stop` destroys the service).
+     */
+    @Volatile
+    private var pinnedByRuntime = false
+
+    /** The at-most-one running wake job (alarms are serialized; a second
+     *  start while one runs is dropped with a log — the global rate cap in
+     *  Rust bounds how much a dropped wake can matter). */
+    @Volatile
+    private var wakeThread: Thread? = null
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
+        // Companion init runs here (ensureChannels is a companion member),
+        // which is where the native library gets loaded — before any
+        // external call can happen in a cold-started process.
         ensureChannels(this)
         promoteToForeground()
     }
@@ -143,10 +231,32 @@ class AgentService : Service() {
         // startForeground within a few seconds of each start request, and a
         // start can arrive while the service is already running.
         promoteToForeground()
+        when (intent?.action) {
+            ACTION_AGENT_WAKE -> {
+                val payload = JSONObject().apply {
+                    put("index", intent.getIntExtra(WakeReceiver.EXTRA_INDEX, -1))
+                    put("message", intent.getStringExtra(WakeReceiver.EXTRA_MESSAGE) ?: "")
+                    put("token", intent.getStringExtra(WakeReceiver.EXTRA_TOKEN) ?: "")
+                    put("dataDirPath", dataDirPath())
+                }.toString()
+                startWakeThread(payload)
+            }
+
+            ACTION_BOOT_RESCHEDULE ->
+                Thread {
+                    runReschedule()
+                }.start()
+
+            // Plain start from the live runtime's slot counting (or a
+            // null-intent restart): the service lifecycle belongs to Rust's
+            // holders from here on.
+            else -> pinnedByRuntime = true
+        }
         return START_NOT_STICKY
     }
 
     override fun onDestroy() {
+        pinnedByRuntime = false
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         super.onDestroy()
     }
@@ -157,6 +267,94 @@ class AgentService : Service() {
             startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         } else {
             startForeground(NOTIF_ID, notif)
+        }
+    }
+
+    /**
+     * The app data dir, resolved the same way Tauri's path plugin resolves
+     * `app_data_dir` on Android (`Context.getDataDir` on API 24+ — verified
+     * against PathPlugin.kt in tauri 2.11; NOT filesDir, which is one level
+     * deeper at `dataDir/files`). agent_wakes.rs derives data_dir/agent_dir
+     * from this value and must reproduce the app's exact on-disk layout.
+     */
+    private fun dataDirPath(): String =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            dataDir?.absolutePath
+        } else {
+            null
+        } ?: applicationInfo.dataDir
+
+    /** Serialize wake jobs: at most one native wake at a time in a process. */
+    private fun startWakeThread(payload: String) {
+        val existing = wakeThread
+        if (existing?.isAlive == true) {
+            Log.w(TAG, "wake already running; dropping the overlapping wake")
+            return
+        }
+        wakeThread = Thread {
+            runWake(payload)
+        }.also { it.start() }
+    }
+
+    /** The blocking native wake + result handling (worker thread only). */
+    private fun runWake(payload: String) {
+        val resultJson = try {
+            agentWake(payload)
+        } catch (t: Throwable) {
+            Log.w(TAG, "agentWake native call failed: $t")
+            JSONObject().apply {
+                put("skipped", true)
+                put("reason", "native agentWake failed: $t")
+                put("stillActive", false)
+            }.toString()
+        }
+        try {
+            val result = JSONObject(resultJson)
+            val skipped = result.optBoolean("skipped", true)
+            val stillActive = result.optBoolean("stillActive", false)
+            val summary = result.optString("summary", "")
+            if (!skipped) {
+                postDoneNotification(summary.ifEmpty { "Wake run finished" })
+            }
+            if (!stillActive && !pinnedByRuntime) {
+                stopSelf()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "wake result handling failed: $e")
+            if (!pinnedByRuntime) stopSelf()
+        }
+    }
+
+    /** Blocking cold reschedule + always-stop (boot path). */
+    private fun runReschedule() {
+        try {
+            val summary = agentReschedule(dataDirPath())
+            Log.i(TAG, "boot reschedule: $summary")
+        } catch (t: Throwable) {
+            Log.w(TAG, "agentReschedule native call failed: $t")
+        }
+        // Reschedule owns no further work: stop unless the live runtime
+        // pinned the service in the meantime (it manages its own lifecycle).
+        if (!pinnedByRuntime) {
+            stopSelf()
+        }
+    }
+
+    /** Completion notification for an actually-run wake (tap → MainActivity). */
+    private fun postDoneNotification(summary: String) {
+        try {
+            val notif = NotificationCompat.Builder(this, DONE_CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_render_notification)
+                .setContentTitle("Agent finished")
+                .setContentText(summary)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(summary))
+                .setAutoCancel(true)
+                .setContentIntent(contentIntent(this))
+                .build()
+            getSystemService(NotificationManager::class.java)
+                ?.notify(DONE_NOTIF_ID, notif)
+        } catch (e: Exception) {
+            Log.w(TAG, "done notification failed: $e")
         }
     }
 }

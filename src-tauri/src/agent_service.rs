@@ -108,8 +108,11 @@ pub fn init(app: &AppHandle) {
 /// `with_webview` exposes `PlatformWebview::jni_handle().exec`, the public
 /// Tauri v2 route for app-side JNI. No main window (headless seed run after
 /// the activity is gone) → debug log and skip.
+///
+/// `pub(crate)` because Stage 5b's agent_wakes reschedule also dispatches
+/// Kotlin statics through this hop (see `agent_wakes::reschedule`).
 #[cfg(target_os = "android")]
-fn exec_on_main<R, F>(app: &AppHandle<R>, f: F)
+pub(crate) fn exec_on_main<R, F>(app: &AppHandle<R>, f: F)
 where
     R: tauri::Runtime,
     F: FnOnce(&mut JNIEnv, &JObject, &JObject) + Send + 'static,
@@ -196,6 +199,22 @@ pub fn release<R: tauri::Runtime>(app: &AppHandle<R>) {
     #[cfg(not(target_os = "android"))]
     {
         let _ = app;
+    }
+}
+
+/// Current slot count. Stage 5b's native wake path uses it to compute
+/// `stillActive` for the service: after a cron-triggered run settles, other
+/// holders (a user turn, a queued seed) keep the service pinned. 0 on
+/// non-Android (where slots are never held).
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn holder_count() -> usize {
+    #[cfg(target_os = "android")]
+    {
+        HOLDERS.load(Ordering::SeqCst)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        0
     }
 }
 

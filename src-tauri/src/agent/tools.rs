@@ -22,7 +22,6 @@
 
 use rig_core as rig;
 use serde_json::{json, Value};
-use tauri::Manager;
 
 use crate::agent::questions;
 use crate::agent::runner::CancelHandle;
@@ -38,11 +37,17 @@ pub(crate) const READ_HEAD_LINES: usize = 50;
 // Tool context
 // ============================================================================
 
-/// Everything a tool execution may need: app handles (bash sandbox state,
-/// event emission), the run's settings snapshot, the chat the run belongs
-/// to, and the run's cancel handle (only `ask_question` listens to it).
+/// Everything a tool execution may need: the runtime environment (the live
+/// app handle when this process has one — `None` in Stage 5b's headless
+/// cold-start runs, where event emission, the question UI and the
+/// foreground-service pin are unavailable and the tools that need them
+/// degrade, see each arm), the app state snapshot (managed state in live
+/// runs, a locally built equivalent in headless runs — dirs + bash sandbox),
+/// the run's settings snapshot, the chat the run belongs to, and the run's
+/// cancel handle (only `ask_question` listens to it).
 pub struct ToolCtx<'a> {
-    pub app: &'a tauri::AppHandle,
+    pub app: Option<&'a tauri::AppHandle>,
+    pub state: &'a crate::AppState,
     pub settings: &'a AgentSettings,
     pub chat_id: &'a str,
     pub cancel: &'a CancelHandle,
@@ -388,8 +393,7 @@ fn arg_u64(args: &Value, key: &str) -> Option<u64> {
 
 async fn bash(ctx: &ToolCtx<'_>, args: &Value) -> Result<Value, String> {
     let command = arg_str(args, "command").ok_or("bash: missing `command`")?;
-    let state = ctx.app.state::<crate::AppState>();
-    let result = state.bash.exec(command).await?;
+    let result = ctx.state.bash.exec(command).await?;
     serde_json::to_value(result).map_err(|e| e.to_string())
 }
 
@@ -397,8 +401,7 @@ fn read_file(ctx: &ToolCtx<'_>, args: &Value) -> Result<Value, String> {
     let path = arg_str(args, "path").ok_or("read_file: missing `path`")?;
     let start_line = arg_u64(args, "start_line");
     let end_line = arg_u64(args, "end_line");
-    let state = ctx.app.state::<crate::AppState>();
-    let result = bash::read_file_under(&state.agent_dir, path)?;
+    let result = bash::read_file_under(&ctx.state.agent_dir, path)?;
     let lines: Vec<&str> = result.split('\n').collect();
     let total_lines = lines.len();
 
@@ -432,8 +435,7 @@ fn read_file(ctx: &ToolCtx<'_>, args: &Value) -> Result<Value, String> {
 fn write_file(ctx: &ToolCtx<'_>, args: &Value) -> Result<Value, String> {
     let path = arg_str(args, "path").ok_or("write_file: missing `path`")?;
     let content = arg_str(args, "content").ok_or("write_file: missing `content`")?;
-    let state = ctx.app.state::<crate::AppState>();
-    bash::write_file_under(&state.agent_dir, path, content)?;
+    bash::write_file_under(&ctx.state.agent_dir, path, content)?;
     let lines = content.split('\n').count();
     let mut result = json!({ "ok": true, "path": path, "bytes": content.chars().count() });
     if lines > LARGE_FILE_LINE_THRESHOLD {
@@ -449,8 +451,7 @@ fn edit_file(ctx: &ToolCtx<'_>, args: &Value) -> Result<Value, String> {
     let old_string = arg_str(args, "old_string").ok_or("edit_file: missing `old_string`")?;
     let new_string = arg_str(args, "new_string").ok_or("edit_file: missing `new_string`")?;
     let replace_all = args["replace_all"].as_bool();
-    let state = ctx.app.state::<crate::AppState>();
-    let result = bash::edit_file_under(&state.agent_dir, path, old_string, new_string, replace_all)?;
+    let result = bash::edit_file_under(&ctx.state.agent_dir, path, old_string, new_string, replace_all)?;
     let mut enhanced = serde_json::to_value(&result).map_err(|e| e.to_string())?;
     if result.bytes > LARGE_FILE_BYTE_THRESHOLD {
         let estimated_lines = (result.bytes as f64 / 80.0).round() as i64;
@@ -464,8 +465,7 @@ fn edit_file(ctx: &ToolCtx<'_>, args: &Value) -> Result<Value, String> {
 
 fn list_files(ctx: &ToolCtx<'_>, args: &Value) -> Result<Value, String> {
     let path = arg_str(args, "path").unwrap_or(".");
-    let state = ctx.app.state::<crate::AppState>();
-    let entries = bash::list_entries_under(&state.agent_dir, path)?;
+    let entries = bash::list_entries_under(&ctx.state.agent_dir, path)?;
     if entries.is_empty() {
         return Ok(Value::String(format!("No files in directory \"{path}\".")));
     }
@@ -489,10 +489,10 @@ fn list_files(ctx: &ToolCtx<'_>, args: &Value) -> Result<Value, String> {
 
 async fn validate_files(ctx: &ToolCtx<'_>, args: &Value) -> Result<Value, String> {
     let path = args["path"].as_str().map(str::to_string);
-    // `State` deref-coerces to `&AppState`, the signature validate_report
-    // takes — the tool produces byte-identical reports to the command.
-    let state = ctx.app.state::<crate::AppState>();
-    let report = crate::validators::validate_report(path, &state).await;
+    // The tool passes the state snapshot directly (managed state in live
+    // runs, the locally built headless equivalent otherwise) — the report is
+    // byte-identical to the command's either way.
+    let report = crate::validators::validate_report(path, ctx.state).await;
     serde_json::to_value(report).map_err(|e| e.to_string())
 }
 
@@ -515,11 +515,21 @@ async fn ask_question(ctx: &ToolCtx<'_>, args: &Value) -> Result<Value, String> 
         }));
     }
 
+    // Headless runs (Stage 5b cold-start wakes) have no UI to answer: block
+    // would hang the whole wake turn, so degrade to an immediate bounce-back
+    // telling the model to continue on its own.
+    let Some(app) = ctx.app else {
+        return Ok(json!({
+            "ok": false,
+            "reason": "The app UI is not running right now (scheduled background wake), so the user cannot answer. Do not wait: continue with your best judgement, or state the question in plain text in your final response so the user sees it when they return."
+        }));
+    };
+
     // Block until answered. Flip the service notification to "Waiting for
     // your answer" for the wait and back to "Working…" after — a run can ask
     // several questions per turn, so the transition goes both ways.
     crate::agent_service::update_phase("waiting-for-answer", None);
-    let result = questions::pose(ctx.app, ctx.chat_id, kind, question, choices, hint, ctx.cancel).await;
+    let result = questions::pose(app, ctx.chat_id, kind, question, choices, hint, ctx.cancel).await;
     crate::agent_service::update_phase("running", None);
     serde_json::to_value(result).map_err(|e| e.to_string())
 }
@@ -527,7 +537,9 @@ async fn ask_question(ctx: &ToolCtx<'_>, args: &Value) -> Result<Value, String> 
 async fn spawn_agent(ctx: &ToolCtx<'_>, args: &Value) -> Result<Value, String> {
     let label = arg_str(args, "label").ok_or("spawn_agent: missing `label`")?;
     let task = arg_str(args, "task").ok_or("spawn_agent: missing `task`")?;
-    match crate::agent::subagents::spawn_agent(ctx.app, ctx.settings, Some(label), task).await {
+    match crate::agent::subagents::spawn_agent(ctx.app, ctx.state, ctx.settings, Some(label), task)
+        .await
+    {
         Ok(output) => Ok(json!({ "ok": true, "output": output })),
         Err(msg) => Ok(json!({ "ok": false, "error": msg })),
     }

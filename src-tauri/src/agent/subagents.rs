@@ -35,7 +35,7 @@ use rig::completion::message::{Message, ToolResultContent, UserContent};
 use rig::completion::CompletionRequest;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
-use tauri::{Emitter, Manager};
+use tauri::Emitter;
 
 use super::prompts;
 use super::providers;
@@ -88,11 +88,15 @@ fn tool_detail(tool_name: &str, input: &Value) -> Option<String> {
     None
 }
 
-fn emit(app: &tauri::AppHandle, event: Value) {
-    let _ = app.emit(AGENT_EVENT, event);
+/// Emit a subagent event. No-op when `app` is `None` (Stage 5b headless
+/// cold-start runs — no webview to receive events).
+fn emit(app: Option<&tauri::AppHandle>, event: Value) {
+    if let Some(app) = app {
+        let _ = app.emit(AGENT_EVENT, event);
+    }
 }
 
-fn emit_start(app: &tauri::AppHandle, run_id: &str, label: Option<&str>, task: Option<&str>) {
+fn emit_start(app: Option<&tauri::AppHandle>, run_id: &str, label: Option<&str>, task: Option<&str>) {
     emit(
         app,
         json!({
@@ -107,7 +111,7 @@ fn emit_start(app: &tauri::AppHandle, run_id: &str, label: Option<&str>, task: O
     );
 }
 
-fn emit_step(app: &tauri::AppHandle, run_id: &str, tool_name: &str, detail: Option<String>) {
+fn emit_step(app: Option<&tauri::AppHandle>, run_id: &str, tool_name: &str, detail: Option<String>) {
     emit(
         app,
         json!({
@@ -122,7 +126,7 @@ fn emit_step(app: &tauri::AppHandle, run_id: &str, tool_name: &str, detail: Opti
     );
 }
 
-fn emit_tool(app: &tauri::AppHandle, run_id: &str, tool_name: &str, detail: Option<String>, ok: bool) {
+fn emit_tool(app: Option<&tauri::AppHandle>, run_id: &str, tool_name: &str, detail: Option<String>, ok: bool) {
     emit(
         app,
         json!({
@@ -139,7 +143,7 @@ fn emit_tool(app: &tauri::AppHandle, run_id: &str, tool_name: &str, detail: Opti
     );
 }
 
-fn emit_end(app: &tauri::AppHandle, run_id: &str) {
+fn emit_end(app: Option<&tauri::AppHandle>, run_id: &str) {
     emit(
         app,
         json!({
@@ -154,7 +158,7 @@ fn emit_end(app: &tauri::AppHandle, run_id: &str) {
 
 /// Report normalized token usage for a subagent step (role `"spawn"` — no
 /// `contextChars`/`chatId`; those are main-only fields).
-fn report_usage(app: &tauri::AppHandle, usage: &rig::completion::Usage, cost: Option<f64>) {
+fn report_usage(app: Option<&tauri::AppHandle>, usage: &rig::completion::Usage, cost: Option<f64>) {
     emit(
         app,
         json!({
@@ -197,16 +201,15 @@ fn with_subagent_context(agent: &str, depth: u32, system_prompt: &str) -> String
 /// final text (the text after its last tool call) — what the parent sees as
 /// the tool result.
 pub(crate) async fn spawn_agent(
-    app: &tauri::AppHandle,
+    app: Option<&tauri::AppHandle>,
+    state: &crate::AppState,
     settings: &AgentSettings,
     label: Option<&str>,
     task: &str,
 ) -> Result<String, String> {
     let depth = 1;
-    let (data_dir, agent_dir) = {
-        let state = app.state::<crate::AppState>();
-        (state.data_dir.clone(), state.agent_dir.clone())
-    };
+    let data_dir = state.data_dir.clone();
+    let agent_dir = state.agent_dir.clone();
 
     let system_prompt = prompts::load_prompt(&data_dir, &agent_dir, "main_agent.md");
     if system_prompt.is_empty() {
@@ -254,6 +257,7 @@ pub(crate) async fn spawn_agent(
 
     let result = run_copy(
         app,
+        state,
         settings,
         &handle,
         &never,
@@ -272,7 +276,8 @@ pub(crate) async fn spawn_agent(
 /// The copy's model loop (the `runSubagent` port).
 #[allow(clippy::too_many_arguments)]
 async fn run_copy(
-    app: &tauri::AppHandle,
+    app: Option<&tauri::AppHandle>,
+    state: &crate::AppState,
     settings: &AgentSettings,
     handle: &providers::ModelHandle,
     cancel: &CancelHandle,
@@ -286,7 +291,7 @@ async fn run_copy(
 
     // `final_text` keeps only the text emitted after the last tool call;
     // `pending_text` buffers the current run of text for logging.
-    let state = Arc::new(Mutex::new((String::new(), String::new())));
+    let text_sink = Arc::new(Mutex::new((String::new(), String::new())));
     let mut recorded_calls: Vec<rig::completion::message::ToolCall> = Vec::new();
 
     for _step in 0..MAX_STEPS {
@@ -306,7 +311,7 @@ async fn run_copy(
             output_schema: None,
             record_telemetry_content: false,
         };
-        let sink = state.clone();
+        let sink = text_sink.clone();
         let calls = &mut recorded_calls;
         let mut on_event = |ev: StepEvent<'_>| {
             let mut s = sink.lock();
@@ -351,6 +356,7 @@ async fn run_copy(
         messages.push(Message::Assistant { id: None, content: outcome.choice });
         let ctx = ToolCtx {
             app,
+            state,
             settings,
             chat_id: "",
             cancel,
@@ -394,7 +400,7 @@ async fn run_copy(
         }
     }
 
-    let (final_text, pending_text) = state.lock().clone();
+    let (final_text, pending_text) = text_sink.lock().clone();
     let _ = pending_text;
     Ok(final_text)
 }
