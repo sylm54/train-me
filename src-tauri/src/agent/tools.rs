@@ -20,6 +20,9 @@
 //! Tool execution is async, tokio-friendly, and safe to run concurrently
 //! (the bash sandbox serializes internally; file ops are independent).
 
+use std::future::Future;
+use std::time::{Duration, Instant};
+
 use rig_core as rig;
 use serde_json::{json, Value};
 
@@ -27,6 +30,61 @@ use crate::agent::questions;
 use crate::agent::runner::CancelHandle;
 use crate::bash;
 use crate::settings::AgentSettings;
+
+/// Wall-clock budget per tool call, keyed by name. `None` = unbounded
+/// (`ask_question` only: it is user-paced by design — it blocks until the
+/// user answers, is cancel-aware, and flips the service notification to
+/// "Waiting for your answer" while it waits).
+///
+/// WHY: a tool that never returns hangs the whole turn with zero visible
+/// progress (the mobile "No data for Xs — the stream may be stuck" report
+/// sat for 112 minutes on a wedged tool). The standout was `bash`: its
+/// worker thread runs commands serially with no internal timeout, so one
+/// wedged command stalls every later call too. Budgets turn that into a
+/// tool error the model can see and route around; the dropped future
+/// abandons the underlying work (a wedged bash worker stays wedged — the
+/// budget keeps the RUN alive rather than repairing the worker).
+fn tool_budget(name: &str) -> Option<Duration> {
+    match name {
+        "ask_question" => None,
+        "bash" => Some(Duration::from_secs(180)),
+        "validate_files" => Some(Duration::from_secs(300)),
+        "spawn_agent" => Some(Duration::from_secs(900)),
+        // read_file / write_file / edit_file / list_files: near-instant FS
+        // ops; the budget only matters for pathological filesystem stalls.
+        _ => Some(Duration::from_secs(60)),
+    }
+}
+
+/// Run one tool future under its budget. Split from [`execute`] so tests
+/// can pass small budgets and synthetic futures.
+async fn run_with_budget<F>(
+    name: &str,
+    budget: Option<Duration>,
+    fut: F,
+) -> Result<Value, String>
+where
+    F: Future<Output = Result<Value, String>>,
+{
+    let started = Instant::now();
+    log::info!("[tool] {name}: start");
+    let result = match budget {
+        None => fut.await,
+        Some(budget) => match tokio::time::timeout(budget, fut).await {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "tool {name} timed out after {}s and was aborted; the underlying work may still be stuck. Do not retry it unchanged.",
+                budget.as_secs()
+            )),
+        },
+    };
+    log::info!(
+        "[tool] {name}: done in {:.1}s ({})",
+        started.elapsed().as_secs_f32(),
+        if result.is_ok() { "ok" } else { "error" }
+    );
+    result
+}
 
 /// Thresholds for large file handling (exported from tools.ts).
 pub(crate) const LARGE_FILE_LINE_THRESHOLD: usize = 200;
@@ -358,6 +416,9 @@ pub(crate) fn spawned_tool_defs() -> Vec<rig::completion::ToolDefinition> {
 /// (`tool-output-available`); `Err` becomes a tool error (the JS tools
 /// reject on the same conditions — command rejections — and the SDK turns
 /// those into `output-error` parts).
+///
+/// Every call runs under its [`tool_budget`] so a wedged tool degrades to
+/// a tool error instead of hanging the turn forever.
 pub(crate) fn execute<'a>(
     ctx: &'a ToolCtx<'a>,
     name: &'a str,
@@ -366,7 +427,11 @@ pub(crate) fn execute<'a>(
     // Boxing note: `spawn_agent` recurses into this dispatcher (a copy runs
     // its tools through the same `execute`), so the future must be boxed or
     // the compiler sees infinite monomorphic recursion.
-    Box::pin(execute_inner(ctx, name, args))
+    Box::pin(run_with_budget(
+        name,
+        tool_budget(name),
+        execute_inner(ctx, name, args),
+    ))
 }
 
 async fn execute_inner(ctx: &ToolCtx<'_>, name: &str, args: &Value) -> Result<Value, String> {
@@ -548,6 +613,70 @@ async fn spawn_agent(ctx: &ToolCtx<'_>, args: &Value) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn budgets_cover_every_dispatchable_tool() {
+        // Every name execute_inner can dispatch must have an entry in
+        // tool_budget (or be the deliberately unbounded ask_question), so a
+        // future tool can't silently join the unbounded set.
+        let dispatchable = [
+            "bash",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "list_files",
+            "validate_files",
+            "ask_question",
+            "spawn_agent",
+        ];
+        for name in dispatchable {
+            let budget = tool_budget(name);
+            if name == "ask_question" {
+                assert_eq!(budget, None, "ask_question stays user-paced");
+            } else {
+                assert!(budget.is_some(), "{name} must be bounded");
+                assert!(budget.unwrap().as_secs() >= 60, "{name} budget is generous");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_times_out_a_hung_tool() {
+        let started = Instant::now();
+        let result: Result<Value, String> =
+            run_with_budget("bash", Some(Duration::from_millis(50)), futures::future::pending())
+                .await;
+        assert!(result.is_err(), "a hung tool must time out");
+        assert!(
+            result.unwrap_err().contains("timed out"),
+            "the error must say the tool timed out"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10), "bounded");
+    }
+
+    #[tokio::test]
+    async fn budget_passes_a_healthy_result_through() {
+        let result: Result<Value, String> = run_with_budget(
+            "bash",
+            Some(Duration::from_millis(500)),
+            futures::future::ready(Ok(json!({ "ok": true }))),
+        )
+        .await;
+        assert_eq!(result.unwrap(), json!({ "ok": true }));
+    }
+
+    #[tokio::test]
+    async fn unbounded_budget_awaits_indefinitely() {
+        // ask_question's None budget must NOT impose a timeout: a fast
+        // future resolves and a slow one is simply awaited.
+        let result: Result<Value, String> = run_with_budget(
+            "ask_question",
+            None,
+            futures::future::ready(Ok(json!({ "ok": true }))),
+        )
+        .await;
+        assert_eq!(result.unwrap(), json!({ "ok": true }));
+    }
 
     #[test]
     fn headings_summary_matches_js() {

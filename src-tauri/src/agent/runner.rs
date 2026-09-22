@@ -672,6 +672,9 @@ impl AgentRuntime {
             Ok(h) => h,
             Err(e) => return self.fail_run(app, chat_id, channel, &e),
         };
+        // Info level: visible in logcat (tag RustStdout) — the first anchor
+        // for any "turn went silent" diagnosis.
+        log::info!("[agent] run {chat_id} starting (model {})", handle.model);
 
         // Fresh include-snapshot window per run (resetIncludeSnapshots).
         prompts::reset_include_snapshots();
@@ -866,7 +869,15 @@ impl AgentRuntime {
                 let call_id = call.id.as_str().to_string();
                 let name = call.function.name.as_str();
                 tool_names.push(name);
-                match super::tools::execute(&ctx, name, &call.function.arguments).await {
+                // Cancel-aware: the Stop button must be able to interrupt a
+                // wedged tool (the dropped future abandons the underlying
+                // work); the loop's next iteration then unwinds as aborted.
+                let tool_result = tokio::select! {
+                    biased;
+                    _ = cancel.wait() => Err(format!("aborted while running {name}")),
+                    result = super::tools::execute(&ctx, name, &call.function.arguments) => result,
+                };
+                match tool_result {
                     Ok(output) => {
                         for chunk in stream.lock().tool_output(&call_id, output.clone()) {
                             Self::send_chunk(channel, chunk);
