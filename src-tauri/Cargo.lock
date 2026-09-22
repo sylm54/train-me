@@ -6470,7 +6470,7 @@ dependencies = [
 
 [[package]]
 name = "train-me"
-version = "0.24.2"
+version = "0.24.3"
 dependencies = [
  "aegis",
  "android_logger",
