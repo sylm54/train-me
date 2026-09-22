@@ -111,6 +111,16 @@ rig-core = "0.42"
 # hanging an agent turn forever (rig ships no default HTTP timeouts). The
 # rename keeps the two major versions apart.
 reqwest13 = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls"] }
+# The injected client builds its own rustls config with BUNDLED webpki
+# roots: reqwest 0.13's `rustls` feature defaults to rustls-platform-verifier,
+# which on Android requires a JVM init call (`init_with_env`) this app never
+# made — every agent HTTPS request panicked the tokio worker at connect
+# time ("Expect rustls-platform-verifier to be initialized"), killing the
+# turn in flight so the UI spun forever. Versions must keep matching what
+# reqwest 0.13 pulls in (`ClientConfig` type identity for the preconfigured
+# backend).
+rustls = "0.23"
+webpki-roots = "0.26"
 # Stream combinators for driving rig's `StreamingCompletionResponse` (which
 # implements `futures::Stream`). Same 0.3 line rig-core uses, so the crate is
 # shared, not duplicated.

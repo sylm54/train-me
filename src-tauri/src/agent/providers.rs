@@ -35,26 +35,44 @@ use rig::streaming::StreamingCompletionResponse;
 
 use crate::settings::AgentSettings;
 
-/// Shared HTTP client for every provider call. Explicitly bounded on the
-/// CONNECT phase: rig ships no default timeouts, so an unroutable provider
-/// — the normal case on a phone whose network can't reach the API host —
-/// would leave every attempt (and any rig-internal reconnect between them)
-/// pending for minutes on a blackholed route. The connect timeout fails
-/// each attempt fast; the per-step no-progress watchdog in
-/// `runner::stream_step` bounds the total silence either way.
+/// Shared HTTP client for every provider call.
 ///
-/// This is rig's reqwest line (0.13), not the app's own 0.12 dep — rig's
-/// `HttpClientExt` is implemented for its own version (see the renamed
-/// `reqwest13` dependency).
+/// TLS is a PRECONFIGURED rustls config over BUNDLED webpki roots — NOT
+/// reqwest 0.13's default. Its `rustls` feature routes certificate
+/// verification through rustls-platform-verifier, which on Android requires
+/// a JVM init call (`rustls_platform_verifier::android::init_with_env`)
+/// this app doesn't make: every HTTPS request panicked the tokio worker at
+/// connect time ("Expect rustls-platform-verifier to be initialized"),
+/// killing the agent command mid-run so the UI spun forever with no error
+/// (the desktop worked because the platform verifier uses the OS trust
+/// store there). The bundled Mozilla root store covers the providers and
+/// behaves identically on every platform.
+///
+/// The connect timeout bounds each attempt on a blackholed route (rig's
+/// SSE transport can reconnect silently); the per-step no-progress
+/// watchdog in `runner::stream_step` bounds the total silence.
 ///
 /// No overall/request timeout: streams are long-lived by design (a
 /// reasoning model can legitimately sit quiet for minutes mid-stream).
 fn http_client() -> reqwest13::Client {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut tls = rustls::ClientConfig::builder_with_provider(
+        rustls::crypto::aws_lc_rs::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .expect("safe default protocol versions exist")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    // ALPN is the caller's responsibility with a preconfigured backend.
+    tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
     reqwest13::Client::builder()
+        .use_preconfigured_tls(tls)
         .connect_timeout(Duration::from_secs(15))
         .tcp_keepalive(Duration::from_secs(30))
         .build()
-        .expect("reqwest client builds without a TLS/runtime misconfiguration")
+        .expect("preconfigured rustls client builds")
 }
 
 /// The configured LLM handle for one agent: provider client + model string
@@ -426,5 +444,38 @@ mod stream_tests {
             Err(e) => panic!("healthy stream must not error: {e}"),
         };
         assert_eq!(outcome.text, "Hi");
+    }
+
+    /// Real-world TLS smoke test for the preconfigured-rustls client
+    /// (network-dependent, so ignored by default; run with
+    /// `cargo test -- --ignored`). Hits a public HTTPS endpoint and only
+    /// asserts the request completes — this is the test that would have
+    /// caught the Android rustls-platform-verifier panic.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires network"]
+    async fn https_handshake_reaches_a_public_endpoint() {
+        let handle = handle_with_base_url("https://openrouter.ai/api/v1");
+        let cancel = CancelHandle::new();
+        let mut sink = |_: StepEvent<'_>| {};
+        // A dummy key: the server answers 401 (an error we surface), which
+        // proves DNS + TCP + TLS + HTTP all work end to end.
+        let result = stream_step(
+            &handle,
+            completion_request(),
+            &cancel,
+            Duration::from_secs(30),
+            &mut sink,
+        )
+        .await;
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("401") || msg.contains("Unauthorized") || msg.contains("No auth"),
+                    "expected an auth error past a successful TLS handshake, got: {msg}"
+                );
+            }
+            Ok(_) => panic!("a dummy key must be rejected with an auth error"),
+        }
     }
 }
