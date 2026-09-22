@@ -39,6 +39,7 @@ use rig_core as rig;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt;
 use parking_lot::Mutex;
@@ -63,6 +64,19 @@ use crate::settings::AgentSettings;
 /// against a runaway tool loop. Hitting it ends the run with
 /// `finishReason: "other"` and a warning log rather than looping forever.
 pub(crate) const MAX_STEPS: u32 = 40;
+
+/// Max wall-clock silence between stream items before a step is abandoned
+/// with a hard error. rig's HTTP layer has no timeouts by default, so a
+/// provider route that blackholes (SYNs silently dropped, a middlebox that
+/// accepts and swallows the request, or a dead-but-open connection after a
+/// NAT timeout — routine on mobile networks) leaves `stream.next()` pending
+/// forever with no error part ever sent: the eternal mobile "No data for
+/// Xs — the stream may be stuck" spinner. Generous on purpose: reasoning
+/// models can legitimately go quiet for a while (reasoning deltas count as
+/// progress here even though they're stripped from the UI stream), and
+/// rig's SSE reconnect backoff peaks at 5 s between attempts. The UI's
+/// 10 s stall hint fires long before this gives up for real.
+pub(crate) const STREAM_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Tauri event name all agent bus events go out on (usage, activity, and
 /// subagent lifecycle — the payloads carry a `type` discriminator matching
@@ -190,10 +204,17 @@ pub(crate) struct StepOutcome {
 /// console; here it's logged at debug). Returns `Ok(None)` when cancelled —
 /// the stream is dropped mid-flight, which tears down the underlying HTTP
 /// response.
+///
+/// The stream is also watched: if no item arrives for `no_progress` (the
+/// connect-included first item counts — the SSE source connects lazily on
+/// the first poll), the step fails with a hard error instead of spinning
+/// forever. Production callers pass [`STREAM_NO_PROGRESS_TIMEOUT`]; tests
+/// pass something small.
 pub(crate) async fn stream_step(
     handle: &providers::ModelHandle,
     request: CompletionRequest,
     cancel: &CancelHandle,
+    no_progress: Duration,
     on_event: &mut (dyn FnMut(StepEvent<'_>) + Send),
 ) -> Result<Option<StepOutcome>, rig::completion::CompletionError> {
     let mut stream = handle.stream(request).await?;
@@ -207,6 +228,9 @@ pub(crate) async fn stream_step(
     };
     let mut reasoning_seen = String::new();
     loop {
+        // A fresh timer per item: the deadline is "no progress for this
+        // long", not "step older than this long" — a slow-but-flowing
+        // stream (reasoning batches, big tool payloads) never trips it.
         let item = tokio::select! {
             biased;
             _ = cancel.wait() => return Ok(None),
@@ -214,6 +238,14 @@ pub(crate) async fn stream_step(
                 Some(Ok(item)) => item,
                 Some(Err(e)) => return Err(e),
                 None => break,
+            },
+            _ = tokio::time::sleep(no_progress) => {
+                let msg = format!(
+                    "no data from the model for {}s — the provider may be unreachable (check network/VPN) or the stream died; run aborted",
+                    no_progress.as_secs().max(1)
+                );
+                log::warn!("[main] stream watchdog: {msg}");
+                return Err(rig::completion::CompletionError::ResponseError(msg));
             }
         };
         match item {
@@ -726,7 +758,10 @@ impl AgentRuntime {
                     }
                 }
             };
-            let outcome = match stream_step(&handle, request, cancel, &mut on_event).await {
+            let outcome =
+                match stream_step(&handle, request, cancel, STREAM_NO_PROGRESS_TIMEOUT, &mut on_event)
+                    .await
+                {
                 Ok(Some(o)) => o,
                 Ok(None) => {
                     // Cancelled mid-stream: persist partial text, best-effort,

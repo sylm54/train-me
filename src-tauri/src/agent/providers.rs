@@ -26,12 +26,36 @@
 //!     flag is an SDK-side output shim with no chat-completions body field,
 //!     so it has nothing to map to and is dropped with a debug log).
 
+use std::time::Duration;
+
 use rig_core as rig;
 use rig::client::CompletionClient;
 use rig::completion::{CompletionError, CompletionRequest, CompletionResponse};
 use rig::streaming::StreamingCompletionResponse;
 
 use crate::settings::AgentSettings;
+
+/// Shared HTTP client for every provider call. Explicitly bounded on the
+/// CONNECT phase: rig ships no default timeouts, so an unroutable provider
+/// — the normal case on a phone whose network can't reach the API host —
+/// would leave every attempt (and any rig-internal reconnect between them)
+/// pending for minutes on a blackholed route. The connect timeout fails
+/// each attempt fast; the per-step no-progress watchdog in
+/// `runner::stream_step` bounds the total silence either way.
+///
+/// This is rig's reqwest line (0.13), not the app's own 0.12 dep — rig's
+/// `HttpClientExt` is implemented for its own version (see the renamed
+/// `reqwest13` dependency).
+///
+/// No overall/request timeout: streams are long-lived by design (a
+/// reasoning model can legitimately sit quiet for minutes mid-stream).
+fn http_client() -> reqwest13::Client {
+    reqwest13::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .tcp_keepalive(Duration::from_secs(30))
+        .build()
+        .expect("reqwest client builds without a TLS/runtime misconfiguration")
+}
 
 /// The configured LLM handle for one agent: provider client + model string
 /// + best-effort reasoning-effort body params.
@@ -104,7 +128,10 @@ pub fn build(settings: &AgentSettings, agent: &str) -> Result<ModelHandle, Strin
 
     match cfg.provider.as_str() {
         "openrouter" => {
-            let client = rig::providers::openrouter::Client::new(api_key)
+            let client = rig::providers::openrouter::Client::builder()
+                .api_key(api_key)
+                .http_client(http_client())
+                .build()
                 .map_err(|e| format!("openrouter client: {e}"))?;
             Ok(ModelHandle {
                 model: cfg.model.clone(),
@@ -119,7 +146,10 @@ pub fn build(settings: &AgentSettings, agent: &str) -> Result<ModelHandle, Strin
             // see AnyModel::OpenAi). Its default base URL is already
             // `https://api.openai.com/v1`, the same URL the JS transport
             // passes explicitly via PROVIDER_BASE_URL.
-            let client = rig::providers::openai::CompletionsClient::new(api_key)
+            let client = rig::providers::openai::CompletionsClient::builder()
+                .api_key(api_key)
+                .http_client(http_client())
+                .build()
                 .map_err(|e| format!("openai client: {e}"))?;
             if effort.is_some() {
                 log::debug!(
@@ -200,5 +230,201 @@ mod tests {
 
         let s = settings("anthropic", Some("sk"), None);
         assert!(build(&s, "main").is_err());
+    }
+}
+
+/// Regression tests for the stream watchdog + bounded HTTP client.
+///
+/// rig ships no HTTP timeouts, so a provider route that blackholes — SYNs
+/// silently dropped, a middlebox that accepts and swallows the request, a
+/// connection NAT'd away mid-flight — leaves `stream_step` pending forever
+/// with no error: the mobile "No data for Xs — the stream may be stuck"
+/// report, eternal. These drive `stream_step` against loopback servers
+/// that mimic the failure shapes and assert the watchdog bounds the silent
+/// ones with a hard error, rig's own surfaced failures stay fast, and a
+/// healthy stream flows untouched.
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use std::net::{TcpListener, TcpStream};
+
+    use crate::agent::runner::{stream_step, CancelHandle, StepEvent};
+
+    /// A handle aimed at an arbitrary loopback base URL (tests talk to mock
+    /// servers; the real `build` only ever constructs the two hardcoded
+    /// provider URLs).
+    fn handle_with_base_url(base: &str) -> ModelHandle {
+        let client = rig::providers::openai::CompletionsClient::builder()
+            .api_key("test-key")
+            .base_url(base)
+            .http_client(http_client())
+            .build()
+            .expect("openai test client builds");
+        ModelHandle {
+            model: "test-model".into(),
+            inner: AnyModel::OpenAi(client.completion_model("test-model")),
+            reasoning_params: None,
+        }
+    }
+
+    fn completion_request() -> rig::completion::CompletionRequest {
+        use rig::completion::message::{Message, UserContent};
+        rig::completion::CompletionRequest {
+            model: Some("test-model".into()),
+            preamble: None,
+            chat_history: vec![Message::User {
+                content: vec![UserContent::text("hello")],
+            }],
+            documents: Vec::new(),
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            tool_choice: None,
+            additional_params: None,
+            output_schema: None,
+            record_telemetry_content: false,
+        }
+    }
+
+    /// Bind a loopback listener on an ephemeral port and serve it on a
+    /// detached thread; returns the port.
+    fn spawn_server<F>(handler: F) -> u16
+    where
+        F: Fn(TcpStream) + Send + Sync + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().unwrap().port();
+        let handler = std::sync::Arc::new(handler);
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                let handler = handler.clone();
+                std::thread::spawn(move || handler(conn));
+            }
+        });
+        port
+    }
+
+    /// Accepts and holds every connection open without ever answering — the
+    /// "provider blackholed" shape (SYNs answered by a middlebox, the
+    /// request swallowed, no bytes ever come back).
+    fn silent_server() -> u16 {
+        spawn_server(|_conn| {
+            // The request stays unread in kernel buffers (it's small); hold
+            // the socket far past any test horizon.
+            std::thread::sleep(Duration::from_secs(120));
+        })
+    }
+
+    /// Every connect succeeds and headers come back, but the body ends
+    /// short of its promised Content-Length (hyper raises a mid-body
+    /// transport error — not a clean stream end). This is the shape that
+    /// drives rig's SSE source into its silent reconnect loop: each
+    /// attempt errors transport-level AFTER a successful open, the policy
+    /// retries unbounded (300 ms → 5 s), and nothing is surfaced.
+    fn midstream_reset_server() -> u16 {
+        spawn_server(|mut conn| {
+            use std::io::Write;
+            let body = "data: {\"partial\": true}\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                 Content-Length: {}\r\n\r\n{}",
+                body.len() + 64, // promises bytes that will never arrive
+                body
+            );
+            let _ = conn.write_all(response.as_bytes());
+            let _ = conn.flush();
+            drop(conn); // EOF well short of the promised length
+        })
+    }
+
+    /// Closes every connection the moment it arrives — the request fails
+    /// before any response exists. rig surfaces this shape as a terminal
+    /// error on its own, fast; the test pins that.
+    fn connect_reset_server() -> u16 {
+        spawn_server(|_conn| drop(_conn))
+    }
+
+    /// A minimal well-formed chat-completions SSE response: one text delta,
+    /// then the `[DONE]` sentinel.
+    fn sse_server() -> u16 {
+        let body = concat!(
+            r#"data: {"id":"c1","object":"chat.completion.chunk","created":1700000000,"#,
+            r#""model":"test-model","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        spawn_server(move |mut conn| {
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 4096];
+            let _ = conn.read(&mut buf); // request headers
+            let _ = conn.write_all(response.as_bytes());
+            let _ = conn.flush();
+            std::thread::sleep(Duration::from_secs(2)); // let the client drain
+        })
+    }
+
+    async fn streamed_text(
+        port: u16,
+        no_progress: Duration,
+    ) -> Result<Option<crate::agent::runner::StepOutcome>, rig::completion::CompletionError> {
+        let handle = handle_with_base_url(&format!("http://127.0.0.1:{port}/v1"));
+        let cancel = CancelHandle::new();
+        let mut sink = |_: StepEvent<'_>| {};
+        stream_step(&handle, completion_request(), &cancel, no_progress, &mut sink).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn watchdog_bounds_a_blackholed_stream() {
+        let port = silent_server();
+        let started = std::time::Instant::now();
+        let result = streamed_text(port, Duration::from_millis(500)).await;
+        assert!(
+            matches!(
+                &result,
+                Err(rig::completion::CompletionError::ResponseError(_))
+            ),
+            "held-open connection must trip the watchdog"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the failure must be bounded, not eternal"
+        );
+    }
+
+    /// Transport failures rig surfaces on its own (dead endpoint before any
+    /// response; body that ends short of its Content-Length) must still be
+    /// BOUNDED errors — pinned here so a rig upgrade can't quietly turn
+    /// them into hangs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transport_failures_surface_as_errors_quickly() {
+        for (name, port) in [
+            ("connect-reset", connect_reset_server()),
+            ("midstream-short-body", midstream_reset_server()),
+        ] {
+            let started = std::time::Instant::now();
+            let result = streamed_text(port, Duration::from_secs(10)).await;
+            assert!(result.is_err(), "{name}: a dead endpoint must error, not hang");
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{name}: transport failures must surface quickly"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn healthy_stream_still_flows() {
+        let port = sse_server();
+        let outcome = match streamed_text(port, Duration::from_secs(10)).await {
+            Ok(Some(outcome)) => outcome,
+            Ok(None) => panic!("healthy stream must not be cancelled"),
+            Err(e) => panic!("healthy stream must not error: {e}"),
+        };
+        assert_eq!(outcome.text, "Hi");
     }
 }

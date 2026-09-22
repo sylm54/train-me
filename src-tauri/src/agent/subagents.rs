@@ -39,7 +39,9 @@ use tauri::Emitter;
 
 use super::prompts;
 use super::providers;
-use super::runner::{stream_step, CancelHandle, StepEvent, MAX_STEPS, AGENT_EVENT};
+use super::runner::{
+    stream_step, CancelHandle, StepEvent, MAX_STEPS, STREAM_NO_PROGRESS_TIMEOUT, AGENT_EVENT,
+};
 use super::tools::{self, ToolCtx};
 use crate::settings::AgentSettings;
 
@@ -334,9 +336,10 @@ async fn run_copy(
                 }
             }
         };
-        let outcome = stream_step(handle, request, cancel, &mut on_event)
-            .await
-            .map_err(|e| format!("subagent stream failed: {e}"))?;
+        let outcome =
+            stream_step(handle, request, cancel, STREAM_NO_PROGRESS_TIMEOUT, &mut on_event)
+                .await
+                .map_err(|e| format!("subagent stream failed: {e}"))?;
         let Some(outcome) = outcome else {
             // Cancelled mid-copy (cannot happen with the never-cancel handle
             // today; kept for symmetry).
