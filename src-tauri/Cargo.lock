@@ -4818,6 +4818,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -6500,6 +6501,7 @@ dependencies = [
  "rig-core",
  "rusqlite",
  "rustfft",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -6515,6 +6517,7 @@ dependencies = [
  "tower-http",
  "unicode-normalization",
  "url",
+ "webpki-roots 0.26.11",
  "zip",
 ]
 

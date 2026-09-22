@@ -62,6 +62,8 @@ use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
+use futures::FutureExt;
+
 use crate::chats;
 use runner::AgentRuntime;
 
@@ -200,7 +202,32 @@ pub async fn agent_run(
     on_chunk: tauri::ipc::Channel<serde_json::Value>,
 ) -> Result<RunInfo, String> {
     let rt = runtime()?;
-    Ok(rt.run_interactive(chat_id, messages, on_chunk).await)
+    // A panic anywhere in the run kills the command task; the invoke's
+    // promise would then never settle and the UI would spin forever with
+    // no error part (how the TLS-platform-verifier panic presented on
+    // Android). Catch it and surface it as a run error — the transport
+    // renders RunInfo.error even when no error chunk was delivered.
+    let info = std::panic::AssertUnwindSafe(rt.run_interactive(chat_id, messages, on_chunk))
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|p| RunInfo {
+            ok: false,
+            aborted: false,
+            steps: 0,
+            error: Some(format!("agent run panicked: {}", panic_msg(&p))),
+        });
+    Ok(info)
+}
+
+/// Best-effort panic payload message (any `Send` payload type).
+fn panic_msg(p: &Box<dyn std::any::Any + Send>) -> String {
+    match p.downcast_ref::<&'static str>() {
+        Some(s) => (*s).to_string(),
+        None => match p.downcast_ref::<String>() {
+            Some(s) => s.clone(),
+            None => "unknown panic".to_string(),
+        },
+    }
 }
 
 /// Cancel the in-flight turn, if any. Queued runs are NOT cleared — they
