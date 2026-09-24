@@ -6,7 +6,10 @@
 //! garbage-collected. Container-referenced scripts (`audio` features,
 //! markdown audio links, `script` actions, queued pending scripts) render
 //! first; scripts nothing references (pure `<include>` subscripts, works in
-//! progress, not-yet-wired ideas) render last so they're warm too.
+//! progress, not-yet-wired ideas) render last so they're warm too. The
+//! root `chats/` directory is excluded: it holds the frontend's exported
+//! chat transcripts (`chats/<id>.xml`), which are conversation records,
+//! not scripts (see [`list_all_scripts`]).
 //!
 //! Scheduling is prioritized: scripts queued in the economy's pending
 //! list render first (the user is waiting on them), then scripts used by
@@ -201,7 +204,11 @@ pub fn collect_script_refs(
 /// Recursively list every `.xml` under `agent_dir` as forward-slashed,
 /// agent-relative paths, sorted. Dot-directories (`.git`, `.trash`, …) are
 /// skipped; everything else is fair game — includes, drafts, whole script
-/// folders the agent manages on its own.
+/// folders the agent manages on its own. The root `chats/` directory is
+/// skipped too: it holds the chat transcripts the frontend exports
+/// (`chats/<id>.xml`, see `src/lib/chatExport.ts`) — conversation records,
+/// not audio scripts, so rendering them would only burn TTS time and
+/// produce render errors.
 pub fn list_all_scripts(agent_dir: &Path) -> Vec<String> {
     fn walk(dir: &Path, prefix: &str, out: &mut Vec<String>) {
         let Ok(rd) = std::fs::read_dir(dir) else {
@@ -219,6 +226,12 @@ pub fn list_all_scripts(agent_dir: &Path) -> Vec<String> {
             };
             let path = entry.path();
             if path.is_dir() {
+                // Only the sandbox root's `chats/` is the transcript store;
+                // a script folder named `chats` deeper down is the agent's
+                // own business and still gets swept.
+                if prefix.is_empty() && name.eq_ignore_ascii_case("chats") {
+                    continue;
+                }
                 walk(&path, &rel, out);
             } else if name.to_ascii_lowercase().ends_with(".xml") {
                 out.push(rel);
@@ -690,6 +703,23 @@ mod tests {
         );
         let srcs: Vec<&str> = refs.iter().map(|r| r.src.as_str()).collect();
         assert_eq!(srcs, vec!["hypnos/c.xml"]);
+        let _ = tmp;
+    }
+
+    #[test]
+    fn collect_refs_full_pass_skips_chat_transcripts() {
+        // `chats/<id>.xml` is the frontend's chat-transcript export
+        // (src/lib/chatExport.ts), not a script — a full pass must not
+        // sweep it up and try to render it as audio.
+        let (tmp, agent, _tracks) = env(&[
+            ("chats/chat1.xml", "<chat id=\"chat1\"></chat>"),
+            ("chats/index.json", "[]"),
+            // A nested `chats` dir inside a script folder is the agent's
+            // own tree and keeps getting swept.
+            ("scripts/chats/kept.xml", "<voice>kept</voice>"),
+        ]);
+        let refs = list_all_scripts(&agent);
+        assert_eq!(refs, vec!["scripts/chats/kept.xml"]);
         let _ = tmp;
     }
 
