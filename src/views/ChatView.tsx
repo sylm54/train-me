@@ -2291,12 +2291,18 @@ function PendingQuestions() {
  * One pending question. Renders the prompt plus an input appropriate to the
  * type: a textarea + send for "open", buttons for "single-choice" (pick one)
  * and "multi-choice" (pick several, then submit), and a 1–10 button row for
- * "rating". The ✕ dismisses (cancels) the question.
+ * "rating". Every closed type also gets a freeform fallback row, so the user
+ * can always answer in their own words when none of the offered options fit.
+ * The ✕ dismisses (cancels) the question.
  */
 function QuestionCard({ q }: { q: PendingQuestion }) {
   const [text, setText] = useState("");
   // Indices of selected options for "multi-choice".
   const [selected, setSelected] = useState<number[]>([]);
+  // Freeform fallback: the text typed into the "other" row (all closed
+  // types), plus custom answers already added to a multi-choice selection.
+  const [other, setOther] = useState("");
+  const [custom, setCustom] = useState<string[]>([]);
 
   const submitOpen = () => {
     const value = text.trim();
@@ -2304,11 +2310,40 @@ function QuestionCard({ q }: { q: PendingQuestion }) {
     respondToQuestion(q.id, value);
   };
 
+  // Freeform fallback for "single-choice" (and "rating"): the typed text
+  // becomes the answer verbatim.
+  const submitOther = () => {
+    const value = other.trim();
+    if (!value) return;
+    if (q.type === "rating") {
+      // A bare 1–10 stays a number (the type's contract); anything else —
+      // "about 7", "no idea" — goes through verbatim as text.
+      const n = Number(value);
+      respondToQuestion(
+        q.id,
+        Number.isInteger(n) && n >= 1 && n <= 10 ? n : value,
+      );
+      return;
+    }
+    respondToQuestion(q.id, value);
+  };
+
+  // Freeform fallback for "multi-choice": the typed text joins the
+  // selection as a custom option (so it can combine with picked choices).
+  const addCustomChoice = () => {
+    const value = other.trim();
+    if (!value) return;
+    setCustom((prev) => (prev.includes(value) ? prev : [...prev, value]));
+    setOther("");
+  };
+
   const submitMulti = () => {
-    if (selected.length === 0) return;
-    const answers = selected
-      .map((i) => q.choices?.[i])
-      .filter((c): c is string => typeof c === "string");
+    const answers = [
+      ...selected
+        .map((i) => q.choices?.[i])
+        .filter((c): c is string => typeof c === "string"),
+      ...custom,
+    ];
     if (answers.length === 0) return;
     respondToQuestion(q.id, answers);
   };
@@ -2365,19 +2400,30 @@ function QuestionCard({ q }: { q: PendingQuestion }) {
       )}
 
       {q.type === "single-choice" && (
-        <div className="mt-2 flex flex-col gap-1 max-h-[40vh] overflow-y-auto min-h-0">
-          {q.choices?.map((choice, i) => (
-            <Button
-              key={i}
-              variant="outline"
-              size="sm"
-              className="justify-start"
-              onClick={() => respondToQuestion(q.id, choice)}
-            >
-              {choice}
-            </Button>
-          ))}
-        </div>
+        <>
+          <div className="mt-2 flex flex-col gap-1 max-h-[40vh] overflow-y-auto min-h-0">
+            {q.choices?.map((choice, i) => (
+              <Button
+                key={i}
+                variant="outline"
+                size="sm"
+                className="justify-start"
+                onClick={() => respondToQuestion(q.id, choice)}
+              >
+                {choice}
+              </Button>
+            ))}
+          </div>
+          <div className="mt-2">
+            <OtherAnswerRow
+              value={other}
+              onChange={setOther}
+              onSubmit={submitOther}
+              placeholder="Or type your own answer…"
+              label="Answer"
+            />
+          </div>
+        </>
       )}
 
       {q.type === "multi-choice" && (
@@ -2415,17 +2461,48 @@ function QuestionCard({ q }: { q: PendingQuestion }) {
               );
             })}
           </div>
+          {/* Freeform fallback: add a custom option to the selection. */}
+          <OtherAnswerRow
+            value={other}
+            onChange={setOther}
+            onSubmit={addCustomChoice}
+            placeholder="Or add your own…"
+            label="Add"
+          />
+          {custom.length > 0 && (
+            <div className="flex flex-wrap gap-1 shrink-0">
+              {custom.map((c) => (
+                <span
+                  key={c}
+                  className="inline-flex items-center gap-1 rounded-md border border-[var(--color-pink-300)] bg-[var(--color-pink-100)] px-2 py-0.5 text-xs text-[var(--color-foreground)]"
+                >
+                  <Check size={11} />
+                  {c}
+                  <button
+                    className="ml-0.5 text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)]"
+                    aria-label={`Remove ${c}`}
+                    title="Remove"
+                    onClick={() =>
+                      setCustom((prev) => prev.filter((x) => x !== c))
+                    }
+                  >
+                    <X size={11} />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
           {/* Submit stays outside the scroll area so it's always reachable. */}
           <div className="flex items-center justify-between gap-2 shrink-0">
             <span className="text-[10px] text-[var(--color-muted-foreground)]">
-              {selected.length === 0
+              {selected.length + custom.length === 0
                 ? "Select one or more options"
-                : `${selected.length} selected`}
+                : `${selected.length + custom.length} selected`}
             </span>
             <Button
               size="sm"
               onClick={submitMulti}
-              disabled={selected.length === 0}
+              disabled={selected.length + custom.length === 0}
             >
               Submit
             </Button>
@@ -2452,8 +2529,61 @@ function QuestionCard({ q }: { q: PendingQuestion }) {
             <span>1 · low</span>
             <span>10 · high</span>
           </div>
+          <div className="mt-2">
+            <OtherAnswerRow
+              value={other}
+              onChange={setOther}
+              onSubmit={submitOther}
+              placeholder="Or answer in your own words…"
+              label="Answer"
+            />
+          </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * The freeform fallback row shared by every closed question type: a small
+ * text input plus a commit button, so "none of the above" is always
+ * available without the agent having to model it. Enter commits (except on
+ * touch-primary devices, where it inserts a newline — same convention as
+ * the open-answer textarea and the main composer); Shift+Enter always
+ * inserts a newline.
+ */
+function OtherAnswerRow({
+  value,
+  onChange,
+  onSubmit,
+  placeholder,
+  label,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  onSubmit: () => void;
+  placeholder: string;
+  label: string;
+}) {
+  return (
+    <div className="flex items-end gap-2">
+      <Textarea
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key !== "Enter") return;
+          if (e.nativeEvent.isComposing) return;
+          if (e.shiftKey) return;
+          if (window.matchMedia("(pointer: coarse)").matches) return;
+          e.preventDefault();
+          onSubmit();
+        }}
+        placeholder={placeholder}
+        className="min-h-9 max-h-40 resize-none"
+      />
+      <Button size="sm" onClick={onSubmit} disabled={!value.trim()}>
+        {label}
+      </Button>
     </div>
   );
 }
