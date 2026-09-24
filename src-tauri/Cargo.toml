@@ -1,6 +1,6 @@
 [package]
 name = "train-me"
-version = "0.24.3"
+version = "0.25.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
