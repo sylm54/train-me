@@ -28,6 +28,7 @@
 
 import { useSyncExternalStore, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { nanoid } from "nanoid";
 import type { UIMessage } from "ai";
 import {
@@ -105,6 +106,32 @@ function ensureHydrated(): Promise<void> {
 
 if (typeof window !== "undefined") {
   ensureHydrated();
+}
+
+/**
+ * Re-read the backend's metadata index (ordering, titles, new chats) into
+ * the cache. Called when the backend reports an out-of-band chat change —
+ * background agent runs (wake seeds, background turns) bump `updatedAt`
+ * and may create chats this cache has never seen.
+ */
+export function refreshMeta(): void {
+  invokeAfterHydration<ChatMeta[]>("chats_list")
+    .then((chats) => {
+      if (!Array.isArray(chats)) return;
+      metaCache = chats;
+      rebuildSnapshot();
+      emit();
+    })
+    .catch((e) => console.warn("[chatStore] meta refresh failed:", e));
+}
+
+if (typeof window !== "undefined") {
+  // The backend mutates chats from outside the webview (background agent
+  // runs emit `chat-changed` — see the runner); keep the cache live so the
+  // switcher reflects them without a restart.
+  void listen("chat-changed", () => refreshMeta()).catch((e) => {
+    console.warn("[chatStore] failed to subscribe to chat-changed:", e);
+  });
 }
 
 /** Invoke a mutating command only after the initial load has settled, so a

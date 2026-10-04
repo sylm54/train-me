@@ -33,7 +33,10 @@
 //! out via `app.emit("agent-event", …)` per step — same payloads as
 //! `agent-events.ts`. Coarse activity is mirrored on the same channel as
 //! `{type:"agent-activity", chatId, phase, detail?, ts}` so any view can
-//! render background-run progress without a Channel.
+//! render background-run progress without a Channel. Background
+//! (Channel-less) transcript writes additionally emit [`CHAT_CHANGED_EVENT`]
+//! so the webview can reload a chat it only reads from disk on mount —
+//! without it, a background-invoked run is invisible in the chat UI.
 
 use rig_core as rig;
 use std::collections::VecDeque;
@@ -82,6 +85,15 @@ pub(crate) const STREAM_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(120)
 /// subagent lifecycle — the payloads carry a `type` discriminator matching
 /// `agent-events.ts`).
 pub const AGENT_EVENT: &str = "agent-event";
+
+/// Tauri event emitted whenever a chat's transcript or metadata changes
+/// OUTSIDE an interactive run (a background wake seed landing, a background
+/// run persisting a step, an orphaned question's answer note). Payload:
+/// `{ "chatId": "…" }`. The UI reloads the affected transcript and its
+/// chat-list cache on receipt — without this, a background-invoked turn is
+/// invisible: the UI reads transcripts from disk only on mount. Headless
+/// (cold-start) runs have no webview and simply skip the emit.
+pub const CHAT_CHANGED_EVENT: &str = "chat-changed";
 
 // ============================================================================
 // Cancellation
@@ -419,9 +431,39 @@ impl AgentRuntime {
     }
 
     fn emit_event(&self, app: Option<&tauri::AppHandle>, event: &Value) {
+        self.emit_named(app, AGENT_EVENT, event);
+    }
+
+    fn emit_named(&self, app: Option<&tauri::AppHandle>, name: &str, payload: &Value) {
         if let Some(app) = app {
             use tauri::Emitter;
-            let _ = app.emit(AGENT_EVENT, event);
+            let _ = app.emit(name, payload);
+        }
+    }
+
+    /// Announce that `chat_id`'s transcript/metadata changed from outside
+    /// the webview (see [`CHAT_CHANGED_EVENT`]). No-op in headless runs.
+    fn notify_chat_changed(&self, app: Option<&tauri::AppHandle>, chat_id: &str) {
+        self.emit_named(
+            app,
+            CHAT_CHANGED_EVENT,
+            &json!({ "chatId": chat_id, "ts": super::now_ms() }),
+        );
+    }
+
+    /// Persist a (re)write of the transcript and, for background runs
+    /// (no Channel), nudge the UI. Interactive runs stream their own chunks
+    /// and already hold the state this save came from — no nudge needed.
+    fn persist_transcript(
+        &self,
+        app: Option<&tauri::AppHandle>,
+        channel: Option<&tauri::ipc::Channel<Value>>,
+        chat_id: &str,
+        messages: Vec<Value>,
+    ) {
+        let _ = crate::chats::save_messages(chat_id, &messages);
+        if channel.is_none() {
+            self.notify_chat_changed(app, chat_id);
         }
     }
 
@@ -479,14 +521,17 @@ impl AgentRuntime {
     }
 
     /// Background wake (cron / agent-action / debug): resolve the working
-    /// chat, persist the seed as an invocation note, queue a run with no
-    /// Channel (events only). Returns immediately with a oneshot that
-    /// resolves to the seeded run's [`RunInfo`] when it settles (Stage 5b's
-    /// native wake path awaits it, bounded, to know when the turn is done;
-    /// fire-and-forget callers simply drop the receiver).
+    /// chat, queue a run seeded with `message` (no Channel — events only).
+    /// Returns immediately with a oneshot that resolves to the seeded run's
+    /// [`RunInfo`] when it settles (Stage 5b's native wake path awaits it,
+    /// bounded, to know when the turn is done; fire-and-forget callers
+    /// simply drop the receiver).
     ///
     /// The run itself happens on a detached task, queued behind whatever
-    /// turn is in flight.
+    /// turn is in flight. The seed is appended to the transcript by that
+    /// task AFTER it acquires the turn gate — appending here instead would
+    /// race an in-flight run's next full-transcript rewrite (it snapshots
+    /// the transcript at its own start) and the seed line would be dropped.
     pub async fn enqueue_seed(
         self: &Arc<Self>,
         origin: &str,
@@ -515,10 +560,6 @@ impl AgentRuntime {
             "parts": [{ "type": "text", "text": message }],
             "metadata": { "origin": origin },
         });
-        if let Err(e) = crate::chats::append_message(&chat_id, &seed) {
-            log::warn!("[agent] wake ({origin}): appending seed failed: {e}");
-        }
-        let _ = crate::chats::touch(&chat_id, None);
         // Pin the foreground service NOW, before queuing: the seed may wait
         // a long turn behind the FIFO gate, and a process frozen while
         // waiting would never reach its ticket. The guard moves into the
@@ -528,16 +569,23 @@ impl AgentRuntime {
         let _slot = self.app().map(crate::agent_service::AgentHold::hold);
         let this = self.clone();
         tauri::async_runtime::spawn(async move {
-            let info = this.run_background(chat_id).await;
+            let info = this.run_background(chat_id, seed).await;
             let _ = tx.send(info);
             drop(_slot);
         });
         rx
     }
 
-    /// The queued background run itself (no Channel — events only).
-    async fn run_background(self: Arc<Self>, chat_id: String) -> RunInfo {
+    /// The queued background run itself (no Channel — events only). Appends
+    /// `seed` to the transcript under the turn gate (see [`enqueue_seed`]),
+    /// then runs the turn off the persisted transcript.
+    async fn run_background(self: Arc<Self>, chat_id: String, seed: Value) -> RunInfo {
         self.gate.acquire().await;
+        if let Err(e) = crate::chats::append_message(&chat_id, &seed) {
+            log::warn!("[agent] background run {chat_id}: appending seed failed: {e}");
+        }
+        let _ = crate::chats::touch(&chat_id, None);
+        self.notify_chat_changed(self.app(), &chat_id);
         let cancel = CancelHandle::new();
         *self.current_cancel.lock() = Some(cancel.clone());
         let info = self.run_turn(&chat_id, None, None, &cancel).await;
@@ -611,6 +659,7 @@ impl AgentRuntime {
             return questions::RespondOutcome { delivered: false, continued: false };
         }
         let _ = crate::chats::touch(&chat_id, None);
+        self.notify_chat_changed(self.app(), &chat_id);
         self.enqueue_seed(
             "agent-action",
             "(The user answered your earlier question out-of-band; their answer is the message above. Continue the task.)".to_string(),
@@ -683,8 +732,17 @@ impl AgentRuntime {
         // Compaction: drop the summarized prefix, fold the summary into the
         // system prompt. The model never sees the summarized prefix.
         let compaction_state = compaction::get_compaction(&data_dir, chat_id);
-        let all_messages =
-            messages.unwrap_or_else(|| crate::chats::load_messages(chat_id).unwrap_or_default());
+        let all_messages = match messages {
+            // Interactive sends re-transmit the UI's full array; fold in
+            // anything the backend appended since the UI last loaded this
+            // chat (background wake seeds/turns, orphaned question notes)
+            // so the up-front save below cannot erase them.
+            Some(incoming) => {
+                let disk = crate::chats::load_messages(chat_id).unwrap_or_default();
+                crate::chats::merge_with_disk(incoming, &disk)
+            }
+            None => crate::chats::load_messages(chat_id).unwrap_or_default(),
+        };
         let live = compaction::live_messages_for_model(&all_messages, compaction_state.as_ref());
         let system_prompt =
             compaction::system_prompt_with_summary(&base_prompt, compaction_state.as_ref());
@@ -774,9 +832,11 @@ impl AgentRuntime {
                     if !step_text.trim().is_empty() {
                         run_parts.push(convert::text_part(&step_text));
                         let msg = convert::assistant_message(&message_id, run_parts);
-                        let _ = crate::chats::save_messages(
+                        self.persist_transcript(
+                            app,
+                            channel,
                             chat_id,
-                            &[all_messages.clone(), vec![msg]].concat(),
+                            [all_messages.clone(), vec![msg]].concat(),
                         );
                     }
                     Self::send_chunk(channel, stream.lock().abort());
@@ -791,9 +851,11 @@ impl AgentRuntime {
                     if !step_text.trim().is_empty() {
                         run_parts.push(convert::text_part(&step_text));
                         let msg_json = convert::assistant_message(&message_id, run_parts);
-                        let _ = crate::chats::save_messages(
+                        self.persist_transcript(
+                            app,
+                            channel,
                             chat_id,
-                            &[all_messages.clone(), vec![msg_json]].concat(),
+                            [all_messages.clone(), vec![msg_json]].concat(),
                         );
                     }
                     Self::send_chunk(channel, stream.lock().error(&msg));
@@ -845,9 +907,11 @@ impl AgentRuntime {
                 }
                 run_parts.extend(step_parts);
                 let run_msg = convert::assistant_message(&message_id, run_parts);
-                let _ = crate::chats::save_messages(
+                self.persist_transcript(
+                    app,
+                    channel,
                     chat_id,
-                    &[all_messages.clone(), vec![run_msg]].concat(),
+                    [all_messages.clone(), vec![run_msg]].concat(),
                 );
                 info.ok = true;
                 break;
@@ -929,9 +993,11 @@ impl AgentRuntime {
             }
             run_parts.extend(step_parts);
             let run_msg = convert::assistant_message(&message_id, run_parts.clone());
-            let _ = crate::chats::save_messages(
+            self.persist_transcript(
+                app,
+                channel,
                 chat_id,
-                &[all_messages.clone(), vec![run_msg]].concat(),
+                [all_messages.clone(), vec![run_msg]].concat(),
             );
             rig_msgs.push(Message::Assistant { id: None, content: outcome.choice });
             rig_msgs.extend(result_msgs);
@@ -947,6 +1013,12 @@ impl AgentRuntime {
         }
 
         let _ = crate::chats::touch(chat_id, None);
+        // The end-touch reorders the chat list (updatedAt) after the last
+        // transcript persist already notified — one final nudge so the UI
+        // settles on the post-run ordering.
+        if channel.is_none() {
+            self.notify_chat_changed(app, chat_id);
+        }
         self.activity(app, chat_id, "end", None);
         // Terminal phase, just before the caller's guard releases the
         // service slot: idle/finished map to no body update (release removes

@@ -50,6 +50,7 @@
 //! backup archive. There is deliberately NO migration from the old webview
 //! localStorage store; that data is abandoned.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -755,6 +756,51 @@ pub fn chats_replace_meta(chats: Vec<ChatMeta>) -> Result<(), String> {
 }
 
 // ============================================================================
+// Transcript union (background writes vs. interactive re-sends)
+// ============================================================================
+
+/// Union an interactive send's message array with the on-disk transcript.
+///
+/// The interactive transport re-sends the UI's full message array and the
+/// runner persists it up-front — which would ERASE messages the backend
+/// appended since the UI last loaded the chat (a background wake seed, its
+/// assistant turn, an orphaned question's answer note). Chats are
+/// append-mostly, so the repair is a union by message id: disk messages the
+/// incoming array does not know are spliced in just before the incoming
+/// array's trailing messages that are themselves absent from disk (the user
+/// message this send is adding), preserving chronology in both directions.
+///
+/// When the incoming array has NO trailing unknown message (e.g. a
+/// regenerate, whose array is a subset of disk), it is returned unchanged —
+/// a deliberate re-send must keep its right to shrink the transcript.
+pub fn merge_with_disk(incoming: Vec<serde_json::Value>, disk: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    fn id_of(m: &serde_json::Value) -> Option<&str> {
+        m.get("id").and_then(serde_json::Value::as_str)
+    }
+    let disk_ids: HashSet<&str> = disk.iter().filter_map(id_of).collect();
+    // Trailing incoming messages absent from disk = what THIS send appends.
+    let mut split = incoming.len();
+    while split > 0 && id_of(&incoming[split - 1]).is_none_or(|id| !disk_ids.contains(id)) {
+        split -= 1;
+    }
+    if split == incoming.len() || incoming.is_empty() {
+        return incoming; // nothing new is being sent — not a growing send
+    }
+    let incoming_ids: HashSet<&str> = incoming.iter().filter_map(id_of).collect();
+    let extras: Vec<serde_json::Value> = disk
+        .iter()
+        .filter(|m| id_of(m).is_some_and(|id| !incoming_ids.contains(id)))
+        .cloned()
+        .collect();
+    if extras.is_empty() {
+        return incoming; // the UI was current
+    }
+    let mut merged = incoming;
+    merged.splice(split..split, extras);
+    merged
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1058,5 +1104,47 @@ mod tests {
         atomic_write(&target, b"two").unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"two");
         assert!(!tmp_sibling.exists());
+    }
+
+    #[test]
+    fn merge_with_disk_preserves_background_messages() {
+        let msg = |id: &str, role: &str| json!({ "id": id, "role": role });
+        // Disk: the UI's known prefix + a background seed and its answer.
+        let disk = vec![
+            msg("u1", "user"),
+            msg("a1", "assistant"),
+            msg("seed", "user"),
+            msg("a2", "assistant"),
+        ];
+        // A stale UI re-sends its prefix plus a NEW user message.
+        let incoming = vec![msg("u1", "user"), msg("a1", "assistant"), msg("u2", "user")];
+        let merged = merge_with_disk(incoming, &disk);
+        let ids: Vec<&str> = merged.iter().map(|m| m["id"].as_str().unwrap()).collect();
+        // Chronology both ways: known prefix, background turn, the new send.
+        assert_eq!(ids, vec!["u1", "a1", "seed", "a2", "u2"]);
+    }
+
+    #[test]
+    fn merge_with_disk_leaves_current_and_shrinking_sends_alone() {
+        let msg = |id: &str| json!({ "id": id });
+        let disk = vec![msg("u1"), msg("a1"), msg("u2")];
+
+        // UI is current (nothing on disk is unknown): returned as-is, in order.
+        let incoming = vec![msg("u1"), msg("a1"), msg("u2"), msg("u3")];
+        let merged = merge_with_disk(incoming, &disk);
+        let ids: Vec<&str> = merged.iter().map(|m| m["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["u1", "a1", "u2", "u3"]);
+
+        // Regenerate: the array is a subset of disk (no trailing unknown
+        // message) — a deliberate re-send keeps the right to shrink.
+        let incoming = vec![msg("u1"), msg("a1"), msg("u2")];
+        assert_eq!(merge_with_disk(incoming, &disk).len(), 3);
+
+        // Degenerate shapes pass through untouched.
+        assert!(merge_with_disk(Vec::new(), &disk).is_empty());
+        assert_eq!(merge_with_disk(vec![msg("u1")], &[]).len(), 1);
+        // Messages without ids never crash the union.
+        let odd = vec![json!({ "role": "user" }), msg("u2")];
+        assert_eq!(merge_with_disk(odd, &disk).len(), 2);
     }
 }
