@@ -62,6 +62,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type React from "react";
 import { useChat } from "@ai-sdk/react";
+import { listen } from "@tauri-apps/api/event";
 import type { UIMessage } from "ai";
 import {
   AlertCircle,
@@ -97,6 +98,7 @@ import {
   createChat,
   deleteChatPermanently,
   loadMessages,
+  refreshMeta,
   renameChat,
   restoreChat,
   saveMessages,
@@ -307,6 +309,48 @@ function ChatViewInner({
     }
     wasGenerating.current = isGenerating;
   }, [isGenerating, messages, activeChatId, error, completionSoundEnabled]);
+
+  // ── Background-run visibility ───────────────────────────────────────
+  // Turns seeded outside this view (cron wakes, schedule agent-actions,
+  // orphaned-question continuations) write to the transcript on disk and
+  // announce it via the backend's `chat-changed` event — the SDK's
+  // in-memory store never hears about them otherwise, so without this a
+  // background-invoked run is invisible until the app restarts. Reload the
+  // on-screen chat's transcript when such a run touches it; never while a
+  // local generation is in flight (the streaming SDK owns the transcript
+  // then — and the backend's FIFO gate keeps a background run's writes off
+  // it anyway). A paused Android webview can drop events entirely, so the
+  // same reload also runs when the app becomes visible again.
+  const reloadFromDisk = useCallback(() => {
+    if (isGenerating) return;
+    void loadMessages(activeChatId).then((saved) => {
+      if (saved.length === 0) return;
+      setMessages(saved);
+      // Derive the title the way a finished interactive run would (a
+      // background-seeded chat never passes through touchChat otherwise).
+      touchChat(activeChatId, saved.find((m) => m.role === "user") ?? null);
+    });
+  }, [activeChatId, isGenerating, setMessages]);
+
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    void listen<{ chatId?: string }>("chat-changed", (e) => {
+      if (e.payload?.chatId === activeChatId) reloadFromDisk();
+    }).then((f) => {
+      un = f;
+    });
+    const onVisible = () => {
+      if (document.visibilityState === "visible") {
+        refreshMeta();
+        reloadFromDisk();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      un?.();
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [activeChatId, reloadFromDisk]);
 
   // ── Stream liveness: "thinking" vs "waiting on the network" ────────
   // The SDK bumps `messages` on every stream chunk (reasoning/text deltas,
