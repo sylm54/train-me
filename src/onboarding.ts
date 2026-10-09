@@ -7,7 +7,8 @@
  * `include` items splice a subfile's array in place (root-relative `src`,
  * the include's showIf ANDed onto each spliced item); cycles and escaping
  * paths are errors. `showIf` conditions may reference questions above the
- * item and installed framework parts (`{ part, installed? }`).
+ * item and installed framework parts (`{ part, installed? }`), and scope
+ * tierlist answers by tier (`tier` / `tierAtLeast`).
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -34,6 +35,17 @@ function conditionParts(c: Json, out: string[]): void {
   if (Array.isArray(c.any)) for (const x of c.any) conditionParts(x, out);
   if (c.not !== undefined) conditionParts(c.not, out);
   if (typeof c.part === "string") out.push(c.part);
+}
+
+/** Tier scopes in a condition: `[question id, tier name]` pairs. */
+function conditionTierScopes(c: Json, out: [string, string][]): void {
+  if (!isObj(c)) return;
+  if (Array.isArray(c.all)) for (const x of c.all) conditionTierScopes(x, out);
+  if (Array.isArray(c.any)) for (const x of c.any) conditionTierScopes(x, out);
+  if (c.not !== undefined) conditionTierScopes(c.not, out);
+  if (typeof c.id !== "string") return;
+  if (typeof c.tier === "string") out.push([c.id, c.tier]);
+  if (typeof c.tierAtLeast === "string") out.push([c.id, c.tierAtLeast]);
 }
 
 function validateCondition(c: Json, label: string, diags: Diag[]): void {
@@ -69,11 +81,26 @@ function validateCondition(c: Json, label: string, diags: Diag[]): void {
     diags.push({ severity: "error", message: `${label}: condition id must be non-empty` });
     return;
   }
+  for (const key of ["tier", "tierAtLeast"] as const) {
+    if (c[key] !== undefined && (typeof c[key] !== "string" || !(c[key] as string).trim())) {
+      diags.push({
+        severity: "error",
+        message: `${label}: \`${key}\` must be a non-empty string`,
+      });
+    }
+  }
+  if (c.tier !== undefined && c.tierAtLeast !== undefined) {
+    diags.push({
+      severity: "error",
+      message: `${label}: condition on \`${id}\` cannot combine \`tier\` and \`tierAtLeast\``,
+    });
+  }
   const comparators = ["equals", "notEquals", "includes", "min", "max", "answered"] as const;
   if (!comparators.some((k) => c[k] !== undefined)) {
     diags.push({
       severity: "error",
-      message: `${label}: condition on \`${id}\` needs at least one of ${comparators.join(", ")}`,
+      message: `${label}: condition on \`${id}\` needs at least one of ${comparators.join(", ")} \
+(tier scopes qualify these, they don't replace them)`,
     });
   }
 }
@@ -152,10 +179,13 @@ function validateItems(items: Json[], knownParts: string[] | null, diags: Diag[]
     return;
   }
   const seen = new Set<string>();
+  // Tierlist questions so far: id → tiers (for condition scope validation).
+  const tierlists = new Map<string, string[]>();
   items.forEach((item, i) => {
     const label = `onboarding item #${i}`;
     // Conditions may only reference questions ABOVE this item.
     const seenBefore = new Set(seen);
+    const tierlistsBefore = new Map(tierlists);
     if (!isObj(item)) {
       diags.push({ severity: "error", message: `${label}: must be an object` });
       return;
@@ -182,10 +212,10 @@ function validateItems(items: Json[], knownParts: string[] | null, diags: Diag[]
         diags.push({ severity: "error", message: `${label}: \`prompt\` must not be empty` });
       }
       const answer = item.answer;
-      if (!["open", "choice", "rating", "ranking"].includes(String(answer))) {
+      if (!["open", "choice", "rating", "ranking", "tierlist"].includes(String(answer))) {
         diags.push({
           severity: "error",
-          message: `${label}: \`answer\` must be open, choice, rating, or ranking`,
+          message: `${label}: \`answer\` must be open, choice, rating, ranking, or tierlist`,
         });
       } else if (answer === "choice" || answer === "ranking") {
         if (!Array.isArray(item.choices) || item.choices.length < 2) {
@@ -199,6 +229,39 @@ function validateItems(items: Json[], knownParts: string[] | null, diags: Diag[]
         const max = typeof item.max === "number" ? item.max : 10;
         if (min >= max) {
           diags.push({ severity: "error", message: `${label}: min must be below max` });
+        }
+      } else if (answer === "tierlist") {
+        const choices = item.choices;
+        if (!Array.isArray(choices) || choices.length < 2) {
+          diags.push({
+            severity: "error",
+            message: `${label}: tierlist questions need at least 2 \`choices\` (the items to rate)`,
+          });
+        } else if (
+          choices.some((c) => typeof c !== "string" || !c.trim()) ||
+          new Set(choices).size !== choices.length
+        ) {
+          diags.push({
+            severity: "error",
+            message: `${label}: tierlist items (\`choices\`) must be non-empty and unique`,
+          });
+        }
+        const tiers = item.tiers;
+        if (!Array.isArray(tiers) || tiers.length < 2) {
+          diags.push({
+            severity: "error",
+            message: `${label}: tierlist questions need at least 2 \`tiers\` (top to bottom)`,
+          });
+        } else if (
+          tiers.some((t) => typeof t !== "string" || !t.trim()) ||
+          new Set(tiers).size !== tiers.length
+        ) {
+          diags.push({
+            severity: "error",
+            message: `${label}: tierlist \`tiers\` must be non-empty and unique`,
+          });
+        } else if (typeof id === "string") {
+          tierlists.set(id, tiers as string[]);
         }
       }
       if (item.optional !== undefined && typeof item.optional !== "boolean") {
@@ -214,6 +277,23 @@ function validateItems(items: Json[], knownParts: string[] | null, diags: Diag[]
           diags.push({
             severity: "error",
             message: `${label}: showIf references \`${r}\`, which is not a question above it`,
+          });
+        }
+      }
+      // Tier scopes must name a tierlist question above and one of its tiers.
+      const scopes: [string, string][] = [];
+      conditionTierScopes(item.showIf, scopes);
+      for (const [id, tier] of scopes) {
+        const tiers = tierlistsBefore.get(id);
+        if (!tiers) {
+          diags.push({
+            severity: "error",
+            message: `${label}: showIf scopes \`${id}\` by tier, but \`${id}\` is not a tierlist question above it`,
+          });
+        } else if (!tiers.includes(tier)) {
+          diags.push({
+            severity: "error",
+            message: `${label}: showIf references tier \`${tier}\`, which \`${id}\` does not define`,
           });
         }
       }

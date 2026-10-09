@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { validateHabit, validateRoutine, type Diag } from "./validate";
+import { validateOnboarding } from "./onboarding";
 
 function diagsFor(body: string): Diag[] {
   const content = `---\nformat: 2\ntitle: T\nschedule: 0 8 * * *\n---\n\n${body}`;
@@ -10,6 +11,12 @@ function diagsFor(body: string): Diag[] {
 
 const errors = (d: Diag[]) => d.filter((x) => x.severity === "error").map((x) => x.message);
 const warnings = (d: Diag[]) => d.filter((x) => x.severity === "warning").map((x) => x.message);
+
+function onboardingErrors(items: unknown): string[] {
+  const diags: Diag[] = [];
+  validateOnboarding(items, ".", null, diags);
+  return errors(diags);
+}
 
 test("proper block conditional parses clean", () => {
   const d = diagsFor("{{#if weekday == \"monday\"}}\n- [ ] item\n{{/if}}");
@@ -68,4 +75,94 @@ test("habit minutes mode mirrors the engine's unit rules", () => {
   expect(
     errors(habitDiags("title: R\ntype: max\nminutes: -5")).join("\n"),
   ).toContain("`minutes` must be ≥ 0");
+});
+
+const TIERLIST_Q = {
+  id: "toys",
+  answer: "tierlist",
+  prompt: "Rate your toys",
+  choices: ["rope", "impact", "blindfold"],
+  tiers: ["S", "A", "B"],
+};
+
+test("tierlist questions validate shape", () => {
+  // A well-formed tierlist lints clean, alone or with tier conditions.
+  expect(onboardingErrors([{ ...TIERLIST_Q }])).toEqual([]);
+  expect(
+    onboardingErrors([
+      { ...TIERLIST_Q },
+      { kind: "text", text: "x", showIf: { id: "toys", tier: "S", includes: "rope" } },
+      {
+        kind: "text",
+        text: "y",
+        showIf: { id: "toys", tierAtLeast: "A", includes: "rope" },
+      },
+    ]),
+  ).toEqual([]);
+
+  // Needs tiers — at least two of them, unique and non-empty.
+  expect(onboardingErrors([{ ...TIERLIST_Q, tiers: undefined }]).join("\n")).toContain(
+    "at least 2 `tiers`",
+  );
+  expect(onboardingErrors([{ ...TIERLIST_Q, tiers: ["S"] }]).join("\n")).toContain(
+    "at least 2 `tiers`",
+  );
+  expect(onboardingErrors([{ ...TIERLIST_Q, tiers: ["S", "S"] }]).join("\n")).toContain(
+    "must be non-empty and unique",
+  );
+  // Items must be unique too, and at least two of them.
+  expect(
+    onboardingErrors([{ ...TIERLIST_Q, choices: ["rope", "rope"] }]).join("\n"),
+  ).toContain("must be non-empty and unique");
+  expect(
+    onboardingErrors([{ ...TIERLIST_Q, choices: ["rope"] }]).join("\n"),
+  ).toContain("at least 2 `choices`");
+});
+
+test("tier showIf scopes must name a tierlist question above and its tier", () => {
+  // Unknown tier name.
+  expect(
+    onboardingErrors([
+      { ...TIERLIST_Q },
+      { kind: "text", text: "x", showIf: { id: "toys", tier: "Z", includes: "rope" } },
+    ]).join("\n"),
+  ).toContain("does not define");
+  // Scoping a non-tierlist question.
+  expect(
+    onboardingErrors([
+      { id: "n", answer: "open", prompt: "p" },
+      { kind: "text", text: "x", showIf: { id: "n", tier: "S", includes: "rope" } },
+    ]).join("\n"),
+  ).toContain("is not a tierlist question above it");
+  // Scoping a question BELOW (self-reference included) is rejected.
+  expect(
+    onboardingErrors([
+      {
+        id: "t2",
+        answer: "tierlist",
+        prompt: "p",
+        choices: ["a", "b"],
+        tiers: ["S", "A"],
+        showIf: { id: "t2", tier: "S", includes: "a" },
+      },
+    ]).join("\n"),
+  ).toContain("is not a tierlist question above it");
+  // Combining both scopes.
+  expect(
+    onboardingErrors([
+      { ...TIERLIST_Q },
+      {
+        kind: "text",
+        text: "x",
+        showIf: { id: "toys", tier: "S", tierAtLeast: "A", includes: "rope" },
+      },
+    ]).join("\n"),
+  ).toContain("cannot combine");
+  // A tier scope without a comparator.
+  expect(
+    onboardingErrors([
+      { ...TIERLIST_Q },
+      { kind: "text", text: "x", showIf: { id: "toys", tier: "S" } },
+    ]).join("\n"),
+  ).toContain("needs at least one of");
 });
