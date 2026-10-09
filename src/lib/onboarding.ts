@@ -14,14 +14,19 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
-export type AnswerKind = "open" | "choice" | "rating" | "ranking";
+export type AnswerKind = "open" | "choice" | "rating" | "ranking" | "tierlist";
+
+/** Tierlist placement: tier label → items in that tier, left→right. */
+export type TierlistPlacement = Record<string, string[]>;
 
 export interface QuestionItem {
   id: string;
   answer: AnswerKind;
   prompt: string;
-  /** `choice`/`ranking` answers only. */
+  /** `choice`/`ranking` answers only — the options. */
   choices?: string[];
+  /** `tierlist` answers only — the tier rows, top→bottom. */
+  tiers?: string[];
   /** `choice` answers only — collect several. */
   multiple?: boolean;
   /** `rating` answers only (default 1..=10). */
@@ -44,7 +49,12 @@ export interface OnboardingStep {
 }
 
 /** `null` marks an optional question the user skipped. */
-export type AnswerValue = string | number | string[] | null;
+export type AnswerValue =
+  | string
+  | number
+  | string[]
+  | TierlistPlacement
+  | null;
 export type AnswerMap = Record<string, AnswerValue>;
 
 /**

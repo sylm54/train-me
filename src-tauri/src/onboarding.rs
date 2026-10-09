@@ -104,6 +104,12 @@ impl Default for Flow {
 /// Display condition. Either a comparison against a previous answer, a
 /// check on an installed framework part, or a compound (`all` / `any` /
 /// `not`). Multiple comparators on one comparison are ANDed.
+///
+/// `tier` / `tierAtLeast` scope a comparison into one tier of a `tierlist`
+/// answer: `includes` then tests whether an item sits in that tier (or in
+/// it or any tier above, for `tierAtLeast` — tiers listed earlier rank
+/// higher), `answered` whether the tier holds anything, and `min`/`max`
+/// bound the tier's item count.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(untagged)]
 pub enum Condition {
@@ -117,17 +123,26 @@ pub enum Condition {
         #[serde(default, rename = "notEquals", skip_serializing_if = "Option::is_none")]
         not_equals: Option<serde_json::Value>,
         /// Array contains the value, or a text answer contains it as a
-        /// substring.
+        /// substring. On tierlist answers: the item is placed in the
+        /// scoped tier(s) (any tier when unscoped).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         includes: Option<serde_json::Value>,
-        /// Numeric bounds (rating answers).
+        /// Numeric bounds (rating answers; tierlist: item counts in the
+        /// scoped tier(s)).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         min: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max: Option<f64>,
-        /// `true`: the question has an answer; `false`: it doesn't.
+        /// `true`: the question has an answer; `false`: it doesn't. With
+        /// `tier`/`tierAtLeast`: the scoped tier(s) hold at least one item.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         answered: Option<bool>,
+        /// Tierlist scope: exactly this tier.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tier: Option<String>,
+        /// Tierlist scope: this tier or any tier above it.
+        #[serde(default, rename = "tierAtLeast", skip_serializing_if = "Option::is_none")]
+        tier_at_least: Option<String>,
     },
     /// True when the named part folder (a `config.json` choice target) was
     /// installed. `installed: false` inverts it.
@@ -153,6 +168,10 @@ pub enum AnswerKind {
     Rating,
     /// All of `choices`, ordered by preference (stored as the ranked array).
     Ranking,
+    /// All of `choices` sorted into `tiers` (stored as
+    /// `{tier: [items…]}` — tier order top→bottom is the tiers array's,
+    /// item order within a tier is left→right as placed).
+    Tierlist,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -183,6 +202,10 @@ pub struct QuestionItem {
     pub prompt: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub choices: Vec<String>,
+    /// `tierlist` answers only — the tier rows, top→bottom. Conditions and
+    /// the stored answer reference tiers by their label.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tiers: Vec<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub multiple: bool,
     #[serde(default = "default_min", skip_serializing_if = "is_default_min")]
@@ -272,9 +295,25 @@ fn validate_condition(c: &Condition, label: &str) -> Result<(), String> {
             min,
             max,
             answered,
+            tier,
+            tier_at_least,
         } => {
             if id.trim().is_empty() {
                 return Err(format!("{label}: condition id must be non-empty"));
+            }
+            for name in [tier, tier_at_least] {
+                if let Some(t) = name {
+                    if t.trim().is_empty() {
+                        return Err(format!(
+                            "{label}: condition on `{id}` has an empty tier name"
+                        ));
+                    }
+                }
+            }
+            if tier.is_some() && tier_at_least.is_some() {
+                return Err(format!(
+                    "{label}: condition on `{id}` cannot combine `tier` and `tierAtLeast`"
+                ));
             }
             let has_comparator = equals.is_some()
                 || not_equals.is_some()
@@ -290,6 +329,29 @@ fn validate_condition(c: &Condition, label: &str) -> Result<(), String> {
             }
             Ok(())
         }
+    }
+}
+
+/// Tier scoping in a condition — `(question id, tier name, atLeast)` pairs.
+fn condition_tiers(c: &Condition, out: &mut Vec<(String, String, bool)>) {
+    match c {
+        Condition::All { all } => all.iter().for_each(|c| condition_tiers(c, out)),
+        Condition::Any { any } => any.iter().for_each(|c| condition_tiers(c, out)),
+        Condition::Not { not } => condition_tiers(not, out),
+        Condition::Cmp {
+            id,
+            tier,
+            tier_at_least,
+            ..
+        } => {
+            if let Some(t) = tier {
+                out.push((id.clone(), t.clone(), false));
+            }
+            if let Some(t) = tier_at_least {
+                out.push((id.clone(), t.clone(), true));
+            }
+        }
+        Condition::Part { .. } => {}
     }
 }
 
@@ -329,6 +391,8 @@ pub fn parse_flow(json: &str) -> Result<Vec<OnboardingItem>, String> {
 
     let mut parsed: Vec<OnboardingItem> = Vec::new();
     let mut seen_ids: Vec<String> = Vec::new();
+    // Tierlist questions seen so far: id → tiers (for condition validation).
+    let mut tiered_above: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (i, raw) in items.iter().enumerate() {
         // Items without a `kind` are questions (short form).
         let is_text = raw.get("kind").and_then(|k| k.as_str()) == Some("text");
@@ -365,10 +429,44 @@ pub fn parse_flow(json: &str) -> Result<Vec<OnboardingItem>, String> {
                 if q.min >= q.max {
                     return Err(format!("question `{}`: min must be below max", q.id));
                 }
-                if matches!(q.answer, AnswerKind::Choice | AnswerKind::Ranking) {
+                if matches!(
+                    q.answer,
+                    AnswerKind::Choice | AnswerKind::Ranking | AnswerKind::Tierlist
+                ) {
                     if q.choices.len() < 2 {
                         return Err(format!(
-                            "question `{}`: choice/ranking questions need at least 2 choices",
+                            "question `{}`: choice/ranking/tierlist questions need at least \
+                             2 choices",
+                            q.id
+                        ));
+                    }
+                }
+                if q.answer == AnswerKind::Tierlist {
+                    let mut seen_items = HashSet::new();
+                    if q
+                        .choices
+                        .iter()
+                        .any(|c| c.trim().is_empty() || !seen_items.insert(c.trim().to_string()))
+                    {
+                        return Err(format!(
+                            "question `{}`: tierlist items must be non-empty and unique",
+                            q.id
+                        ));
+                    }
+                    if q.tiers.len() < 2 {
+                        return Err(format!(
+                            "question `{}`: tierlist questions need at least 2 tiers",
+                            q.id
+                        ));
+                    }
+                    let mut seen_tiers = HashSet::new();
+                    if q
+                        .tiers
+                        .iter()
+                        .any(|t| t.trim().is_empty() || !seen_tiers.insert(t.trim().to_string()))
+                    {
+                        return Err(format!(
+                            "question `{}`: tiers must be non-empty and unique",
                             q.id
                         ));
                     }
@@ -388,9 +486,33 @@ pub fn parse_flow(json: &str) -> Result<Vec<OnboardingItem>, String> {
                     ));
                 }
             }
+            // Tier scoping must name a tierlist question above and one of
+            // its tiers.
+            let mut tier_refs = Vec::new();
+            condition_tiers(cond, &mut tier_refs);
+            for (id, tier, _) in tier_refs {
+                match tiered_above.get(id.as_str()) {
+                    None => {
+                        return Err(format!(
+                            "{label}: showIf scopes `{id}` by tier, but `{id}` is not a \
+                             tierlist question above it"
+                        ));
+                    }
+                    Some(tiers) if !tiers.contains(&tier) => {
+                        return Err(format!(
+                            "{label}: showIf references tier `{tier}`, which `{id}` does \
+                             not define"
+                        ));
+                    }
+                    _ => {}
+                }
+            }
         }
         if let OnboardingItem::Question(q) = &item {
             seen_ids.push(q.id.trim().to_string());
+            if q.answer == AnswerKind::Tierlist {
+                tiered_above.insert(q.id.trim().to_string(), q.tiers.clone());
+            }
         }
         parsed.push(item);
     }
@@ -551,11 +673,82 @@ fn value_matches(answer: &serde_json::Value, expected: &serde_json::Value) -> bo
     answer == expected
 }
 
-fn eval_condition(c: &Condition, answers: &Answers, parts: &HashSet<String>) -> bool {
+/// Tier rows per tierlist question: id → tiers in definition order (top→
+/// bottom, best first by convention). `tierAtLeast` needs the order to
+/// resolve "this tier or above".
+fn tier_orders(items: &[OnboardingItem]) -> BTreeMap<String, Vec<String>> {
+    items
+        .iter()
+        .filter_map(|i| match i {
+            OnboardingItem::Question(q) if q.answer == AnswerKind::Tierlist => {
+                Some((q.id.clone(), q.tiers.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The items of a tierlist answer a tier-scoped comparison tests against:
+/// exactly `tier`, or — for `tierAtLeast` — everything in that tier or any
+/// tier above it (definition order). An unknown scope yields an empty list
+/// (the comparison then tests against nothing, i.e. false for `includes`).
+fn tier_scoped_items<'a>(
+    answer: &'a serde_json::Value,
+    tiers: &[String],
+    scope: &str,
+    at_least: bool,
+) -> Option<Vec<&'a str>> {
+    let map = answer.as_object()?;
+    let in_scope: Vec<&str> = if at_least {
+        let mut acc: Vec<&str> = Vec::new();
+        let mut hit = false;
+        for t in tiers {
+            acc.push(t);
+            if t == scope {
+                hit = true;
+                break;
+            }
+        }
+        if hit { acc } else { Vec::new() }
+    } else if tiers.iter().any(|t| t == scope) {
+        vec![scope]
+    } else {
+        Vec::new()
+    };
+    let mut out: Vec<&str> = Vec::new();
+    for t in in_scope {
+        if let Some(list) = map.get(t).and_then(|v| v.as_array()) {
+            out.extend(list.iter().filter_map(|v| v.as_str()));
+        }
+    }
+    Some(out)
+}
+
+/// Every placed item of a tierlist answer, in tier order. Items in tiers
+/// the question no longer defines (a framework update renamed one) still
+/// count as placed.
+fn all_placed_items<'a>(answer: &'a serde_json::Value) -> Vec<&'a str> {
+    let mut out: Vec<&'a str> = Vec::new();
+    if let Some(map) = answer.as_object() {
+        for list in map.values() {
+            if let Some(arr) = list.as_array() {
+                out.extend(arr.iter().filter_map(|v| v.as_str()));
+            }
+        }
+    }
+    out
+}
+
+fn eval_condition(
+    c: &Condition,
+    answers: &Answers,
+    parts: &HashSet<String>,
+    orders: &BTreeMap<String, Vec<String>>,
+) -> bool {
     match c {
-        Condition::All { all } => all.iter().all(|c| eval_condition(c, answers, parts)),
-        Condition::Any { any } => any.iter().any(|c| eval_condition(c, answers, parts)),
-        Condition::Not { not } => !eval_condition(not, answers, parts),
+        Condition::All { all } => all.iter().all(|c| eval_condition(c, answers, parts, orders)),
+        Condition::Any { any } => any.iter().any(|c| eval_condition(c, answers, parts, orders)),
+        Condition::Not { not } => !eval_condition(not, answers, parts, orders),
         Condition::Part { part, installed } => parts.contains(part) == *installed,
         Condition::Cmp {
             id,
@@ -565,8 +758,30 @@ fn eval_condition(c: &Condition, answers: &Answers, parts: &HashSet<String>) -> 
             min,
             max,
             answered,
+            tier,
+            tier_at_least,
         } => {
             let answer = answers.get(id);
+            // The value list a tierlist-scoped comparison sees (None = not
+            // tier-scoped or the answer isn't a tierlist object).
+            let scoped: Option<Option<Vec<&str>>> = match (tier, tier_at_least) {
+                (Some(t), _) => Some(answer.and_then(|a| {
+                    orders
+                        .get(id)
+                        .and_then(|tiers| tier_scoped_items(a, tiers, t, false))
+                })),
+                (None, Some(t)) => Some(answer.and_then(|a| {
+                    orders
+                        .get(id)
+                        .and_then(|tiers| tier_scoped_items(a, tiers, t, true))
+                })),
+                // Unscoped tierlist answers still count as item lists for
+                // `includes`/`min`/`max` — "placed anywhere".
+                (None, None) => match answer {
+                    Some(a) if a.is_object() => Some(Some(all_placed_items(a))),
+                    _ => None,
+                },
+            };
             let mut ok = true;
             if let Some(expected) = equals {
                 ok &= answer.map(|a| value_matches(a, expected)).unwrap_or(false);
@@ -576,27 +791,49 @@ fn eval_condition(c: &Condition, answers: &Answers, parts: &HashSet<String>) -> 
                 ok &= answer.map(|a| !value_matches(a, expected)).unwrap_or(false);
             }
             if let Some(needle) = includes {
-                ok &= answer
-                    .map(|a| match a {
-                        serde_json::Value::Array(items) => {
-                            items.iter().any(|v| value_matches(v, needle))
-                        }
-                        serde_json::Value::String(s) => needle
-                            .as_str()
-                            .map(|n| s.contains(n))
-                            .unwrap_or(false),
-                        _ => false,
-                    })
-                    .unwrap_or(false);
+                let needle_str = needle.as_str();
+                ok &= match &scoped {
+                    Some(items) => items
+                        .as_ref()
+                        .map(|items| {
+                            needle_str
+                                .map(|n| items.contains(&n))
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false),
+                    None => answer
+                        .map(|a| match a {
+                            serde_json::Value::Array(items) => items
+                                .iter()
+                                .any(|v| value_matches(v, needle)),
+                            serde_json::Value::String(s) => needle_str
+                                .map(|n| s.contains(n))
+                                .unwrap_or(false),
+                            _ => false,
+                        })
+                        .unwrap_or(false),
+                };
             }
-            if let Some(lo) = min {
-                ok &= answer.and_then(|a| a.as_f64()).map(|a| a >= *lo).unwrap_or(false);
+            if let Some(bound) = min {
+                ok &= match &scoped {
+                    Some(items) => items.as_ref().map(|i| i.len()).unwrap_or(0) as f64 >= *bound,
+                    None => answer.and_then(|a| a.as_f64()).map(|a| a >= *bound).unwrap_or(false),
+                };
             }
-            if let Some(hi) = max {
-                ok &= answer.and_then(|a| a.as_f64()).map(|a| a <= *hi).unwrap_or(false);
+            if let Some(bound) = max {
+                ok &= match &scoped {
+                    Some(items) => items.as_ref().map(|i| i.len()).unwrap_or(0) as f64 <= *bound,
+                    None => answer.and_then(|a| a.as_f64()).map(|a| a <= *bound).unwrap_or(false),
+                };
             }
             if let Some(want) = answered {
-                ok &= is_answered(answer) == *want;
+                let has = match &scoped {
+                    // Scoped: the named tier(s) hold at least one item.
+                    Some(items) => items.as_ref().map(|i| !i.is_empty()).unwrap_or(false),
+                    // Unscoped: the question has an answer at all.
+                    None => is_answered(answer),
+                };
+                ok &= has == *want;
             }
             ok
         }
@@ -610,11 +847,12 @@ pub fn visible_items<'a>(
     answers: &Answers,
     parts: &HashSet<String>,
 ) -> Vec<&'a OnboardingItem> {
+    let orders = tier_orders(items);
     items
         .iter()
         .filter(|item| {
             item.show_if()
-                .map(|c| eval_condition(c, answers, parts))
+                .map(|c| eval_condition(c, answers, parts, &orders))
                 .unwrap_or(true)
         })
         .collect()
@@ -640,6 +878,10 @@ fn is_answered(answer: Option<&serde_json::Value>) -> bool {
         .map(|a| match a {
             serde_json::Value::String(s) => !s.trim().is_empty(),
             serde_json::Value::Array(items) => !items.is_empty(),
+            // Tierlist placement objects: any item placed anywhere counts.
+            serde_json::Value::Object(map) => map.values().any(|v| {
+                v.as_array().map(|a| !a.is_empty()).unwrap_or(false)
+            }),
             serde_json::Value::Null => false,
             _ => true,
         })
@@ -774,7 +1016,8 @@ fn state_for(data_dir: &Path) -> OnboardingState {
 /// key followed by the answer — kept deliberately terse since the file is
 /// typically inlined into prompts. Choice questions also list the options
 /// the user did NOT pick (and flag multi-select) so the agent knows the
-/// full option set, not just the selection. A question's free-text
+/// full option set, not just the selection; tierlist answers read tier by
+/// tier in definition order (`S: a, b | B: c`). A question's free-text
 /// clarification (`note:<id>`, the addendum the UI offers on non-open
 /// questions) is appended to its line. Skipped (`null`) and
 /// still-unanswered questions render nothing. A trailing "App setup"
@@ -854,6 +1097,33 @@ pub(crate) fn write_user_md(agent_dir: &Path, data_dir: &Path) -> Result<(), Str
                 let ranked: Vec<&str> =
                     items.iter().filter_map(|v| v.as_str()).collect();
                 format!("**{}** (ranking) {}", q.prompt, ranked.join(" > "))
+            }
+            // Tierlists read tier by tier, in the tiers' definition order;
+            // empty tiers render nothing (only what the user placed).
+            (AnswerKind::Tierlist, serde_json::Value::Object(map)) => {
+                let rows: Vec<String> = q
+                    .tiers
+                    .iter()
+                    .filter_map(|tier| {
+                        let items = map.get(tier)?;
+                        let items: Vec<&str> = items
+                            .as_array()?
+                            .iter()
+                            .filter_map(|v| v.as_str())
+                            .collect();
+                        if items.is_empty() {
+                            None
+                        } else {
+                            Some(format!("{tier}: {}", items.join(", ")))
+                        }
+                    })
+                    .collect();
+                let body = if rows.is_empty() {
+                    "nothing placed".to_string()
+                } else {
+                    rows.join(" | ")
+                };
+                format!("**{}** (tierlist) {}", q.prompt, body)
             }
             (_, other) => format!(
                 "**{}** {}",
@@ -1118,7 +1388,7 @@ mod tests {
 
         let eval = |c: &str, a: &Answers| {
             let cond: Condition = serde_json::from_str(c).unwrap();
-            eval_condition(&cond, a, &no_parts())
+            eval_condition(&cond, a, &no_parts(), &BTreeMap::new())
         };
         assert!(eval(r#"{ "id": "exp", "equals": "lots" }"#, &answers));
         assert!(eval(r#"{ "id": "exp", "notEquals": "none" }"#, &answers));
@@ -1139,7 +1409,7 @@ mod tests {
         let installed = parts(&["journal", "fitness"]);
         let eval = |c: &str, p: &HashSet<String>| {
             let cond: Condition = serde_json::from_str(c).unwrap();
-            eval_condition(&cond, &Answers::default(), p)
+            eval_condition(&cond, &Answers::default(), p, &BTreeMap::new())
         };
         assert!(eval(r#"{ "part": "journal" }"#, &installed));
         assert!(!eval(r#"{ "part": "voice" }"#, &installed));
@@ -1300,7 +1570,7 @@ mod tests {
             r#"[{ "kind": "question", "id": "r", "answer": "ranking", "prompt": "p", "choices": ["a"] }]"#
         )
         .is_err());
-        let flow = parse_flow(
+        let _flow = parse_flow(
             r#"[{ "kind": "question", "id": "r", "answer": "ranking", "prompt": "p", "choices": ["a", "b"] }]"#
         )
         .unwrap();
@@ -1312,9 +1582,177 @@ mod tests {
         assert!(eval_condition(
             &serde_json::from_str::<Condition>(r#"{ "id": "r", "includes": "b" }"#).unwrap(),
             &a,
-            &no_parts()
+            &no_parts(),
+            &BTreeMap::new()
         ));
         assert!(is_answered(a.get("r")));
+    }
+
+    #[test]
+    fn tierlist_questions_validate() {
+        // Needs tiers…
+        assert!(parse_flow(
+            r#"[{ "kind": "question", "id": "t", "answer": "tierlist", "prompt": "p",
+                 "choices": ["a", "b"] }]"#
+        )
+        .is_err());
+        // …at least two of them,…
+        assert!(parse_flow(
+            r#"[{ "kind": "question", "id": "t", "answer": "tierlist", "prompt": "p",
+                 "choices": ["a", "b"], "tiers": ["S"] }]"#
+        )
+        .is_err());
+        // …unique and non-empty,…
+        assert!(parse_flow(
+            r#"[{ "kind": "question", "id": "t", "answer": "tierlist", "prompt": "p",
+                 "choices": ["a", "b"], "tiers": ["S", "S"] }]"#
+        )
+        .is_err());
+        assert!(parse_flow(
+            r#"[{ "kind": "question", "id": "t", "answer": "tierlist", "prompt": "p",
+                 "choices": ["a", "b"], "tiers": ["S", " "] }]"#
+        )
+        .is_err());
+        // …and at least two unique items.
+        assert!(parse_flow(
+            r#"[{ "kind": "question", "id": "t", "answer": "tierlist", "prompt": "p",
+                 "choices": ["a", "a"], "tiers": ["S", "A"] }]"#
+        )
+        .is_err());
+        assert!(parse_flow(
+            r#"[{ "kind": "question", "id": "t", "answer": "tierlist", "prompt": "p",
+                 "choices": ["a", "b"], "tiers": ["S", "A"] }]"#
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn tier_conditions_scope_placements() {
+        let f = parse_flow(
+            r###"[
+            { "kind": "question", "id": "toys", "answer": "tierlist", "prompt": "Rate",
+              "choices": ["rope", "impact", "blindfold"], "tiers": ["S", "A", "B"] }
+        ]"###,
+        )
+        .unwrap();
+        let orders = tier_orders(&f);
+        let eval = |c: &str, a: &Answers| {
+            let cond: Condition = serde_json::from_str(c).unwrap();
+            eval_condition(&cond, a, &no_parts(), &orders)
+        };
+
+        let mut a = Answers::new();
+        a.insert("toys".into(), json!({ "S": ["rope"], "B": ["impact"] }));
+
+        // `includes` without a tier: placed anywhere.
+        assert!(eval(r#"{ "id": "toys", "includes": "rope" }"#, &a));
+        assert!(eval(r#"{ "id": "toys", "includes": "impact" }"#, &a));
+        assert!(!eval(r#"{ "id": "toys", "includes": "blindfold" }"#, &a));
+
+        // `tier` is an exact placement test.
+        assert!(eval(r#"{ "id": "toys", "tier": "S", "includes": "rope" }"#, &a));
+        assert!(!eval(r#"{ "id": "toys", "tier": "A", "includes": "rope" }"#, &a));
+
+        // `tierAtLeast` includes the named tier and everything above it:
+        // impact sits in B, so it's "at least B" but not "at least A".
+        assert!(eval(r#"{ "id": "toys", "tierAtLeast": "B", "includes": "impact" }"#, &a));
+        assert!(eval(r#"{ "id": "toys", "tierAtLeast": "S", "includes": "rope" }"#, &a));
+        assert!(!eval(r#"{ "id": "toys", "tierAtLeast": "A", "includes": "impact" }"#, &a));
+
+        // Unknown tiers never match.
+        assert!(!eval(r#"{ "id": "toys", "tier": "Z", "includes": "rope" }"#, &a));
+        assert!(!eval(r#"{ "id": "toys", "tierAtLeast": "Z", "includes": "rope" }"#, &a));
+
+        // Tier item counts (`min`/`max`) and per-tier `answered`.
+        assert!(eval(r#"{ "id": "toys", "tier": "S", "min": 1 }"#, &a));
+        assert!(eval(r#"{ "id": "toys", "tier": "S", "max": 1 }"#, &a));
+        assert!(!eval(r#"{ "id": "toys", "tier": "A", "answered": true }"#, &a));
+        assert!(eval(r#"{ "id": "toys", "tier": "A", "answered": false }"#, &a));
+        // Unscoped: totals across all tiers.
+        assert!(eval(r#"{ "id": "toys", "min": 2 }"#, &a));
+        assert!(!eval(r#"{ "id": "toys", "min": 3 }"#, &a));
+        assert!(eval(r#"{ "id": "toys", "answered": true }"#, &a));
+
+        // Tier scoping a non-tierlist question is a parse error, as is an
+        // unknown tier name, as is combining both scopes.
+        assert!(parse_flow(
+            r###"[
+            { "kind": "question", "id": "n", "answer": "open", "prompt": "p" },
+            { "kind": "text", "text": "x",
+              "showIf": { "id": "n", "tier": "S", "includes": "x" } }
+        ]"###,
+        )
+        .is_err());
+        assert!(parse_flow(
+            r###"[
+            { "kind": "question", "id": "toys", "answer": "tierlist", "prompt": "Rate",
+              "choices": ["a", "b"], "tiers": ["S", "A"] },
+            { "kind": "text", "text": "x",
+              "showIf": { "id": "toys", "tier": "Z", "includes": "a" } }
+        ]"###,
+        )
+        .is_err());
+        assert!(parse_flow(
+            r###"[
+            { "kind": "question", "id": "toys", "answer": "tierlist", "prompt": "Rate",
+              "choices": ["a", "b"], "tiers": ["S", "A"] },
+            { "kind": "text", "text": "x",
+              "showIf": { "id": "toys", "tier": "S", "tierAtLeast": "A", "includes": "a" } }
+        ]"###,
+        )
+        .is_err());
+        // Conditions still need a comparator alongside the tier scope.
+        assert!(parse_flow(
+            r###"[
+            { "kind": "question", "id": "toys", "answer": "tierlist", "prompt": "Rate",
+              "choices": ["a", "b"], "tiers": ["S", "A"] },
+            { "kind": "text", "text": "x", "showIf": { "id": "toys", "tier": "S" } }
+        ]"###,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn tierlist_answers_drive_visibility_and_render_per_tier() {
+        let flow = parse_flow(
+            r###"[
+            { "kind": "question", "id": "toys", "answer": "tierlist", "prompt": "Rate your toys",
+              "choices": ["rope", "impact", "blindfold"], "tiers": ["S", "A", "B"] },
+            { "kind": "question", "id": "rope_depth", "answer": "open", "prompt": "Rope how?",
+              "showIf": { "id": "toys", "tierAtLeast": "A", "includes": "rope" } },
+            { "kind": "question", "id": "blindfold_when", "answer": "open", "prompt": "Blindfolds when?",
+              "showIf": { "id": "toys", "tier": "S", "includes": "blindfold" } }
+        ]"###,
+        )
+        .unwrap();
+
+        // rope in B: the "rope how?" follow-up (A or better) hides; blindfold
+        // unplaced hides too. Placing rope in A and blindfold in S shows both.
+        let mut a = Answers::new();
+        a.insert("toys".into(), json!({ "B": ["rope"] }));
+        assert_eq!(visible_question_ids(&flow, &a, &no_parts()).len(), 1);
+        a.insert("toys".into(), json!({ "A": ["rope"], "S": ["blindfold", "impact"] }));
+        let ids = visible_question_ids(&flow, &a, &no_parts());
+        assert_eq!(ids.len(), 3);
+
+        // An empty placement object counts as unanswered.
+        a.insert("toys".into(), json!({}));
+        assert!(!is_answered(a.get("toys")));
+
+        // USER.md renders tier by tier, definition order, skipping empties.
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        let agent = data.join("agent_data");
+        std::fs::create_dir_all(&agent).unwrap();
+        a.insert("toys".into(), json!({ "A": ["rope"], "S": ["blindfold", "impact"] }));
+        std::fs::write(data.join(QUESTIONS_FILE), serde_json::to_string(&flow).unwrap()).unwrap();
+        std::fs::write(data.join(ANSWERS_FILE), serde_json::to_string(&a).unwrap()).unwrap();
+        write_user_md(&agent, data).unwrap();
+        let md = std::fs::read_to_string(agent.join("USER.md")).unwrap();
+        assert!(md.contains(
+            "**Rate your toys** (tierlist) S: blindfold, impact | A: rope"
+        ));
+        let _ = tmp;
     }
 
     #[test]

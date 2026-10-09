@@ -5,11 +5,11 @@
  * visible unresolved question — asking the backend for the next screen
  * after every answer, so `showIf` conditionals hide/show live without
  * any duplicated logic on this side. Optional questions may be skipped
- * (stored as `null`). Non-open questions (choice, rating, ranking) also
- * get an optional free-text clarification, stored under the `note:<id>`
- * answer key and only kept alongside an actual answer. When the flow
- * completes it saves the session (which regenerates `agent_data/USER.md`)
- * and calls `onFinish`.
+ * (stored as `null`). Non-open questions (choice, rating, ranking,
+ * tierlist) also get an optional free-text clarification, stored under the
+ * `note:<id>` answer key and only kept alongside an actual answer. When
+ * the flow completes it saves the session (which regenerates
+ * `agent_data/USER.md`) and calls `onFinish`.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -24,6 +24,7 @@ import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { MarkdownBody } from "@/components/MarkdownBody";
+import { TierlistEditor } from "@/components/TierlistEditor";
 import {
   fetchOnboardingStep,
   noteKey,
@@ -32,6 +33,7 @@ import {
   type AnswerValue,
   type OnboardingStep,
   type QuestionItem,
+  type TierlistPlacement,
 } from "@/lib/onboarding";
 
 interface Props {
@@ -43,6 +45,17 @@ function isAnswered(answer: AnswerValue | undefined): boolean {
   if (typeof answer === "string") return answer.trim().length > 0;
   if (Array.isArray(answer)) return answer.length > 0;
   return true;
+}
+
+/** A tierlist answer counts once every item sits in some tier. */
+function tierlistComplete(
+  q: QuestionItem,
+  draft: AnswerValue | undefined,
+): boolean {
+  if (!draft || typeof draft !== "object" || Array.isArray(draft)) return false;
+  const placed = new Set(Object.values(draft as TierlistPlacement).flat());
+  const wanted = q.choices ?? [];
+  return wanted.length > 0 && wanted.every((c) => placed.has(c));
 }
 
 /**
@@ -190,6 +203,8 @@ export function OnboardingFlow({ onFinish }: Props) {
 
   const q = step.question;
   const answeredCount = step.total - step.remaining + (q ? 1 : 0);
+  // Tierlists are "answered" only once every item is placed.
+  const answered = q ? (q.answer === "tierlist" ? tierlistComplete(q, draft) : isAnswered(draft)) : false;
 
   /** Swap a ranking entry with its neighbour (delta −1 = up, +1 = down). */
   const moveChoice = (index: number, delta: number) => {
@@ -336,6 +351,19 @@ export function OnboardingFlow({ onFinish }: Props) {
             </div>
           )}
 
+          {q.answer === "tierlist" && (
+            <TierlistEditor
+              tiers={q.tiers ?? []}
+              items={q.choices ?? []}
+              value={
+                draft && typeof draft === "object" && !Array.isArray(draft)
+                  ? (draft as TierlistPlacement)
+                  : undefined
+              }
+              onChange={setDraft}
+            />
+          )}
+
           {q.answer !== "open" && (
             <Textarea
               value={noteDraft}
@@ -353,10 +381,10 @@ export function OnboardingFlow({ onFinish }: Props) {
             )}
             <Button
               size="sm"
-              disabled={!isAnswered(draft) && !q.optional}
-              onClick={() => void advance(isAnswered(draft) ? draft : undefined)}
+              disabled={!answered && !q.optional}
+              onClick={() => void advance(answered ? draft : undefined)}
             >
-              {isAnswered(draft) ? "Continue" : "Skip"}
+              {answered ? "Continue" : "Skip"}
               <ArrowRight className="size-3.5" />
             </Button>
           </div>
