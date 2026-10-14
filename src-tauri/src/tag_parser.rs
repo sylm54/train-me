@@ -6,7 +6,6 @@
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 
 use crate::visual::{self, VisualConfig};
 
@@ -1288,8 +1287,7 @@ pub fn wildcard_match(pattern: &str, name: &str) -> bool {
 /// Returns `Err` with a multi-line summary of all semantic problems found.
 pub fn validate(nodes: &[Node]) -> Result<()> {
     let mut errors: Vec<String> = Vec::new();
-    let mut seen_includes = HashSet::new();
-    validate_nodes(nodes, &mut errors, &mut seen_includes, &mut Vec::new());
+    validate_nodes(nodes, &mut errors, &mut Vec::new());
     if errors.is_empty() {
         Ok(())
     } else if errors.len() == 1 {
@@ -1305,12 +1303,7 @@ pub fn validate(nodes: &[Node]) -> Result<()> {
     }
 }
 
-fn validate_nodes(
-    nodes: &[Node],
-    errors: &mut Vec<String>,
-    seen_includes: &mut HashSet<String>,
-    breadcrumb: &mut Vec<String>,
-) {
+fn validate_nodes(nodes: &[Node], errors: &mut Vec<String>, breadcrumb: &mut Vec<String>) {
     for node in nodes {
         match node {
             Node::Text(_) => {}
@@ -1328,13 +1321,13 @@ fn validate_nodes(
                     ));
                 }
                 breadcrumb.push(format!("<voice speaker=\"{}\">", speaker));
-                validate_nodes(children, errors, seen_includes, breadcrumb);
+                validate_nodes(children, errors, breadcrumb);
                 breadcrumb.pop();
             }
 
             Node::Speed { children, .. } | Node::Volume { children, .. } => {
                 breadcrumb.push("<speed>|<volume>".to_string());
-                validate_nodes(children, errors, seen_includes, breadcrumb);
+                validate_nodes(children, errors, breadcrumb);
                 breadcrumb.pop();
             }
 
@@ -1409,18 +1402,13 @@ fn validate_nodes(
                     );
                 }
                 breadcrumb.push(format!("<effect type=\"{}\">", effect_type));
-                validate_nodes(children, errors, seen_includes, breadcrumb);
+                validate_nodes(children, errors, breadcrumb);
                 breadcrumb.pop();
             }
 
             Node::Include { src } => {
                 if src.is_empty() {
                     errors.push("<include> has an empty 'src' attribute".to_string());
-                } else if seen_includes.contains(src) {
-                    errors.push(format!(
-                        "Circular or repeated <include src=\"{}\"> — each file may only be included once in a render tree",
-                        src,
-                    ));
                 } else if include_src_is_glob(src) {
                     // Wildcards are only expanded over one directory; reject
                     // patterns that would need recursive directory matching.
@@ -1433,18 +1421,17 @@ fn validate_nodes(
                         }
                     }
                 }
-                seen_includes.insert(src.clone());
             }
 
             Node::Loop { children, .. } => {
                 breadcrumb.push("<loop>".to_string());
-                validate_nodes(children, errors, seen_includes, breadcrumb);
+                validate_nodes(children, errors, breadcrumb);
                 breadcrumb.pop();
             }
 
             Node::Background { children, .. } => {
                 breadcrumb.push("<background>".to_string());
-                validate_nodes(children, errors, seen_includes, breadcrumb);
+                validate_nodes(children, errors, breadcrumb);
                 breadcrumb.pop();
             }
 
@@ -1455,7 +1442,7 @@ fn validate_nodes(
                     SectionRole::Outro => "outro",
                 };
                 breadcrumb.push(format!("<{}>", name));
-                validate_nodes(children, errors, seen_includes, breadcrumb);
+                validate_nodes(children, errors, breadcrumb);
                 breadcrumb.pop();
             }
 
@@ -1474,7 +1461,7 @@ fn validate_nodes(
                     }
                 }
                 breadcrumb.push("<until>".to_string());
-                validate_nodes(children, errors, seen_includes, breadcrumb);
+                validate_nodes(children, errors, breadcrumb);
                 breadcrumb.pop();
             }
 
@@ -1487,7 +1474,7 @@ fn validate_nodes(
                             "<part role=\"…\"> is only valid inside <react>".to_string(),
                         );
                     }
-                    validate_nodes(&part.children, errors, seen_includes, breadcrumb);
+                    validate_nodes(&part.children, errors, breadcrumb);
                 }
                 breadcrumb.pop();
             }
@@ -1500,7 +1487,7 @@ fn validate_nodes(
                             "<part role=\"…\"> is only valid inside <react>".to_string(),
                         );
                     }
-                    validate_nodes(&part.children, errors, seen_includes, breadcrumb);
+                    validate_nodes(&part.children, errors, breadcrumb);
                 }
             }
 
@@ -1536,7 +1523,7 @@ fn validate_nodes(
                 }
                 breadcrumb.push("<react>".to_string());
                 for part in parts {
-                    validate_nodes(&part.children, errors, seen_includes, breadcrumb);
+                    validate_nodes(&part.children, errors, breadcrumb);
                 }
                 breadcrumb.pop();
             }
@@ -1579,7 +1566,7 @@ fn validate_nodes(
                     }
                 }
                 breadcrumb.push("<beatmeter>".to_string());
-                validate_nodes(children, errors, seen_includes, breadcrumb);
+                validate_nodes(children, errors, breadcrumb);
                 breadcrumb.pop();
             }
 
@@ -1603,9 +1590,9 @@ fn validate_nodes(
                     errors.push(format!("<if cond=\"{cond}\">: {e}"));
                 }
                 breadcrumb.push("<if>".to_string());
-                validate_nodes(then_branch, errors, seen_includes, breadcrumb);
+                validate_nodes(then_branch, errors, breadcrumb);
                 if let Some(else_nodes) = r#else {
-                    validate_nodes(else_nodes, errors, seen_includes, breadcrumb);
+                    validate_nodes(else_nodes, errors, breadcrumb);
                 }
                 breadcrumb.pop();
             }
@@ -1628,7 +1615,7 @@ fn validate_nodes(
                 }
                 config.validate_into(errors);
                 breadcrumb.push("<visual>".to_string());
-                validate_nodes(children, errors, seen_includes, breadcrumb);
+                validate_nodes(children, errors, breadcrumb);
                 breadcrumb.pop();
             }
 
@@ -2291,6 +2278,21 @@ mod tests {
         let nodes = parse(r#"<visual order="recent">x</visual>"#).unwrap();
         assert!(validate(&nodes).is_err());
         let nodes = parse(r#"<visual order="top7">x</visual>"#).unwrap();
+        validate(&nodes).unwrap();
+    }
+
+    #[test]
+    fn test_validate_allows_repeated_includes() {
+        // The same src may appear any number of times in one file; only true
+        // cycles (an include back to an ancestor) are rejected, and those are
+        // detected where includes are resolved across files, not in this
+        // per-file semantic pass.
+        let nodes = parse(
+            r#"<include src="foo.xml"/>
+               <voice speaker="female">between</voice>
+               <include src="foo.xml"/>"#,
+        )
+        .unwrap();
         validate(&nodes).unwrap();
     }
 }
