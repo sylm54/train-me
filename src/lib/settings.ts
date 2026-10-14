@@ -207,7 +207,7 @@ export function useSettings() {
               reasoningEffort:
                 extras && "reasoningEffort" in extras
                   ? extras.reasoningEffort
-                  : prev.agents[agent].reasoningEffort,
+                  : prev.agents[agent]?.reasoningEffort,
             },
           },
         };
@@ -217,6 +217,21 @@ export function useSettings() {
     },
     [],
   );
+
+  /**
+   * Remove a per-agent config override so the agent falls back to the main
+   * model. Only meaningful for `spawn` (the optional slot); `main` is kept.
+   */
+  const clearAgent = useCallback((agent: AgentName) => {
+    setSettings((prev) => {
+      if (agent === "main" || !prev.agents.spawn) return prev;
+      const agents = { ...prev.agents };
+      delete agents.spawn;
+      const next: AgentSettings = { ...prev, agents };
+      save(next);
+      return next;
+    });
+  }, []);
 
   const completeOnboarding = useCallback(() => {
     setSettings(() => {
@@ -283,6 +298,7 @@ export function useSettings() {
     settings,
     setApiKey,
     setAgent,
+    clearAgent,
     setChat,
     setPlayback,
     setAudio,

@@ -35,8 +35,8 @@ import {
   X,
 } from "lucide-react";
 import { useSettings } from "@/lib/settings";
-import type { AgentName, ProviderName } from "@/lib/types";
-import { AGENT_LABELS, PROVIDER_LABELS } from "@/lib/models";
+import type { ProviderName } from "@/lib/types";
+import { AGENT_LABELS, PICKER_AGENTS, PROVIDER_LABELS } from "@/lib/models";
 import { ModelPicker } from "@/components/ModelPicker";
 import { FrameworkOptionsList } from "@/components/FrameworkOptions";
 import {
@@ -560,8 +560,9 @@ function ModelsStep({
         <h3 className="text-xs uppercase tracking-wider text-[var(--color-muted-foreground)]">
           Models
         </h3>
-        {(Object.keys(AGENT_LABELS) as AgentName[]).map((agent) => {
+        {PICKER_AGENTS.map((agent) => {
           const cfg = settings.agents[agent];
+          if (!cfg) return null;
           return (
             <div
               key={agent}

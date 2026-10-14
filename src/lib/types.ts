@@ -2,8 +2,11 @@
  * Shared types for the Train-Me frontend.
  */
 
-/** An agent settings slot. The spawned copy reuses the main agent's config. */
-export type AgentName = "main";
+/**
+ * An agent settings slot. `"spawn"` is optional in the persisted settings:
+ * when absent, spawned copies reuse the main agent's model config.
+ */
+export type AgentName = "main" | "spawn";
 
 /** Provider identifier (OpenAI-compatible endpoints). */
 export type ProviderName = "openrouter" | "openai";
@@ -114,7 +117,11 @@ export const DEFAULT_AUDIO_SETTINGS: AudioSettings = {
  * Rust backend's `get_settings` / `set_settings` commands). */
 export interface AgentSettings {
   apiKeys: ApiKeys;
-  agents: Record<AgentName, AgentModelConfig>;
+  /**
+   * Per-agent model config. `main` is always present; `spawn` is optional —
+   * absent means spawned copies follow the main agent's model.
+   */
+  agents: { main: AgentModelConfig } & { spawn?: AgentModelConfig };
   /** Chat behaviour (context limit, compaction, idle clear). */
   chat: ChatSettings;
   /** Conditioning playback settings (beat offset, etc.). */

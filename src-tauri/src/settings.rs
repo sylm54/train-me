@@ -132,7 +132,8 @@ impl Default for AudioSettings {
 pub struct AgentSettings {
     /// API keys indexed by provider (`"openrouter"` / `"openai"`).
     pub api_keys: HashMap<String, Option<String>>,
-    /// Per-agent config, keyed by agent name (`"main"`).
+    /// Per-agent config, keyed by agent name (`"main"`, plus an optional
+    /// `"spawn"` — absent means spawned copies follow the main model).
     pub agents: HashMap<String, AgentModelConfig>,
     /// Chat behaviour (context limit, compaction, idle clear).
     pub chat: ChatSettings,
@@ -195,13 +196,21 @@ impl AgentSettings {
 
     /// Minimal sanity check before persisting: the frontend always keeps a
     /// `main` agent entry with a provider + model, and downstream code
-    /// (`agent.ts`) reads `agents.main` unguarded.
+    /// (`agent.ts`) reads `agents.main` unguarded. The optional `spawn`
+    /// entry, when present, must be fully specified too — an empty model
+    /// there would otherwise only fail later, at spawn time.
     fn validate(&self) -> Result<(), String> {
         match self.agents.get("main") {
-            Some(cfg) if !cfg.provider.is_empty() && !cfg.model.is_empty() => Ok(()),
-            Some(_) => Err("agents.main needs a non-empty provider and model".into()),
-            None => Err("agents.main is required".into()),
+            Some(cfg) if !cfg.provider.is_empty() && !cfg.model.is_empty() => {}
+            Some(_) => return Err("agents.main needs a non-empty provider and model".into()),
+            None => return Err("agents.main is required".into()),
         }
+        if let Some(cfg) = self.agents.get("spawn") {
+            if cfg.provider.is_empty() || cfg.model.is_empty() {
+                return Err("agents.spawn needs a non-empty provider and model".into());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -327,5 +336,50 @@ mod tests {
         s.agents.insert("main".into(), AgentModelConfig::default());
         s.agents.get_mut("main").unwrap().model = String::new();
         assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn spawn_entry_roundtrips_and_validates() {
+        let dir = tmp_dir("spawn");
+        let path = dir.join("settings.json");
+
+        // A settings file with a dedicated spawn entry loads it verbatim.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"agents":{"main":{"provider":"openrouter","model":"m1"},
+                 "spawn":{"provider":"openai","model":"m2","reasoningEffort":"low"}}}"#,
+        )
+        .unwrap();
+        let s = AgentSettings::load(&path);
+        let spawn = s.agents.get("spawn").expect("spawn entry loads");
+        assert_eq!(spawn.provider, "openai");
+        assert_eq!(spawn.model, "m2");
+        assert_eq!(spawn.reasoning_effort.as_deref(), Some("low"));
+        assert!(s.validate().is_ok());
+
+        // Without a spawn entry the file still loads (spawn follows main).
+        std::fs::write(
+            &path,
+            r#"{"agents":{"main":{"provider":"openrouter","model":"m1"}}}"#,
+        )
+        .unwrap();
+        let s = AgentSettings::load(&path);
+        assert!(!s.agents.contains_key("spawn"));
+        assert!(s.validate().is_ok());
+
+        // A present-but-empty spawn entry is rejected at save time.
+        let mut s = AgentSettings::with_default_agent();
+        s.agents.insert(
+            "spawn".into(),
+            AgentModelConfig {
+                provider: "openai".into(),
+                model: String::new(),
+                reasoning_effort: None,
+            },
+        );
+        assert!(s.validate().is_err());
+
+        let _ = fs::remove_file(&path);
     }
 }

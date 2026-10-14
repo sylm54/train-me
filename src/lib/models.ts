@@ -17,7 +17,15 @@ import type { AgentName, ProviderName, ReasoningEffort } from "./types";
 /** Human-readable name for each agent slot. */
 export const AGENT_LABELS: Record<AgentName, string> = {
   main: "Main agent",
+  spawn: "Subagent (spawned copies)",
 };
+
+/**
+ * Agent slots rendered as a plain `<ModelPicker>` card (onboarding + the
+ * Settings "Models" section). The subagent slot is handled separately: it
+ * only exists when the user overrides it (absent = follows the main model).
+ */
+export const PICKER_AGENTS: readonly AgentName[] = ["main"];
 
 /** Human-readable name for each provider. */
 export const PROVIDER_LABELS: Record<ProviderName, string> = {

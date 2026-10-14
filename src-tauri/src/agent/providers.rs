@@ -33,7 +33,7 @@ use rig::client::CompletionClient;
 use rig::completion::{CompletionError, CompletionRequest, CompletionResponse};
 use rig::streaming::StreamingCompletionResponse;
 
-use crate::settings::AgentSettings;
+use crate::settings::{AgentModelConfig, AgentSettings};
 
 /// Shared HTTP client for every provider call.
 ///
@@ -122,13 +122,27 @@ impl ModelHandle {
     }
 }
 
-/// Build the model handle for `agent` (`"main"` today) from settings.
-/// Fails with the SAME user-facing message the JS transport throws when the
-/// provider has no API key — Stage 3b surfaces it identically.
+/// The config slot for `agent`, falling back to `main` for the optional
+/// agent slots that have no entry of their own (the spawn copy follows the
+/// main model unless the user configured a dedicated `spawn` entry).
+pub fn config_for<'a>(
+    settings: &'a AgentSettings,
+    agent: &str,
+) -> Option<&'a AgentModelConfig> {
+    match settings.agents.get(agent) {
+        Some(cfg) => Some(cfg),
+        None if agent != "main" => settings.agents.get("main"),
+        None => None,
+    }
+}
+
+/// Build the model handle for `agent` (`"main"`, or `"spawn"` which falls
+/// back to main's config when no dedicated spawn entry exists — see
+/// [`config_for`]). Fails with the SAME user-facing message the JS transport
+/// throws when the provider has no API key — Stage 3b surfaces it
+/// identically.
 pub fn build(settings: &AgentSettings, agent: &str) -> Result<ModelHandle, String> {
-    let cfg = settings
-        .agents
-        .get(agent)
+    let cfg = config_for(settings, agent)
         .ok_or_else(|| format!("no model configured for agent \"{agent}\""))?;
     let api_key = settings
         .api_keys
@@ -247,6 +261,41 @@ mod tests {
         assert_eq!(h.reasoning_params, Some(serde_json::json!({"reasoning_effort": "xhigh"})));
 
         let s = settings("anthropic", Some("sk"), None);
+        assert!(build(&s, "main").is_err());
+    }
+
+    #[test]
+    fn spawn_slot_falls_back_to_main_config() {
+        // No spawn entry → the spawn slot resolves to main's config (and
+        // builds with main's model).
+        let s = settings("openrouter", Some("sk"), None);
+        let cfg = config_for(&s, "spawn").unwrap();
+        assert_eq!(cfg.model, "test-model");
+        assert_eq!(build(&s, "spawn").unwrap().model, "test-model");
+
+        // A dedicated spawn entry wins over main's.
+        let mut s = settings("openrouter", Some("sk"), Some("high"));
+        s.api_keys.insert("openai".into(), Some("sk".into()));
+        s.agents.insert(
+            "spawn".into(),
+            crate::settings::AgentModelConfig {
+                provider: "openai".into(),
+                model: "spawn-model".into(),
+                reasoning_effort: None,
+            },
+        );
+        let cfg = config_for(&s, "spawn").unwrap();
+        assert_eq!(cfg.provider, "openai");
+        assert_eq!(cfg.model, "spawn-model");
+        let h = build(&s, "spawn").unwrap();
+        assert_eq!(h.model, "spawn-model");
+        // The spawn entry's own (absent) effort applies — not main's "high".
+        assert!(h.reasoning_params.is_none());
+
+        // `main` itself never falls back anywhere.
+        let mut s = settings("openrouter", Some("sk"), None);
+        s.agents.remove("main");
+        assert!(config_for(&s, "main").is_none());
         assert!(build(&s, "main").is_err());
     }
 }

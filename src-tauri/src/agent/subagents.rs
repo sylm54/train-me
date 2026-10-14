@@ -8,6 +8,10 @@
 //! index at the front of context instead of buried under chat history. Only
 //! the copy's final text is returned to the parent as the tool result.
 //!
+//! Model config: the copy uses the optional `spawn` settings slot; when the
+//! user hasn't configured one, it follows the main agent's model (see
+//! `providers::config_for`).
+//!
 //! Depth cap is structural: the copy's toolset has no `spawn_agent` (and no
 //! `ask_question` — a background copy asking the user would block forever),
 //! so recursion cannot go deeper than 1.
@@ -223,10 +227,10 @@ pub(crate) async fn spawn_agent(
     }
 
     // The JS subagent throws its own (shorter) message when the key is
-    // missing — reproduce it exactly before delegating to the builder.
-    let provider_name = settings
-        .agents
-        .get("main")
+    // missing — reproduce it exactly before delegating to the builder. The
+    // spawn slot resolves to the main agent's config when the user hasn't
+    // configured a dedicated subagent model (see `providers::config_for`).
+    let provider_name = providers::config_for(settings, "spawn")
         .map(|c| c.provider.clone())
         .unwrap_or_default();
     let key_present = settings
@@ -240,7 +244,7 @@ pub(crate) async fn spawn_agent(
             "No API key configured for the \"{provider_name}\" provider."
         ));
     }
-    let handle = providers::build(settings, "main")?;
+    let handle = providers::build(settings, "spawn")?;
 
     // Unique id for THIS run — the UI keys each delegation frame on it (the
     // model may spawn several copies in parallel).

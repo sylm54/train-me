@@ -66,6 +66,7 @@ import {
 } from "@/lib/frameworks";
 import {
   AGENT_LABELS,
+  PICKER_AGENTS,
   PROVIDER_LABELS,
 } from "@/lib/models";
 import {
@@ -121,6 +122,7 @@ export function SettingsView({
     settings,
     setApiKey,
     setAgent,
+    clearAgent,
     setChat,
     setPlayback,
     setAudio,
@@ -467,8 +469,9 @@ export function SettingsView({
           <h2 className="text-sm uppercase tracking-wider text-[var(--color-muted-foreground)]">
             Models
           </h2>
-          {(Object.keys(AGENT_LABELS) as AgentName[]).map((agent) => {
+          {PICKER_AGENTS.map((agent) => {
             const cfg = settings.agents[agent];
+            if (!cfg) return null;
             return (
               <div
                 key={agent}
@@ -488,6 +491,38 @@ export function SettingsView({
               </div>
             );
           })}
+          <div className="border border-[var(--color-border)] rounded-lg p-4 bg-[var(--color-surface)]">
+            <ToggleField
+              label={AGENT_LABELS.spawn}
+              value={!!settings.agents.spawn}
+              hint="Spawned copies (delegated tasks) reuse the Main agent's model unless you pick a different one here."
+              onChange={(useOwn) => {
+                if (useOwn) {
+                  // Seed the override from the main agent's current config so
+                  // enabling the toggle never changes the effective model.
+                  const main = settings.agents.main;
+                  setAgent("spawn", main.provider, main.model, {
+                    reasoningEffort: main.reasoningEffort,
+                  });
+                } else {
+                  clearAgent("spawn");
+                }
+                flashSave();
+              }}
+            />
+            {settings.agents.spawn && (
+              <div className="mt-3">
+                <ModelPicker
+                  agent="spawn"
+                  cfg={settings.agents.spawn}
+                  onChange={(provider, model, extras) => {
+                    setAgent("spawn", provider, model, extras);
+                    flashSave();
+                  }}
+                />
+              </div>
+            )}
+          </div>
         </section>
 
         {/* ── Chat behaviour ──────────────────────────────────────── */}
