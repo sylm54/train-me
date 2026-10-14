@@ -546,19 +546,14 @@ class Parser {
 
 // ── semantic validation (mirror tag_parser.rs `validate`) ──────────────────
 
-function validateNodes(
-  nodes: Node[],
-  errors: string[],
-  seenIncludes: Set<string>,
-  parents: string[] = [],
-): void {
+function validateNodes(nodes: Node[], errors: string[], parents: string[] = []): void {
   for (const node of nodes) {
     switch (node.kind) {
       case "voice":
         if (!VALID_SPEAKERS.includes(node.speaker)) {
           errors.push(`unknown speaker '${node.speaker}' — valid: ${VALID_SPEAKERS.join(", ")}`);
         }
-        validateNodes(node.children, errors, seenIncludes, [...parents, "voice"]);
+        validateNodes(node.children, errors, [...parents, "voice"]);
         break;
       case "speed":
       case "volume":
@@ -566,13 +561,13 @@ function validateNodes(
       case "background":
       case "section":
       case "beatmeterContainer":
-        validateNodes(node.children, errors, seenIncludes, [...parents, node.kind]);
+        validateNodes(node.children, errors, [...parents, node.kind]);
         break;
       case "until":
         if (node.waitingSound && !VALID_SOUND_TYPES.includes(node.waitingSound)) {
           errors.push(`unknown waiting-sound '${node.waitingSound}' in <until> — valid: ${VALID_SOUND_TYPES.join(", ")}`);
         }
-        validateNodes(node.children, errors, seenIncludes, [...parents, "until"]);
+        validateNodes(node.children, errors, [...parents, "until"]);
         break;
       case "beatmeter":
         if (node.bpm <= 0) errors.push(`<beatmeter> bpm must be > 0 (got ${node.bpm})`);
@@ -588,7 +583,7 @@ function validateNodes(
             errors.push(`invalid pattern char '${bad}' in <beatmeter pattern="${node.pattern}"> — only X, x, . are allowed`);
           }
         }
-        validateNodes(node.children, errors, seenIncludes, [...parents, "beatmeter"]);
+        validateNodes(node.children, errors, [...parents, "beatmeter"]);
         break;
       case "sound":
         if (!VALID_SOUND_TYPES.includes(node.soundType)) {
@@ -613,7 +608,7 @@ function validateNodes(
         if (node.children.some((c) => c.kind === "if")) {
           errors.push(`<if> is not allowed directly inside <effect> — move it outside the effect`);
         }
-        validateNodes(node.children, errors, seenIncludes, [...parents, "effect"]);
+        validateNodes(node.children, errors, [...parents, "effect"]);
         break;
       case "overlay":
       case "random":
@@ -623,7 +618,7 @@ function validateNodes(
           if (part.role !== undefined) {
             errors.push(`<part role="..."> is only valid inside <react>`);
           }
-          validateNodes(part.children, errors, seenIncludes, [...parents, node.kind]);
+          validateNodes(part.children, errors, [...parents, node.kind]);
         }
         break;
       case "react": {
@@ -637,7 +632,7 @@ function validateNodes(
           }
         }
         for (const part of node.parts) {
-          validateNodes(part.children, errors, seenIncludes, [...parents, "react"]);
+          validateNodes(part.children, errors, [...parents, "react"]);
         }
         break;
       }
@@ -649,7 +644,7 @@ function validateNodes(
         if (!parsed.ok) {
           errors.push(`<if cond="${node.cond}">: ${parsed.error}`);
         }
-        validateNodes(node.children, errors, seenIncludes, [...parents, "if"]);
+        validateNodes(node.children, errors, [...parents, "if"]);
         break;
       }
       case "visual": {
@@ -683,14 +678,12 @@ function validateNodes(
             errors.push(`unknown effect '${e}' in <visual effect="..."> — valid: ${VALID_VISUAL_EFFECTS.join(", ")}`);
           }
         }
-        validateNodes(node.children, errors, seenIncludes, [...parents, "visual"]);
+        validateNodes(node.children, errors, [...parents, "visual"]);
         break;
       }
       case "include":
         if (!node.src) errors.push(`<include> has an empty 'src' attribute`);
-        else if (seenIncludes.has(node.src)) {
-          errors.push(`circular or repeated <include src="${node.src}"> — each file may only be included once in a render tree`);
-        } else if (includeSrcIsGlob(node.src)) {
+        else if (includeSrcIsGlob(node.src)) {
           // Wildcards expand over one directory; reject patterns that would
           // need recursive directory matching (mirrors the Rust validator).
           const sep = Math.max(node.src.lastIndexOf("/"), node.src.lastIndexOf("\\"));
@@ -700,7 +693,9 @@ function validateNodes(
             );
           }
         }
-        seenIncludes.add(node.src);
+        // Repeats are fine — only true cycles (an include back to an
+        // ancestor) are rejected, and those are caught by the cross-file
+        // include-tree walk in lint.ts, which follows srcs across files.
         break;
       case "text":
       case "pause":
@@ -722,6 +717,6 @@ export function validateXml(content: string): Diag[] {
     return [{ severity: "error", message: `XML parse error: ${e}` }];
   }
   const errors: string[] = [];
-  validateNodes(nodes, errors, new Set());
+  validateNodes(nodes, errors);
   return errors.map((message) => ({ severity: "error" as const, message }));
 }
