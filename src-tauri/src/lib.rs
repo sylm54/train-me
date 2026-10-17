@@ -1972,8 +1972,8 @@ pub fn run() {
             onboarding::onboarding_questions,
             onboarding::onboarding_step,
             onboarding::save_onboarding_answers,
-            onboarding::onboarding_export_md,
-            onboarding::onboarding_import_md,
+            onboarding::onboarding_export_answers,
+            onboarding::onboarding_import_answers,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

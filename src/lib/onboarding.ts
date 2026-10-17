@@ -9,9 +9,11 @@
  * `agent_data/USER.md` on the agent filesystem and emits
  * `prompt-inputs-changed`, which rebuilds the system prompt — so prompts
  * that `{{include './USER.md'}}` pick up the new answers without a
- * restart. Nothing is auto-added to any prompt. The rendered file can be
- * exported at the end of the flow and imported — as-is, no validation — at
- * the start of a fresh one, moving a profile between installs.
+ * restart. Nothing is auto-added to any prompt. The answers store can be
+ * exported at the end of the flow and imported at the start of a fresh
+ * one, moving a profile between installs — an import replaces the answers
+ * and re-renders the file, so partial imports leave the missing questions
+ * to answer.
  */
 
 import { invoke } from "@tauri-apps/api/core";
@@ -71,8 +73,6 @@ export function noteKey(id: string): string {
 
 export interface OnboardingState {
   pending_count: number;
-  /** Sandbox-relative path the rendered answer file is written to. */
-  output: string;
 }
 
 export function fetchOnboardingState(): Promise<OnboardingState> {
@@ -89,20 +89,20 @@ export function saveOnboardingAnswers(session: AnswerMap): Promise<OnboardingSta
 }
 
 /**
- * Export the onboarding state: the rendered answer file (`USER.md`, or the
- * flow's `output`) as markdown. Desktop writes to `outPath`; Android
+ * Export the onboarding state: the answers store
+ * (`onboarding_answers.json`) as JSON. Desktop writes to `outPath`; Android
  * (`outPath: null`) writes to public `Downloads/train-me/` and fires the
  * share sheet. Returns a warning note when sharing failed.
  */
-export function exportOnboardingMd(outPath: string | null): Promise<string | null> {
-  return invoke("onboarding_export_md", { outPath });
+export function exportOnboardingAnswers(outPath: string | null): Promise<string | null> {
+  return invoke("onboarding_export_answers", { outPath });
 }
 
 /**
- * Import a previously exported markdown as the answer file, taken as-is
- * (no validation). Marks every question resolved, so the questionnaire
- * counts as complete.
+ * Import a previously exported answers store. The answers replace the
+ * store and re-render the answer file, so a partial import leaves exactly
+ * the missing questions to answer.
  */
-export function importOnboardingMd(path: string): Promise<OnboardingState> {
-  return invoke("onboarding_import_md", { path });
+export function importOnboardingAnswers(path: string): Promise<OnboardingState> {
+  return invoke("onboarding_import_answers", { path });
 }

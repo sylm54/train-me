@@ -57,7 +57,7 @@ import {
   type ImportResult,
   type StagedFramework,
 } from "@/lib/frameworks";
-import { fetchOnboardingState, importOnboardingMd } from "@/lib/onboarding";
+import { fetchOnboardingState, importOnboardingAnswers } from "@/lib/onboarding";
 import { OnboardingFlow } from "@/components/OnboardingFlow";
 import { logActivity } from "@/lib/activity";
 
@@ -99,10 +99,11 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
   const [urlDraft, setUrlDraft] = useState("");
   // Framework onboarding questions (asked after install).
   const [onboardingPending, setOnboardingPending] = useState(false);
-  // The flow's answer-file path — the export's default file name.
-  const [onboardingOutput, setOnboardingOutput] = useState("USER.md");
-  // Importing a previously exported onboarding markdown.
-  const [importingMd, setImportingMd] = useState(false);
+  // Bumped after a partial import so OnboardingFlow remounts and resumes
+  // from the imported answers.
+  const [flowKey, setFlowKey] = useState(0);
+  // Importing a previously exported answers store.
+  const [importingAnswers, setImportingAnswers] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
 
   // On mount: if a framework is already installed, jump straight to the
@@ -152,7 +153,6 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
       const state = await fetchOnboardingState();
       const pending = state.pending_count > 0;
       setOnboardingPending(pending);
-      setOnboardingOutput(state.output || "USER.md");
       return pending;
     } catch {
       setOnboardingPending(false);
@@ -160,23 +160,26 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
     }
   };
 
-  /** Adopt a previously exported answers markdown instead of re-answering. */
-  const handleImportMd = async () => {
+  /** Adopt a previously exported answers store instead of re-answering. */
+  const handleImportAnswers = async () => {
     setImportError(null);
-    setImportingMd(true);
+    setImportingAnswers(true);
     try {
       const selected = await openDialog({
         multiple: false,
-        filters: [{ name: "Markdown", extensions: ["md"] }],
+        filters: [{ name: "JSON", extensions: ["json"] }],
       });
       if (!selected) return; // user cancelled
       const path = typeof selected === "string" ? selected : selected[0];
-      await importOnboardingMd(path);
-      onComplete();
+      const state = await importOnboardingAnswers(path);
+      // A full import completes onboarding; a partial one leaves the
+      // missing questions to answer — remount the flow to resume from it.
+      if (state.pending_count === 0) onComplete();
+      else setFlowKey((k) => k + 1);
     } catch (e) {
       setImportError(String(e));
     } finally {
-      setImportingMd(false);
+      setImportingAnswers(false);
     }
   };
 
@@ -391,20 +394,20 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
                 </p>
                 <div className="mt-3 flex flex-wrap items-center gap-2">
                   <button
-                    onClick={() => void handleImportMd()}
-                    disabled={importingMd}
+                    onClick={() => void handleImportAnswers()}
+                    disabled={importingAnswers}
                     className="px-3 py-2 text-sm rounded-md border border-[var(--color-border)] hover:bg-[var(--color-pink-50)] disabled:opacity-50 inline-flex items-center gap-2"
                   >
-                    {importingMd ? (
+                    {importingAnswers ? (
                       <Loader2 size={14} className="animate-spin" />
                     ) : (
                       <FileUp size={14} />
                     )}
-                    Import previous answers (.md)
+                    Import previous answers (.json)
                   </button>
                   <span className="text-xs text-[var(--color-muted-foreground)]">
-                    Exported from another install? Import it to skip these
-                    questions.
+                    Exported from another install? Import it — questions the
+                    file doesn't answer are still asked.
                   </span>
                 </div>
                 {importError && (
@@ -414,7 +417,7 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
                   </p>
                 )}
               </div>
-              <OnboardingFlow onFinish={onComplete} outputPath={onboardingOutput} />
+              <OnboardingFlow key={flowKey} onFinish={onComplete} />
             </div>
           )}
         </div>

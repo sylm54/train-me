@@ -36,14 +36,15 @@
 //!
 //! The user answers right after install, as the final step of the setup
 //! wizard. The questionnaire is purely an init mechanism: once onboarding
-//! is done it is never asked again. The rendered answer file can be
-//! exported at the end of the flow and re-imported — as-is, no validation —
-//! at the start of a fresh one, moving a profile between installs. Answers
-//! are stored at
+//! is done it is never asked again. Answers are stored at
 //! `<data_dir>/onboarding_answers.json` and rendered into the agent sandbox
 //! as `agent_data/USER.md` (or the flow's `output`) — plus an auto-added
 //! "App setup" section snapshotting app-managed state (chastity, inventory)
-//! so the agent gets a heads-up about it. Nothing is added to
+//! so the agent gets a heads-up about it. The store can be exported at the
+//! end of the flow and imported at the start of a fresh one, moving a
+//! profile between installs: an import replaces the store and re-renders
+//! the answer file, so a partial import leaves exactly the missing
+//! questions to answer. Nothing is added to
 //! the system prompt: the framework decides how the agent consumes the
 //! profile (typically `{{include './USER.md'}}` in its own prompts).
 //!
@@ -994,9 +995,6 @@ pub struct OnboardingState {
     pub answered: Answers,
     /// Visible questions with no stored answer.
     pub pending_count: usize,
-    /// Sandbox-relative path the rendered answer file is written to (the
-    /// export's default file name).
-    pub output: String,
 }
 
 fn state_for(data_dir: &Path) -> OnboardingState {
@@ -1014,7 +1012,6 @@ fn state_for(data_dir: &Path) -> OnboardingState {
         items: flow.items,
         answered,
         pending_count,
-        output: flow.output,
     }
 }
 
@@ -1030,20 +1027,6 @@ fn state_for(data_dir: &Path) -> OnboardingState {
 /// section heads the agent up about app-managed state the questionnaire
 /// never asked about (chastity, inventory).
 pub(crate) fn write_user_md(agent_dir: &Path, data_dir: &Path) -> Result<(), String> {
-    let md = render_user_md(data_dir)?;
-    let flow = load_installed_flow(data_dir);
-    let target = agent_dir.join(flow.output.trim());
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("{}: {e}", flow.output))?;
-    }
-    std::fs::write(&target, md).map_err(|e| format!("{}: {e}", flow.output))
-}
-
-/// The answer file's markdown, without writing it — also what the export
-/// command hands the user. Fresh render from the stored answers (not a read
-/// of the sandbox file), so it works even before the first save.
-pub(crate) fn render_user_md(data_dir: &Path) -> Result<String, String> {
     let flow = load_installed_flow(data_dir);
     let parts = installed_parts(data_dir);
     let answered = merged_answers(data_dir, &Answers::default());
@@ -1148,7 +1131,12 @@ pub(crate) fn render_user_md(data_dir: &Path) -> Result<String, String> {
         md.push_str("_(No answers yet.)_\n\n");
     }
     md.push_str(&app_setup_section(&data_dir.join("state")));
-    Ok(md)
+    let target = agent_dir.join(flow.output.trim());
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("{}: {e}", flow.output))?;
+    }
+    std::fs::write(&target, md).map_err(|e| format!("{}: {e}", flow.output))
 }
 
 /// The app-setup heads-up appended to the answer file: a save-time
@@ -1303,82 +1291,95 @@ pub fn save_onboarding_answers(
     Ok(state_for(&state.data_dir))
 }
 
-/// Export the onboarding state as markdown: the rendered answer file
-/// (`USER.md` or the flow's `output`), freshly rendered from the stored
-/// answers. `out_path` is the desktop save-dialog target; `None` (Android)
-/// writes to public `Downloads/train-me/` and fires the share sheet.
+/// Export the onboarding state: the answers store
+/// (`onboarding_answers.json`) as JSON, pruned to the flow's effective
+/// state. The import is its exact inverse — structured answers round-trip
+/// untouched, so nothing is lost to rendering. `out_path` is the desktop
+/// save-dialog target; `None` (Android) writes to public
+/// `Downloads/train-me/` and fires the share sheet.
 #[tauri::command]
-pub async fn onboarding_export_md(
+pub async fn onboarding_export_answers(
     app: AppHandle,
     out_path: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Option<String>, String> {
     let data_dir = state.data_dir.clone();
-    let md = tauri::async_runtime::spawn_blocking(move || render_user_md(&data_dir))
-        .await
-        .map_err(|e| format!("render task panicked: {e}"))??;
-    let default_name = Path::new(load_installed_flow(&state.data_dir).output.trim())
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(DEFAULT_OUTPUT)
-        .to_string();
+    let json = tauri::async_runtime::spawn_blocking(move || {
+        serde_json::to_string_pretty(&merged_answers(&data_dir, &Answers::default()))
+            .map_err(|e| format!("serialize answers: {e}"))
+    })
+    .await
+    .map_err(|e| format!("serialize task panicked: {e}"))??;
     crate::persist_export_artifact(
         &app,
         out_path,
-        md.as_bytes(),
-        &default_name,
-        "text/markdown",
+        json.as_bytes(),
+        "onboarding_answers.json",
+        "application/json",
     )
     .await
 }
 
-/// Import a previously exported onboarding markdown as the answer file.
-/// The content is taken as-is — no validation, it's the user's file. Every
-/// question is marked resolved (an explicit skip) so the questionnaire
-/// counts as complete and won't re-ask; the imported file is the answers
-/// now.
+/// Import a previously exported answers store (JSON). The answers replace
+/// the store outright — keys the installed flow doesn't know are dropped —
+/// and the answer file is re-rendered from them, so a partial import
+/// leaves exactly the missing questions to answer.
 #[tauri::command]
-pub async fn onboarding_import_md(
+pub async fn onboarding_import_answers(
     app: AppHandle,
     path: String,
     state: State<'_, AppState>,
 ) -> Result<OnboardingState, String> {
     let bytes = crate::inventory::read_import_file_bytes(&app, &path).await?;
-    let md = String::from_utf8_lossy(&bytes).to_string();
-    let imported = import_md(&state.agent_dir, &state.data_dir, &md)?;
+    let imported: Answers =
+        serde_json::from_slice(&bytes).map_err(|e| format!("invalid answers file: {e}"))?;
+    let imported = import_answers(&state.agent_dir, &state.data_dir, imported)?;
     // The answer file is the canonical `{{include}}` target: prompts that
     // inline it must be rebuilt, else the agent keeps the old content.
     let _ = app.emit(crate::PROMPT_INPUTS_CHANGED, ());
     Ok(imported)
 }
 
-/// The file-side half of [`onboarding_import_md`]: write `md` as the answer
-/// file and mark every question resolved. Tests call this directly; the
-/// command only adds the content read and the prompt-rebuild signal.
-fn import_md(agent_dir: &Path, data_dir: &Path, md: &str) -> Result<OnboardingState, String> {
+/// The file-side half of [`onboarding_import_answers`]: store `imported`
+/// as the answers and re-render the answer file from it. Tests call this
+/// directly; the command only adds the content read and the prompt-rebuild
+/// signal.
+fn import_answers(
+    agent_dir: &Path,
+    data_dir: &Path,
+    imported: Answers,
+) -> Result<OnboardingState, String> {
     let flow = load_installed_flow(data_dir);
-    let target = agent_dir.join(flow.output.trim());
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", flow.output))?;
-    }
-    std::fs::write(&target, md).map_err(|e| format!("{}: {e}", flow.output))?;
-
-    let mut answers = Answers::new();
-    for item in &flow.items {
-        if let OnboardingItem::Question(q) = item {
-            answers.insert(q.id.clone(), serde_json::Value::Null);
-        }
-    }
-    let json = serde_json::to_string_pretty(&answers)
-        .map_err(|e| format!("serialize answers: {e}"))?;
+    // Keep what this flow can use: question answers plus the notes riding
+    // on them (the merge re-prunes notes whose question ends up hidden or
+    // unanswered).
+    let known: HashSet<String> = flow
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            OnboardingItem::Question(q) => Some(q.id.clone()),
+            _ => None,
+        })
+        .collect();
+    let answers: Answers = imported
+        .into_iter()
+        .filter(|(k, _)| {
+            known.contains(k)
+                || k.strip_prefix(NOTE_PREFIX)
+                    .map(|id| known.contains(id))
+                    .unwrap_or(false)
+        })
+        .collect();
+    let json =
+        serde_json::to_string_pretty(&answers).map_err(|e| format!("serialize answers: {e}"))?;
     std::fs::write(data_dir.join(ANSWERS_FILE), json)
         .map_err(|e| format!("write answers: {e}"))?;
-
+    write_user_md(agent_dir, data_dir)?;
     crate::schedule::log_activity(
         agent_dir,
         "onboarding",
         "import",
-        &format!("imported {}", flow.output),
+        &format!("{} answers imported", answers.len()),
     );
     Ok(state_for(data_dir))
 }
@@ -2064,7 +2065,7 @@ mod tests {
     }
 
     #[test]
-    fn import_md_replaces_answer_file_and_completes_the_flow() {
+    fn import_answers_replace_the_store_and_render() {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path();
         let agent = data.join("agent_data");
@@ -2075,48 +2076,26 @@ mod tests {
         )
         .unwrap();
 
-        // Some answers exist from an earlier run…
-        let mut a = Answers::new();
-        a.insert("exp".into(), json!("lots"));
-        std::fs::write(data.join(ANSWERS_FILE), serde_json::to_string(&a).unwrap()).unwrap();
-
-        // …then an exported markdown is imported as-is, no validation.
-        let state =
-            import_md(&agent, data, "# Imported profile\n\nhand-written answers\n").unwrap();
-        assert_eq!(state.pending_count, 0, "an import counts as complete");
+        // A partial import: answers replace the store, unknown ids are
+        // dropped, notes ride along, and the answer file re-renders from it.
+        let mut imported = Answers::new();
+        imported.insert("exp".into(), json!("lots"));
+        imported.insert("ghost".into(), json!("other framework"));
+        imported.insert(note_key("exp"), json!("mostly rope"));
+        let state = import_answers(&agent, data, imported).unwrap();
+        assert_eq!(state.pending_count, 3, "focus, intensity, contact remain");
         let md = std::fs::read_to_string(agent.join("USER.md")).unwrap();
-        assert!(md.contains("hand-written answers"));
-        assert!(!md.contains("Experience?"));
+        assert!(md.contains("**Experience?** lots — note: \"mostly rope\""));
+        assert!(!md.contains("ghost"), "unknown ids are dropped");
 
-        // Every question is marked resolved (an explicit skip)…
-        let stored: Answers =
-            serde_json::from_str(&std::fs::read_to_string(data.join(ANSWERS_FILE)).unwrap())
-                .unwrap();
-        assert_eq!(stored.get("exp"), Some(&serde_json::Value::Null));
-
-        // …and a fresh render produces no question lines (the imported file
-        // is the source of truth now).
-        assert!(render_user_md(data).unwrap().contains("(No answers yet.)"));
-        let _ = tmp;
-    }
-
-    #[test]
-    fn render_matches_written_answer_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path();
-        let agent = data.join("agent_data");
-        std::fs::create_dir_all(&agent).unwrap();
-        std::fs::write(
-            data.join(QUESTIONS_FILE),
-            serde_json::to_string(&flow()).unwrap(),
-        )
-        .unwrap();
-        let mut a = Answers::new();
-        a.insert("exp".into(), json!("lots"));
-        std::fs::write(data.join(ANSWERS_FILE), serde_json::to_string(&a).unwrap()).unwrap();
-        write_user_md(&agent, data).unwrap();
-        let written = std::fs::read_to_string(agent.join("USER.md")).unwrap();
-        assert_eq!(render_user_md(data).unwrap(), written);
+        // Importing the rest completes the flow.
+        let mut rest = Answers::new();
+        rest.insert("exp".into(), json!("lots"));
+        rest.insert("focus".into(), json!("voice"));
+        rest.insert("intensity".into(), json!(8));
+        rest.insert("contact".into(), json!("no"));
+        let state = import_answers(&agent, data, rest).unwrap();
+        assert_eq!(state.pending_count, 0);
         let _ = tmp;
     }
 

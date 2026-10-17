@@ -10,7 +10,7 @@
  * `note:<id>` answer key and only kept alongside an actual answer. When
  * the flow completes it saves the session (which regenerates
  * `agent_data/USER.md`) and shows a completion screen offering the answers
- * as a markdown export; `Done` calls `onFinish`.
+ * store as a JSON export; `Done` calls `onFinish`.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -30,7 +30,7 @@ import { MarkdownBody } from "@/components/MarkdownBody";
 import { TierlistEditor } from "@/components/TierlistEditor";
 import { isAndroid, pickExportPath } from "@/lib/export";
 import {
-  exportOnboardingMd,
+  exportOnboardingAnswers,
   fetchOnboardingStep,
   noteKey,
   saveOnboardingAnswers,
@@ -43,8 +43,6 @@ import {
 
 interface Props {
   onFinish: () => void;
-  /** Sandbox-relative answer-file path — the export's default file name. */
-  outputPath?: string;
 }
 
 function isAnswered(answer: AnswerValue | undefined): boolean {
@@ -85,7 +83,7 @@ function rankingOrder(
   return choices;
 }
 
-export function OnboardingFlow({ onFinish, outputPath }: Props) {
+export function OnboardingFlow({ onFinish }: Props) {
   const [step, setStep] = useState<OnboardingStep | null>(null);
   const [session, setSession] = useState<AnswerMap>({});
   /** Ids answered this session, in order — powers Back. */
@@ -194,20 +192,19 @@ export function OnboardingFlow({ onFinish, outputPath }: Props) {
     await load(next);
   };
 
-  /** Save the rendered answer file (USER.md …) as a markdown export. */
+  /** Save the answers store (onboarding_answers.json) as a JSON export. */
   const handleExport = async () => {
     setExporting(true);
     setExportStatus(null);
     try {
       // Android: skip the save dialog (it returns an unusable content://
       // URI) — the backend writes to Downloads/train-me/ and shares instead.
-      const name = outputPath?.split(/[\\/]/).pop() || "USER.md";
       let target: string | null = null;
       if (!(await isAndroid())) {
-        target = await pickExportPath(name, "md");
+        target = await pickExportPath("onboarding_answers.json", "json");
         if (!target) return; // user cancelled
       }
-      const note = await exportOnboardingMd(target);
+      const note = await exportOnboardingAnswers(target);
       setExportStatus({ kind: "ok", text: note ?? "Answers exported." });
     } catch (e) {
       setExportStatus({ kind: "error", text: String(e) });
@@ -432,8 +429,8 @@ export function OnboardingFlow({ onFinish, outputPath }: Props) {
             <div>
               <div className="text-sm font-medium">Take your answers with you</div>
               <p className="text-xs text-muted-foreground mt-0.5">
-                Export your onboarding answers as a markdown file — import it
-                on another install to skip the questions there.
+                Export your onboarding answers as a JSON file — import it on
+                another install to skip the questions there.
               </p>
             </div>
             {exportStatus && (
@@ -459,7 +456,7 @@ export function OnboardingFlow({ onFinish, outputPath }: Props) {
                 ) : (
                   <Download className="size-3.5" />
                 )}
-                Export answers (.md)
+                Export answers (.json)
               </Button>
               <Button size="sm" onClick={onFinish}>
                 Done
