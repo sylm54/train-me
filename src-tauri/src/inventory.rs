@@ -594,7 +594,7 @@ pub async fn inventory_import_csv(
     state: State<'_, AppState>,
 ) -> Result<InventoryCsvImportResult, String> {
     // Read the file bytes (handles content:// on Android, plain path elsewhere).
-    let bytes = read_csv_bytes(&app, &path).await?;
+    let bytes = read_import_file_bytes(&app, &path).await?;
 
     // Parse + decode on a blocking thread.
     let rows = tauri::async_runtime::spawn_blocking(move || -> Result<(Vec<CsvRow>, Vec<String>), String> {
@@ -756,10 +756,14 @@ pub async fn inventory_import_csv(
     Ok(result)
 }
 
-/// Read a CSV file's bytes, transparently handling an Android `content://`
-/// URI (read fully into memory via `tauri-plugin-android-fs`) or a plain
-/// filesystem path (`std::fs::read`). Mirrors `package_import::open_zip`.
-async fn read_csv_bytes(app: &tauri::AppHandle, path: &str) -> Result<Vec<u8>, String> {
+/// Read an imported file's bytes, transparently handling an Android
+/// `content://` URI (read fully into memory via `tauri-plugin-android-fs`)
+/// or a plain filesystem path (`std::fs::read`). Mirrors
+/// `package_import::open_zip`. Shared with the onboarding md import.
+pub(crate) async fn read_import_file_bytes(
+    app: &tauri::AppHandle,
+    path: &str,
+) -> Result<Vec<u8>, String> {
     if path.starts_with("content://") {
         #[cfg(target_os = "android")]
         {
@@ -790,7 +794,7 @@ async fn read_csv_bytes(app: &tauri::AppHandle, path: &str) -> Result<Vec<u8>, S
     } else {
         let p = PathBuf::from(path);
         if !p.exists() {
-            return Err(format!("CSV file not found: {}", path));
+            return Err(format!("file not found: {}", path));
         }
         std::fs::read(&p).map_err(|e| format!("Failed to read '{}': {}", path, e))
     }

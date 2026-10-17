@@ -36,7 +36,10 @@
 //!
 //! The user answers right after install, as the final step of the setup
 //! wizard. The questionnaire is purely an init mechanism: once onboarding
-//! is done it is never asked again. Answers are stored at
+//! is done it is never asked again. The rendered answer file can be
+//! exported at the end of the flow and re-imported — as-is, no validation —
+//! at the start of a fresh one, moving a profile between installs. Answers
+//! are stored at
 //! `<data_dir>/onboarding_answers.json` and rendered into the agent sandbox
 //! as `agent_data/USER.md` (or the flow's `output`) — plus an auto-added
 //! "App setup" section snapshotting app-managed state (chastity, inventory)
@@ -991,6 +994,9 @@ pub struct OnboardingState {
     pub answered: Answers,
     /// Visible questions with no stored answer.
     pub pending_count: usize,
+    /// Sandbox-relative path the rendered answer file is written to (the
+    /// export's default file name).
+    pub output: String,
 }
 
 fn state_for(data_dir: &Path) -> OnboardingState {
@@ -1008,22 +1014,36 @@ fn state_for(data_dir: &Path) -> OnboardingState {
         items: flow.items,
         answered,
         pending_count,
+        output: flow.output,
     }
 }
 
 /// Render the answer file (`USER.md` or the flow's `output`) into the agent
 /// sandbox. One line per visible, answered question — the prompt as a bold
 /// key followed by the answer — kept deliberately terse since the file is
-/// typically inlined into prompts. Choice questions also list the options
-/// the user did NOT pick (and flag multi-select) so the agent knows the
-/// full option set, not just the selection; tierlist answers read tier by
-/// tier in definition order (`S: a, b | B: c`). A question's free-text
+/// typically inlined into prompts. Multi-select choice answers are flagged;
+/// tierlist answers read tier by tier in definition order
+/// (`S: a, b | B: c`). A question's free-text
 /// clarification (`note:<id>`, the addendum the UI offers on non-open
 /// questions) is appended to its line. Skipped (`null`) and
 /// still-unanswered questions render nothing. A trailing "App setup"
 /// section heads the agent up about app-managed state the questionnaire
 /// never asked about (chastity, inventory).
 pub(crate) fn write_user_md(agent_dir: &Path, data_dir: &Path) -> Result<(), String> {
+    let md = render_user_md(data_dir)?;
+    let flow = load_installed_flow(data_dir);
+    let target = agent_dir.join(flow.output.trim());
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("{}: {e}", flow.output))?;
+    }
+    std::fs::write(&target, md).map_err(|e| format!("{}: {e}", flow.output))
+}
+
+/// The answer file's markdown, without writing it — also what the export
+/// command hands the user. Fresh render from the stored answers (not a read
+/// of the sandbox file), so it works even before the first save.
+pub(crate) fn render_user_md(data_dir: &Path) -> Result<String, String> {
     let flow = load_installed_flow(data_dir);
     let parts = installed_parts(data_dir);
     let answered = merged_answers(data_dir, &Answers::default());
@@ -1043,8 +1063,8 @@ pub(crate) fn write_user_md(agent_dir: &Path, data_dir: &Path) -> Result<(), Str
             Some(answer) => answer,
         };
         let mut line = match (&q.answer, answer) {
-            // Choices: the picked option(s) plus the declined ones, so the
-            // agent sees the whole menu. Multi-select is flagged.
+            // Multi-select choices are flagged so the agent reads the list as
+            // a set, not one answer.
             (
                 AnswerKind::Choice,
                 serde_json::Value::Array(selected),
@@ -1053,35 +1073,14 @@ pub(crate) fn write_user_md(agent_dir: &Path, data_dir: &Path) -> Result<(), Str
                     .iter()
                     .filter_map(|v| v.as_str())
                     .collect();
-                let declined: Vec<&str> = q
-                    .choices
-                    .iter()
-                    .map(String::as_str)
-                    .filter(|c| !chosen.contains(c))
-                    .collect();
-                let list = chosen.join(", ");
-                let mut line = format!("**{}** (multiple choice) {}", q.prompt, list);
-                if !declined.is_empty() {
-                    line.push_str(&format!(" (not chosen: {})", declined.join(", ")));
-                }
-                line
+                format!("**{}** (multiple choice) {}", q.prompt, chosen.join(", "))
             }
             (AnswerKind::Choice, single) => {
                 let chosen = single
                     .as_str()
                     .map(str::to_string)
                     .unwrap_or_else(|| single.to_string());
-                let declined: Vec<&str> = q
-                    .choices
-                    .iter()
-                    .map(String::as_str)
-                    .filter(|c| *c != chosen)
-                    .collect();
-                let mut line = format!("**{}** {}", q.prompt, chosen);
-                if !declined.is_empty() {
-                    line.push_str(&format!(" (not chosen: {})", declined.join(", ")));
-                }
-                line
+                format!("**{}** {}", q.prompt, chosen)
             }
             // Ratings carry their scale — a bare "7" is meaningless without
             // the range it came from.
@@ -1149,12 +1148,7 @@ pub(crate) fn write_user_md(agent_dir: &Path, data_dir: &Path) -> Result<(), Str
         md.push_str("_(No answers yet.)_\n\n");
     }
     md.push_str(&app_setup_section(&data_dir.join("state")));
-    let target = agent_dir.join(flow.output.trim());
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("{}: {e}", flow.output))?;
-    }
-    std::fs::write(&target, md).map_err(|e| format!("{}: {e}", flow.output))
+    Ok(md)
 }
 
 /// The app-setup heads-up appended to the answer file: a save-time
@@ -1307,6 +1301,86 @@ pub fn save_onboarding_answers(
         &format!("{} answers stored", merged.len()),
     );
     Ok(state_for(&state.data_dir))
+}
+
+/// Export the onboarding state as markdown: the rendered answer file
+/// (`USER.md` or the flow's `output`), freshly rendered from the stored
+/// answers. `out_path` is the desktop save-dialog target; `None` (Android)
+/// writes to public `Downloads/train-me/` and fires the share sheet.
+#[tauri::command]
+pub async fn onboarding_export_md(
+    app: AppHandle,
+    out_path: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    let data_dir = state.data_dir.clone();
+    let md = tauri::async_runtime::spawn_blocking(move || render_user_md(&data_dir))
+        .await
+        .map_err(|e| format!("render task panicked: {e}"))??;
+    let default_name = Path::new(load_installed_flow(&state.data_dir).output.trim())
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(DEFAULT_OUTPUT)
+        .to_string();
+    crate::persist_export_artifact(
+        &app,
+        out_path,
+        md.as_bytes(),
+        &default_name,
+        "text/markdown",
+    )
+    .await
+}
+
+/// Import a previously exported onboarding markdown as the answer file.
+/// The content is taken as-is — no validation, it's the user's file. Every
+/// question is marked resolved (an explicit skip) so the questionnaire
+/// counts as complete and won't re-ask; the imported file is the answers
+/// now.
+#[tauri::command]
+pub async fn onboarding_import_md(
+    app: AppHandle,
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<OnboardingState, String> {
+    let bytes = crate::inventory::read_import_file_bytes(&app, &path).await?;
+    let md = String::from_utf8_lossy(&bytes).to_string();
+    let imported = import_md(&state.agent_dir, &state.data_dir, &md)?;
+    // The answer file is the canonical `{{include}}` target: prompts that
+    // inline it must be rebuilt, else the agent keeps the old content.
+    let _ = app.emit(crate::PROMPT_INPUTS_CHANGED, ());
+    Ok(imported)
+}
+
+/// The file-side half of [`onboarding_import_md`]: write `md` as the answer
+/// file and mark every question resolved. Tests call this directly; the
+/// command only adds the content read and the prompt-rebuild signal.
+fn import_md(agent_dir: &Path, data_dir: &Path, md: &str) -> Result<OnboardingState, String> {
+    let flow = load_installed_flow(data_dir);
+    let target = agent_dir.join(flow.output.trim());
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", flow.output))?;
+    }
+    std::fs::write(&target, md).map_err(|e| format!("{}: {e}", flow.output))?;
+
+    let mut answers = Answers::new();
+    for item in &flow.items {
+        if let OnboardingItem::Question(q) = item {
+            answers.insert(q.id.clone(), serde_json::Value::Null);
+        }
+    }
+    let json = serde_json::to_string_pretty(&answers)
+        .map_err(|e| format!("serialize answers: {e}"))?;
+    std::fs::write(data_dir.join(ANSWERS_FILE), json)
+        .map_err(|e| format!("write answers: {e}"))?;
+
+    crate::schedule::log_activity(
+        agent_dir,
+        "onboarding",
+        "import",
+        &format!("imported {}", flow.output),
+    );
+    Ok(state_for(data_dir))
 }
 
 // ============================================================================
@@ -1518,14 +1592,14 @@ mod tests {
         write_user_md(&agent, data).unwrap();
         let md = std::fs::read_to_string(agent.join("USER.md")).unwrap();
         assert!(md.contains("**Experience?** none"));
-        assert!(md.contains("not chosen: some, lots"));
+        assert!(!md.contains("not chosen"));
         assert!(!md.contains("focus"));
         assert!(!md.contains("<!--"), "no id comment headers");
         let _ = tmp;
     }
 
     #[test]
-    fn user_md_marks_multi_choice_and_declined_options() {
+    fn user_md_marks_multi_choice_without_declined_options() {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path();
         let agent = data.join("agent_data");
@@ -1552,8 +1626,9 @@ mod tests {
         std::fs::write(data.join(ANSWERS_FILE), serde_json::to_string(&answers).unwrap()).unwrap();
         write_user_md(&agent, data).unwrap();
         let md = std::fs::read_to_string(agent.join("USER.md")).unwrap();
-        assert!(md.contains("**Topics?** (multiple choice) voice, fitness (not chosen: posture)"));
-        assert!(md.contains("**Style?** strict (not chosen: gentle)"));
+        assert!(md.contains("**Topics?** (multiple choice) voice, fitness"));
+        assert!(md.contains("**Style?** strict"));
+        assert!(!md.contains("not chosen"), "declined options are not enumerated");
         assert!(md.contains("**Heat?** 4 (scale 1–5)"));
         assert!(md.contains("**Prefer?** (ranking) impact > rope"));
         let _ = tmp;
@@ -1787,7 +1862,7 @@ mod tests {
         write_user_md(&agent, data).unwrap();
         let md = std::fs::read_to_string(agent.join("USER.md")).unwrap();
         assert!(md.contains(
-            "**Experience?** lots (not chosen: none, some) — note: \"mostly rope, light impact\""
+            "**Experience?** lots — note: \"mostly rope, light impact\""
         ));
         assert!(md.contains("**Intensity 1-10?** 8 (scale 1–10) — note: \"higher on weekends\""));
         assert!(!md.contains("orphan"));
@@ -1985,6 +2060,63 @@ mod tests {
         )
         .unwrap();
         assert!(resolve_flow(root, None).is_err());
+        let _ = tmp;
+    }
+
+    #[test]
+    fn import_md_replaces_answer_file_and_completes_the_flow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        let agent = data.join("agent_data");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(
+            data.join(QUESTIONS_FILE),
+            serde_json::to_string(&flow()).unwrap(),
+        )
+        .unwrap();
+
+        // Some answers exist from an earlier run…
+        let mut a = Answers::new();
+        a.insert("exp".into(), json!("lots"));
+        std::fs::write(data.join(ANSWERS_FILE), serde_json::to_string(&a).unwrap()).unwrap();
+
+        // …then an exported markdown is imported as-is, no validation.
+        let state =
+            import_md(&agent, data, "# Imported profile\n\nhand-written answers\n").unwrap();
+        assert_eq!(state.pending_count, 0, "an import counts as complete");
+        let md = std::fs::read_to_string(agent.join("USER.md")).unwrap();
+        assert!(md.contains("hand-written answers"));
+        assert!(!md.contains("Experience?"));
+
+        // Every question is marked resolved (an explicit skip)…
+        let stored: Answers =
+            serde_json::from_str(&std::fs::read_to_string(data.join(ANSWERS_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(stored.get("exp"), Some(&serde_json::Value::Null));
+
+        // …and a fresh render produces no question lines (the imported file
+        // is the source of truth now).
+        assert!(render_user_md(data).unwrap().contains("(No answers yet.)"));
+        let _ = tmp;
+    }
+
+    #[test]
+    fn render_matches_written_answer_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        let agent = data.join("agent_data");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(
+            data.join(QUESTIONS_FILE),
+            serde_json::to_string(&flow()).unwrap(),
+        )
+        .unwrap();
+        let mut a = Answers::new();
+        a.insert("exp".into(), json!("lots"));
+        std::fs::write(data.join(ANSWERS_FILE), serde_json::to_string(&a).unwrap()).unwrap();
+        write_user_md(&agent, data).unwrap();
+        let written = std::fs::read_to_string(agent.join("USER.md")).unwrap();
+        assert_eq!(render_user_md(data).unwrap(), written);
         let _ = tmp;
     }
 

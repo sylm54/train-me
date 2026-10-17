@@ -9,7 +9,8 @@
  * tierlist) also get an optional free-text clarification, stored under the
  * `note:<id>` answer key and only kept alongside an actual answer. When
  * the flow completes it saves the session (which regenerates
- * `agent_data/USER.md`) and calls `onFinish`.
+ * `agent_data/USER.md`) and shows a completion screen offering the answers
+ * as a markdown export; `Done` calls `onFinish`.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -19,13 +20,17 @@ import {
   Check,
   ChevronDown,
   ChevronUp,
+  Download,
+  Loader2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { MarkdownBody } from "@/components/MarkdownBody";
 import { TierlistEditor } from "@/components/TierlistEditor";
+import { isAndroid, pickExportPath } from "@/lib/export";
 import {
+  exportOnboardingMd,
   fetchOnboardingStep,
   noteKey,
   saveOnboardingAnswers,
@@ -38,6 +43,8 @@ import {
 
 interface Props {
   onFinish: () => void;
+  /** Sandbox-relative answer-file path — the export's default file name. */
+  outputPath?: string;
 }
 
 function isAnswered(answer: AnswerValue | undefined): boolean {
@@ -78,7 +85,7 @@ function rankingOrder(
   return choices;
 }
 
-export function OnboardingFlow({ onFinish }: Props) {
+export function OnboardingFlow({ onFinish, outputPath }: Props) {
   const [step, setStep] = useState<OnboardingStep | null>(null);
   const [session, setSession] = useState<AnswerMap>({});
   /** Ids answered this session, in order — powers Back. */
@@ -89,6 +96,11 @@ export function OnboardingFlow({ onFinish }: Props) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [exportStatus, setExportStatus] = useState<{
+    kind: "ok" | "error";
+    text: string;
+  } | null>(null);
   const sessionRef = useRef(session);
   sessionRef.current = session;
 
@@ -159,7 +171,6 @@ export function OnboardingFlow({ onFinish }: Props) {
         setSaving(true);
         try {
           await saveOnboardingAnswers(next);
-          onFinish();
         } catch (e) {
           setError(String(e));
         } finally {
@@ -181,6 +192,28 @@ export function OnboardingFlow({ onFinish }: Props) {
     setSession(next);
     setHistory((h) => h.slice(0, -1));
     await load(next);
+  };
+
+  /** Save the rendered answer file (USER.md …) as a markdown export. */
+  const handleExport = async () => {
+    setExporting(true);
+    setExportStatus(null);
+    try {
+      // Android: skip the save dialog (it returns an unusable content://
+      // URI) — the backend writes to Downloads/train-me/ and shares instead.
+      const name = outputPath?.split(/[\\/]/).pop() || "USER.md";
+      let target: string | null = null;
+      if (!(await isAndroid())) {
+        target = await pickExportPath(name, "md");
+        if (!target) return; // user cancelled
+      }
+      const note = await exportOnboardingMd(target);
+      setExportStatus({ kind: "ok", text: note ?? "Answers exported." });
+    } catch (e) {
+      setExportStatus({ kind: "error", text: String(e) });
+    } finally {
+      setExporting(false);
+    }
   };
 
   if (error) {
@@ -390,9 +423,50 @@ export function OnboardingFlow({ onFinish }: Props) {
           </div>
         </div>
       ) : (
-        <div className="flex items-center gap-2">
-          <Check className="size-4 text-[var(--color-pink-500)]" />
-          <span className="text-sm">All set — your profile has been saved.</span>
+        <div className="space-y-4">
+          <div className="flex items-center gap-2">
+            <Check className="size-4 text-[var(--color-pink-500)]" />
+            <span className="text-sm">All set — your profile has been saved.</span>
+          </div>
+          <div className="rounded-lg border border-[var(--color-border)] p-4 space-y-3">
+            <div>
+              <div className="text-sm font-medium">Take your answers with you</div>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Export your onboarding answers as a markdown file — import it
+                on another install to skip the questions there.
+              </p>
+            </div>
+            {exportStatus && (
+              <p
+                className={`text-xs flex items-start gap-1.5 ${
+                  exportStatus.kind === "ok"
+                    ? "text-[var(--color-success)]"
+                    : "text-[var(--color-danger)]"
+                }`}
+              >
+                <span className="break-words">{exportStatus.text}</span>
+              </p>
+            )}
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={exporting}
+                onClick={() => void handleExport()}
+              >
+                {exporting ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : (
+                  <Download className="size-3.5" />
+                )}
+                Export answers (.md)
+              </Button>
+              <Button size="sm" onClick={onFinish}>
+                Done
+                <ArrowRight className="size-3.5" />
+              </Button>
+            </div>
+          </div>
         </div>
       )}
     </div>

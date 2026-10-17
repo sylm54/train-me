@@ -26,6 +26,7 @@ import {
   Download,
   Eye,
   EyeOff,
+  FileUp,
   Link,
   Loader2,
   Lock,
@@ -56,7 +57,7 @@ import {
   type ImportResult,
   type StagedFramework,
 } from "@/lib/frameworks";
-import { fetchOnboardingState } from "@/lib/onboarding";
+import { fetchOnboardingState, importOnboardingMd } from "@/lib/onboarding";
 import { OnboardingFlow } from "@/components/OnboardingFlow";
 import { logActivity } from "@/lib/activity";
 
@@ -98,6 +99,11 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
   const [urlDraft, setUrlDraft] = useState("");
   // Framework onboarding questions (asked after install).
   const [onboardingPending, setOnboardingPending] = useState(false);
+  // The flow's answer-file path — the export's default file name.
+  const [onboardingOutput, setOnboardingOutput] = useState("USER.md");
+  // Importing a previously exported onboarding markdown.
+  const [importingMd, setImportingMd] = useState(false);
+  const [importError, setImportError] = useState<string | null>(null);
 
   // On mount: if a framework is already installed, jump straight to the
   // "installed" phase so re-running onboarding reflects reality. Also
@@ -146,10 +152,31 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
       const state = await fetchOnboardingState();
       const pending = state.pending_count > 0;
       setOnboardingPending(pending);
+      setOnboardingOutput(state.output || "USER.md");
       return pending;
     } catch {
       setOnboardingPending(false);
       return false;
+    }
+  };
+
+  /** Adopt a previously exported answers markdown instead of re-answering. */
+  const handleImportMd = async () => {
+    setImportError(null);
+    setImportingMd(true);
+    try {
+      const selected = await openDialog({
+        multiple: false,
+        filters: [{ name: "Markdown", extensions: ["md"] }],
+      });
+      if (!selected) return; // user cancelled
+      const path = typeof selected === "string" ? selected : selected[0];
+      await importOnboardingMd(path);
+      onComplete();
+    } catch (e) {
+      setImportError(String(e));
+    } finally {
+      setImportingMd(false);
     }
   };
 
@@ -362,8 +389,32 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
                   from the start — the agent reads them later, so it won't
                   re-ask in chat.
                 </p>
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                  <button
+                    onClick={() => void handleImportMd()}
+                    disabled={importingMd}
+                    className="px-3 py-2 text-sm rounded-md border border-[var(--color-border)] hover:bg-[var(--color-pink-50)] disabled:opacity-50 inline-flex items-center gap-2"
+                  >
+                    {importingMd ? (
+                      <Loader2 size={14} className="animate-spin" />
+                    ) : (
+                      <FileUp size={14} />
+                    )}
+                    Import previous answers (.md)
+                  </button>
+                  <span className="text-xs text-[var(--color-muted-foreground)]">
+                    Exported from another install? Import it to skip these
+                    questions.
+                  </span>
+                </div>
+                {importError && (
+                  <p className="text-xs text-[var(--color-danger)] flex items-start gap-1.5 mt-2">
+                    <AlertCircle size={14} className="mt-0.5 shrink-0" />
+                    <span className="break-words">{importError}</span>
+                  </p>
+                )}
               </div>
-              <OnboardingFlow onFinish={onComplete} />
+              <OnboardingFlow onFinish={onComplete} outputPath={onboardingOutput} />
             </div>
           )}
         </div>
