@@ -123,18 +123,18 @@ const IFRAME_SHIM_JS = `
     });
   }
 
-  // Every op is a method that forwards to the parent; vars is swapped
+  // Plain ops are methods that forward to the parent; vars is swapped
   // for the run's snapshot right before the program starts (init).
-  ["wait", "show", "hide", "audio", "media", "log", "notify", "fail"].forEach(
-    function (op) {
-      tm[op] = function () {
-        return call(op, Array.prototype.slice.call(arguments));
-      };
-    },
-  );
+  // show/hide are special-cased below (widget handles).
+  ["wait", "audio", "media", "log", "notify", "fail"].forEach(function (op) {
+    tm[op] = function () {
+      return call(op, Array.prototype.slice.call(arguments));
+    };
+  });
   tm.vars = {};
 
-  // Event subscription (widget handles build on this in later phases).
+  // Event subscription. Widget events arrive as "widget:<id>:<event>"
+  // pushes, so w.on(event, cb) is just a scoped subscribe.
   tm.subscribe = function (name, handler) {
     if (!subs.has(name)) subs.set(name, new Set());
     var set = subs.get(name);
@@ -146,6 +146,45 @@ const IFRAME_SHIM_JS = `
     pending.forEach(function (p) { p.reject(new Error(message)); });
     pending.clear();
   }
+
+  // ── Widget handles (stage) ───────────────────────────────────────────
+  //
+  // show resolves to a stable handle object. State snapshots arrive as
+  // "widget:<id>:state" pushes and are cached below (keyed by id, NOT
+  // by subscription) so w.state is synchronous and race-free — the
+  // parent may push the initial snapshot before this handle even
+  // exists. Everything else on a handle is an RPC into the parent:
+  // done/once settle parent-side (removal resolves them with null),
+  // set patches the live props, remove is hide by id.
+  var widgetState = new Map();
+
+  function widgetEventName(id, event) { return "widget:" + id + ":" + event; }
+
+  function makeHandle(id) {
+    return {
+      id: id,
+      done: call("widget.done", [id]),
+      get state() { return widgetState.get(id); },
+      set: function (patch) { return call("widget.set", [id, patch]); },
+      on: function (event, cb) { return tm.subscribe(widgetEventName(id, event), cb); },
+      once: function (event) { return call("widget.once", [id, event]); },
+      remove: function () { return call("hide", [id]); },
+    };
+  }
+
+  tm.show = function (id, props) {
+    var handleId = String(id);
+    return call("show", [handleId, props]).then(function () {
+      return makeHandle(handleId);
+    });
+  };
+  tm.hide = function (target) {
+    var id =
+      target && typeof target === "object" && typeof target.id === "string"
+        ? target.id
+        : target;
+    return call("hide", [id]);
+  };
 
   window.addEventListener("message", function (e) {
     if (e.source !== parent) return;
@@ -163,11 +202,20 @@ const IFRAME_SHIM_JS = `
         break;
       }
       case "event": {
-        var set = subs.get(d.name);
+        var name = typeof d.name === "string" ? d.name : "";
+        if (
+          name.lastIndexOf("widget:", 0) === 0 &&
+          name.length > "widget::state".length &&
+          name.slice(-6) === ":state"
+        ) {
+          widgetState.set(name.slice(7, -6), d.payload);
+        }
+        var set = subs.get(name);
         if (set) set.forEach(function (h) { h(d.payload); });
         break;
       }
       case "teardown":
+        widgetState.clear();
         rejectAll("script runtime torn down");
         break;
       case "init":

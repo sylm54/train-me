@@ -26,6 +26,8 @@ import {
   type SessionRequest,
 } from "@/lib/v2";
 import type { View } from "@/lib/views";
+import { Stage } from "@/widgets/stage";
+import type { WidgetStore } from "@/widgets/store";
 
 interface Props {
   request: SessionRequest | null;
@@ -40,12 +42,16 @@ type Phase =
 
 export function ScriptSessionView({ request, navigate }: Props) {
   const [phase, setPhase] = useState<Phase>({ stage: "loading" });
+  /** The live sandbox's widget store — what the Stage renders. Set as
+   * soon as the script starts, before the first `show` can arrive. */
+  const [stageStore, setStageStore] = useState<WidgetStore | null>(null);
   /** The live sandbox, if any — torn down on unmount, outcome, or give-up. */
   const handleRef = useRef<ScriptHandle | null>(null);
 
   const completeRun = useCallback(async (runId: string) => {
     handleRef.current?.teardown();
     handleRef.current = null;
+    setStageStore(null);
     try {
       const outcome = await finishRun(runId);
       setPhase({ stage: "outcome", outcome, failed: false, reason: null });
@@ -57,6 +63,7 @@ export function ScriptSessionView({ request, navigate }: Props) {
   const failWithReason = useCallback(async (runId: string, reason: string) => {
     handleRef.current?.teardown();
     handleRef.current = null;
+    setStageStore(null);
     void logActivity("session", "fail", reason);
     try {
       const outcome = await failRun(runId);
@@ -70,6 +77,7 @@ export function ScriptSessionView({ request, navigate }: Props) {
     if (!request) return;
     let cancelled = false;
     setPhase({ stage: "loading" });
+    setStageStore(null);
 
     startRun(request.kind, request.ref, request.occurrence)
       .then(async (run) => {
@@ -85,6 +93,7 @@ export function ScriptSessionView({ request, navigate }: Props) {
           return;
         }
         handleRef.current = handle;
+        setStageStore(handle.widgets);
         handle.result.then(
           (res) => (res.ok ? completeRun(run.run_id) : failWithReason(run.run_id, res.reason)),
           // `result` never rejects today (teardown leaves it pending);
@@ -100,6 +109,7 @@ export function ScriptSessionView({ request, navigate }: Props) {
       cancelled = true;
       handleRef.current?.teardown();
       handleRef.current = null;
+      setStageStore(null);
     };
   }, [request, completeRun, failWithReason]);
 
@@ -170,28 +180,25 @@ export function ScriptSessionView({ request, navigate }: Props) {
     // included) rejects, then the engine honestly fails the run.
     handleRef.current?.teardown();
     handleRef.current = null;
+    setStageStore(null);
     await failWithReason(phase.runId, "gave up");
   };
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
-      <div className="max-w-2xl w-full mx-auto px-4 py-6 flex-1 flex flex-col gap-6 min-h-0">
-        <div className="flex items-center justify-between gap-4">
-          <h1 className="text-lg font-bold truncate">{phase.title}</h1>
-          <Button
-            variant="ghost"
-            className="shrink-0 text-[var(--color-danger)]"
-            onClick={() => void giveUp()}
-          >
-            Give up
-          </Button>
-        </div>
-
-        {/* The stage: widgets the script shows will render here. */}
-        <div className="flex-1 min-h-48 rounded-xl border border-dashed border-[var(--color-border)] grid place-items-center">
-          <span className="text-xs uppercase tracking-wide text-muted-foreground">Stage</span>
-        </div>
+      <div className="max-w-2xl w-full mx-auto px-4 pt-6 pb-2 flex items-center justify-between gap-4">
+        <h1 className="text-lg font-bold truncate">{phase.title}</h1>
+        <Button
+          variant="ghost"
+          className="shrink-0 text-[var(--color-danger)]"
+          onClick={() => void giveUp()}
+        >
+          Give up
+        </Button>
       </div>
+
+      {/* The stage: widgets the script shows render here, live. */}
+      <Stage store={stageStore} className="mx-auto w-full flex-1 min-h-48 px-4 pb-6" />
     </div>
   );
 }

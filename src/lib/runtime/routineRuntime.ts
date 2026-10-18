@@ -3,10 +3,12 @@
  *
  * Runs a routine/task JS body inside the sandboxed iframe from
  * `bridge.ts` and implements the parent side of the `tm` API. The
- * headless ops — `wait`, `log`, `vars`, `notify`, `fail` — are live;
- * `show`, `hide`, `audio`, and `media` exist on the surface but reject
- * with "not implemented yet" until the stage and player phases wire
- * them.
+ * headless ops — `wait`, `log`, `vars`, `notify`, `fail` — are live,
+ * and so are the stage ops: `show`/`hide` mount and remove widgets on
+ * this run's WidgetStore (rendered by the Stage), and the
+ * `widget.*` ops back the iframe-side handles (`done`, `state`, `set`,
+ * `on`/`once`, `remove`). `audio` and `media` still reject with "not
+ * implemented yet" until the player phase wires them.
  *
  * All timing is parent-driven: `wait(seconds)` is a parent setTimeout
  * that posts the response back — the iframe never runs a timer of its
@@ -16,6 +18,7 @@
 import { emit } from "@tauri-apps/api/event";
 import { logActivity } from "@/lib/activity";
 import { SANDBOX_SRCDOC, ScriptBridge, type OpHandler } from "@/lib/runtime/bridge";
+import { WidgetStore } from "@/widgets/store";
 
 /** How the program ended — the only two ways a script run settles. */
 export type ScriptResult =
@@ -39,9 +42,15 @@ export interface ScriptHandle {
    */
   result: Promise<ScriptResult>;
   /**
+   * The live widget store this run's `show`/`hide` ops drive — render
+   * it with the Stage. Cleared by teardown (widgets all removed).
+   */
+  widgets: WidgetStore;
+  /**
    * Kill the sandbox: reject every pending RPC on both sides, clear all
-   * parent-side wait timers, remove the iframe. Idempotent. Does NOT
-   * settle `result` — the caller decides what the teardown means.
+   * parent-side wait timers, remove the iframe, drop every widget.
+   * Idempotent. Does NOT settle `result` — the caller decides what the
+   * teardown means.
    */
   teardown: () => void;
 }
@@ -71,6 +80,9 @@ export async function startScript(config: ScriptConfig): Promise<ScriptHandle> {
   // Parent-side wait timers — cleared on teardown so a pending wait
   // can never fire into a dead iframe.
   const timers = new Set<number>();
+  // This run's stage: the widget store the show/hide ops drive. Event
+  // and state pushes leave through the bridge sink below.
+  const widgets = new WidgetStore();
   // The first `fail(reason)` wins even if the script catches it and the
   // program later resolves — a called fail is a failed run, period.
   let failReason: string | null = null;
@@ -123,8 +135,23 @@ export async function startScript(config: ScriptConfig): Promise<ScriptHandle> {
       // even if the script catches the throw.
       throw new Error(failReason);
     },
-    show: notImplemented("show"),
-    hide: notImplemented("hide"),
+    show: ([id, props]) => {
+      // WidgetStore.create validates and throws author-facing errors,
+      // which the bridge turns into the call's rejection.
+      widgets.create(id as string, props);
+      return null;
+    },
+    hide: ([id]) => {
+      // The shim normalizes a handle to its id before sending.
+      widgets.remove(id as string);
+      return null;
+    },
+    "widget.set": ([id, patch]) => {
+      widgets.applyPatch(id as string, patch);
+      return null;
+    },
+    "widget.done": ([id]) => widgets.done(id as string),
+    "widget.once": ([id, name]) => widgets.onceEvent(id as string, name as string),
     audio: notImplemented("audio"),
     media: notImplemented("media"),
   };
@@ -136,14 +163,24 @@ export async function startScript(config: ScriptConfig): Promise<ScriptHandle> {
       settleResult({ ok: false, reason: failReason ?? message }),
   });
 
+  // Widget events and state snapshots push into the iframe as
+  // `widget:<id>:<event>` / `widget:<id>:state` messages; the shim
+  // caches state by id and scopes `on` subscriptions by name.
+  widgets.setSink((id, name, payload) =>
+    bridge.emitEvent(`widget:${id}:${name}`, payload),
+  );
+
   const teardown = () => {
     for (const id of timers) window.clearTimeout(id);
     timers.clear();
+    // Bridge first: its posts stop, then store teardown (which settles
+    // waiters) can never push into a dead iframe.
     bridge.teardown();
+    widgets.clear();
     iframe.remove();
   };
 
   await bridge.ready;
   bridge.post({ tm: "init", body: config.body, vars: config.vars });
-  return { result, teardown };
+  return { result, widgets, teardown };
 }
