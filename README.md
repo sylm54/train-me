@@ -10,10 +10,13 @@ bunx tm-framework lint      # validate everything; exit 1 on errors
 bunx tm-framework package   # build dist/<id>.zip + dist/index.json
 ```
 
-- **lint** — manifest/config/onboarding schemas, the full feature grammar
-  (routines, habits, tasks, store), referenced XML scripts with
-  `<include>` cycle detection, task-template references, prompt
-  embed/include/link resolution, token estimates.
+- **lint** — manifest/config/onboarding schemas, the full v3 feature
+  grammar (routines/tasks as `.js` orchestration scripts: comment
+  front-matter + syntax-checked JS bodies; habits, store), the audio-only
+  TTS tag set (`clip`/`zone`/`mark`; removed tags are errors), referenced
+  XML scripts with `<include>` cycle detection, `<clip>` sources,
+  task-template references, prompt embed/include/link resolution, token
+  estimates.
 - **package** — zips the framework (flat root: `manifest.json`,
   `onboarding.json`, `base/` + parts) and writes the update-channel
   `index.json` (`version`/`url`/`sha256`/`description`/`min_app_version`).

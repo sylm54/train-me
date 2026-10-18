@@ -4,44 +4,38 @@
  * `validate_files` remains authoritative; this port exists so framework CI
  * can catch the same classes of errors before packaging. Keep in sync when
  * the tag grammar changes.
+ *
+ * The grammar is audio-only: voice, speed, volume, pause, tone, effect,
+ * overlay, loop, background, random, scramble, include, clip, zone, mark.
+ * Interactive/visual/section/sound tags (until, choice, rating, react,
+ * beatmeter, visual, if, else, intro, main, outro, sound, caption) no
+ * longer parse — they surface as unknown-tag errors, mirroring the Rust
+ * parser.
  */
 
 import type { Diag } from "./validate";
-import { parseCondition } from "./cond";
 
 // ── AST (only what semantic validation needs) ─────────────────────────────
 
 interface Part {
-  label?: string;
-  role?: string;
+  looped?: boolean;
   children: Node[];
 }
 
 export type Node =
   | { kind: "text" }
   | { kind: "voice"; speaker: string; children: Node[] }
-  | { kind: "speed" | "volume" | "loop" | "background" | "until" | "section"
-    | "beatmeterContainer"; children: Node[] }
-  | { kind: "until"; waitingSound?: string; children: Node[] }
-  | { kind: "beatmeter"; bpm: number; pattern?: string; sound?: string; children: Node[] }
-  | { kind: "sound"; soundType: string }
+  | { kind: "speed" | "volume" | "loop" | "background"; children: Node[] }
+  | { kind: "pause" }
   | { kind: "tone"; preset: string }
   | { kind: "effect"; effectType: string; preset?: string; children: Node[] }
-  | { kind: "overlay" | "random" | "scramble" | "choice"; parts: Part[] }
-  | { kind: "react"; parts: Part[] }
-  | { kind: "rating"; min: number; max: number }
-  | { kind: "if"; cond: string; children: Node[] }
-  | { kind: "visual"; source: string; niches: string[]; everyMin: number; everyMax: number;
-    count: number; captions: string; order?: string; effects: string[]; children: Node[] }
-  | { kind: "include"; src: string };
+  | { kind: "overlay" | "random" | "scramble"; parts: Part[] }
+  | { kind: "include"; src: string }
+  | { kind: "clip"; src: string }
+  | { kind: "zone"; name: string; children: Node[] }
+  | { kind: "mark"; name: string };
 
 // ── known values (mirror tag_parser.rs) ────────────────────────────────────
-
-const VALID_SOUND_TYPES = [
-  "beep", "pop", "bubble_pop", "camera_shutter", "censor_beep",
-  "heart_beat", "padlock", "snap", "ding", "swoosh", "click",
-  "error", "success", "bell", "water_drop",
-];
 
 const VALID_TONE_PRESETS = [
   "sine", "square", "sawtooth", "triangle", "whitenoise",
@@ -56,18 +50,6 @@ const VALID_SPEAKERS = [
   "male", "male2", "male3", "male4", "male5",
   "female", "female2", "female3", "female4", "female5",
 ];
-
-// <visual> known values (mirror tag_parser.rs / visual.rs).
-const VALID_VISUAL_SOURCES = ["redgifs"];
-const VALID_VISUAL_EFFECTS = [
-  "cut", "zoom", "pulse", "flash", "shake", "grayscale", "sepia", "contrast",
-  "blur", "vignette", "scanlines",
-];
-const VALID_CAPTION_MODES = ["off", "meta"];
-const VALID_VISUAL_ORDERS = ["top", "top7", "top28", "latest", "score", "trending"];
-const DEFAULT_EVERY_MIN = 5;
-const DEFAULT_EVERY_MAX = 9;
-const DEFAULT_VISUAL_COUNT = 16;
 
 // ── glob <include> helpers (mirror tag_parser.rs) ─────────────────────────
 
@@ -104,13 +86,11 @@ export function wildcardMatch(pattern: string, name: string): boolean {
   return pi === p.length;
 }
 
-// Container tags that require children and a matching closing tag.
-// `<else>` is deliberately absent — it is only consumed inside `<if>`; a
-// stray `<else>` elsewhere is an unknown-tag error (mirrors tag_parser.rs).
-const CONTAINER_TAGS = new Set([
-  "voice", "speed", "volume", "effect", "overlay", "loop", "background",
-  "until", "random", "scramble", "choice", "react", "beatmeter",
-  "intro", "main", "outro", "if", "visual",
+/** Every tag the audio-only grammar knows; anything else is a parse error. */
+const KNOWN_TAGS = new Set([
+  "voice", "speed", "volume", "pause", "tone", "effect", "overlay",
+  "loop", "background", "random", "scramble", "include", "clip", "zone",
+  "mark",
 ]);
 
 // ── parser ─────────────────────────────────────────────────────────────────
@@ -214,7 +194,7 @@ class Parser {
     this.expectStr(">");
   }
 
-  private parseNodes(): Node[] {
+  parseNodes(): Node[] {
     const nodes: Node[] = [];
     while (this.pos < this.input.length) {
       if (this.peekStr("</")) break;
@@ -238,6 +218,9 @@ class Parser {
   /** Parse the children of a container tag, then its closing tag. */
   private parseChildren(tag: string): Node[] {
     this.skipWs();
+    if (this.peekStr("/>")) {
+      throw new ParseError(`<${tag}> tag must have children`, this.pos);
+    }
     this.expectStr(">");
     const children = this.parseNodes();
     this.expectClosing(tag);
@@ -276,8 +259,7 @@ class Parser {
     const children = this.parseNodes();
     this.expectClosing("part");
     return {
-      label: attrs.get("label"),
-      role: attrs.get("role"),
+      looped: attrs.get("looped") === "true",
       children,
     };
   }
@@ -287,44 +269,49 @@ class Parser {
     this.skipWs();
     const tag = this.readName("tag name");
 
-    if (!CONTAINER_TAGS.has(tag) && !["pause", "sound", "tone", "include", "rating"].includes(tag)) {
-      throw new ParseError(`unknown tag <${tag}>`, this.pos);
+    if (!KNOWN_TAGS.has(tag)) {
+      throw new ParseError(`Unknown tag: <${tag}>`, this.pos);
     }
 
     const attrs = this.readAttributes();
-    const num = (k: string): number | undefined => {
-      const v = attrs.get(k);
-      if (v === undefined) return undefined;
-      const n = parseFloat(v);
-      return Number.isFinite(n) ? n : undefined;
-    };
     this.skipWs();
 
-    // Self-closing forms.
-    if (this.peekStr("/>")) {
-      this.pos += 2;
+    // Self-closing tags: <pause/>, <tone/>, <include/>, <clip/>, <mark/>.
+    if (["pause", "tone", "include", "clip", "mark"].includes(tag)) {
+      this.skipWs();
+      this.expectStr("/>");
       switch (tag) {
-        case "pause":
-        case "sound":
-        case "tone":
-        case "include":
-        case "rating":
-          break;
-        default:
-          throw new ParseError(`<${tag}> tag must have children`, this.pos);
-      }
-      switch (tag) {
-        case "sound": return { kind: "sound", soundType: attrs.get("type") ?? "beep" };
-        case "tone": return { kind: "tone", preset: attrs.get("preset") ?? "sine" };
         case "include": {
           const src = attrs.get("src");
-          if (!src) throw new ParseError(`<include> tag requires a 'src' attribute`, this.pos);
+          if (src === undefined) {
+            throw new ParseError(`<include> tag requires a 'src' attribute`, this.pos);
+          }
           return { kind: "include", src };
         }
-        case "rating":
-          return { kind: "rating", min: num("min") ?? 1, max: num("max") ?? 5 };
+        case "clip": {
+          const src = attrs.get("src");
+          if (src === undefined) {
+            throw new ParseError(`<clip> tag requires a 'src' attribute`, this.pos);
+          }
+          if (src.trim() === "") {
+            throw new ParseError(`<clip> has an empty 'src' attribute`, this.pos);
+          }
+          return { kind: "clip", src };
+        }
+        case "mark": {
+          const name = attrs.get("name");
+          if (name === undefined) {
+            throw new ParseError(`<mark> tag requires a 'name' attribute`, this.pos);
+          }
+          if (name.trim() === "") {
+            throw new ParseError(`<mark> has an empty 'name' attribute`, this.pos);
+          }
+          return { kind: "mark", name };
+        }
+        case "tone":
+          return { kind: "tone", preset: attrs.get("preset") ?? "sine" };
         default:
-          return { kind: "text" }; // <pause/> — nothing to validate
+          return { kind: "pause" }; // <pause/> — nothing to validate
       }
     }
 
@@ -338,352 +325,83 @@ class Parser {
       case "loop":
       case "background":
         return { kind: tag, children: this.parseChildren(tag) };
-      case "until": {
-        const waitingSound = attrs.get("waiting-sound");
-        const children = this.parseChildren("until");
-        return { kind: "until", waitingSound, children };
-      }
-      case "intro":
-      case "main":
-      case "outro":
-        return { kind: "section", children: this.parseChildren(tag) };
       case "effect": {
         const children = this.parseChildren("effect");
-        return { kind: "effect", effectType: attrs.get("type") ?? "echo", preset: attrs.get("preset"), children };
-      }
-      case "beatmeter": {
-        const children = this.parseChildren("beatmeter");
         return {
-          kind: "beatmeter",
-          bpm: num("bpm") ?? 120,
-          pattern: attrs.get("pattern"),
-          sound: attrs.get("sound"),
+          kind: "effect",
+          effectType: attrs.get("type") ?? "echo",
+          preset: attrs.get("preset"),
           children,
         };
       }
+      case "zone": {
+        const name = attrs.get("name");
+        if (name === undefined) {
+          throw new ParseError(`<zone> tag requires a 'name' attribute`, this.pos);
+        }
+        if (name.trim() === "") {
+          throw new ParseError(`<zone> has an empty 'name' attribute`, this.pos);
+        }
+        const children = this.parseChildren("zone");
+        return { kind: "zone", name, children };
+      }
       case "overlay":
       case "random":
-      case "scramble":
-      case "choice": {
+      case "scramble": {
         this.skipWs();
         this.expectStr(">");
         const parts = this.parsePartsContainer(tag);
         return { kind: tag, parts };
       }
-      case "react": {
-        this.skipWs();
-        this.expectStr(">");
-        const parts = this.parsePartsContainer("react");
-        return { kind: "react", parts };
-      }
-      case "if": {
-        const cond = attrs.get("cond");
-        if (!cond || !cond.trim()) {
-          throw new ParseError(`<if> tag requires a cond attribute`, this.pos);
-        }
-        this.skipWs();
-        this.expectStr(">");
-        const children = this.parseIfChildren();
-        return { kind: "if", cond, children };
-      }
-      case "visual":
-        // `attrs` was already consumed by parseTag — pass it down (a second
-        // readAttributes() here would return an empty map).
-        return this.parseVisual(attrs, num);
       default:
-        // pause/sound/tone/include/rating reached here = not self-closing.
-        throw new ParseError(`<${tag}> must be self-closing (ends with '/>')`, this.pos);
+        throw new ParseError(`Unknown tag: <${tag}>`, this.pos);
     }
-  }
-
-  /**
-   * Parse `<visual>` — slideshow attributes (`every` scalar or `min..max`,
-   * or `bpm` folding to 60/bpm) plus a custom child loop that consumes
-   * `<caption>` elements (authored caption lines; not spoken, not validated
-   * beyond their container role). `<caption>` outside `<visual>` stays an
-   * unknown-tag error, mirroring the Rust parser.
-   */
-  private parseVisual(
-    attrs: Map<string, string>,
-    num: (k: string) => number | undefined,
-  ): Node {
-    const source = attrs.get("source") ?? "redgifs";
-    const list = (k: string): string[] =>
-      (attrs.get(k) ?? "")
-        .split(",")
-        .map((s) => s.trim().toLowerCase())
-        .filter((s) => s !== "");
-    // Niche ids are lowercase hyphenated; display names ("Just Boobs") fold
-    // onto the same form.
-    const niches = list("niche").map((n) => n.replace(/ /g, "-"));
-
-    let everyMin: number;
-    let everyMax: number;
-    const bpm = num("bpm");
-    const everyRaw = attrs.get("every");
-    if (everyRaw !== undefined && bpm !== undefined) {
-      throw new ParseError(
-        `<visual> accepts either every="…" or bpm="…", not both`,
-        this.pos,
-      );
-    } else if (everyRaw !== undefined) {
-      const t = everyRaw.trim();
-      if (t.includes("..")) {
-        const [lo, hi] = t.split("..", 2);
-        everyMin = parseFloat(lo!);
-        everyMax = parseFloat(hi!);
-        if (!Number.isFinite(everyMin) || !Number.isFinite(everyMax)) {
-          throw new ParseError(`<visual every="${everyRaw}"> is not a number range`, this.pos);
-        }
-      } else {
-        everyMin = parseFloat(t);
-        everyMax = everyMin;
-        if (!Number.isFinite(everyMin)) {
-          throw new ParseError(`<visual every="${everyRaw}"> is not a number`, this.pos);
-        }
-      }
-    } else if (bpm !== undefined) {
-      everyMin = 60 / bpm;
-      everyMax = everyMin;
-    } else {
-      everyMin = DEFAULT_EVERY_MIN;
-      everyMax = DEFAULT_EVERY_MAX;
-    }
-    const count = num("count") ?? DEFAULT_VISUAL_COUNT;
-    const captions = attrs.get("captions") ?? "off";
-    const order = attrs.get("order");
-    const effects = list("effect");
-
-    this.skipWs();
-    if (this.peekStr("/>")) {
-      this.pos += 2;
-      throw new ParseError(`<visual> tag must have children`, this.pos);
-    }
-    this.expectStr(">");
-    const children: Node[] = [];
-    for (;;) {
-      this.skipWs();
-      if (this.pos >= this.input.length) {
-        throw new ParseError("<visual> is never closed (missing </visual>)", this.pos);
-      }
-      if (this.peekStr("</visual>")) {
-        this.skipWs();
-        this.expectStr("</visual>");
-        break;
-      }
-      if (this.peekStr("<caption")) {
-        this.expectStr("<caption");
-        this.readAttributes();
-        this.skipWs();
-        if (this.peekStr("/>")) {
-          this.pos += 2;
-          continue;
-        }
-        this.expectStr(">");
-        this.parseNodes(); // caption body — consumed, not part of the AST
-        this.expectClosing("caption");
-        continue;
-      }
-      if (this.peekStr("<")) {
-        children.push(this.parseTag());
-      } else {
-        const start = this.pos;
-        const lt = this.input.indexOf("<", this.pos);
-        this.pos = lt === -1 ? this.input.length : lt;
-        if (this.input.slice(start, this.pos).trim()) children.push({ kind: "text" });
-      }
-    }
-    return { kind: "visual", source, niches, everyMin, everyMax, count, captions, order, effects, children };
-  }
-
-  /**
-   * Children of an `<if>`: both branches' content is collected (and thus
-   * validated) while the `<else>`/`</else>` markers are skipped. Content
-   * after `</else>` joins the else branch, mirroring the Rust parser.
-   */
-  private parseIfChildren(): Node[] {
-    const nodes: Node[] = [];
-    for (;;) {
-      if (this.pos >= this.input.length) {
-        throw new ParseError("<if> is never closed (missing </if>)", this.pos);
-      }
-      this.skipWs();
-      if (this.peekStr("</")) {
-        const save = this.pos;
-        this.pos += 2;
-        const name = this.readName("closing tag name");
-        this.skipWs();
-        this.expectStr(">");
-        if (name === "if") break;
-        if (name === "else") continue;
-        this.pos = save;
-        throw new ParseError(`unexpected closing tag </${name}> inside <if>`, this.pos);
-      }
-      if (this.peekStr("<")) {
-        const save = this.pos;
-        this.pos++;
-        const name = this.readName("tag name");
-        if (name === "else") {
-          this.readAttributes();
-          this.skipWs();
-          if (this.peekStr("/>")) this.pos += 2;
-          else this.expectStr(">");
-          continue;
-        }
-        this.pos = save;
-        nodes.push(this.parseTag());
-        continue;
-      }
-      const lt = this.input.indexOf("<", this.pos);
-      const end = lt === -1 ? this.input.length : lt;
-      const text = this.input.slice(this.pos, end);
-      this.pos = end;
-      if (text.trim()) nodes.push({ kind: "text" });
-    }
-    return nodes;
   }
 }
 
 // ── semantic validation (mirror tag_parser.rs `validate`) ──────────────────
 
-function validateNodes(nodes: Node[], errors: string[], parents: string[] = []): void {
+function validateNodes(nodes: Node[], errors: string[], boundaryNames: Set<string>): void {
   for (const node of nodes) {
     switch (node.kind) {
       case "voice":
         if (!VALID_SPEAKERS.includes(node.speaker)) {
-          errors.push(`unknown speaker '${node.speaker}' — valid: ${VALID_SPEAKERS.join(", ")}`);
+          errors.push(`Unknown speaker '${node.speaker}'. Valid speakers: ${VALID_SPEAKERS.join(", ")}`);
         }
-        validateNodes(node.children, errors, [...parents, "voice"]);
+        validateNodes(node.children, errors, boundaryNames);
         break;
       case "speed":
       case "volume":
       case "loop":
       case "background":
-      case "section":
-      case "beatmeterContainer":
-        validateNodes(node.children, errors, [...parents, node.kind]);
-        break;
-      case "until":
-        if (node.waitingSound && !VALID_SOUND_TYPES.includes(node.waitingSound)) {
-          errors.push(`unknown waiting-sound '${node.waitingSound}' in <until> — valid: ${VALID_SOUND_TYPES.join(", ")}`);
-        }
-        validateNodes(node.children, errors, [...parents, "until"]);
-        break;
-      case "beatmeter":
-        if (node.bpm <= 0) errors.push(`<beatmeter> bpm must be > 0 (got ${node.bpm})`);
-        const soundName = node.sound ?? "click";
-        if (!VALID_SOUND_TYPES.includes(soundName)) {
-          errors.push(`unknown sound '${soundName}' in <beatmeter sound="..."> — valid: ${VALID_SOUND_TYPES.join(", ")}`);
-        }
-        if (node.pattern !== undefined) {
-          const bad = [...node.pattern].find((c) => !"Xx.".includes(c));
-          if (node.pattern === "") {
-            errors.push("<beatmeter> pattern is empty — use at least one of X/x/. or omit it");
-          } else if (bad !== undefined) {
-            errors.push(`invalid pattern char '${bad}' in <beatmeter pattern="${node.pattern}"> — only X, x, . are allowed`);
-          }
-        }
-        validateNodes(node.children, errors, [...parents, "beatmeter"]);
-        break;
-      case "sound":
-        if (!VALID_SOUND_TYPES.includes(node.soundType)) {
-          errors.push(`unknown sound type '${node.soundType}' — valid: ${VALID_SOUND_TYPES.join(", ")}`);
-        }
+        validateNodes(node.children, errors, boundaryNames);
         break;
       case "tone":
         if (!VALID_TONE_PRESETS.includes(node.preset)) {
-          errors.push(`unknown tone preset '${node.preset}' — valid: ${VALID_TONE_PRESETS.join(", ")} (others fall back to sine)`);
+          errors.push(`Unknown tone preset '${node.preset}' in <tone preset="${node.preset}">. Valid presets: ${VALID_TONE_PRESETS.join(", ")}`);
         }
         break;
       case "effect":
         if (!VALID_EFFECT_TYPES.includes(node.effectType)) {
-          errors.push(`unknown effect type '${node.effectType}' — valid: ${VALID_EFFECT_TYPES.join(", ")}`);
+          errors.push(`Unknown effect type '${node.effectType}'. Valid types: ${VALID_EFFECT_TYPES.join(", ")}`);
         } else if (node.effectType === "echo" && node.preset !== undefined && !VALID_ECHO_PRESETS.includes(node.preset)) {
-          errors.push(`unknown echo preset '${node.preset}' — valid: ${VALID_ECHO_PRESETS.join(", ")}`);
+          errors.push(`Unknown echo preset '${node.preset}'. Valid presets: ${VALID_ECHO_PRESETS.join(", ")}`);
         } else if (node.effectType === "reverb" && node.preset !== undefined && !VALID_REVERB_PRESETS.includes(node.preset)) {
-          errors.push(`unknown reverb preset '${node.preset}' — valid: ${VALID_REVERB_PRESETS.join(", ")}`);
+          errors.push(`Unknown reverb preset '${node.preset}'. Valid presets: ${VALID_REVERB_PRESETS.join(", ")}`);
         }
-        // `<effect>` content is baked into ONE clip (no split points), so a
-        // conditional inside can never be toggled per playback.
-        if (node.children.some((c) => c.kind === "if")) {
-          errors.push(`<if> is not allowed directly inside <effect> — move it outside the effect`);
-        }
-        validateNodes(node.children, errors, [...parents, "effect"]);
+        validateNodes(node.children, errors, boundaryNames);
         break;
       case "overlay":
       case "random":
       case "scramble":
-      case "choice":
         for (const part of node.parts) {
-          if (part.role !== undefined) {
-            errors.push(`<part role="..."> is only valid inside <react>`);
-          }
-          validateNodes(part.children, errors, [...parents, node.kind]);
+          validateNodes(part.children, errors, boundaryNames);
         }
         break;
-      case "react": {
-        const mains = node.parts.filter((p) => p.role === "main").length;
-        const fallbacks = node.parts.filter((p) => p.role === "fallback").length;
-        if (mains !== 1) errors.push(`<react> requires exactly one <part role="main">`);
-        if (fallbacks !== 1) errors.push(`<react> requires exactly one <part role="fallback">`);
-        for (const p of node.parts) {
-          if (p.role !== undefined && p.role !== "main" && p.role !== "fallback") {
-            errors.push(`<part role="${p.role}"> is not valid in <react> (use "main" or "fallback")`);
-          }
-        }
-        for (const part of node.parts) {
-          validateNodes(part.children, errors, [...parents, "react"]);
-        }
-        break;
-      }
-      case "rating":
-        if (node.min > node.max) errors.push(`<rating> min (${node.min}) must be ≤ max (${node.max})`);
-        break;
-      case "if": {
-        const parsed = parseCondition(node.cond);
-        if (!parsed.ok) {
-          errors.push(`<if cond="${node.cond}">: ${parsed.error}`);
-        }
-        validateNodes(node.children, errors, [...parents, "if"]);
-        break;
-      }
-      case "visual": {
-        // Containment: one screen at a time, and never inside a concurrent
-        // audio layer or an `<until>` (mirrors tag_parser.rs). `<effect>` and
-        // `<beatmeter>` host a baked-in visual (direct child for beatmeter).
-        for (const parent of ["visual", "until", "background", "overlay"]) {
-          if (parents.includes(parent)) {
-            errors.push(
-              `<visual> is not allowed inside <${parent}> — place it in sequence content (top level, inside <voice>/<loop>/<main>, a <choice>/<random>/<react> part, an <effect>, or directly in a <beatmeter>)`,
-            );
-          }
-        }
-        if (!VALID_VISUAL_SOURCES.includes(node.source)) {
-          errors.push(`unknown source '${node.source}' in <visual source="..."> — valid: ${VALID_VISUAL_SOURCES.join(", ")}`);
-        }
-        if (!(node.everyMin > 0) || node.everyMax < node.everyMin) {
-          errors.push(`<visual> every/bpm must be > 0 with min ≤ max (got ${node.everyMin}..${node.everyMax})`);
-        }
-        if (node.count < 1 || node.count > 40) {
-          errors.push(`<visual> count must be between 1 and 40 (got ${node.count})`);
-        }
-        if (!VALID_CAPTION_MODES.includes(node.captions)) {
-          errors.push(`unknown captions mode '${node.captions}' in <visual captions="..."> — valid: ${VALID_CAPTION_MODES.join(", ")}`);
-        }
-        if (node.order !== undefined && !VALID_VISUAL_ORDERS.includes(node.order)) {
-          errors.push(`unknown order '${node.order}' in <visual order="..."> — valid: ${VALID_VISUAL_ORDERS.join(", ")}`);
-        }
-        for (const e of node.effects) {
-          if (!VALID_VISUAL_EFFECTS.includes(e)) {
-            errors.push(`unknown effect '${e}' in <visual effect="..."> — valid: ${VALID_VISUAL_EFFECTS.join(", ")}`);
-          }
-        }
-        validateNodes(node.children, errors, [...parents, "visual"]);
-        break;
-      }
       case "include":
-        if (!node.src) errors.push(`<include> has an empty 'src' attribute`);
-        else if (includeSrcIsGlob(node.src)) {
+        if (node.src === "") {
+          errors.push(`<include> has an empty 'src' attribute`);
+        } else if (includeSrcIsGlob(node.src)) {
           // Wildcards expand over one directory; reject patterns that would
           // need recursive directory matching (mirrors the Rust validator).
           const sep = Math.max(node.src.lastIndexOf("/"), node.src.lastIndexOf("\\"));
@@ -693,9 +411,25 @@ function validateNodes(nodes: Node[], errors: string[], parents: string[] = []):
             );
           }
         }
-        // Repeats are fine — only true cycles (an include back to an
-        // ancestor) are rejected, and those are caught by the cross-file
-        // include-tree walk in lint.ts, which follows srcs across files.
+        break;
+      case "clip":
+        if (node.src === "") {
+          errors.push(`<clip> has an empty 'src' attribute`);
+        } else if (includeSrcIsGlob(node.src)) {
+          errors.push(`Wildcards are not allowed in <clip src="${node.src}"> — point at one file`);
+        }
+        break;
+      case "zone":
+      case "mark":
+        // Zones and marks share one namespace per script: both are
+        // interaction-layer addresses, so a zone/mark collision is just as
+        // ambiguous as a duplicate zone.
+        if (boundaryNames.has(node.name)) {
+          errors.push(`Duplicate name '${node.name}' on a <zone>/<mark> — names must be unique within a script`);
+        } else {
+          boundaryNames.add(node.name);
+        }
+        if (node.kind === "zone") validateNodes(node.children, errors, boundaryNames);
         break;
       case "text":
       case "pause":
@@ -717,6 +451,20 @@ export function validateXml(content: string): Diag[] {
     return [{ severity: "error", message: `XML parse error: ${e}` }];
   }
   const errors: string[] = [];
-  validateNodes(nodes, errors);
+  validateNodes(nodes, errors, new Set());
   return errors.map((message) => ({ severity: "error" as const, message }));
+}
+
+/**
+ * Every `<clip src="…">` path in a script's raw text (the AST-level clip
+ * list is not exported; the linter regexes content the same way it already
+ * does for `<include>`). Used to check clip sources exist in the framework
+ * tree.
+ */
+export function clipSrcsInContent(content: string): string[] {
+  const out: string[] = [];
+  for (const m of content.matchAll(/<clip\s[^>]*?\bsrc\s*=\s*["']([^"']+)["']/g)) {
+    out.push(m[1]!);
+  }
+  return out;
 }
