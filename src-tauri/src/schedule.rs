@@ -1272,50 +1272,100 @@ pub async fn v2_finish_run(
     let agent_dir = state.agent_dir.clone();
     let state_dir = state.state_dir.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let sched = open(&state_dir.join("schedule.db"))?;
-        let econ = open(&state_dir.join("economy.db"))?;
-        let now = utc_now();
-
-        if let Some((_, template)) = as_task_instance(&sched, &run_id) {
-            let full = crate::bash::resolve_under(
-                &agent_dir,
-                &format::template_to_path(&template),
-            )?;
-            let content = std::fs::read_to_string(full).map_err(|e| e.to_string())?;
-            let (task, _) = format::parse_task(&content);
-            sched.execute(
-                "UPDATE task_instances SET status = 'completed' WHERE iid = ?1",
-                [&run_id],
-            ).map_err(|e| e.to_string())?;
-            let actions = task.map(|t| t.success).unwrap_or_default();
-            let lines = execute_actions(&econ, &sched, Some(&app), &agent_dir, &actions, &format!("{run_id}:success"));
-            log_activity(&agent_dir, "task", "done", &run_id);
-            return Ok(RunOutcome {
-                lines,
-                balance: economy::balance(&econ)?,
-            });
-        }
-
-        let container: String = sched
-            .query_row("SELECT container FROM occurrences WHERE id = ?1", [&run_id], |r| r.get(0))
-            .map_err(|_| format!("unknown run `{run_id}`"))?;
-        sched.execute(
-            "UPDATE occurrences SET status = 'completed', resolved = ?2 WHERE id = ?1",
-            rusqlite::params![run_id, ts(now)],
-        ).map_err(|e| e.to_string())?;
-        let full = crate::bash::resolve_under(&agent_dir, &container)?;
-        let content = std::fs::read_to_string(full).map_err(|e| e.to_string())?;
-        let (routine, _) = format::parse_routine(&content);
-        let actions = routine.map(|r| r.success).unwrap_or_default();
-        let lines = execute_actions(&econ, &sched, Some(&app), &agent_dir, &actions, &format!("{run_id}:success"));
-        log_activity(&agent_dir, "routine", "done", &container);
-        Ok(RunOutcome {
-            lines,
-            balance: economy::balance(&econ)?,
-        })
+        finish_run_inner(&agent_dir, &state_dir, Some(&app), &run_id)
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Core of `v2_finish_run`, split out so tests can drive it without a
+/// Tauri runtime. Completion is window-guarded (FORMAT.md §4.1/§4.2):
+/// only a still-open run whose window has not ended may complete, so a
+/// finish arriving after reconcile lapsed the run (or after the window
+/// ended but before the next reconcile) can never fire the success
+/// actions on top of the failure side.
+fn finish_run_inner(
+    agent_dir: &Path,
+    state_dir: &Path,
+    app: Option<&tauri::AppHandle>,
+    run_id: &str,
+) -> Result<RunOutcome, String> {
+    let sched = open(&state_dir.join("schedule.db"))?;
+    let econ = open(&state_dir.join("economy.db"))?;
+    let now = utc_now();
+    let now_s = ts(now);
+
+    if let Some((_, template)) = as_task_instance(&sched, run_id) {
+        let full = crate::bash::resolve_under(
+            &agent_dir,
+            &format::template_to_path(&template),
+        )?;
+        let content = std::fs::read_to_string(full).map_err(|e| e.to_string())?;
+        let (task, _) = format::parse_task(&content);
+        // Guard: reconcile fails an instance once `now` passes its hard
+        // deadline (`deadline` / `max_timeout`, whichever is sooner), so a
+        // completion past that point — or for an already-resolved
+        // instance — must not flip it to completed. The failure side
+        // fires (or already fired) from reconcile, exactly once.
+        let marked = sched
+            .execute(
+                "UPDATE task_instances SET status = 'completed' WHERE iid = ?1 \
+                 AND status IN ('assigned', 'in_progress') \
+                 AND (deadline IS NULL OR deadline >= ?2) \
+                 AND (max_timeout IS NULL OR max_timeout >= ?2)",
+                rusqlite::params![run_id, now_s],
+            )
+            .map_err(|e| e.to_string())?;
+        if marked == 0 {
+            return Ok(RunOutcome {
+                lines: vec![format!(
+                    "{run_id}: completion ignored — instance already resolved or past its deadline \
+                     (failure fires on reconcile)"
+                )],
+                balance: economy::balance(&econ)?,
+            });
+        }
+        let actions = task.map(|t| t.success).unwrap_or_default();
+        let lines = execute_actions(&econ, &sched, app, agent_dir, &actions, &format!("{run_id}:success"));
+        log_activity(agent_dir, "task", "done", run_id);
+        return Ok(RunOutcome {
+            lines,
+            balance: economy::balance(&econ)?,
+        });
+    }
+
+    let container: String = sched
+        .query_row("SELECT container FROM occurrences WHERE id = ?1", [run_id], |r| r.get(0))
+        .map_err(|_| format!("unknown run `{run_id}`"))?;
+    // Guard: reconcile lapses an occurrence once `now` passes `window_end`
+    // (the routine's `timeframe`), mirroring this condition — whichever
+    // side marks first wins, and the other is a no-op.
+    let marked = sched
+        .execute(
+            "UPDATE occurrences SET status = 'completed', resolved = ?2 WHERE id = ?1 \
+             AND status IN ('pending', 'in_progress') AND window_end >= ?3",
+            rusqlite::params![run_id, now_s, now_s],
+        )
+        .map_err(|e| e.to_string())?;
+    if marked == 0 {
+        return Ok(RunOutcome {
+            lines: vec![format!(
+                "{run_id}: completion ignored — window lapsed or occurrence already resolved \
+                 (failure fires on reconcile)"
+            )],
+            balance: economy::balance(&econ)?,
+        });
+    }
+    let full = crate::bash::resolve_under(agent_dir, &container)?;
+    let content = std::fs::read_to_string(full).map_err(|e| e.to_string())?;
+    let (routine, _) = format::parse_routine(&content);
+    let actions = routine.map(|r| r.success).unwrap_or_default();
+    let lines = execute_actions(&econ, &sched, app, agent_dir, &actions, &format!("{run_id}:success"));
+    log_activity(agent_dir, "routine", "done", &container);
+    Ok(RunOutcome {
+        lines,
+        balance: economy::balance(&econ)?,
+    })
 }
 
 #[tauri::command]
@@ -2591,6 +2641,196 @@ mod tests {
         assert_eq!(trun.body, "await audio(\"hypnos/x.xml\");\n");
         assert!(trun.task.is_some());
         assert!(trun.vars.contains_key("done"));
+        let _ = tmp;
+    }
+
+    /// A scheduled routine whose window lapsed: reconcile fires the
+    /// failure side, and a late finish must NOT flip it to completed or
+    /// fire success on top (FORMAT.md §4.1 — success and failure can
+    /// never both fire for one occurrence).
+    #[test]
+    fn finish_after_reconcile_lapse_does_not_fire_success() {
+        let routine = "/*---\ntitle: Drill\nschedule: @daily\ntimeframe: 1h\n\
+                       success: { \"type\": \"points\", \"delta\": 10 }\n\
+                       failure: { \"type\": \"points\", \"delta\": -20 }\n---*/\nawait wait(\"10m\");\n";
+        let (tmp, agent, state) = env(&[("routines/drill.js", routine)]);
+        {
+            let sched = open(&state.join("schedule.db")).unwrap();
+            let past = ts(utc_now() - chrono::Duration::hours(2));
+            sched
+                .execute(
+                    "INSERT INTO occurrences (id, kind, container, due, window_end, status, created, started) \
+                     VALUES (?1, 'routine', 'routines/drill.js', ?2, ?2, 'in_progress', ?2, ?2)",
+                    rusqlite::params!["routine:routines/drill.js:past", past],
+                )
+                .unwrap();
+        }
+        let report = reconcile_blocking(&agent, &state, None);
+        assert_eq!(report.lapsed, 1, "{report:?}");
+
+        // The finding's exact scenario: failure already fired (-20)…
+        {
+            let econ = open(&state.join("economy.db")).unwrap();
+            assert_eq!(economy::balance(&econ).unwrap(), -20, "failure fired once");
+        }
+        // …and the late finish is ignored — no success on top.
+        let outcome = finish_run_inner(&agent, &state, None, "routine:routines/drill.js:past").unwrap();
+        assert!(
+            outcome.lines.iter().any(|l| l.contains("completion ignored")),
+            "{:?}",
+            outcome.lines
+        );
+        {
+            let sched = open(&state.join("schedule.db")).unwrap();
+            let status: String = sched
+                .query_row(
+                    "SELECT status FROM occurrences WHERE id = 'routine:routines/drill.js:past'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "lapsed", "lapse verdict must survive the finish");
+            let econ = open(&state.join("economy.db")).unwrap();
+            assert_eq!(economy::balance(&econ).unwrap(), -20, "success must not fire after the lapse");
+        }
+        let _ = tmp;
+    }
+
+    /// Window already ended but reconcile has not run yet: the finish is
+    /// still ignored (the occurrence stays open so the next reconcile
+    /// lapses it and fires the failure side exactly once).
+    #[test]
+    fn finish_after_window_before_reconcile_is_ignored() {
+        let routine = "/*---\ntitle: Drill\nschedule: @daily\ntimeframe: 1h\n\
+                       success: { \"type\": \"points\", \"delta\": 10 }\n---*/\nawait wait(\"10m\");\n";
+        let (tmp, agent, state) = env(&[("routines/drill.js", routine)]);
+        {
+            let sched = open(&state.join("schedule.db")).unwrap();
+            let started = ts(utc_now() - chrono::Duration::hours(2));
+            let window_end = ts(utc_now() - chrono::Duration::minutes(5));
+            sched
+                .execute(
+                    "INSERT INTO occurrences (id, kind, container, due, window_end, status, created, started) \
+                     VALUES (?1, 'routine', 'routines/drill.js', ?2, ?3, 'in_progress', ?2, ?2)",
+                    rusqlite::params!["routine:routines/drill.js:late", started, window_end],
+                )
+                .unwrap();
+        }
+        let outcome = finish_run_inner(&agent, &state, None, "routine:routines/drill.js:late").unwrap();
+        assert!(
+            outcome.lines.iter().any(|l| l.contains("completion ignored")),
+            "{:?}",
+            outcome.lines
+        );
+        {
+            let sched = open(&state.join("schedule.db")).unwrap();
+            let status: String = sched
+                .query_row(
+                    "SELECT status FROM occurrences WHERE id = 'routine:routines/drill.js:late'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "in_progress", "left open for reconcile to lapse");
+            let econ = open(&state.join("economy.db")).unwrap();
+            assert_eq!(economy::balance(&econ).unwrap(), 0, "no success fired");
+        }
+        let _ = tmp;
+    }
+
+    /// Happy path: a run finished inside its window completes, fires the
+    /// success actions once, and a second finish is a no-op.
+    #[test]
+    fn finish_in_window_completes_and_fires_success_once() {
+        let routine = "/*---\ntitle: Drill\nschedule: 0 8 * * *\n\
+                       success: { \"type\": \"points\", \"delta\": 10 }\n---*/\nawait wait(\"45m\");\n";
+        let (tmp, agent, state) = env(&[("routines/drill.js", routine)]);
+        let run = start_run_inner(&agent, &state, "routine", "routines/drill.js", None).unwrap();
+        let outcome = finish_run_inner(&agent, &state, None, &run.run_id).unwrap();
+        assert!(
+            outcome.lines.iter().any(|l| l.contains("points +10")),
+            "{:?}",
+            outcome.lines
+        );
+        {
+            let sched = open(&state.join("schedule.db")).unwrap();
+            let (status, resolved): (String, Option<String>) = sched
+                .query_row(
+                    "SELECT status, resolved FROM occurrences WHERE id = ?1",
+                    [&run.run_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(status, "completed");
+            assert!(resolved.is_some(), "resolution time recorded");
+        }
+        // A repeat finish cannot re-fire success (status guard).
+        let again = finish_run_inner(&agent, &state, None, &run.run_id).unwrap();
+        assert!(
+            again.lines.iter().any(|l| l.contains("completion ignored")),
+            "{:?}",
+            again.lines
+        );
+        let econ = open(&state.join("economy.db")).unwrap();
+        assert_eq!(economy::balance(&econ).unwrap(), 10, "success fired exactly once");
+        let _ = tmp;
+    }
+
+    /// Task instances: same guard — a finish past the hard deadline (or
+    /// for an already-resolved instance) is ignored; an open instance
+    /// inside its deadline completes.
+    #[test]
+    fn finish_task_respects_deadline_and_status() {
+        let task = "/*---\ntitle: Check\n\
+                    success: { \"type\": \"points\", \"delta\": 10 }\n---*/\nawait wait(\"1m\");\n";
+        let (tmp, agent, state) = env(&[("tasks/check.js", task)]);
+        {
+            let sched = open(&state.join("schedule.db")).unwrap();
+            let past = ts(utc_now() - chrono::Duration::minutes(5));
+            sched
+                .execute(
+                    "INSERT INTO task_instances (iid, template, title, assigned, deadline, timeouts_json, status) \
+                     VALUES ('task:check:late', 'check', 'Check', ?1, ?1, '[]', 'in_progress')",
+                    [&past],
+                )
+                .unwrap();
+            let future = ts(utc_now() + chrono::Duration::hours(1));
+            sched
+                .execute(
+                    "INSERT INTO task_instances (iid, template, title, assigned, deadline, timeouts_json, status) \
+                     VALUES ('task:check:open', 'check', 'Check', ?1, ?1, '[]', 'in_progress')",
+                    [&future],
+                )
+                .unwrap();
+        }
+
+        // Past deadline → ignored, stays open for reconcile to fail.
+        let late = finish_run_inner(&agent, &state, None, "task:check:late").unwrap();
+        assert!(
+            late.lines.iter().any(|l| l.contains("completion ignored")),
+            "{:?}",
+            late.lines
+        );
+        // Open instance → completes and fires success.
+        let done = finish_run_inner(&agent, &state, None, "task:check:open").unwrap();
+        assert!(
+            done.lines.iter().any(|l| l.contains("points +10")),
+            "{:?}",
+            done.lines
+        );
+        {
+            let sched = open(&state.join("schedule.db")).unwrap();
+            let late_status: String = sched
+                .query_row("SELECT status FROM task_instances WHERE iid = 'task:check:late'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(late_status, "in_progress", "deadline verdict unchanged by the finish");
+            let open_status: String = sched
+                .query_row("SELECT status FROM task_instances WHERE iid = 'task:check:open'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(open_status, "completed");
+            let econ = open(&state.join("economy.db")).unwrap();
+            assert_eq!(economy::balance(&econ).unwrap(), 10, "only the in-deadline success fired");
+        }
         let _ = tmp;
     }
 }
