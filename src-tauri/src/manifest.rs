@@ -2,9 +2,10 @@
 //!
 //! A [`Manifest`] describes a rendered TTS script as a tree of [`Segment`]s.
 //! Leaf segments reference WAV files (relative to the manifest's own
-//! directory); interactive constructs (`Until`, `Random`, `Scramble`,
-//! `Choice`) become first-class tree nodes so the player can resolve them at
-//! playback time instead of at render time.
+//! directory); dynamic constructs (`Random`, `Scramble`) become first-class
+//! tree nodes so the player can resolve them at playback time instead of at
+//! render time. `Zone`/`Mark` are named boundary nodes the interaction layer
+//! can target (jump-to/seek/display); they carry no audio of their own.
 //!
 //! This module holds the *data* types plus pure helpers (path relativisation,
 //! content hashing, the split-detector, the nominal-duration estimator). The
@@ -16,12 +17,13 @@ use sha2::{Digest, Sha256};
 use std::path::{Component, Path, PathBuf};
 
 use crate::audio_renderer::resolve_scalar;
-use crate::tag_parser::{Node, SectionRole};
+use crate::tag_parser::Node;
 
 /// Current on-disk manifest format version (see [`Manifest::version`]).
-/// v4: overlay `<part volume/speed>` are baked into clip synthesis by the
-/// renderer instead of being left to the player.
-pub const MANIFEST_VERSION: u32 = 4;
+/// v5: audio-only grammar. The interactive/visual segment variants
+/// (`until`/`choice`/`rating`/`react`/`cond`/`section`/`visual` and the
+/// beatmeter metadata) are gone, and `zone`/`mark` boundary nodes were added.
+pub const MANIFEST_VERSION: u32 = 5;
 
 // ============================================================================
 // Segment tree
@@ -44,32 +46,6 @@ pub enum Segment {
     Static {
         file: String,
         duration: f32,
-        /// Beat schedule when this clip was authored under a `<beatmeter>`,
-        /// absent otherwise. Carries the click sample path + resolved beat
-        /// times so the player can drive a runtime metronome + on-screen
-        /// meter without re-deriving anything.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        beatmeter: Option<BeatmeterMeta>,
-        /// Slideshow config when a `<visual>` was baked INTO this clip (a
-        /// visual directly inside a `<beatmeter>`, or inside an `<effect>`).
-        /// The player mounts the slideshow for the clip's duration. Visuals
-        /// in sequence content become their own `Visual` segment instead.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        visual: Option<crate::visual::VisualConfig>,
-    },
-
-    /// Loop the inner clip until the user presses `button`. An optional
-    /// `waiting_sound` is a separate WAV the player layers while waiting.
-    Until {
-        file: String,
-        duration: f32,
-        button: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        text: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        waiting_sound: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        waiting_sound_volume: Option<f32>,
     },
 
     /// Reference to another manifest (a deduplicated `<include>` target).
@@ -86,30 +62,6 @@ pub enum Segment {
     /// playback).
     Scramble {
         options: Vec<Segment>,
-    },
-
-    /// Interactive branch; the user picks one option.
-    Choice {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        prompt: Option<String>,
-        options: Vec<ChoiceOption>,
-    },
-
-    /// Interactive scalar prompt; the user supplies a value in `[min, max]`.
-    /// No audio of its own → contributes zero duration.
-    Rating {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        prompt: Option<String>,
-        min: u32,
-        max: u32,
-    },
-
-    /// Non-blocking interrupt. `main` plays with `button` armed; on press,
-    /// `main` is preempted and `fallback` plays. Duration counts only `main`.
-    React {
-        button: String,
-        main: Box<Segment>,
-        fallback: Box<Segment>,
     },
 
     /// Repeat `child` exactly `loops` times.
@@ -136,42 +88,21 @@ pub enum Segment {
         parts: Vec<OverlayPartSegment>,
     },
 
-    /// Structural section (`<intro>`/`<main>`/`<outro>`). The player plays
-    /// `<intro>`/`<outro>` once and loops `<main>` a chosen number of times.
-    /// Mirrors `tag_parser::Node::Section` so the structure survives into the
-    /// manifest (otherwise the whole section would bake into one `Static`
-    /// clip and couldn't be looped independently).
-    Section {
-        role: SectionRole,
+    /// A named region of the timeline (`<zone name="…">`). Audio-transparent:
+    /// `child` plays exactly as if the wrapper were absent. The name is
+    /// unique within its script, so the interaction layer can address the
+    /// zone (jump to it, read its position).
+    Zone {
+        name: String,
         child: Box<Segment>,
     },
 
-    /// Playback-time conditional (`<if>`). Both branches are fully rendered;
-    /// the player evaluates `cond` (the condition DSL) against the
-    /// run-context variables when playback starts and plays exactly one
-    /// branch. Duration estimates count the `then` branch only.
-    Cond {
-        cond: String,
-        then: Box<Segment>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        r#else: Option<Box<Segment>>,
+    /// A named zero-length boundary (`<mark name="…"/>`) at the position
+    /// between the surrounding segments. Carries no audio; useful as a
+    /// seek/sync target for the interaction layer.
+    Mark {
+        name: String,
     },
-
-    /// Slideshow layer (`<visual>`). Transparent to audio: `child` is the
-    /// fully-rendered subtree; the player mounts a gif/image slideshow
-    /// (resolved per playback from `config` via the `visual_fetch` command)
-    /// over it for the child's duration. See `crate::visual`.
-    Visual {
-        config: crate::visual::VisualConfig,
-        child: Box<Segment>,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChoiceOption {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-    pub segment: Segment,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,28 +114,6 @@ pub struct OverlayPartSegment {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speed: Option<String>,
     pub segment: Segment,
-}
-
-/// Beat schedule attached to a `Static` clip authored under a `<beatmeter>`.
-/// The renderer resolves the schedule (applying bpm/pattern) to flat `beats`
-/// and renders the click `sample` WAV once; the player triggers that sample at
-/// each beat via Web Audio and drives the on-screen meter from `beats`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BeatmeterMeta {
-    /// Path (relative to the manifest dir) of the rendered click sample WAV.
-    pub sample: String,
-    /// Base gain for every click (0.0–1.5).
-    pub volume: f32,
-    /// Multiplier applied to `volume` on accented beats (`X` in the pattern).
-    pub accent_gain: f32,
-    /// Resolved beat times (seconds from clip start) + accent flag.
-    pub beats: Vec<BeatMark>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BeatMark {
-    pub time: f32,
-    pub accent: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -226,6 +135,13 @@ pub struct Manifest {
     /// even though its own bytes didn't change.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub glob_digest: Option<String>,
+    /// Digest of every `<clip src>` file's CONTENT hash (see
+    /// `audio_renderer::clips_digest`); `None` when the script references no
+    /// clips. Clip audio is baked into the rendered WAVs, so editing a WAV on
+    /// disk must re-render the script even though its own bytes didn't
+    /// change — freshness compares the CURRENT digest against this one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clips_digest: Option<String>,
     /// Script path relative to `agent_dir` (forward-slash normalised), or an
     /// absolute path if the script lives outside the agent dir.
     pub script: String,
@@ -239,15 +155,12 @@ pub struct Manifest {
 /// Inherited rendering context threaded through the manifest walker.
 ///
 /// Mirrors the (speaker, volume_scale, speed_scale) triple the flat
-/// `render_nodes` carries, plus `forbid_pause` which is set inside
-/// `<background>`/`<overlay>` to reject interactive nodes that can't be
-/// pre-rendered.
+/// `render_nodes` carries.
 #[derive(Clone)]
 pub(crate) struct WalkCtx {
     pub speaker: String,
     pub volume_scale: f32,
     pub speed_scale: f32,
-    pub forbid_pause: bool,
 }
 
 impl WalkCtx {
@@ -256,7 +169,6 @@ impl WalkCtx {
             speaker: "male".to_string(),
             volume_scale: 1.0,
             speed_scale: 1.0,
-            forbid_pause: false,
         }
     }
 
@@ -283,11 +195,6 @@ impl WalkCtx {
             speed_scale: (self.speed_scale * s).clamp(0.5, 1.5),
             ..self
         }
-    }
-
-    pub(crate) fn with_forbid_pause(mut self, v: bool) -> Self {
-        self.forbid_pause = v;
-        self
     }
 }
 
@@ -358,35 +265,30 @@ pub(crate) fn relative_path(from_dir: &Path, to: &Path) -> PathBuf {
     result
 }
 
-/// True if `node`'s subtree contains an interactive construct
-/// (`Until`/`Random`/`Scramble`/`Choice`) or an `Include`, recursing through
-/// the context-carrying containers (`Voice`/`Speed`/`Volume`/`Loop`/
-/// `Background`/`Overlay`).
+/// True if `node`'s subtree contains a construct that must become its own
+/// manifest node — a dynamic option (`Random`/`Scramble`), an `Include`
+/// (linked, not baked), or a `Zone`/`Mark` boundary (their positions must be
+/// segment boundaries) — recursing through the context-carrying containers
+/// (`Voice`/`Speed`/`Volume`/`Loop`/`Background`/`Overlay`).
 ///
-/// Returns `false` for `Effect`/`Text`/`Pause`/`Sound`/`Tone`. In particular
-/// interactive nodes nested inside `<effect>` are intentionally **not** treated
+/// Returns `false` for `Effect`/`Text`/`Pause`/`Tone`/`Clip`. In particular
+/// dynamic nodes nested inside `<effect>` are intentionally **not** treated
 /// as splits: the flat Stage-1 fallback renders them inline, so the manifest
 /// keeps the whole `<effect>` block in a single `Static` segment. This is a
 /// documented v1 limitation.
 pub(crate) fn contains_split(node: &Node) -> bool {
     match node {
-        Node::Until { .. }
-        | Node::Random { .. }
+        Node::Random { .. }
         | Node::Scramble { .. }
-        | Node::Choice { .. }
         | Node::Include { .. }
-        | Node::Beatmeter { .. }
-        | Node::Rating { .. }
-        | Node::React { .. }
-        | Node::If { .. }
-        | Node::Visual { .. } => true,
+        | Node::Zone { .. }
+        | Node::Mark { .. } => true,
 
         Node::Voice { children, .. }
         | Node::Speed { children, .. }
         | Node::Volume { children, .. }
         | Node::Loop { children, .. }
-        | Node::Background { children, .. }
-        | Node::Section { children, .. } => children.iter().any(contains_split),
+        | Node::Background { children, .. } => children.iter().any(contains_split),
 
         Node::Overlay { parts, .. } => parts.iter().any(|p| p.children.iter().any(contains_split)),
 
@@ -394,20 +296,8 @@ pub(crate) fn contains_split(node: &Node) -> bool {
         Node::Effect { .. }
         | Node::Text(_)
         | Node::Pause { .. }
-        | Node::Sound { .. }
-        | Node::Tone { .. } => false,
-    }
-}
-
-/// Like [`contains_split`], but a `<visual>` is TRANSPARENT: the slideshow
-/// produces no audio and can be baked into a clip (its config rides the
-/// resulting `Static` segment), so it must not by itself make content
-/// "dynamic". A blocking split INSIDE the visual still counts — recursed
-/// through here.
-pub(crate) fn contains_blocking_split(node: &Node) -> bool {
-    match node {
-        Node::Visual { children, .. } => children.iter().any(contains_blocking_split),
-        other => contains_split(other),
+        | Node::Tone { .. }
+        | Node::Clip { .. } => false,
     }
 }
 
@@ -415,22 +305,18 @@ pub(crate) fn contains_blocking_split(node: &Node) -> bool {
 ///
 /// `Import` contributes `0.0` (reading sub-manifests here would require file
 /// I/O; the estimate is only used for UI display). `Background` contributes
-/// `0.0` because it is concurrent with following siblings. This is a
-/// good-enough estimate, not exact.
+/// `0.0` because it is concurrent with following siblings. `Zone` passes its
+/// child's duration through; `Mark` is zero-length. This is a good-enough
+/// estimate, not exact.
 pub(crate) fn nominal_duration(seg: &Segment) -> f32 {
     match seg {
         Segment::Sequence { children } => children.iter().map(nominal_duration).sum(),
-        Segment::Static { duration, .. } | Segment::Until { duration, .. } => *duration,
-        Segment::Import { .. } | Segment::Background { .. } => 0.0,
+        Segment::Static { duration, .. } => *duration,
+        Segment::Import { .. } | Segment::Background { .. } | Segment::Mark { .. } => 0.0,
         Segment::Random { options } => options.first().map(nominal_duration).unwrap_or(0.0),
         Segment::Scramble { options } => options.iter().map(nominal_duration).sum(),
-        Segment::Choice { options, .. } => options
-            .first()
-            .map(|o| nominal_duration(&o.segment))
-            .unwrap_or(0.0),
-        Segment::Rating { .. } => 0.0,
-        Segment::React { main, .. } => nominal_duration(main),
         Segment::Loop { loops, child } => nominal_duration(child) * (*loops as f32),
+        Segment::Zone { child, .. } => nominal_duration(child),
         Segment::Overlay { duration, parts } => {
             if let Some(d) = duration {
                 *d
@@ -441,9 +327,6 @@ pub(crate) fn nominal_duration(seg: &Segment) -> f32 {
                     .fold(0.0, f32::max)
             }
         }
-        Segment::Section { child, .. } => nominal_duration(child),
-        Segment::Cond { then, .. } => nominal_duration(then),
-        Segment::Visual { child, .. } => nominal_duration(child),
     }
 }
 
@@ -480,7 +363,7 @@ pub(crate) fn resolve_paths_recursive(value: &mut serde_json::Value, base_dir: &
 
     // Resolve this node's own relative paths.
     match ty.as_deref() {
-        Some("static") | Some("until") => {
+        Some("static") => {
             if let Some(f) = value
                 .get("file")
                 .and_then(|x| x.as_str())
@@ -488,28 +371,6 @@ pub(crate) fn resolve_paths_recursive(value: &mut serde_json::Value, base_dir: &
             {
                 let abs = normalize_lexical(&base_dir.join(&f));
                 value["file"] = json!(abs.to_string_lossy().to_string());
-            }
-            if ty.as_deref() == Some("until") {
-                if let Some(w) = value
-                    .get("waiting_sound")
-                    .and_then(|x| x.as_str())
-                    .map(|s| s.to_string())
-                {
-                    let abs = normalize_lexical(&base_dir.join(&w));
-                    value["waiting_sound"] = json!(abs.to_string_lossy().to_string());
-                }
-            }
-            if ty.as_deref() == Some("static") {
-                // The beat click sample path lives under beatmeter.sample.
-                if let Some(s) = value
-                    .get("beatmeter")
-                    .and_then(|b| b.get("sample"))
-                    .and_then(|x| x.as_str())
-                    .map(|s| s.to_string())
-                {
-                    let abs = normalize_lexical(&base_dir.join(&s));
-                    value["beatmeter"]["sample"] = json!(abs.to_string_lossy().to_string());
-                }
             }
         }
         Some("import") => {
@@ -543,16 +404,7 @@ pub(crate) fn resolve_paths_recursive(value: &mut serde_json::Value, base_dir: &
                 }
             }
         }
-        Some("choice") => {
-            if let Some(arr) = value.get_mut("options").and_then(|x| x.as_array_mut()) {
-                for opt in arr {
-                    if let Some(seg) = opt.get_mut("segment") {
-                        resolve_paths_recursive(seg, base_dir);
-                    }
-                }
-            }
-        }
-        Some("loop") => {
+        Some("loop") | Some("zone") => {
             if let Some(seg) = value.get_mut("child") {
                 resolve_paths_recursive(seg, base_dir);
             }
@@ -571,32 +423,6 @@ pub(crate) fn resolve_paths_recursive(value: &mut serde_json::Value, base_dir: &
                 }
             }
         }
-        Some("section") => {
-            if let Some(seg) = value.get_mut("child") {
-                resolve_paths_recursive(seg, base_dir);
-            }
-        }
-        Some("react") => {
-            if let Some(seg) = value.get_mut("main") {
-                resolve_paths_recursive(seg, base_dir);
-            }
-            if let Some(seg) = value.get_mut("fallback") {
-                resolve_paths_recursive(seg, base_dir);
-            }
-        }
-        Some("cond") => {
-            if let Some(seg) = value.get_mut("then") {
-                resolve_paths_recursive(seg, base_dir);
-            }
-            if let Some(seg) = value.get_mut("else") {
-                resolve_paths_recursive(seg, base_dir);
-            }
-        }
-        Some("visual") => {
-            if let Some(seg) = value.get_mut("child") {
-                resolve_paths_recursive(seg, base_dir);
-            }
-        }
         _ => {}
     }
 }
@@ -604,28 +430,25 @@ pub(crate) fn resolve_paths_recursive(value: &mut serde_json::Value, base_dir: &
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tag_parser::{OverlayPart, SectionRole};
+    use crate::tag_parser::OverlayPart;
     use std::fs;
     use tempfile::tempdir;
 
     #[test]
-    fn test_contains_split_interactive() {
+    fn test_contains_split_dynamic_and_boundaries() {
         assert!(contains_split(&Node::Include {
             src: "x.xml".into()
         }));
         assert!(contains_split(&Node::Random { parts: vec![] }));
         assert!(contains_split(&Node::Scramble { parts: vec![] }));
-        assert!(contains_split(&Node::Choice {
-            prompt: None,
-            options: vec![],
-        }));
-        assert!(contains_split(&Node::Until {
-            button: "ok".into(),
-            waiting_sound: None,
-            waiting_sound_volume: None,
-            pre_pause: None,
-            post_pause: None,
+        // Zone and mark are split points: their positions must land on
+        // segment boundaries.
+        assert!(contains_split(&Node::Zone {
+            name: "warmup".into(),
             children: vec![],
+        }));
+        assert!(contains_split(&Node::Mark {
+            name: "halfway".into()
         }));
     }
 
@@ -633,6 +456,11 @@ mod tests {
     fn test_contains_split_leaves_and_recurse() {
         assert!(!contains_split(&Node::Text("hi".into())));
         assert!(!contains_split(&Node::Pause { duration: 1.0 }));
+        assert!(!contains_split(&Node::Clip {
+            src: "click.wav".into(),
+            volume: None,
+            speed: None,
+        }));
         // Voice wrapping a Random still splits.
         assert!(contains_split(&Node::Voice {
             speaker: "male".into(),
@@ -655,8 +483,6 @@ mod tests {
                 looped: None,
                 volume: None,
                 speed: None,
-                label: None,
-                role: None,
                 children: vec![Node::Random { parts: vec![] }],
             }],
         }));
@@ -714,22 +540,16 @@ mod tests {
                 Segment::Static {
                     file: "a.wav".into(),
                     duration: 2.0,
-                    beatmeter: None,
-                    visual: None,
                 },
                 Segment::Random {
                     options: vec![
                         Segment::Static {
                             file: "b.wav".into(),
                             duration: 3.0,
-                            beatmeter: None,
-                            visual: None,
                         },
                         Segment::Static {
                             file: "c.wav".into(),
                             duration: 5.0,
-                            beatmeter: None,
-                            visual: None,
                         },
                     ],
                 },
@@ -738,8 +558,6 @@ mod tests {
                     child: Box::new(Segment::Static {
                         file: "d.wav".into(),
                         duration: 1.0,
-                        beatmeter: None,
-                        visual: None,
                     }),
                 },
             ],
@@ -755,14 +573,10 @@ mod tests {
                         Segment::Static {
                             file: "x.wav".into(),
                             duration: 1.0,
-                            beatmeter: None,
-                            visual: None,
                         },
                         Segment::Static {
                             file: "y.wav".into(),
                             duration: 2.0,
-                            beatmeter: None,
-                            visual: None,
                         },
                     ],
                 },
@@ -772,13 +586,48 @@ mod tests {
                     layer: Box::new(Segment::Static {
                         file: "bg.wav".into(),
                         duration: 100.0,
-                        beatmeter: None,
-                        visual: None,
                     }),
                 },
             ],
         };
         assert!((nominal_duration(&seq2) - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_nominal_duration_zone_and_mark() {
+        // Zone passes its child's duration through.
+        let zone = Segment::Zone {
+            name: "warmup".into(),
+            child: Box::new(Segment::Static {
+                file: "a.wav".into(),
+                duration: 10.0,
+            }),
+        };
+        assert!((nominal_duration(&zone) - 10.0).abs() < 1e-6);
+
+        // Mark is zero-length.
+        let mark = Segment::Mark {
+            name: "peak".into(),
+        };
+        assert!((nominal_duration(&mark) - 0.0).abs() < 1e-6);
+
+        // A sequence static+mark+static sums the statics only.
+        let seq = Segment::Sequence {
+            children: vec![
+                Segment::Static {
+                    file: "a.wav".into(),
+                    duration: 2.0,
+                },
+                Segment::Mark {
+                    name: "split".into(),
+                },
+                Segment::Static {
+                    file: "b.wav".into(),
+                    duration: 3.0,
+                },
+            ],
+        };
+        assert!((nominal_duration(&seq) - 5.0).abs() < 1e-6);
     }
 
     #[test]
@@ -791,9 +640,10 @@ mod tests {
         let h1 = hash_bytes(&bytes);
 
         let manifest = Manifest {
-            version: 2,
+            version: MANIFEST_VERSION,
             hash: h1.clone(),
             glob_digest: None,
+            clips_digest: None,
             script: "s.xml".into(),
             root: Segment::Sequence { children: vec![] },
         };
@@ -802,6 +652,7 @@ mod tests {
 
         let reloaded: Manifest = serde_json::from_str(&fs::read_to_string(&mp).unwrap()).unwrap();
         assert_eq!(reloaded.hash, h1);
+        assert_eq!(reloaded.version, MANIFEST_VERSION);
         // Unchanged bytes → not stale.
         assert_eq!(hash_bytes(&fs::read(&script).unwrap()), reloaded.hash);
         // Changed bytes → stale.
@@ -809,70 +660,51 @@ mod tests {
     }
 
     #[test]
-    fn test_contains_split_section_recurse() {
-        // A section wrapping a Random splits (interactive inside).
-        assert!(contains_split(&Node::Section {
-            role: SectionRole::Main,
-            children: vec![Node::Random { parts: vec![] }],
-        }));
-        // A clean section does NOT split on its own.
-        assert!(!contains_split(&Node::Section {
-            role: SectionRole::Intro,
-            children: vec![Node::Text("hello".into())],
-        }));
-    }
-
-    #[test]
-    fn test_nominal_duration_section() {
-        // Section contributes its child's duration once (the UI's "~15:00"
-        // badge is a one-pass estimate; main-repeats is a play-time concern).
-        let seg = Segment::Section {
-            role: SectionRole::Main,
-            child: Box::new(Segment::Static {
-                file: "a.wav".into(),
-                duration: 10.0,
-                beatmeter: None,
-                visual: None,
-            }),
-        };
-        assert!((nominal_duration(&seg) - 10.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_resolve_paths_recursive_section() {
-        use serde_json::json;
-        let mut val = json!({
+    fn test_manifest_v5_json_shape() {
+        // The on-disk shape of the new segment types: snake_case `zone` /
+        // `mark` tags, `child` on zone, bare `name` on mark, and no
+        // removed variants can deserialize anymore.
+        let root: Segment = serde_json::from_value(serde_json::json!({
             "type": "sequence",
             "children": [
-                {"type": "section", "role": "intro", "child": {"type": "static", "file": "seg-000.wav", "duration": 1.0}},
-                {"type": "section", "role": "main", "child": {"type": "static", "file": "seg-001.wav", "duration": 2.0}},
-                {"type": "section", "role": "outro", "child": {"type": "static", "file": "seg-002.wav", "duration": 3.0}}
+                {"type": "static", "file": "seg-000.wav", "duration": 1.5},
+                {"type": "mark", "name": "halfway"},
+                {"type": "zone", "name": "cooldown", "child": {
+                    "type": "static", "file": "seg-001.wav", "duration": 2.0
+                }}
             ]
-        });
-        let base = Path::new("/app/tracks/top1");
-        resolve_paths_recursive(&mut val, base);
-        let children = val.get("children").unwrap().as_array().unwrap();
-        for (i, expected) in ["seg-000.wav", "seg-001.wav", "seg-002.wav"].iter().enumerate() {
-            let got = children[i]
-                .get("child")
-                .unwrap()
-                .get("file")
-                .unwrap()
-                .as_str()
-                .unwrap()
-                .replace('\\', "/");
-            assert_eq!(got, format!("/app/tracks/top1/{}", expected));
+        }))
+        .unwrap();
+        let Segment::Sequence { children } = root else {
+            panic!("expected sequence");
+        };
+        assert_eq!(children.len(), 3);
+        assert!(matches!(&children[0], Segment::Static { duration, .. } if (*duration - 1.5).abs() < 1e-6));
+        assert!(matches!(&children[1], Segment::Mark { name } if name == "halfway"));
+        assert!(matches!(&children[2], Segment::Zone { name, .. } if name == "cooldown"));
+
+        // Removed variants no longer parse as Segments.
+        for gone in ["until", "choice", "rating", "react", "cond", "section", "visual"] {
+            let v = serde_json::json!({"type": gone});
+            assert!(
+                serde_json::from_value::<Segment>(v).is_err(),
+                "{gone} should not deserialize into a v5 Segment"
+            );
         }
     }
 
     #[test]
-    fn test_resolve_paths_recursive_static_and_import() {        use serde_json::json;
+    fn test_resolve_paths_recursive_zone_and_static() {
+        use serde_json::json;
         let mut val = json!({
             "type": "sequence",
             "children": [
                 {"type": "static", "file": "seg-000.wav", "duration": 1.0},
-                {"type": "import", "manifest": "../imports/abcd/manifest.json"},
-                {"type": "until", "file": "seg-001.wav", "duration": 2.0, "button": "ok"}
+                {"type": "mark", "name": "mid"},
+                {"type": "zone", "name": "tail", "child": {
+                    "type": "static", "file": "seg-001.wav", "duration": 2.0
+                }},
+                {"type": "import", "manifest": "../imports/abcd/manifest.json"}
             ]
         });
         let base = Path::new("/app/tracks/top1");
@@ -887,17 +719,13 @@ mod tests {
                 .replace('\\', "/"),
             "/app/tracks/top1/seg-000.wav"
         );
-        assert_eq!(
-            children[1]
-                .get("manifest")
-                .unwrap()
-                .as_str()
-                .unwrap()
-                .replace('\\', "/"),
-            "/app/tracks/imports/abcd/manifest.json"
-        );
+        // The mark passes through untouched.
+        assert_eq!(children[1].get("name").unwrap().as_str().unwrap(), "mid");
+        // The zone's nested static resolves through `child`.
         assert_eq!(
             children[2]
+                .get("child")
+                .unwrap()
                 .get("file")
                 .unwrap()
                 .as_str()
@@ -905,56 +733,14 @@ mod tests {
                 .replace('\\', "/"),
             "/app/tracks/top1/seg-001.wav"
         );
-    }
-
-    #[test]
-    fn test_contains_split_beatmeter() {
-        // A <beatmeter> is itself a split point (the walker emits its own Static).
-        assert!(contains_split(&Node::Beatmeter {
-            bpm: 120.0,
-            pattern: None,
-            sound: None,
-            volume: None,
-            accent_gain: None,
-            children: vec![Node::Text("hi".into())],
-        }));
-    }
-
-    #[test]
-    fn test_resolve_paths_recursive_beatmeter_sample() {
-        use serde_json::json;
-        // A static segment with a beatmeter: both the clip `file` and the
-        // click `sample` must be resolved to absolute paths.
-        let mut val = json!({
-            "type": "static",
-            "file": "seg-000.wav",
-            "duration": 4.0,
-            "beatmeter": {
-                "sample": "beat-click.wav",
-                "volume": 0.5,
-                "accent_gain": 1.5,
-                "beats": [{"time": 0.0, "accent": true}]
-            }
-        });
-        let base = Path::new("/app/tracks/top1");
-        resolve_paths_recursive(&mut val, base);
         assert_eq!(
-            val.get("file").unwrap().as_str().unwrap().replace('\\', "/"),
-            "/app/tracks/top1/seg-000.wav"
-        );
-        assert_eq!(
-            val.get("beatmeter")
-                .unwrap()
-                .get("sample")
+            children[3]
+                .get("manifest")
                 .unwrap()
                 .as_str()
                 .unwrap()
                 .replace('\\', "/"),
-            "/app/tracks/top1/beat-click.wav"
+            "/app/tracks/imports/abcd/manifest.json"
         );
-        // A static without a beatmeter is unaffected (no sample key added).
-        let mut bare = json!({"type": "static", "file": "seg-001.wav", "duration": 1.0});
-        resolve_paths_recursive(&mut bare, base);
-        assert!(bare.get("beatmeter").is_none());
     }
 }

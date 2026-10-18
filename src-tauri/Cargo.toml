@@ -155,6 +155,11 @@ env_logger = "0.11"
 
 [dev-dependencies]
 tempfile = "3"
+# audio_server router tests: drive the axum Router with `oneshot` and read
+# response bodies. Both are already in the dependency graph (axum/tower-http
+# pull them in); declared directly so tests can name them.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 # Local override: `turso_ext` (pulled in transitively via
 # bashkit[sqlite] → turso_core → turso_ext) ships a build script that uses

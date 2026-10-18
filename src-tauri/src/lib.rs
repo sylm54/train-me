@@ -45,7 +45,6 @@ mod render_notify;
 mod render_service;
 mod schedule;
 mod settings;
-mod sounds;
 mod tag_parser;
 mod validators;
 mod visual;
@@ -256,7 +255,6 @@ async fn synthesize(
         // Resolve <include> tags against the agent's writable data directory.
         // Missing/circular/invalid includes are silently skipped here.
         let nodes = audio_renderer::resolve_includes(nodes, &agent_dir);
-
         // Seed the tracker with the render cost of this AST (flat-renderer
         // semantics: `<loop>` repeats, `<random>` picks one part — see
         // `progress::CountMode`). Cost units: words for text, a small
@@ -288,6 +286,10 @@ async fn synthesize(
         let renderer = guard
             .as_mut()
             .ok_or_else(|| "Model not loaded. Please load the model first.".to_string())?;
+
+        // Flat-path markup has no script file, so `<clip src>` resolves
+        // against the agent dir for both bases (same base includes use).
+        renderer.set_clip_resolution(&agent_dir, &agent_dir);
 
         // Build output filename
         let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
@@ -401,15 +403,6 @@ fn delete_manifest(script_path: String, state: State<'_, AppState>) -> Result<()
         fs::remove_dir_all(&dir).map_err(|e| format!("Failed to delete render: {}", e))?;
     }
     Ok(())
-}
-
-/// Return available sound effect names.
-#[tauri::command]
-fn get_sound_names() -> Vec<String> {
-    sounds::available_sound_names()
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
 }
 
 /// Return the absolute path of the app data directory (for debugging UI).
@@ -843,7 +836,8 @@ fn manifest_status(
         Ok(bytes) => {
             // Same freshness contract as the renderer: version + content
             // hash + glob-include expansion digest (a globbed folder's
-            // contents changing makes the script stale).
+            // contents changing makes the script stale) + clip-content
+            // digest (editing a referenced WAV makes it stale).
             let script_dir = source_abs
                 .parent()
                 .unwrap_or_else(|| Path::new("."))
@@ -851,9 +845,13 @@ fn manifest_status(
             let current_glob_digest = std::str::from_utf8(&bytes).ok().and_then(|source| {
                 audio_renderer::glob_digest(source, &script_dir, &state.agent_dir)
             });
+            let current_clips_digest = std::str::from_utf8(&bytes).ok().and_then(|source| {
+                audio_renderer::clips_digest(source, &script_dir, &state.agent_dir)
+            });
             existing.version != manifest::MANIFEST_VERSION
                 || existing.hash != manifest::hash_bytes(&bytes)
                 || existing.glob_digest != current_glob_digest
+                || existing.clips_digest != current_clips_digest
         }
         // Source file missing — surface as stale so the UI re-renders.
         Err(_) => true,
@@ -1074,26 +1072,13 @@ fn collect_includes(
             | tag_parser::Node::Volume { children, .. }
             | tag_parser::Node::Effect { children, .. }
             | tag_parser::Node::Background { children, .. }
-            | tag_parser::Node::Until { children, .. }
             | tag_parser::Node::Loop { children, .. }
-            | tag_parser::Node::Section { children, .. }
-            | tag_parser::Node::Beatmeter { children, .. }
-            | tag_parser::Node::Visual { children, .. } => {
+            | tag_parser::Node::Zone { children, .. } => {
                 collect_includes(children, script_dir, agent_dir, out, visited, warnings);
-            }
-            tag_parser::Node::If {
-                then_branch, r#else, ..
-            } => {
-                collect_includes(then_branch, script_dir, agent_dir, out, visited, warnings);
-                if let Some(else_nodes) = r#else {
-                    collect_includes(else_nodes, script_dir, agent_dir, out, visited, warnings);
-                }
             }
             tag_parser::Node::Overlay { parts, .. }
             | tag_parser::Node::Random { parts }
-            | tag_parser::Node::Scramble { parts }
-            | tag_parser::Node::Choice { options: parts, .. }
-            | tag_parser::Node::React { parts, .. } => {
+            | tag_parser::Node::Scramble { parts } => {
                 for part in parts {
                     collect_includes(
                         &part.children,
@@ -1108,9 +1093,9 @@ fn collect_includes(
             // Leaves with no children / no includes.
             tag_parser::Node::Text(_)
             | tag_parser::Node::Pause { .. }
-            | tag_parser::Node::Sound { .. }
             | tag_parser::Node::Tone { .. }
-            | tag_parser::Node::Rating { .. } => {}
+            | tag_parser::Node::Clip { .. }
+            | tag_parser::Node::Mark { .. } => {}
         }
     }
 }
@@ -1790,6 +1775,7 @@ pub fn run() {
                 audio_server::bind_audio_server(
                     tracks_dir.clone(),
                     visuals_dir,
+                    agent_dir.clone(),
                     audio_token.clone(),
                 ),
             ) {
@@ -1850,7 +1836,6 @@ pub fn run() {
             synthesize,
             list_tracks,
             delete_track,
-            get_sound_names,
             // Recursive segment manifest commands
             render_manifest,
             manifest_status,

@@ -53,10 +53,6 @@ pub struct PrerenderReport {
     pub model_missing: bool,
     /// Per-script render errors (rendering continues past them).
     pub errors: Vec<String>,
-    /// Visual clip prefetch for the `<visual>` tags these scripts use —
-    /// resolved into the playlist cache so playback never waits on the
-    /// network (see `crate::visual`).
-    pub visuals: crate::visual::PrefetchReport,
 }
 
 // ============================================================================
@@ -289,10 +285,11 @@ pub fn gc_targets(
 
 /// True when `tracks/<manifest_id(src)>/manifest.json` exists, its format
 /// version is current, its stored hash matches the current script bytes,
-/// its glob digest matches the current expansion, and at least one `.wav`
-/// survived in the track dir (the same freshness the render path applies —
-/// a manifest without audio would make playback re-render on demand, so
-/// the pass must not call it fresh and skip).
+/// its glob digest matches the current expansion, its clips digest matches
+/// the referenced WAV contents, and at least one `.wav` survived in the
+/// track dir (the same freshness the render path applies — a manifest
+/// without audio would make playback re-render on demand, so the pass must
+/// not call it fresh and skip).
 fn is_fresh(tracks_dir: &Path, agent_dir: &Path, src: &str) -> bool {
     let Ok(script_bytes) = std::fs::read(agent_dir.join(src)) else {
         return false;
@@ -313,9 +310,13 @@ fn is_fresh(tracks_dir: &Path, agent_dir: &Path, src: &str) -> bool {
     let current_glob_digest = std::str::from_utf8(&script_bytes)
         .ok()
         .and_then(|source| crate::audio_renderer::glob_digest(source, &script_dir, agent_dir));
+    let current_clips_digest = std::str::from_utf8(&script_bytes)
+        .ok()
+        .and_then(|source| crate::audio_renderer::clips_digest(source, &script_dir, agent_dir));
     existing.version == crate::manifest::MANIFEST_VERSION
         && existing.hash == crate::manifest::hash_bytes(&script_bytes)
         && existing.glob_digest == current_glob_digest
+        && existing.clips_digest == current_clips_digest
         && crate::audio_renderer::has_any_wav(&track_dir)
 }
 
@@ -360,7 +361,6 @@ pub fn prerender_blocking(
     state_dir: &Path,
     tracks_dir: &Path,
     model_dir: &Path,
-    visual_cache_dir: &Path,
     renderer_arc: &parking_lot::Mutex<Option<crate::audio_renderer::AudioRenderer>>,
     only: Option<&[String]>,
     app: Option<&tauri::AppHandle>,
@@ -391,8 +391,8 @@ pub fn prerender_blocking(
     report.fresh = refs.len() - stale.len();
 
     // Foreground-service hold for this pass: acquired on the first real
-    // phase (synthesis batch or visual prefetch), released when the pass
-    // ends. Empty holds are free — a no-work pass never starts the service.
+    // phase (synthesis batch), released when the pass ends. Empty holds are
+    // free — a no-work pass never starts the service.
     let mut hold = crate::render_service::RenderHold::new();
 
     if !stale.is_empty() {
@@ -478,72 +478,15 @@ pub fn prerender_blocking(
         }
     }
 
-    // Visual clips: prefetch the `<visual>` slideshow playlists (and their
-    // media) for every script in this pass — stale or fresh, an unrendered
-    // script can still reference clips the player will need — so playback
-    // never sits on "Fetching visuals…". Failures are per-config and soft
-    // (the player falls back to a cold fetch). Surfaced through the same
-    // progress pill under a pseudo-script name so the pass's visual phase
-    // is visible like the audio one.
-    let srcs: Vec<String> = refs.iter().map(|r| r.src.clone()).collect();
-    let configs = crate::visual::collect_configs_in_scripts(agent_dir, &srcs);
-    if !configs.is_empty() {
-        let pseudo = "⟨visual clips⟩";
-        if let Some(app) = app {
-            emit_progress(app, pseudo, 0, configs.len(), "Prefetching visual clips…");
-        }
-        if let Some(webview) = service {
-            hold.hold(webview);
-        }
-        report.visuals = crate::visual::prefetch_configs(
-            visual_cache_dir,
-            configs,
-            Some(&|done, total| {
-                if let Some(app) = app {
-                    emit_progress(app, pseudo, done, total, "Prefetching visual clips…");
-                }
-                #[cfg(target_os = "android")]
-                if let Some(webview) = service {
-                    crate::render_notify::show_render_progress(
-                        webview,
-                        "Prefetching visual clips…",
-                        &crate::progress::Snapshot {
-                            done: done as u64,
-                            total: total as u64,
-                            pct: if total > 0 {
-                                ((done.min(total) * 100 / total) as u8).clamp(0, 100)
-                            } else {
-                                0
-                            },
-                            label: String::new(),
-                        },
-                        None,
-                    );
-                }
-            }),
-        );
-        if let Some(app) = app {
-            let error = if report.visuals.failed == 0 {
-                None
-            } else {
-                Some(format!(
-                    "{} visual clip prefetch(es) failed",
-                    report.visuals.failed
-                ))
-            };
-            emit_done(app, pseudo, error.as_deref());
-        }
-    }
+    // Visual-playlist prefetching is gone: `<visual>` left the TTS grammar
+    // (visuals become interaction-layer widgets in a later phase).
 
     log::info!(
-        "prerender pass: referenced={} rendered={} fresh={} gc={} visuals(found={}, prefetched={}, failed={})",
+        "prerender pass: referenced={} rendered={} fresh={} gc={}",
         report.referenced,
         report.rendered.len(),
         report.fresh,
         report.gc_removed.len(),
-        report.visuals.configs,
-        report.visuals.prefetched,
-        report.visuals.failed,
     );
     report
 }
@@ -569,7 +512,6 @@ pub async fn v2_prerender(
     let state_dir = state.state_dir.clone();
     let tracks_dir = state.tracks_dir.clone();
     let model_dir = state.model_dir.clone();
-    let visual_cache_dir = state.data_dir.join("visuals");
     let renderer_arc = state.renderer.clone();
     let report_app = app.clone();
     let report_webview = webview.clone();
@@ -579,7 +521,6 @@ pub async fn v2_prerender(
             &state_dir,
             &tracks_dir,
             &model_dir,
-            &visual_cache_dir,
             &renderer_arc,
             paths.as_deref(),
             Some(&report_app),
@@ -829,6 +770,46 @@ x
 
         // Drop a new variant in the folder → same script bytes, new digest.
         std::fs::write(agent.join("hypnos/parts/b.xml"), "<voice>b</voice>").unwrap();
+        assert!(!is_fresh(&tracks, &agent, "hypnos/main.xml"));
+        let _ = tmp;
+    }
+
+    #[test]
+    fn is_fresh_notices_clip_content_changes() {
+        // A script with a <clip>: its manifest is fresh while the referenced
+        // WAV's content digest matches, stale the moment the WAV is edited —
+        // even though the script's own bytes never changed.
+        let (tmp, agent, tracks) = env(&[
+            ("hypnos/main.xml", "<voice><clip src='beat.wav'/></voice>"),
+            ("hypnos/beat.wav", "first-bytes"),
+        ]);
+        let bytes = std::fs::read(agent.join("hypnos/main.xml")).unwrap();
+        let hash = crate::manifest::hash_bytes(&bytes);
+        let digest = crate::audio_renderer::clips_digest(
+            std::str::from_utf8(&bytes).unwrap(),
+            &agent.join("hypnos"),
+            &agent,
+        )
+        .unwrap();
+        let dir = tracks.join(crate::manifest::manifest_id("hypnos/main.xml"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("seg-000.wav"), b"fake").unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::json!({
+                "version": crate::manifest::MANIFEST_VERSION,
+                "hash": hash,
+                "clips_digest": digest,
+                "script": "hypnos/main.xml",
+                "root": { "type": "sequence", "children": [] },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(is_fresh(&tracks, &agent, "hypnos/main.xml"));
+
+        // Re-export the WAV (same path, different bytes) → stale.
+        std::fs::write(agent.join("hypnos/beat.wav"), "re-exported-bytes").unwrap();
         assert!(!is_fresh(&tracks, &agent, "hypnos/main.xml"));
         let _ = tmp;
     }

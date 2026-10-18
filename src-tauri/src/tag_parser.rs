@@ -1,38 +1,11 @@
 //! Parser for TTS tag markup language.
 //!
-//! Parses XML-like tags into an AST that can be rendered to audio.
-//! Supports: voice, pause, sound, tone, effect, overlay, loop, background, until,
-//! speed, volume, random, scramble, choice tags.
+//! Parses XML-like tags into an AST that can be rendered to audio. The
+//! grammar is audio-only: voice, speed, volume, pause, tone, effect, overlay,
+//! loop, background, random, scramble, include, clip, zone, mark.
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
-
-use crate::visual::{self, VisualConfig};
-
-/// Which structural section a `<intro>`/`<main>`/`<outro>` block belongs to.
-///
-/// Sections are transparent to flat audio synthesis but are preserved through
-/// the manifest so the player can loop `<main>` a chosen number of times while
-/// playing `<intro>`/`<outro>` once each.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SectionRole {
-    Intro,
-    Main,
-    Outro,
-}
-
-impl SectionRole {
-    /// Parse a tag name (`"intro"`/`"main"`/`"outro"`) into a role.
-    pub fn from_tag(name: &str) -> Option<Self> {
-        match name {
-            "intro" => Some(SectionRole::Intro),
-            "main" => Some(SectionRole::Main),
-            "outro" => Some(SectionRole::Outro),
-            _ => None,
-        }
-    }
-}
 
 /// AST node for the TTS tag language.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,16 +33,6 @@ pub enum Node {
 
     /// Insert silence.
     Pause { duration: f32 },
-
-    /// Play a sound effect.
-    Sound {
-        #[serde(rename = "type")]
-        sound_type: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        volume: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        speed: Option<String>,
-    },
 
     /// Play a background tone until end of segment.
     Tone {
@@ -110,14 +73,6 @@ pub enum Node {
     /// Render all parts in a randomly-shuffled order (render time in flat path).
     Scramble { parts: Vec<OverlayPart> },
 
-    /// Interactive branch. Flat-path fallback renders the first option; the
-    /// manifest path (later stage) makes it a real per-playback choice.
-    Choice {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        prompt: Option<String>,
-        options: Vec<OverlayPart>,
-    },
-
     /// Background audio layer (plays concurrently with following foreground).
     Background {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -127,99 +82,32 @@ pub enum Node {
         children: Vec<Node>,
     },
 
-    /// Interactive pause - renders inner content repeatedly until button press.
-    /// In pre-rendered mode, renders once.
-    Until {
-        button: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        waiting_sound: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        waiting_sound_volume: Option<f32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pre_pause: Option<f32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        post_pause: Option<f32>,
-        children: Vec<Node>,
-    },
-
     /// Include another XML file at this point. Resolved by the audio renderer
     /// before rendering (see `audio_renderer::resolve_includes`).
     Include { src: String },
 
-    /// Structural section marker (`<intro>`/`<main>`/`<outro>`). Transparent to
-    /// flat synthesis (its children render inline) but preserved as a distinct
-    /// manifest segment so the player can loop `<main>` and play
-    /// `<intro>`/`<outro>` once each.
-    Section {
-        role: SectionRole,
-        children: Vec<Node>,
+    /// Play a media file from the agent sandbox (WAV in v1). `src` resolves
+    /// like an `<include>` target (script dir first, then the agent dir; no
+    /// globs). The decoded audio is mixed into the surrounding static buffer,
+    /// exactly where the tag sits — including inside `<background>` layers
+    /// and `<overlay>` parts.
+    Clip {
+        src: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        volume: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        speed: Option<String>,
     },
 
-    /// A metronome over its (non-interactive) children. The renderer bakes the
-    /// children into one `Static` clip, computes a beat schedule over that
-    /// clip's duration, and renders a short click sample (named by `sound`); at
-    /// playback the player triggers that sample at each beat via Web Audio and
-    /// drives an on-screen meter from the schedule. `pattern` is a string of
-    /// `X` (accent) / `x` (normal) / `.` (rest); default `x` (every beat).
-    Beatmeter {
-        bpm: f32,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pattern: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        sound: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        volume: Option<f32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        accent_gain: Option<f32>,
-        children: Vec<Node>,
-    },
+    /// A named region of the timeline. Audio-transparent: children render
+    /// exactly as if the wrapper were absent. The zone becomes a manifest
+    /// `Zone` node at segment boundaries so the interaction layer can address
+    /// it by name.
+    Zone { name: String, children: Vec<Node> },
 
-    /// Interactive scalar prompt. At playback the player pauses and asks the
-    /// listener for a value in `[min, max]`; the chosen value is recorded (via
-    /// the player's `onResolve`) and playback continues. Has no rendered audio
-    /// of its own, so it contributes a zero-duration segment.
-    Rating {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        prompt: Option<String>,
-        min: u32,
-        max: u32,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        default: Option<u32>,
-    },
-
-    /// Non-blocking interrupt. The `main` part plays with `button` armed; if
-    /// the listener presses it, `main` is preempted and `fallback` plays. Two
-    /// `<part>` children distinguished by `role="main"` / `role="fallback"`.
-    React {
-        button: String,
-        parts: Vec<OverlayPart>,
-    },
-
-    /// Playback-time conditional (`<if cond="…">…<else>…</else></if>`). ALL
-    /// branches are rendered to audio; the player evaluates `cond` (the
-    /// condition DSL, see `crate::cond`) against the run-context variables
-    /// when playback starts and plays exactly one branch. Like the other
-    /// interactive tags it is a split point and is rejected inside
-    /// `<background>`/`<overlay>` layers.
-    If {
-        cond: String,
-        #[serde(rename = "then")]
-        then_branch: Vec<Node>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        r#else: Option<Vec<Node>>,
-    },
-
-    /// A gif/image slideshow layered over the inner content at playback.
-    /// Transparent to audio synthesis (children render exactly as if the
-    /// wrapper were absent); the config is carried into the manifest as a
-    /// `Visual` segment and resolved to a media playlist by the player via
-    /// the `visual_fetch` command at PLAYBACK. `<caption>` children are
-    /// pulled out into `config.lines` (authored caption text) and are not
-    /// spoken. See `crate::visual`.
-    Visual {
-        config: VisualConfig,
-        children: Vec<Node>,
-    },
+    /// A named zero-length boundary at this position. Becomes a manifest
+    /// `Mark` node; carries no audio.
+    Mark { name: String },
 }
 
 /// A part within an overlay.
@@ -231,12 +119,6 @@ pub struct OverlayPart {
     pub volume: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speed: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-    /// `<react>` only: `"main"` or `"fallback"`. Ignored (and errored) on
-    /// `<part>` inside `<overlay>`/`<random>`/`<scramble>`/`<choice>`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
     pub children: Vec<Node>,
 }
 
@@ -315,24 +197,17 @@ impl TagParser {
             "speed" => self.parse_speed_tag(),
             "volume" => self.parse_volume_tag(),
             "pause" => self.parse_pause_tag(),
-            "sound" => self.parse_sound_tag(),
             "tone" => self.parse_tone_tag(),
             "effect" => self.parse_effect_tag(),
             "include" => self.parse_include_tag(),
             "overlay" => self.parse_overlay_tag(),
             "loop" => self.parse_loop_tag(),
             "background" => self.parse_background_tag(),
-            "until" => self.parse_until_tag(),
             "random" => self.parse_random_tag(),
             "scramble" => self.parse_scramble_tag(),
-            "choice" => self.parse_choice_tag(),
-            "intro" | "main" | "outro" => self.parse_section_tag(&tag_name),
-            "beatmeter" => self.parse_beatmeter_tag(),
-            "rating" => self.parse_rating_tag(),
-            "react" => self.parse_react_tag(),
-            "if" => self.parse_if_tag(),
-            "visual" => self.parse_visual_tag(),
-            "else" => bail!("<else> is only valid inside an <if> block"),
+            "clip" => self.parse_clip_tag(),
+            "zone" => self.parse_zone_tag(),
+            "mark" => self.parse_mark_tag(),
             other => bail!("Unknown tag: <{}>", other),
         }
     }
@@ -429,21 +304,61 @@ impl TagParser {
         Ok(Node::Include { src })
     }
 
-    fn parse_sound_tag(&mut self) -> Result<Node> {
+    /// Parse `<clip src="…" volume="…" speed="…"/>` — self-closing media
+    /// paste from the sandbox.
+    fn parse_clip_tag(&mut self) -> Result<Node> {
         let attrs = self.read_attributes();
         self.skip_ws();
-        let sound_type = attrs
-            .get("type")
+        let src = attrs
+            .get("src")
             .cloned()
-            .unwrap_or_else(|| "beep".to_string());
+            .ok_or_else(|| anyhow::anyhow!("<clip> tag requires a 'src' attribute"))?;
+        if src.trim().is_empty() {
+            bail!("<clip> has an empty 'src' attribute");
+        }
         let volume = attrs.get("volume").cloned();
         let speed = attrs.get("speed").cloned();
         self.expect_str("/>")?;
-        Ok(Node::Sound {
-            sound_type,
-            volume,
-            speed,
+        Ok(Node::Clip { src, volume, speed })
+    }
+
+    /// Parse `<zone name="…">…</zone>` — a named timeline region wrapping its
+    /// (required) children.
+    fn parse_zone_tag(&mut self) -> Result<Node> {
+        let attrs = self.read_attributes();
+        let name = attrs
+            .get("name")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("<zone> tag requires a 'name' attribute"))?;
+        if name.trim().is_empty() {
+            bail!("<zone> has an empty 'name' attribute");
+        }
+        if self.peek_str("/>") {
+            self.expect_str("/>")?;
+            bail!("<zone> tag must have children");
+        }
+        self.expect_str(">")?;
+        let children = self.parse_nodes()?;
+        self.expect_closing("zone")?;
+        Ok(Node::Zone {
+            name,
+            children: filter_empty_text(children),
         })
+    }
+
+    /// Parse `<mark name="…"/>` — a self-closing zero-length boundary.
+    fn parse_mark_tag(&mut self) -> Result<Node> {
+        let attrs = self.read_attributes();
+        self.skip_ws();
+        let name = attrs
+            .get("name")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("<mark> tag requires a 'name' attribute"))?;
+        if name.trim().is_empty() {
+            bail!("<mark> has an empty 'name' attribute");
+        }
+        self.expect_str("/>")?;
+        Ok(Node::Mark { name })
     }
 
     fn parse_tone_tag(&mut self) -> Result<Node> {
@@ -522,8 +437,6 @@ impl TagParser {
                     looped: None,
                     volume: None,
                     speed: None,
-                    label: None,
-                    role: None,
                     children: vec![node],
                 });
             } else {
@@ -538,8 +451,6 @@ impl TagParser {
                     looped: None,
                     volume: None,
                     speed: None,
-                    label: None,
-                    role: None,
                     children: vec![node],
                 });
             }
@@ -563,22 +474,12 @@ impl TagParser {
         Ok(Node::Scramble { parts })
     }
 
-    fn parse_choice_tag(&mut self) -> Result<Node> {
-        let attrs = self.read_attributes();
-        let prompt = attrs.get("prompt").cloned();
-        self.expect_str(">")?;
-        let options = self.parse_parts_container("choice")?;
-        Ok(Node::Choice { prompt, options })
-    }
-
     fn parse_overlay_part(&mut self) -> Result<OverlayPart> {
         self.expect_str("<part")?;
         let attrs = self.read_attributes();
         let looped = attrs.get("looped").and_then(|v| v.parse::<bool>().ok());
         let volume = attrs.get("volume").cloned();
         let speed = attrs.get("speed").cloned();
-        let label = attrs.get("label").cloned();
-        let role = attrs.get("role").cloned();
 
         self.expect_str(">")?;
         let children = self.parse_nodes()?;
@@ -588,8 +489,6 @@ impl TagParser {
             looped,
             volume,
             speed,
-            label,
-            role,
             children: filter_empty_text(children),
         })
     }
@@ -623,330 +522,6 @@ impl TagParser {
         Ok(Node::Background {
             volume,
             speed,
-            children: filter_empty_text(children),
-        })
-    }
-
-    fn parse_until_tag(&mut self) -> Result<Node> {
-        let attrs = self.read_attributes();
-        let button = attrs
-            .get("button")
-            .cloned()
-            .unwrap_or_else(|| "Continue".to_string());
-        let waiting_sound = attrs.get("waiting-sound").cloned();
-        let waiting_sound_volume = attrs
-            .get("waiting-sound-volume")
-            .and_then(|v| v.parse::<f32>().ok());
-        let pre_pause = attrs.get("pre-pause").and_then(|v| v.parse::<f32>().ok());
-        let post_pause = attrs.get("post-pause").and_then(|v| v.parse::<f32>().ok());
-
-        self.expect_str(">")?;
-        let children = self.parse_nodes()?;
-        self.expect_closing("until")?;
-
-        Ok(Node::Until {
-            button,
-            waiting_sound,
-            waiting_sound_volume,
-            pre_pause,
-            post_pause,
-            children: filter_empty_text(children),
-        })
-    }
-
-    /// Parse `<intro>`/`<main>`/`<outro>` — container tags (children required)
-    /// with no meaningful attributes. The name maps to a `SectionRole`.
-    fn parse_section_tag(&mut self, name: &str) -> Result<Node> {
-        let role = SectionRole::from_tag(name)
-            .ok_or_else(|| anyhow::anyhow!("not a section tag: <{}>", name))?;
-        // Sections take no attributes today; read & discard any present so a
-        // stray attribute doesn't break parsing.
-        let _attrs = self.read_attributes();
-        if self.peek_str("/>") {
-            self.expect_str("/>")?;
-            bail!("<{}> tag must have children", name);
-        }
-        self.expect_str(">")?;
-        let children = self.parse_nodes()?;
-        self.expect_closing(name)?;
-        Ok(Node::Section {
-            role,
-            children: filter_empty_text(children),
-        })
-    }
-
-    /// Parse `<beatmeter>` — a metronome container over its non-interactive
-    /// children. Attributes: `bpm` (default 120), `pattern` (default every
-    /// beat), `sound` (default `click`), `volume` (default 0.5), `accent-gain`
-    /// (default 1.5). Semantic checks (valid sound/pattern, non-interactive
-    /// children, not inside background/overlay) happen in `validate`.
-    fn parse_beatmeter_tag(&mut self) -> Result<Node> {
-        let attrs = self.read_attributes();
-        let bpm = attrs
-            .get("bpm")
-            .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(120.0);
-        let pattern = attrs.get("pattern").cloned();
-        let sound = attrs.get("sound").cloned();
-        let volume = attrs.get("volume").and_then(|v| v.parse::<f32>().ok());
-        let accent_gain = attrs.get("accent-gain").and_then(|v| v.parse::<f32>().ok());
-
-        if self.peek_str("/>") {
-            self.expect_str("/>")?;
-            bail!("<beatmeter> tag must have children");
-        }
-        self.expect_str(">")?;
-        let children = self.parse_nodes()?;
-        self.expect_closing("beatmeter")?;
-        Ok(Node::Beatmeter {
-            bpm,
-            pattern,
-            sound,
-            volume,
-            accent_gain,
-            children: filter_empty_text(children),
-        })
-    }
-
-    /// Parse `<rating/>` — a self-closing scalar prompt. Attributes: `prompt`
-    /// (optional), `min` (default 1), `max` (default 5), `default` (optional).
-    fn parse_rating_tag(&mut self) -> Result<Node> {
-        let attrs = self.read_attributes();
-        self.skip_ws();
-        let prompt = attrs.get("prompt").cloned();
-        let min = attrs.get("min").and_then(|v| v.parse::<u32>().ok()).unwrap_or(1);
-        let max = attrs.get("max").and_then(|v| v.parse::<u32>().ok()).unwrap_or(5);
-        let default = attrs.get("default").and_then(|v| v.parse::<u32>().ok());
-        self.expect_str("/>")?;
-        Ok(Node::Rating {
-            prompt,
-            min,
-            max,
-            default,
-        })
-    }
-
-    /// Parse `<react>` — a non-blocking interrupt container whose two `<part>`
-    /// children are distinguished by `role="main"` / `role="fallback"`. Uses
-    /// the shared parts container; role validation happens in `validate`.
-    fn parse_react_tag(&mut self) -> Result<Node> {
-        let attrs = self.read_attributes();
-        let button = attrs
-            .get("button")
-            .cloned()
-            .unwrap_or_else(|| "Continue".to_string());
-        self.expect_str(">")?;
-        let parts = self.parse_parts_container("react")?;
-        Ok(Node::React { button, parts })
-    }
-
-    /// Parse `<if cond="…">then…<else>other…</else></if>` (the `<else>`
-    /// branch is optional). Handled with a custom loop because `<else>` is
-    /// a sibling-aware marker, not a normal nested tag.
-    fn parse_if_tag(&mut self) -> Result<Node> {
-        let attrs = self.read_attributes();
-        let cond = match attrs.get("cond").cloned() {
-            Some(c) if !c.trim().is_empty() => c,
-            _ => bail!("<if> tag requires a cond attribute"),
-        };
-        if self.peek_str("/>") {
-            self.expect_str("/>")?;
-            bail!("<if> tag must have children");
-        }
-        self.expect_str(">")?;
-
-        let mut then_nodes: Vec<Node> = Vec::new();
-        let mut else_nodes: Option<Vec<Node>> = None;
-        let mut in_else = false;
-        loop {
-            if self.pos >= self.input.len() {
-                bail!("<if> is never closed (missing </if>)");
-            }
-            if self.peek_str("</") {
-                let save = self.pos;
-                self.pos += 2;
-                let name = self.read_tag_name()?;
-                self.skip_ws();
-                self.expect_str(">")?;
-                match name.as_str() {
-                    "if" => break,
-                    // `</else>` simply ends the else branch; `</if>` follows.
-                    "else" if in_else => continue,
-                    other => {
-                        self.pos = save;
-                        bail!("Unexpected closing tag </{}> inside <if>", other);
-                    }
-                }
-            }
-            if self.peek_str("<") {
-                let save = self.pos;
-                self.pos += 1;
-                let name = self.read_tag_name()?;
-                if name == "else" {
-                    if in_else {
-                        self.pos = save;
-                        bail!("<else> appears twice inside one <if>");
-                    }
-                    let _extra = self.read_attributes();
-                    if self.peek_str("/>") {
-                        self.expect_str("/>")?;
-                    } else {
-                        self.expect_str(">")?;
-                    }
-                    in_else = true;
-                    else_nodes = Some(Vec::new());
-                    continue;
-                }
-                self.pos = save;
-                let node = self.parse_tag()?;
-                if in_else {
-                    else_nodes.as_mut().expect("set with in_else").push(node);
-                } else {
-                    then_nodes.push(node);
-                }
-                continue;
-            }
-            let node = self.parse_text()?;
-            if in_else {
-                else_nodes.as_mut().expect("set with in_else").push(node);
-            } else {
-                then_nodes.push(node);
-            }
-        }
-        Ok(Node::If {
-            cond,
-            then_branch: filter_empty_text(then_nodes),
-            r#else: else_nodes.map(filter_empty_text),
-        })
-    }
-
-    /// Parse `<visual>` — a slideshow container over its (audio) children.
-    /// Attributes: `source` (default `redgifs`), `niche` (curated source
-    /// communities), `tags`/`block` (comma lists), `query`, `order`, `every`
-    /// (seconds or `min..max`) / `bpm`, `count`, `captions` (`off`/`meta`)
-    /// and `effect` (comma list). `<caption>` children are collected into
-    /// `config.lines` as authored caption text; everything else is regular
-    /// audio content. Numeric and value-set validation happens in `validate`.
-    fn parse_visual_tag(&mut self) -> Result<Node> {
-        let attrs = self.read_attributes();
-        let source = attrs
-            .get("source")
-            .cloned()
-            .unwrap_or_else(|| visual::DEFAULT_SOURCE.to_string());
-        let niches = visual::parse_attr_list(attrs.get("niche"))
-            .into_iter()
-            .map(|n| visual::canonical_niche(&n))
-            .collect();
-        let tags = visual::parse_attr_list(attrs.get("tags"));
-        let block = visual::parse_attr_list(attrs.get("block"));
-        let query = attrs
-            .get("query")
-            .map(|q| q.trim().to_string())
-            .filter(|q| !q.is_empty());
-        let order = attrs
-            .get("order")
-            .map(|q| q.trim().to_string())
-            .filter(|q| !q.is_empty());
-        let bpm = attrs
-            .get("bpm")
-            .map(|v| {
-                v.parse::<f32>()
-                    .map_err(|_| anyhow::anyhow!("<visual bpm=\"{v}\"> is not a number"))
-            })
-            .transpose()?;
-        // `every` is the interval spec; a `bpm` overrides it (60/bpm seconds
-        // per slide). Invalid `every` strings are a parse error so the
-        // writer agent sees them immediately.
-        let (every_min, every_max) = match (&attrs.get("every").cloned(), bpm) {
-            (Some(raw), None) => visual::parse_every(&raw)
-                .map_err(|e| anyhow::anyhow!("<visual every=\"{raw}\">: {e}"))?,
-            (Some(raw), Some(_)) => {
-                bail!("<visual> accepts either every=\"…\" or bpm=\"…\", not both (got every=\"{raw}\")")
-            }
-            (None, Some(b)) => {
-                if !(b > 0.0) {
-                    bail!("<visual bpm=\"{b}\"> must be > 0");
-                }
-                (60.0 / b, 60.0 / b)
-            }
-            (None, None) => (visual::DEFAULT_EVERY_MIN, visual::DEFAULT_EVERY_MAX),
-        };
-        let count = attrs
-            .get("count")
-            .map(|v| {
-                v.parse::<u32>()
-                    .map_err(|_| anyhow::anyhow!("<visual count=\"{v}\"> is not a number"))
-            })
-            .transpose()?
-            .unwrap_or(visual::DEFAULT_COUNT);
-        let captions = attrs
-            .get("captions")
-            .cloned()
-            .unwrap_or_else(|| "off".to_string());
-        let effects = visual::parse_attr_list(attrs.get("effect"));
-
-        if self.peek_str("/>") {
-            self.expect_str("/>")?;
-            bail!("<visual> tag must have children");
-        }
-        self.expect_str(">")?;
-
-        // Custom child loop: `<caption>` elements are pulled out as authored
-        // caption lines (not spoken, not rendered to audio); everything else
-        // parses normally. `<caption>` outside `<visual>` remains an unknown
-        // tag because only this loop consumes it.
-        let mut children: Vec<Node> = Vec::new();
-        let mut lines: Vec<String> = Vec::new();
-        loop {
-            self.skip_ws();
-            if self.pos >= self.input.len() {
-                bail!("<visual> is never closed (missing </visual>)");
-            }
-            if self.peek_str("</visual>") {
-                self.skip_ws();
-                self.expect_str("</visual>")?;
-                break;
-            }
-            if self.peek_str("<caption") {
-                self.expect_str("<caption")?;
-                let _caption_attrs = self.read_attributes();
-                self.skip_ws();
-                if self.peek_str("/>") {
-                    self.expect_str("/>")?;
-                    continue; // empty caption — nothing to add
-                }
-                self.expect_str(">")?;
-                let inner = self.parse_nodes()?;
-                self.expect_closing("caption")?;
-                let text = extract_text(&inner);
-                let text = text.trim();
-                if !text.is_empty() {
-                    lines.push(text.to_string());
-                }
-                continue;
-            }
-            if self.peek_str("<") {
-                children.push(self.parse_tag()?);
-            } else {
-                children.push(self.parse_text()?);
-            }
-        }
-
-        Ok(Node::Visual {
-            config: VisualConfig {
-                source,
-                niches,
-                tags,
-                block,
-                query,
-                order,
-                every_min,
-                every_max,
-                count,
-                captions,
-                effects,
-                lines,
-            },
             children: filter_empty_text(children),
         })
     }
@@ -1127,7 +702,12 @@ fn filter_empty_text(nodes: Vec<Node>) -> Vec<Node> {
 }
 
 /// Extract all plain text from a node tree (useful for getting the text to
-/// synthesize, or the inner label of an `<until>` segment).
+/// synthesize). Boundary wrappers (`<zone>`) recurse; audio leaves
+/// (`<pause>`/`<tone>`/`<clip>`/`<mark>`) contribute nothing.
+///
+/// Not referenced by the render paths since `<until>` (which surfaced its
+/// text) left the grammar; kept for tests and the lint/later phases.
+#[allow(dead_code)]
 pub fn extract_text(nodes: &[Node]) -> String {
     let mut texts = Vec::new();
     for node in nodes {
@@ -1149,10 +729,7 @@ fn extract_text_recursive(node: &Node, texts: &mut Vec<String>) {
         | Node::Effect { children, .. }
         | Node::Loop { children, .. }
         | Node::Background { children, .. }
-        | Node::Until { children, .. }
-        | Node::Section { children, .. }
-        | Node::Beatmeter { children, .. }
-        | Node::Visual { children, .. } => {
+        | Node::Zone { children, .. } => {
             for child in children {
                 extract_text_recursive(child, texts);
             }
@@ -1164,41 +741,24 @@ fn extract_text_recursive(node: &Node, texts: &mut Vec<String>) {
                 }
             }
         }
-        Node::Random { parts } | Node::Scramble { parts } | Node::Choice { options: parts, .. }
-        | Node::React { parts, .. } => {
+        Node::Random { parts } | Node::Scramble { parts } => {
             for part in parts {
                 for child in &part.children {
                     extract_text_recursive(child, texts);
                 }
             }
         }
-        Node::If {
-            then_branch, r#else, ..
-        } => {
-            for child in then_branch {
-                extract_text_recursive(child, texts);
-            }
-            if let Some(else_nodes) = r#else {
-                for child in else_nodes {
-                    extract_text_recursive(child, texts);
-                }
-            }
-        }
-        Node::Pause { .. } | Node::Sound { .. } | Node::Tone { .. } | Node::Include { .. }
-        | Node::Rating { .. } => {}
+        Node::Pause { .. }
+        | Node::Tone { .. }
+        | Node::Include { .. }
+        | Node::Clip { .. }
+        | Node::Mark { .. } => {}
     }
 }
 
 // ============================================================================
 // Semantic validation
 // ============================================================================
-
-/// Known sound type values that the renderer will accept.
-const VALID_SOUND_TYPES: &[&str] = &[
-    "beep", "pop", "bubble_pop", "camera_shutter", "censor_beep",
-    "heart_beat", "padlock", "snap", "ding", "swoosh", "click",
-    "error", "success", "bell", "water_drop",
-];
 
 /// Known tone presets accepted by `generate_tone`.
 const VALID_TONE_PRESETS: &[&str] = &[
@@ -1279,15 +839,16 @@ pub fn wildcard_match(pattern: &str, name: &str) -> bool {
 
 /// Validate a parsed AST for semantic correctness.
 ///
-/// This catches issues the parser doesn't: unknown sound types, tone presets,
-/// effect types, effect presets, and speaker names. The renderer would trip
-/// on these with an opaque error; this gives the writer agent a clear message
-/// at validation time instead.
+/// This catches issues the parser doesn't: unknown tone presets, effect
+/// types, effect presets, speaker names, and duplicate `<zone>`/`<mark>`
+/// names. The renderer would trip on these with an opaque error; this gives
+/// the writer agent a clear message at validation time instead.
 ///
 /// Returns `Err` with a multi-line summary of all semantic problems found.
 pub fn validate(nodes: &[Node]) -> Result<()> {
     let mut errors: Vec<String> = Vec::new();
-    validate_nodes(nodes, &mut errors, &mut Vec::new());
+    let mut names: Vec<String> = Vec::new();
+    validate_nodes(nodes, &mut errors, &mut Vec::new(), &mut names);
     if errors.is_empty() {
         Ok(())
     } else if errors.len() == 1 {
@@ -1303,7 +864,12 @@ pub fn validate(nodes: &[Node]) -> Result<()> {
     }
 }
 
-fn validate_nodes(nodes: &[Node], errors: &mut Vec<String>, breadcrumb: &mut Vec<String>) {
+fn validate_nodes(
+    nodes: &[Node],
+    errors: &mut Vec<String>,
+    breadcrumb: &mut Vec<String>,
+    boundary_names: &mut Vec<String>,
+) {
     for node in nodes {
         match node {
             Node::Text(_) => {}
@@ -1321,33 +887,17 @@ fn validate_nodes(nodes: &[Node], errors: &mut Vec<String>, breadcrumb: &mut Vec
                     ));
                 }
                 breadcrumb.push(format!("<voice speaker=\"{}\">", speaker));
-                validate_nodes(children, errors, breadcrumb);
+                validate_nodes(children, errors, breadcrumb, boundary_names);
                 breadcrumb.pop();
             }
 
             Node::Speed { children, .. } | Node::Volume { children, .. } => {
                 breadcrumb.push("<speed>|<volume>".to_string());
-                validate_nodes(children, errors, breadcrumb);
+                validate_nodes(children, errors, breadcrumb, boundary_names);
                 breadcrumb.pop();
             }
 
-            Node::Sound { sound_type, .. } => {
-                if !VALID_SOUND_TYPES.contains(&sound_type.as_str()) {
-                    let near = breadcrumb.last().map(|s| s.as_str()).unwrap_or("top-level");
-                    errors.push(format!(
-                        "Unknown sound type '{}' in <sound type=\"{}\"> (inside {}). Valid types: {}",
-                        sound_type,
-                        sound_type,
-                        near,
-                        VALID_SOUND_TYPES.join(", ")
-                    ));
-                }
-            }
-
-            Node::Tone {
-                preset,
-                ..
-            } => {
+            Node::Tone { preset, .. } => {
                 if !VALID_TONE_PRESETS.contains(&preset.as_str()) {
                     let near = breadcrumb.last().map(|s| s.as_str()).unwrap_or("top-level");
                     errors.push(format!(
@@ -1393,16 +943,8 @@ fn validate_nodes(nodes: &[Node], errors: &mut Vec<String>, breadcrumb: &mut Vec
                         }
                     }
                 }
-                // `<effect>` content is baked into ONE clip (no split points),
-                // so a conditional inside can never be toggled per playback.
-                if children.iter().any(|c| matches!(c, Node::If { .. })) {
-                    errors.push(
-                        "<if> is not allowed directly inside <effect> — move it outside the effect"
-                            .to_string(),
-                    );
-                }
                 breadcrumb.push(format!("<effect type=\"{}\">", effect_type));
-                validate_nodes(children, errors, breadcrumb);
+                validate_nodes(children, errors, breadcrumb, boundary_names);
                 breadcrumb.pop();
             }
 
@@ -1423,200 +965,63 @@ fn validate_nodes(nodes: &[Node], errors: &mut Vec<String>, breadcrumb: &mut Vec
                 }
             }
 
+            Node::Clip { src, .. } => {
+                if src.is_empty() {
+                    errors.push("<clip> has an empty 'src' attribute".to_string());
+                } else if include_src_is_glob(src) {
+                    errors.push(format!(
+                        "Wildcards are not allowed in <clip src=\"{}\"> — point at one file",
+                        src
+                    ));
+                }
+            }
+
+            Node::Zone { name, children } => {
+                // Zone and mark names share one namespace per script: both
+                // are interaction-layer addresses, so a collision between a
+                // zone and a mark is just as ambiguous as a duplicate zone.
+                if boundary_names.iter().any(|n| n == name) {
+                    errors.push(format!(
+                        "Duplicate name '{}' on a <zone>/<mark> — names must be unique within a script",
+                        name
+                    ));
+                } else {
+                    boundary_names.push(name.clone());
+                }
+                breadcrumb.push(format!("<zone name=\"{}\">", name));
+                validate_nodes(children, errors, breadcrumb, boundary_names);
+                breadcrumb.pop();
+            }
+
+            Node::Mark { name } => {
+                if boundary_names.iter().any(|n| n == name) {
+                    errors.push(format!(
+                        "Duplicate name '{}' on a <zone>/<mark> — names must be unique within a script",
+                        name
+                    ));
+                } else {
+                    boundary_names.push(name.clone());
+                }
+            }
+
             Node::Loop { children, .. } => {
                 breadcrumb.push("<loop>".to_string());
-                validate_nodes(children, errors, breadcrumb);
+                validate_nodes(children, errors, breadcrumb, boundary_names);
                 breadcrumb.pop();
             }
 
             Node::Background { children, .. } => {
                 breadcrumb.push("<background>".to_string());
-                validate_nodes(children, errors, breadcrumb);
+                validate_nodes(children, errors, breadcrumb, boundary_names);
                 breadcrumb.pop();
             }
 
-            Node::Section { role, children } => {
-                let name = match role {
-                    SectionRole::Intro => "intro",
-                    SectionRole::Main => "main",
-                    SectionRole::Outro => "outro",
-                };
-                breadcrumb.push(format!("<{}>", name));
-                validate_nodes(children, errors, breadcrumb);
-                breadcrumb.pop();
-            }
-
-            Node::Until {
-                waiting_sound,
-                children,
-                ..
-            } => {
-                if let Some(ws) = waiting_sound {
-                    if !VALID_SOUND_TYPES.contains(&ws.as_str()) {
-                        errors.push(format!(
-                            "Unknown waiting-sound type '{}' in <until>. Valid sound types: {}",
-                            ws,
-                            VALID_SOUND_TYPES.join(", ")
-                        ));
-                    }
-                }
-                breadcrumb.push("<until>".to_string());
-                validate_nodes(children, errors, breadcrumb);
-                breadcrumb.pop();
-            }
-
-            Node::Overlay { parts, .. } => {
-                breadcrumb.push("<overlay>".to_string());
+            Node::Overlay { parts, .. }
+            | Node::Random { parts }
+            | Node::Scramble { parts } => {
                 for part in parts {
-                    // `role` is only meaningful on a `<part>` inside `<react>`.
-                    if part.role.is_some() {
-                        errors.push(
-                            "<part role=\"…\"> is only valid inside <react>".to_string(),
-                        );
-                    }
-                    validate_nodes(&part.children, errors, breadcrumb);
+                    validate_nodes(&part.children, errors, breadcrumb, boundary_names);
                 }
-                breadcrumb.pop();
-            }
-
-            Node::Random { parts } | Node::Scramble { parts } | Node::Choice { options: parts, .. } => {
-                for part in parts {
-                    // `role` is only meaningful on a `<part>` inside `<react>`.
-                    if part.role.is_some() {
-                        errors.push(
-                            "<part role=\"…\"> is only valid inside <react>".to_string(),
-                        );
-                    }
-                    validate_nodes(&part.children, errors, breadcrumb);
-                }
-            }
-
-            Node::React { button: _, parts } => {
-                let mains = parts
-                    .iter()
-                    .filter(|p| p.role.as_deref() == Some("main"))
-                    .count();
-                let fallbacks = parts
-                    .iter()
-                    .filter(|p| p.role.as_deref() == Some("fallback"))
-                    .count();
-                if mains != 1 {
-                    errors.push(
-                        "<react> requires exactly one <part role=\"main\">".to_string(),
-                    );
-                }
-                if fallbacks != 1 {
-                    errors.push(
-                        "<react> requires exactly one <part role=\"fallback\">".to_string(),
-                    );
-                }
-                // Any unrecognized role is also an error.
-                for p in parts {
-                    if let Some(r) = &p.role {
-                        if r != "main" && r != "fallback" {
-                            errors.push(format!(
-                                "<part role=\"{}\"> is not valid in <react> (use \"main\" or \"fallback\")",
-                                r
-                            ));
-                        }
-                    }
-                }
-                breadcrumb.push("<react>".to_string());
-                for part in parts {
-                    validate_nodes(&part.children, errors, breadcrumb);
-                }
-                breadcrumb.pop();
-            }
-
-            Node::Beatmeter {
-                bpm,
-                pattern,
-                sound,
-                children,
-                ..
-            } => {
-                if *bpm <= 0.0 {
-                    errors.push(format!(
-                        "<beatmeter> bpm must be > 0 (got {})",
-                        bpm
-                    ));
-                }
-                // Validate the click sound (default `click`, which is valid).
-                let sound_name = sound.as_deref().unwrap_or("click");
-                if !VALID_SOUND_TYPES.contains(&sound_name) {
-                    errors.push(format!(
-                        "Unknown sound '{}' in <beatmeter sound=\"{}\">. Valid sound types: {}",
-                        sound_name,
-                        sound_name,
-                        VALID_SOUND_TYPES.join(", ")
-                    ));
-                }
-                // Validate the pattern string: only X (accent) / x (normal) / . (rest).
-                if let Some(p) = pattern {
-                    if p.is_empty() {
-                        errors.push(
-                            "<beatmeter> pattern is empty — use at least one of X/x/. (or omit it for every beat)"
-                                .to_string(),
-                        );
-                    } else if let Some(bad) = p.chars().find(|c| !matches!(c, 'X' | 'x' | '.')) {
-                        errors.push(format!(
-                            "Invalid pattern char '{}' in <beatmeter pattern=\"{}\">. Only X (accent), x (normal), . (rest) are allowed",
-                            bad, p
-                        ));
-                    }
-                }
-                breadcrumb.push("<beatmeter>".to_string());
-                validate_nodes(children, errors, breadcrumb);
-                breadcrumb.pop();
-            }
-
-            Node::Rating {
-                min, max, ..
-            } => {
-                if *min > *max {
-                    errors.push(format!(
-                        "<rating> min ({}) must be ≤ max ({})",
-                        min, max
-                    ));
-                }
-            }
-
-            Node::If {
-                cond,
-                then_branch,
-                r#else,
-            } => {
-                if let Err(e) = crate::cond::parse(cond) {
-                    errors.push(format!("<if cond=\"{cond}\">: {e}"));
-                }
-                breadcrumb.push("<if>".to_string());
-                validate_nodes(then_branch, errors, breadcrumb);
-                if let Some(else_nodes) = r#else {
-                    validate_nodes(else_nodes, errors, breadcrumb);
-                }
-                breadcrumb.pop();
-            }
-
-            Node::Visual { config, children } => {
-                // Nesting/containment: a visual inside another visual is
-                // meaningless (one screen), and a visual inside a concurrent
-                // audio layer or an `<until>` (whose body is one baked clip
-                // the visual can't attach to) can't scope. `<effect>` and
-                // `<beatmeter>` ARE allowed — the slideshow rides the baked
-                // clip as segment metadata (see `Segment::Static::visual`).
-                let parent = breadcrumb.iter().rev().find(|b| {
-                    let b = b.as_str();
-                    b == "<visual>" || b == "<until>" || b == "<background>" || b == "<overlay>"
-                });
-                if let Some(parent) = parent {
-                    errors.push(format!(
-                        "<visual> is not allowed inside {parent} — place it in sequence content (top level, inside <voice>/<loop>/<main>, a <choice>/<random>/<react> part, an <effect>, or directly in a <beatmeter>)"
-                    ));
-                }
-                config.validate_into(errors);
-                breadcrumb.push("<visual>".to_string());
-                validate_nodes(children, errors, breadcrumb);
-                breadcrumb.pop();
             }
 
             Node::Pause { .. } => {}
@@ -1633,44 +1038,6 @@ mod tests {
         let nodes = parse("Hello world").unwrap();
         assert_eq!(nodes.len(), 1);
         assert!(matches!(&nodes[0], Node::Text(t) if t == "Hello world"));
-    }
-
-    #[test]
-    fn test_parse_if_tag() {
-        let input =
-            r#"<voice speaker="male">Hi <if cond='streak >= 7'>A<else>B</else></if></voice>"#;
-        let nodes = parse(input).unwrap();
-        let Node::Voice { children, .. } = &nodes[0] else {
-            panic!("expected Voice");
-        };
-        assert!(matches!(&children[0], Node::Text(t) if t == "Hi"));
-        let Node::If {
-            cond,
-            then_branch,
-            r#else,
-        } = &children[1]
-        else {
-            panic!("expected If");
-        };
-        assert_eq!(cond, "streak >= 7");
-        assert!(matches!(&then_branch[0], Node::Text(t) if t == "A"));
-        assert!(matches!(
-            &r#else.as_ref().expect("else branch")[0],
-            Node::Text(t) if t == "B"
-        ));
-        // Semantically valid.
-        validate(&nodes).unwrap();
-    }
-
-    #[test]
-    fn test_parse_if_requires_cond() {
-        assert!(parse("<if>x</if>").is_err());
-        assert!(parse("<else>x</else>").is_err());
-        // Unclosed if.
-        assert!(parse(r#"<if cond="a == 1">x"#).is_err());
-        // A bad condition parses structurally but fails validate.
-        let nodes = parse(r#"<if cond="a >>> 1">x</if>"#).unwrap();
-        assert!(validate(&nodes).is_err());
     }
 
     #[test]
@@ -1699,16 +1066,28 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_sound_tag() {
-        let nodes = parse(r#"<sound type="beep" volume="0.5"/>"#).unwrap();
-        match &nodes[0] {
-            Node::Sound {
-                sound_type, volume, ..
-            } => {
-                assert_eq!(sound_type, "beep");
-                assert_eq!(volume.as_deref(), Some("0.5"));
-            }
-            _ => panic!("Expected Sound node"),
+    fn test_removed_tags_are_unknown() {
+        // The grammar is audio-only: interactive/visual/section/sound tags
+        // no longer parse at all.
+        for gone in [
+            r#"<sound type="beep"/>"#,
+            r#"<until button="go">x</until>"#,
+            r#"<choice><part>a</part></choice>"#,
+            r#"<rating min="1" max="5"/>"#,
+            r#"<react button="b"><part role="main">a</part></react>"#,
+            r#"<if cond="a">x</if>"#,
+            r#"<else>x</else>"#,
+            "<intro>x</intro>",
+            "<main>x</main>",
+            "<outro>x</outro>",
+            r#"<beatmeter bpm="120">x</beatmeter>"#,
+            r#"<visual>x</visual>"#,
+            r#"<caption>x</caption>"#,
+        ] {
+            assert!(
+                parse(gone).is_err(),
+                "removed tag should not parse anymore: {gone}"
+            );
         }
     }
 
@@ -1749,7 +1128,7 @@ mod tests {
 
     #[test]
     fn test_parse_overlay() {
-        let input = r#"<overlay><part><sound type="beep"/></part><part>Hello</part></overlay>"#;
+        let input = r#"<overlay><part><pause duration="1"/></part><part>Hello</part></overlay>"#;
         let nodes = parse(input).unwrap();
         match &nodes[0] {
             Node::Overlay { parts, .. } => {
@@ -1770,7 +1149,7 @@ mod tests {
 
     #[test]
     fn test_parse_background() {
-        let input = r#"<background volume="0.5"><sound type="beep"/></background>"#;
+        let input = r#"<background volume="0.5"><pause duration="1"/></background>"#;
         let nodes = parse(input).unwrap();
         match &nodes[0] {
             Node::Background {
@@ -1780,26 +1159,6 @@ mod tests {
                 assert_eq!(children.len(), 1);
             }
             _ => panic!("Expected Background node"),
-        }
-    }
-
-    #[test]
-    fn test_parse_until() {
-        let input =
-            r#"<until button="I'm ready" waiting-sound="heart_beat">Press the button</until>"#;
-        let nodes = parse(input).unwrap();
-        match &nodes[0] {
-            Node::Until {
-                button,
-                waiting_sound,
-                children,
-                ..
-            } => {
-                assert_eq!(button, "I'm ready");
-                assert_eq!(*waiting_sound, Some("heart_beat".to_string()));
-                assert_eq!(children.len(), 1);
-            }
-            _ => panic!("Expected Until node"),
         }
     }
 
@@ -1849,11 +1208,8 @@ mod tests {
         let input = r#"<voice speaker="male" volume="0.8">
             <tone type="noise" preset="pinknoise" volume="0.15"/>
             Welcome to the exercise.
-            <until button="I'm ready" waiting-sound="heart_beat">
-                Press the Button.
-            </until>
             Now take a deep breath
-            <background><sound type="swoosh" volume="0.4"/></background>
+            <background><pause duration="1"/></background>
             and let it go slowly.
         </voice>"#;
         let result = parse(input);
@@ -1889,74 +1245,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_comprehensive_example() {
-        let input = r#"<voice speaker="male" pitch="1.1" volume="@fadein(2)" speed="1.0">
-  <tone type="binaural" preset="theta" volume="0.15"/>
-
-  Welcome to the comprehensive TTS demonstration.
-  <pause duration="0.5"/>
-  <sound type="ding" volume="0.8"/>
-
-  <speed value="0.9">
-    <volume value="@fade(1)">
-      This part is slightly slower and fades in and out.
-    </volume>
-  </speed>
-
-  <overlay>
-    <part looped="true" volume="0.4"><sound type="water_drop"/></part>
-    <part>And here is an overlay with a looping sound under speech.</part>
-  </overlay>
-
-  <effect type="reverb" preset="large_hall">
-    <voice speaker="female" volume="0.9">
-      This voice has reverb applied.
-    </voice>
-  </effect>
-
-  <effect type="filter" preset="lowpass" cutoff="800">
-    <voice speaker="female2">
-      And this voice is filtered.
-    </voice>
-  </effect>
-
-  <loop loops="2">
-    <voice speaker="male2" speed="1.2" volume="@ramp(0.5,1.0)">
-      Repeated phrase.
-    </voice>
-    <pause duration="0.3"/>
-  </loop>
-
-  <background volume="@env(0.2,0.3,0.5,0.2)"><sound type="swoosh" volume="0.5"/></background>
-  Now take a deep breath and let it go.
-  <pause duration="0.5"/>
-
-  <voice speaker="female" volume="@min(1.0, @max(0.3, @beat(60, 0.5)))">
-    This voice pulses with a beat at sixty B P M.
-  </voice>
-
-  <voice speaker="male" volume="@sin(2) * 0.5 + 0.5">
-    This voice oscillates with a sine wave.
-  </voice>
-
-  <until button="I'm ready"
-         waiting-sound="heart_beat"
-         waiting-sound-volume="0.4"
-         pre-pause="0.5"
-         post-pause="0.3">
-    Press the button when you are ready.
-  </until>
-
-  <sound type="success"/>
-  <voice speaker="female" volume="@fadeout(1)">
-    Thank you for exploring every feature. Goodbye.
-  </voice>
-</voice>"#;
-        let result = parse(input);
-        assert!(result.is_ok(), "Failed to parse: {:?}", result.err());
-    }
-
-    #[test]
     fn test_parse_include_tag() {
         let nodes = parse(r#"<include src="foo.xml"/>"#).unwrap();
         assert_eq!(nodes.len(), 1);
@@ -1986,6 +1274,108 @@ mod tests {
             "Non-self-closing <include> should error; got {:?}",
             result,
         );
+    }
+
+    #[test]
+    fn test_parse_clip_tag() {
+        let nodes = parse(r#"<clip src="sfx/click.wav" volume="0.4" speed="1.2"/>"#).unwrap();
+        match &nodes[0] {
+            Node::Clip { src, volume, speed } => {
+                assert_eq!(src, "sfx/click.wav");
+                assert_eq!(volume.as_deref(), Some("0.4"));
+                assert_eq!(speed.as_deref(), Some("1.2"));
+            }
+            _ => panic!("Expected Clip node"),
+        }
+        validate(&nodes).unwrap();
+    }
+
+    #[test]
+    fn test_parse_clip_requires_src() {
+        assert!(parse("<clip/>").is_err());
+        let err = parse(r#"<clip src="  "/>"#).unwrap_err().to_string();
+        assert!(err.contains("src"), "unexpected error: {err}");
+        // Not self-closing is a structural error too.
+        assert!(parse(r#"<clip src="a.wav"></clip>"#).is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_clip_glob() {
+        let nodes = parse(r#"<clip src="sfx/*.wav"/>"#).unwrap();
+        let err = validate(&nodes).unwrap_err().to_string();
+        assert!(err.contains("Wildcards"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_parse_zone() {
+        let nodes = parse(r#"<zone name="warmup"><voice speaker="male">Breathe.</voice></zone>"#)
+            .unwrap();
+        match &nodes[0] {
+            Node::Zone { name, children } => {
+                assert_eq!(name, "warmup");
+                assert_eq!(children.len(), 1);
+                assert!(matches!(&children[0], Node::Voice { .. }));
+            }
+            _ => panic!("Expected Zone node"),
+        }
+        validate(&nodes).unwrap();
+        // Zone text is spoken (audio-transparent wrapper).
+        assert_eq!(extract_text(&nodes), "Breathe.");
+    }
+
+    #[test]
+    fn test_parse_zone_requires_name_and_children() {
+        assert!(parse("<zone>x</zone>").is_err(), "missing name");
+        let err = parse(r#"<zone name="  ">x</zone>"#).unwrap_err().to_string();
+        assert!(err.contains("name"), "unexpected error: {err}");
+        assert!(parse(r#"<zone name="a"/>"#).is_err(), "self-closing zone");
+    }
+
+    #[test]
+    fn test_parse_mark() {
+        let nodes = parse(r#"Before <mark name="halfway"/> After"#).unwrap();
+        assert_eq!(nodes.len(), 3);
+        assert!(matches!(&nodes[1], Node::Mark { name } if name == "halfway"));
+        // A mark contributes no text.
+        assert_eq!(extract_text(&nodes), "Before After");
+        validate(&nodes).unwrap();
+    }
+
+    #[test]
+    fn test_parse_mark_requires_name() {
+        assert!(parse("<mark/>").is_err(), "missing name");
+        let err = parse(r#"<mark name=""/>"#).unwrap_err().to_string();
+        assert!(err.contains("name"), "unexpected error: {err}");
+        assert!(parse(r#"<mark name="a"></mark>"#).is_err(), "not self-closing");
+    }
+
+    #[test]
+    fn test_validate_rejects_duplicate_boundary_names() {
+        // zone + zone
+        let nodes = parse(
+            r#"<zone name="a">x</zone><zone name="a">y</zone>"#,
+        )
+        .unwrap();
+        let err = validate(&nodes).unwrap_err().to_string();
+        assert!(err.contains("Duplicate name"), "unexpected error: {err}");
+
+        // mark + mark
+        let nodes = parse(r#"<mark name="m"/><mark name="m"/>"#).unwrap();
+        assert!(validate(&nodes).is_err());
+
+        // zone + mark collide (one namespace)
+        let nodes = parse(r#"<zone name="z">x</zone><mark name="z"/>"#).unwrap();
+        let err = validate(&nodes).unwrap_err().to_string();
+        assert!(err.contains("Duplicate name"), "unexpected error: {err}");
+
+        // Nested duplicates count too.
+        let nodes = parse(r#"<zone name="outer"><mark name="outer"/></zone>"#).unwrap();
+        assert!(validate(&nodes).is_err());
+
+        // Distinct names are fine, including across nesting.
+        let nodes =
+            parse(r#"<zone name="outer"><mark name="inner"/></zone><mark name="after"/>"#).unwrap();
+        validate(&nodes).unwrap();
     }
 
     #[test]
@@ -2035,7 +1425,6 @@ mod tests {
                 assert_eq!(parts.len(), 2);
                 assert_eq!(parts[0].children.len(), 1);
                 assert_eq!(parts[1].children.len(), 1);
-                assert!(parts.iter().all(|p| p.label.is_none()));
             }
             _ => panic!("Expected Random node"),
         }
@@ -2061,31 +1450,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_choice() {
-        let input = r#"<choice prompt="Which path?">
-  <part label="Left">You drift to the left, sinking deeper.</part>
-  <part label="Right">You float to the right, letting go.</part>
-</choice>"#;
-        let nodes = parse(input).unwrap();
-        match &nodes[0] {
-            Node::Choice { prompt, options } => {
-                assert_eq!(prompt.as_deref(), Some("Which path?"));
-                assert_eq!(options.len(), 2);
-                assert_eq!(options[0].label.as_deref(), Some("Left"));
-                assert_eq!(options[1].label.as_deref(), Some("Right"));
-                assert_eq!(options[0].children.len(), 1);
-                assert_eq!(options[1].children.len(), 1);
-            }
-            _ => panic!("Expected Choice node"),
-        }
-    }
-
-    #[test]
     fn test_parse_random_implicit_part() {
         let input = r#"<random>
   Bare text here
   <part>Explicit part</part>
-  <sound type="beep"/>
+  <pause duration="1"/>
 </random>"#;
         let nodes = parse(input).unwrap();
         match &nodes[0] {
@@ -2094,191 +1463,10 @@ mod tests {
                 assert_eq!(parts.len(), 3);
                 assert_eq!(parts[0].children.len(), 1);
                 assert_eq!(parts[1].children.len(), 1);
-                assert!(matches!(parts[2].children[0], Node::Sound { .. }));
+                assert!(matches!(&parts[2].children[0], Node::Pause { .. }));
             }
             _ => panic!("Expected Random node"),
         }
-    }
-
-    #[test]
-    fn test_parse_sections() {
-        let input = r#"<intro>Welcome</intro><main><loop loops="3">Breathe</loop></main><outro>Goodbye</outro>"#;
-        let nodes = parse(input).unwrap();
-        assert_eq!(nodes.len(), 3);
-        assert!(matches!(
-            &nodes[0],
-            Node::Section { role: SectionRole::Intro, .. }
-        ));
-        assert!(matches!(
-            &nodes[1],
-            Node::Section { role: SectionRole::Main, .. }
-        ));
-        assert!(matches!(
-            &nodes[2],
-            Node::Section { role: SectionRole::Outro, .. }
-        ));
-        if let Node::Section { children, .. } = &nodes[1] {
-            assert_eq!(children.len(), 1);
-            assert!(matches!(children[0], Node::Loop { loops: 3, .. }));
-        }
-    }
-
-    #[test]
-    fn test_parse_section_requires_children() {
-        let result = parse("<main/>");
-        assert!(result.is_err(), "self-closing <main/> should error");
-        let result = parse("<intro></intro>");
-        // Empty (whitespace-only) children parse to zero nodes, which is valid
-        // structurally — the section just has no content.
-        assert!(result.is_ok(), "empty section should parse: {:?}", result.err());
-    }
-
-    #[test]
-    fn test_parse_section_nested() {
-        let input = r#"<main><voice speaker="female"><until button="Go">Press</until></voice></main>"#;
-        let nodes = parse(input).unwrap();
-        match &nodes[0] {
-            Node::Section {
-                role: SectionRole::Main,
-                children,
-            } => {
-                assert_eq!(children.len(), 1);
-                assert!(matches!(children[0], Node::Voice { .. }));
-            }
-            _ => panic!("Expected Section node"),
-        }
-    }
-
-    #[test]
-    fn test_section_role_from_tag() {
-        assert_eq!(SectionRole::from_tag("intro"), Some(SectionRole::Intro));
-        assert_eq!(SectionRole::from_tag("main"), Some(SectionRole::Main));
-        assert_eq!(SectionRole::from_tag("outro"), Some(SectionRole::Outro));
-        assert_eq!(SectionRole::from_tag("verse"), None);
-    }
-
-    #[test]
-    fn test_parse_visual() {
-        let input = r#"<visual source="redgifs" tags="hypno, Joi" block="feet"
-                             query="edging" every="4..8" count="10"
-                             captions="meta" effect="zoom,vignette">
-          <caption>Sink deeper.</caption>
-          <voice speaker="female">Watch the screen.</voice>
-        </visual>"#;
-        let nodes = parse(input).unwrap();
-        let Node::Visual { config, children } = &nodes[0] else {
-            panic!("expected Visual");
-        };
-        assert_eq!(config.source, "redgifs");
-        assert_eq!(config.tags, vec!["hypno", "joi"]);
-        assert_eq!(config.block, vec!["feet"]);
-        assert_eq!(config.query.as_deref(), Some("edging"));
-        assert_eq!(config.every_min, 4.0);
-        assert_eq!(config.every_max, 8.0);
-        assert_eq!(config.count, 10);
-        assert_eq!(config.captions, "meta");
-        assert_eq!(config.effects, vec!["zoom", "vignette"]);
-        assert_eq!(config.lines, vec!["Sink deeper."]);
-        // The caption is pulled out; the voice is the only audio child.
-        assert_eq!(children.len(), 1);
-        assert!(matches!(&children[0], Node::Voice { .. }));
-        // Caption text must not be spoken.
-        assert_eq!(extract_text(&nodes), "Watch the screen.");
-        validate(&nodes).unwrap();
-    }
-
-    #[test]
-    fn test_parse_visual_defaults() {
-        let nodes = parse(r#"<visual>hello</visual>"#).unwrap();
-        match &nodes[0] {
-            Node::Visual { config, children } => {
-                assert_eq!(config.source, "redgifs");
-                assert!(config.tags.is_empty());
-                assert_eq!(config.every_min, visual::DEFAULT_EVERY_MIN);
-                assert_eq!(config.every_max, visual::DEFAULT_EVERY_MAX);
-                assert_eq!(config.count, visual::DEFAULT_COUNT);
-                assert_eq!(config.captions, "off");
-                assert_eq!(children.len(), 1);
-            }
-            _ => panic!("expected Visual"),
-        }
-    }
-
-    #[test]
-    fn test_parse_visual_bpm_folds_into_every() {
-        let nodes = parse(r#"<visual bpm="30"><pause duration="2"/></visual>"#).unwrap();
-        match &nodes[0] {
-            Node::Visual { config, .. } => {
-                // 60/30 bpm = one slide every 2 seconds.
-                assert_eq!(config.every_min, 2.0);
-                assert_eq!(config.every_max, 2.0);
-            }
-            _ => panic!("expected Visual"),
-        }
-        validate(&nodes).unwrap();
-    }
-
-    #[test]
-    fn test_parse_visual_rejects() {
-        // every + bpm are mutually exclusive.
-        assert!(parse(r#"<visual every="4" bpm="30">x</visual>"#).is_err());
-        // Self-closing (no content to show anything over).
-        assert!(parse(r#"<visual/>"#).is_err());
-        // Bad interval specs are parse errors.
-        assert!(parse(r#"<visual every="8..4">x</visual>"#).is_err());
-        assert!(parse(r#"<visual every="abc">x</visual>"#).is_err());
-        // Unknown values parse structurally but fail validate.
-        let nodes = parse(r#"<visual source="vimeo">x</visual>"#).unwrap();
-        assert!(validate(&nodes).is_err());
-        let nodes = parse(r#"<visual effect="laser">x</visual>"#).unwrap();
-        assert!(validate(&nodes).is_err());
-        let nodes = parse(r#"<visual captions="always">x</visual>"#).unwrap();
-        assert!(validate(&nodes).is_err());
-        let nodes = parse(r#"<visual count="99">x</visual>"#).unwrap();
-        assert!(validate(&nodes).is_err());
-        // Nested visuals are rejected.
-        let nodes = parse(r#"<visual><visual>x</visual></visual>"#).unwrap();
-        assert!(validate(&nodes).is_err());
-        // Forbidden parents.
-        let nodes = parse(r#"<background><visual>x</visual></background>"#).unwrap();
-        assert!(validate(&nodes).is_err());
-        let nodes = parse(r#"<until><visual>x</visual></until>"#).unwrap();
-        assert!(validate(&nodes).is_err());
-        // Overlay parts are rejected…
-        let nodes = parse(r#"<overlay><part><visual>x</visual></part></overlay>"#).unwrap();
-        assert!(validate(&nodes).is_err());
-        // …but <effect> and <beatmeter> host a baked-in visual now.
-        let nodes = parse(r#"<effect type="echo"><visual>x</visual></effect>"#).unwrap();
-        validate(&nodes).unwrap();
-        let nodes = parse(r#"<beatmeter bpm="120"><visual><pause duration="4"/></visual>Match this</beatmeter>"#).unwrap();
-        validate(&nodes).unwrap();
-        // A visual whose own content is interactive is still too dynamic for
-        // a beat schedule, and a voice-wrapped visual is not a direct child.
-        let nodes = parse(r#"<beatmeter><visual><until button="b">x</until></visual></beatmeter>"#).unwrap();
-        assert!(validate(&nodes).is_ok(), "validate allows it; the RENDER rejects the interactive content");
-        // <caption> is only consumed inside <visual>.
-        assert!(parse(r#"<caption>x</caption>"#).is_err());
-    }
-
-    #[test]
-    fn test_parse_visual_niche() {
-        let nodes =
-            parse(r#"<visual niche="Just Boobs, tik-tok" tags="gooning">x</visual>"#).unwrap();
-        match &nodes[0] {
-            Node::Visual { config, .. } => {
-                // Display names fold onto hyphenated ids ("Just Boobs" →
-                // `just-boobs`).
-                assert_eq!(config.niches, vec!["just-boobs", "tik-tok"]);
-                assert_eq!(config.tags, vec!["gooning"]);
-            }
-            _ => panic!("expected Visual"),
-        }
-        validate(&nodes).unwrap();
-        // Unknown order values are a validation error (server 400s on them).
-        let nodes = parse(r#"<visual order="recent">x</visual>"#).unwrap();
-        assert!(validate(&nodes).is_err());
-        let nodes = parse(r#"<visual order="top7">x</visual>"#).unwrap();
-        validate(&nodes).unwrap();
     }
 
     #[test]

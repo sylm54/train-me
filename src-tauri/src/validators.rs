@@ -632,33 +632,20 @@ fn collect_include_srcs(nodes: &[crate::tag_parser::Node]) -> Vec<String> {
                 | Node::Volume { children, .. }
                 | Node::Effect { children, .. }
                 | Node::Background { children, .. }
-                | Node::Until { children, .. }
                 | Node::Loop { children, .. }
-                | Node::Section { children, .. }
-                | Node::Beatmeter { children, .. }
-                | Node::Visual { children, .. } => rec(children, out),
-                Node::If {
-                    then_branch, r#else, ..
-                } => {
-                    rec(then_branch, out);
-                    if let Some(else_nodes) = r#else {
-                        rec(else_nodes, out);
-                    }
-                }
+                | Node::Zone { children, .. } => rec(children, out),
                 Node::Overlay { parts, .. }
                 | Node::Random { parts }
-                | Node::Scramble { parts }
-                | Node::Choice { options: parts, .. }
-                | Node::React { parts, .. } => {
+                | Node::Scramble { parts } => {
                     for part in parts {
                         rec(&part.children, out);
                     }
                 }
                 Node::Text(_)
                 | Node::Pause { .. }
-                | Node::Sound { .. }
                 | Node::Tone { .. }
-                | Node::Rating { .. } => {}
+                | Node::Clip { .. }
+                | Node::Mark { .. } => {}
             }
         }
     }

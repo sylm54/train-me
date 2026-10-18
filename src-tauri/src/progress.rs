@@ -11,10 +11,10 @@
 //!
 //! Progress is measured in abstract **cost units**, not leaf nodes: TTS
 //! synthesis time scales with the number of words in a `Text` leaf, while a
-//! `Sound`/`Pause`/`Tone` leaf is a near-instant sample paste or buffer op.
+//! `Clip`/`Pause`/`Tone` leaf is a near-instant sample paste or buffer op.
 //! A leaf therefore costs its word count (`Text`) or a small constant
 //! (`PASTE_COST`). This keeps the bar's motion proportional to actual work —
-//! a script of mostly sound-effect ticks no longer reads as "fast" progress
+//! a script of mostly clip-effect ticks no longer reads as "fast" progress
 //! followed by a long frozen tail, and rate-based time estimates extrapolate
 //! correctly (the rate is dominated by words/sec, and the remaining work is
 //! mostly words).
@@ -28,8 +28,9 @@ use crate::tag_parser::Node;
 // Cost model
 // ============================================================================
 
-/// Cost of a leaf that only pastes/mixes pre-existing audio (sound effect,
-/// silence pause, generated tone): effectively instant next to a TTS call.
+/// Cost of a leaf that only pastes/mixes pre-existing audio (a `<clip>`
+/// paste, silence pause, generated tone): effectively instant next to a TTS
+/// call.
 pub const PASTE_COST: u64 = 1;
 
 /// Number of whitespace-separated words in `text`.
@@ -47,15 +48,13 @@ pub fn text_cost(text: &str) -> u64 {
 /// for constructs whose parts are NOT all synthesized:
 ///
 /// - `<loop>`: the manifest walker bakes a loop over non-split content
-///   `loops` times, but a loop WRAPPING a split (interactive descendant) is
-///   synthesized once and repeated only at playback. The flat renderer
-///   always repeats. Counting `loops ×` for the walker's wrapped case made
-///   the pre-counted total unreachable — the bar stalled at `100/loops %`.
+///   `loops` times, but a loop WRAPPING a split is synthesized once and
+///   repeated only at playback. The flat renderer always repeats. Counting
+///   `loops ×` for the walker's wrapped case made the pre-counted total
+///   unreachable — the bar stalled at `100/loops %`.
 /// - `<random>`: the flat renderer synthesizes one (randomly chosen) part —
 ///   costed as the average of the parts; the walker synthesizes every part
 ///   (the player picks per playback) — costed as the sum.
-/// - `<choice>`/`<react>`: flat renders the first/`main` part; the walker
-///   renders all of them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CountMode {
     /// Mirror the manifest walker (`AudioRenderer::render_manifest`).
@@ -66,9 +65,10 @@ pub enum CountMode {
 
 /// Total cost of the leaves an AST render will synthesize, under `mode`'s
 /// semantics. Empty `Text` costs nothing (both render paths skip it).
-/// `Include` contributes 0 — the file-level pre-count
+/// `Include`/`Mark` contribute 0 — the file-level pre-count
 /// (`audio_renderer::count_render_cost`) resolves includes itself, skipping
-/// fresh manifests exactly as the walker will.
+/// fresh manifests exactly as the walker will, and a `<mark>` produces no
+/// audio at all.
 pub fn ast_cost(nodes: &[Node], mode: CountMode) -> u64 {
     let mut total = 0;
     for node in nodes {
@@ -76,7 +76,7 @@ pub fn ast_cost(nodes: &[Node], mode: CountMode) -> u64 {
             Node::Text(t) if !t.is_empty() => total += text_cost(t),
             Node::Text(_) => {}
 
-            Node::Pause { .. } | Node::Sound { .. } | Node::Tone { .. } => {
+            Node::Pause { .. } | Node::Clip { .. } | Node::Tone { .. } => {
                 total += PASTE_COST;
             }
 
@@ -85,9 +85,7 @@ pub fn ast_cost(nodes: &[Node], mode: CountMode) -> u64 {
             | Node::Volume { children, .. }
             | Node::Effect { children, .. }
             | Node::Background { children, .. }
-            | Node::Section { children, .. }
-            | Node::Beatmeter { children, .. }
-            | Node::Visual { children, .. } => total += ast_cost(children, mode),
+            | Node::Zone { children, .. } => total += ast_cost(children, mode),
 
             // Non-split loops bake `loops` copies; loops around a split are
             // synthesized once (Walker). Flat always repeats. (See mode docs.)
@@ -138,61 +136,7 @@ pub fn ast_cost(nodes: &[Node], mode: CountMode) -> u64 {
                 }
             }
 
-            // Walker: every option renders. Flat: the first option only.
-            Node::Choice { options, .. } => match mode {
-                CountMode::Walker => {
-                    for part in options {
-                        total += ast_cost(&part.children, mode);
-                    }
-                }
-                CountMode::Flat => {
-                    if let Some(first) = options.first() {
-                        total += ast_cost(&first.children, mode);
-                    }
-                }
-            },
-
-            // Walker: main + fallback both render. Flat: main only.
-            Node::React { parts, .. } => match mode {
-                CountMode::Walker => {
-                    for part in parts {
-                        total += ast_cost(&part.children, mode);
-                    }
-                }
-                CountMode::Flat => {
-                    if let Some(main) = parts.iter().find(|p| p.role.as_deref() == Some("main")) {
-                        total += ast_cost(&main.children, mode);
-                    }
-                }
-            },
-
-            // Both branches are always synthesized (the player picks one per
-            // playback).
-            Node::If {
-                then_branch,
-                r#else,
-                ..
-            } => {
-                total += ast_cost(then_branch, mode);
-                if let Some(else_nodes) = r#else {
-                    total += ast_cost(else_nodes, mode);
-                }
-            }
-
-            // `<until>` renders its children once; the waiting sound is one
-            // more paste (the walker emits it as its own leaf tick).
-            Node::Until {
-                waiting_sound,
-                children,
-                ..
-            } => {
-                total += ast_cost(children, mode);
-                if waiting_sound.is_some() {
-                    total += PASTE_COST;
-                }
-            }
-
-            Node::Include { .. } | Node::Rating { .. } => {}
+            Node::Include { .. } | Node::Mark { .. } => {}
         }
     }
     total
@@ -466,7 +410,6 @@ impl ProgressTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tag_parser::SectionRole;
 
     fn parse(src: &str) -> Vec<Node> {
         crate::tag_parser::parse(src).expect("parse")
@@ -493,7 +436,7 @@ mod tests {
 
     #[test]
     fn ast_cost_counts_words_for_text_and_paste_cost_for_clips() {
-        let nodes = parse("one two three <pause duration=\"1\"/><sound type=\"pop\"/>");
+        let nodes = parse("one two three <pause duration=\"1\"/><clip src=\"a.wav\"/>");
         assert_eq!(ast_cost(&nodes, CountMode::Walker), 3 + PASTE_COST * 2);
     }
 
@@ -533,27 +476,6 @@ mod tests {
     }
 
     #[test]
-    fn choice_first_option_on_flat_all_on_walker() {
-        let src = "<choice><part label=\"a\">one</part><part label=\"b\">a b c</part></choice>";
-        let nodes = parse(src);
-        assert_eq!(ast_cost(&nodes, CountMode::Walker), 1 + 3);
-        assert_eq!(ast_cost(&nodes, CountMode::Flat), 1);
-    }
-
-    #[test]
-    fn react_main_only_on_flat() {
-        let src = concat!(
-            "<react button=\"x\">",
-            "<part role=\"main\">one</part>",
-            "<part role=\"fallback\">a b c</part>",
-            "</react>"
-        );
-        let nodes = parse(src);
-        assert_eq!(ast_cost(&nodes, CountMode::Walker), 1 + 3);
-        assert_eq!(ast_cost(&nodes, CountMode::Flat), 1);
-    }
-
-    #[test]
     fn scramble_sums_on_both_paths() {
         let nodes = parse("<scramble><part>one</part><part>a b c</part></scramble>");
         assert_eq!(ast_cost(&nodes, CountMode::Walker), 1 + 3);
@@ -561,33 +483,9 @@ mod tests {
     }
 
     #[test]
-    fn if_sums_both_branches() {
-        let nodes = vec![Node::If {
-            cond: "true".into(),
-            then_branch: parse("one"),
-            r#else: Some(parse("a b")),
-        }];
-        assert_eq!(ast_cost(&nodes, CountMode::Walker), 1 + 2);
-        assert_eq!(ast_cost(&nodes, CountMode::Flat), 1 + 2);
-    }
-
-    #[test]
-    fn until_counts_children_plus_waiting_sound() {
-        let nodes = vec![Node::Until {
-            button: "go".into(),
-            waiting_sound: Some("pop".into()),
-            waiting_sound_volume: None,
-            pre_pause: None,
-            post_pause: None,
-            children: parse("<pause duration=\"1\"/>"),
-        }];
-        assert_eq!(ast_cost(&nodes, CountMode::Walker), PASTE_COST + PASTE_COST);
-    }
-
-    #[test]
-    fn containers_recurse_and_rating_include_cost_nothing() {
+    fn containers_recurse_and_mark_include_cost_nothing() {
         let nodes = parse(
-            "<voice speaker=\"a\">one two</voice><rating min=\"1\" max=\"5\"/><include src=\"x.xml\"/>",
+            "<voice speaker=\"a\">one two</voice><mark name=\"mid\"/><include src=\"x.xml\"/>",
         );
         assert_eq!(ast_cost(&nodes, CountMode::Walker), 2);
     }
@@ -601,34 +499,11 @@ mod tests {
     }
 
     #[test]
-    fn visual_is_transparent_to_cost() {
-        let nodes = vec![Node::Visual {
-            config: crate::visual::VisualConfig {
-                source: "redgifs".into(),
-                niches: vec![],
-                tags: vec![],
-                block: vec![],
-                query: None,
-                order: None,
-                every_min: 3.0,
-                every_max: 6.0,
-                count: 10,
-                captions: "off".into(),
-                effects: vec![],
-                lines: vec![],
-            },
-            children: parse("one two"),
-        }];
+    fn zone_is_transparent_to_cost() {
+        // A zone wraps its children; a mark is zero-length — neither adds
+        // audio of its own.
+        let nodes = parse("<zone name=\"a\">one two</zone><mark name=\"m\"/>");
         assert_eq!(ast_cost(&nodes, CountMode::Walker), 2);
-    }
-
-    #[test]
-    fn section_recurses() {
-        let nodes = vec![Node::Section {
-            role: SectionRole::Main,
-            children: parse("one two three"),
-        }];
-        assert_eq!(ast_cost(&nodes, CountMode::Walker), 3);
     }
 
     // ── Ledger ─────────────────────────────────────────────────────────────
@@ -845,7 +720,7 @@ mod tests {
         tracker.ledger.seed(10);
         tracker.emit_leaf(7, "seven words");
         tracker.emit_phase("Parsing script…"); // relabels, no advance
-        tracker.emit_leaf(1, "Sound: pop");
+        tracker.emit_leaf(1, "Clip: pop.wav");
         tracker.emit_leaf(5, "over the count"); // 13 > 10 → clamp
 
         tracker.finish("Done");

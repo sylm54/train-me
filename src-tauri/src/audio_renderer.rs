@@ -1,7 +1,7 @@
 //! Audio renderer for the TTS tag AST.
 //!
 //! Walks the parsed AST and renders each node to audio samples.
-//! Supports TTS synthesis, sound effects, tones, pauses, effects, and mixing.
+//! Supports TTS synthesis, tones, pauses, effects, sandbox clips, and mixing.
 //! Expression-based volume envelopes are evaluated per-sample and baked into the waveform.
 
 use anyhow::{bail, Context, Result};
@@ -12,15 +12,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::expression::{self, Expr};
 use crate::helper::{load_text_to_speech, load_voice_style, write_wav_file, Style, TextToSpeech};
-use crate::manifest::{
-    self, nominal_duration, relative_path, BeatMark, BeatmeterMeta, ChoiceOption, Manifest,
-    OverlayPartSegment, Segment, WalkCtx,
-};
+use crate::manifest::{self, nominal_duration, relative_path, Manifest, OverlayPartSegment, Segment, WalkCtx};
 use crate::model_downloader;
 use crate::progress;
-use crate::sounds::SoundType;
 use crate::tag_parser::{self, include_src_is_glob, split_glob_src, wildcard_match, Node, OverlayPart};
-use crate::visual::VisualConfig;
 use crate::RenderedManifest;
 
 use rand::seq::SliceRandom;
@@ -142,6 +137,13 @@ pub struct AudioRenderer {
     /// each style lazily on first use, then serves it from memory. `Arc` so a
     /// future `&self` call path can return a cheap clone.
     styles: HashMap<String, Arc<Style>>,
+    /// Bases a `<clip src>` resolves against (script dir first, then agent
+    /// dir — same order as `<include>` targets). Set per rendered file by the
+    /// manifest walker (`render_manifest_file`) and by the flat-path caller
+    /// (`set_clip_resolution`). Renders are sequential per renderer instance,
+    /// so plain fields are safe.
+    clip_script_dir: PathBuf,
+    clip_agent_dir: PathBuf,
 }
 
 impl AudioRenderer {
@@ -156,7 +158,20 @@ impl AudioRenderer {
             model_dir: model_dir.to_path_buf(),
             sample_rate,
             styles: HashMap::new(),
+            clip_script_dir: PathBuf::new(),
+            clip_agent_dir: PathBuf::new(),
         })
+    }
+
+    /// Set the bases `<clip src>` paths resolve against (flat-path callers:
+    /// pass the agent dir as both arguments — there is no script file). Must
+    /// be called before `render_to_file`/`render_to_file_with_progress` on
+    /// markup that contains `<clip>` tags, otherwise clips resolve against
+    /// the empty path and fail with "Clip not found". The manifest walker
+    /// sets this itself per file.
+    pub fn set_clip_resolution(&mut self, script_dir: &Path, agent_dir: &Path) {
+        self.clip_script_dir = script_dir.to_path_buf();
+        self.clip_agent_dir = agent_dir.to_path_buf();
     }
 
     /// Render a full AST to a WAV file.
@@ -263,13 +278,11 @@ impl AudioRenderer {
                     _total_duration += *duration;
                 }
 
-                Node::Sound {
-                    sound_type,
-                    volume,
-                    speed: _,
-                } => {
-                    let sound_vol = resolve_scalar(volume.as_deref(), 1.0);
-                    let (samples, dur) = self.render_sound(sound_type, sound_vol * volume_scale)?;
+                Node::Clip { src, volume, speed } => {
+                    let clip_vol = resolve_scalar(volume.as_deref(), 1.0);
+                    let clip_speed = resolve_scalar(speed.as_deref(), 1.0).clamp(0.5, 1.5);
+                    let (samples, dur) =
+                        self.render_clip(src, clip_vol * volume_scale, clip_speed)?;
                     foreground.extend_from_slice(&samples);
                     _total_duration += dur;
                 }
@@ -438,24 +451,6 @@ impl AudioRenderer {
                     }
                 }
 
-                Node::Choice { prompt: _, options } => {
-                    // Flat-path fallback: render the first option only.
-                    if let Some(part) = options.first() {
-                        let part_vol = (volume_scale * resolve_scalar(part.volume.as_deref(), 1.0))
-                            .clamp(0.0, 1.5);
-                        let part_speed = speed_scale
-                            * resolve_scalar(part.speed.as_deref(), 1.0).clamp(0.5, 1.5);
-                        let (samples, dur) = self.render_nodes(
-                            &part.children,
-                            default_speaker,
-                            part_vol,
-                            part_speed,
-                        )?;
-                        foreground.extend_from_slice(&samples);
-                        _total_duration += dur;
-                    }
-                }
-
                 Node::Loop { loops, children } => {
                     for _ in 0..*loops {
                         let (samples, dur) = self.render_nodes(
@@ -469,103 +464,21 @@ impl AudioRenderer {
                     }
                 }
 
-                Node::Until {
-                    button: _,
-                    waiting_sound,
-                    waiting_sound_volume,
-                    pre_pause,
-                    post_pause,
-                    children,
-                } => {
-                    // Pre-pause
-                    if let Some(pp) = pre_pause {
-                        let num_samples = (*pp * self.sample_rate as f32) as usize;
-                        foreground.extend(std::iter::repeat(0.0f32).take(num_samples));
-                        _total_duration += *pp;
-                    }
-
-                    // Render inner content once (pre-rendered mode)
+                // Boundaries are transparent to the flat path: a zone's
+                // children render inline and a mark contributes no audio.
+                // (The manifest walker splits on them instead.)
+                Node::Zone { children, .. } => {
                     let (samples, dur) =
                         self.render_nodes(children, default_speaker, volume_scale, speed_scale)?;
                     foreground.extend_from_slice(&samples);
                     _total_duration += dur;
-
-                    // Optional waiting sound (render once as background layer)
-                    if let Some(ws) = waiting_sound {
-                        let ws_vol = waiting_sound_volume.unwrap_or(0.5) * volume_scale;
-                        let (ws_samples, _) = self.render_sound(ws, ws_vol)?;
-                        let mut aligned = vec![0.0f32; foreground.len()];
-                        aligned.extend_from_slice(&ws_samples);
-                        bg_layers.push(BgLayer::background(aligned));
-                    }
-
-                    // Post-pause
-                    if let Some(pp) = post_pause {
-                        let num_samples = (*pp * self.sample_rate as f32) as usize;
-                        foreground.extend(std::iter::repeat(0.0f32).take(num_samples));
-                        _total_duration += *pp;
-                    }
                 }
+
+                Node::Mark { .. } => {}
 
                 Node::Include { .. } => {
                     // Includes should have been resolved by `resolve_includes`
                     // before reaching the renderer. Silently ignore if not.
-                }
-
-                Node::Section { children, .. } => {
-                    // Sections are structural: render their children inline with
-                    // the inherited context (transparent to flat synthesis).
-                    let (samples, dur) =
-                        self.render_nodes(children, default_speaker, volume_scale, speed_scale)?;
-                    foreground.extend_from_slice(&samples);
-                    _total_duration += dur;
-                }
-
-                Node::Beatmeter { children, .. } => {
-                    // Flat path: the metronome is a runtime concern (clicks are
-                    // triggered by Web Audio at playback). Render the wrapped
-                    // content inline, exactly as if the wrapper were absent.
-                    let (samples, dur) =
-                        self.render_nodes(children, default_speaker, volume_scale, speed_scale)?;
-                    foreground.extend_from_slice(&samples);
-                    _total_duration += dur;
-                }
-
-                Node::Rating { .. } => {
-                    // A runtime scalar prompt — no audio in the flat path.
-                }
-
-                Node::React { parts, .. } => {
-                    // Flat fallback: render the `main` part only (fallback is
-                    // press-only, and the flat path has no interactivity).
-                    let main_nodes: &[Node] = parts
-                        .iter()
-                        .find(|p| p.role.as_deref() == Some("main"))
-                        .map(|p| p.children.as_slice())
-                        .unwrap_or(&[]);
-                    let (samples, dur) =
-                        self.render_nodes(main_nodes, default_speaker, volume_scale, speed_scale)?;
-                    foreground.extend_from_slice(&samples);
-                    _total_duration += dur;
-                }
-
-                Node::If { .. } => {
-                    // Unreachable via the manifest walker (an `<if>` is always
-                    // a split point) — only a nested spot that can't hold one
-                    // (`<effect>`/`<until>` content) can land here.
-                    bail!(
-                        "<if> cannot be rendered inline — it is only allowed in playback \
-                         sequence content (not inside <effect> or <until>)"
-                    );
-                }
-
-                Node::Visual { .. } => {
-                    // Same class of rejection as `<if>`: only a nested spot
-                    // that can't hold a split point can land here.
-                    bail!(
-                        "<visual> cannot be rendered inline — it is only allowed in playback \
-                         sequence content (not inside <effect>, <until> or <beatmeter>)"
-                    );
                 }
             }
         }
@@ -671,18 +584,24 @@ impl AudioRenderer {
         Ok((samples, duration))
     }
 
-    /// Render a sound effect.
-    fn render_sound(&self, sound_type: &str, volume: f32) -> Result<(Vec<f32>, f32)> {
-        let st = SoundType::from_tag(sound_type)
-            .ok_or_else(|| anyhow::anyhow!("Unknown sound type: {}", sound_type))?;
-
-        let (sr, mut samples) = st.decode().context("Failed to decode sound")?;
-
-        // Resample if needed
-        if sr != self.sample_rate {
-            samples = resample(&samples, sr, self.sample_rate);
-        }
-
+    /// Render a `<clip>`: resolve `src` against the current clip bases
+    /// (script dir, then agent dir — same order as `<include>` targets; no
+    /// globs), decode the WAV, linear-resample to the TTS sample rate
+    /// (folding `speed` into the resample ratio — best-effort playback-rate
+    /// control), and apply the volume scalar.
+    fn render_clip(&self, src: &str, volume: f32, speed: f32) -> Result<(Vec<f32>, f32)> {
+        let path = resolve_clip_target(src, &self.clip_script_dir, &self.clip_agent_dir)
+            .with_context(|| format!("resolve <clip src=\"{src}\">"))?;
+        let (sr, samples) = decode_wav_mono(&path)
+            .with_context(|| format!("decode clip {}", path.display()))?;
+        // Speed via resample ratio: a clip played at `speed` × behaves like a
+        // source whose sample rate is `sr * speed`.
+        let from_sr = (sr as f64 * speed as f64).round() as u32;
+        let samples = if from_sr != self.sample_rate {
+            resample(&samples, from_sr, self.sample_rate)
+        } else {
+            samples
+        };
         let samples = apply_volume(&samples, volume.clamp(0.0, 1.5));
         let duration = samples.len() as f32 / self.sample_rate as f32;
         Ok((samples, duration))
@@ -865,19 +784,17 @@ impl AudioRenderer {
                     self.emit_progress(tracker, progress::PASTE_COST, "Pause");
                 }
 
-                Node::Sound {
-                    sound_type,
-                    volume,
-                    speed: _,
-                } => {
-                    let sound_vol = resolve_scalar(volume.as_deref(), 1.0);
-                    let (samples, dur) = self.render_sound(sound_type, sound_vol * volume_scale)?;
+                Node::Clip { src, volume, speed } => {
+                    let clip_vol = resolve_scalar(volume.as_deref(), 1.0);
+                    let clip_speed = resolve_scalar(speed.as_deref(), 1.0).clamp(0.5, 1.5);
+                    let (samples, dur) =
+                        self.render_clip(src, clip_vol * volume_scale, clip_speed)?;
                     foreground.extend_from_slice(&samples);
                     _total_duration += dur;
                     self.emit_progress(
                         tracker,
                         progress::PASTE_COST,
-                        &format!("Sound: {}", sound_type),
+                        &format!("Clip: {}", src),
                     );
                 }
 
@@ -1072,26 +989,6 @@ impl AudioRenderer {
                     }
                 }
 
-                Node::Choice { prompt: _, options } => {
-                    // Flat-path fallback: render the first option only.
-                    if let Some(part) = options.first() {
-                        let part_vol = (volume_scale * resolve_scalar(part.volume.as_deref(), 1.0))
-                            .clamp(0.0, 1.5);
-                        let part_speed = speed_scale
-                            * resolve_scalar(part.speed.as_deref(), 1.0).clamp(0.5, 1.5);
-                        let (samples, dur) = self.render_nodes_tracked(
-                            &part.children,
-                            default_speaker,
-                            part_vol,
-                            part_speed,
-                            tracker,
-                        )?;
-                        foreground.extend_from_slice(&samples);
-                        _total_duration += dur;
-                        self.emit_label(tracker, "Choice option");
-                    }
-                }
-
                 Node::Loop { loops, children } => {
                     for _ in 0..*loops {
                         let (samples, dur) = self.render_nodes_tracked(
@@ -1106,20 +1003,9 @@ impl AudioRenderer {
                     }
                 }
 
-                Node::Until {
-                    button: _,
-                    waiting_sound,
-                    waiting_sound_volume,
-                    pre_pause,
-                    post_pause,
-                    children,
-                } => {
-                    if let Some(pp) = pre_pause {
-                        let num_samples = (*pp * self.sample_rate as f32) as usize;
-                        foreground.extend(std::iter::repeat(0.0f32).take(num_samples));
-                        _total_duration += *pp;
-                    }
-
+                // Boundaries are transparent to the flat path (the manifest
+                // walker splits on them instead).
+                Node::Zone { children, .. } => {
                     let (samples, dur) = self.render_nodes_tracked(
                         children,
                         default_speaker,
@@ -1129,93 +1015,11 @@ impl AudioRenderer {
                     )?;
                     foreground.extend_from_slice(&samples);
                     _total_duration += dur;
-
-                    if let Some(ws) = waiting_sound {
-                        let ws_vol = waiting_sound_volume.unwrap_or(0.5) * volume_scale;
-                        let (ws_samples, _) = self.render_sound(ws, ws_vol)?;
-                        let mut aligned = vec![0.0f32; foreground.len()];
-                        aligned.extend_from_slice(&ws_samples);
-                        bg_layers.push(BgLayer::background(aligned));
-                        // Accounted as its own paste-cost leaf, matching
-                        // `ast_cost`'s Until arm.
-                        self.emit_progress(tracker, progress::PASTE_COST, "Waiting sound");
-                    }
-
-                    if let Some(pp) = post_pause {
-                        let num_samples = (*pp * self.sample_rate as f32) as usize;
-                        foreground.extend(std::iter::repeat(0.0f32).take(num_samples));
-                        _total_duration += *pp;
-                    }
                 }
+
+                Node::Mark { .. } => {}
 
                 Node::Include { .. } => {}
-
-                Node::Section { children, .. } => {
-                    // Structural — render children inline with inherited context.
-                    let (samples, dur) = self.render_nodes_tracked(
-                        children,
-                        default_speaker,
-                        volume_scale,
-                        speed_scale,
-                        tracker,
-                    )?;
-                    foreground.extend_from_slice(&samples);
-                    _total_duration += dur;
-                }
-
-                Node::Beatmeter { children, .. } => {
-                    // Flat tracked path: render the wrapped content inline (the
-                    // metronome is a runtime concern). Mirrors the Section arm.
-                    let (samples, dur) = self.render_nodes_tracked(
-                        children,
-                        default_speaker,
-                        volume_scale,
-                        speed_scale,
-                        tracker,
-                    )?;
-                    foreground.extend_from_slice(&samples);
-                    _total_duration += dur;
-                }
-
-                Node::Rating { .. } => {
-                    // A runtime scalar prompt — no audio in the flat path.
-                }
-
-                Node::React { parts, .. } => {
-                    // Flat tracked fallback: render the `main` part only.
-                    let main_nodes: &[Node] = parts
-                        .iter()
-                        .find(|p| p.role.as_deref() == Some("main"))
-                        .map(|p| p.children.as_slice())
-                        .unwrap_or(&[]);
-                    let (samples, dur) = self.render_nodes_tracked(
-                        main_nodes,
-                        default_speaker,
-                        volume_scale,
-                        speed_scale,
-                        tracker,
-                    )?;
-                    foreground.extend_from_slice(&samples);
-                    _total_duration += dur;
-                }
-
-                Node::If { .. } => {
-                    // Unreachable via the manifest walker (an `<if>` is always
-                    // a split point) — only a nested spot that can't hold one
-                    // (`<effect>`/`<until>` content) can land here.
-                    bail!(
-                        "<if> cannot be rendered inline — it is only allowed in playback \
-                         sequence content (not inside <effect> or <until>)"
-                    );
-                }
-
-                Node::Visual { .. } => {
-                    // Same class of rejection as `<if>` (see the untracked path).
-                    bail!(
-                        "<visual> cannot be rendered inline — it is only allowed in playback \
-                         sequence content (not inside <effect>, <until> or <beatmeter>)"
-                    );
-                }
             }
         }
 
@@ -1469,13 +1273,17 @@ impl AudioRenderer {
         let bytes = fs::read(source_abs)
             .with_context(|| format!("read script {}", source_abs.display()))?;
         let hash = manifest::hash_bytes(&bytes);
-        // Glob includes bake their match set into the manifest, so freshness
-        // compares the CURRENT expansion digest too (cheap: parse + readdir,
-        // no synthesis) — adding/removing a matching file re-renders this
-        // script even though its own bytes didn't change.
+        // Clips are baked into the rendered WAVs and glob includes bake their
+        // match set into the manifest, so freshness compares the CURRENT
+        // digests too (cheap: parse + stat/read, no synthesis) — editing a
+        // referenced WAV, or adding/removing a glob-matched file, re-renders
+        // this script even though its own bytes didn't change.
         let glob_digest = std::str::from_utf8(&bytes)
             .ok()
             .and_then(|source| glob_digest(source, script_dir, agent_dir));
+        let clips_digest = std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|source| clips_digest(source, script_dir, agent_dir));
         let manifest_path = out_dir.join("manifest.json");
 
         // Freshness shortcut (shared with the progress pre-count).
@@ -1484,7 +1292,13 @@ impl AudioRenderer {
                 t.emit_phase("Checking freshness…");
             }
         }
-        if let Some(existing) = manifest_is_fresh(&manifest_path, out_dir, &hash, glob_digest.as_deref()) {
+        if let Some(existing) = manifest_is_fresh(
+            &manifest_path,
+            out_dir,
+            &hash,
+            glob_digest.as_deref(),
+            clips_digest.as_deref(),
+        ) {
             let duration = nominal_duration(&existing.root);
             return Ok(RenderedManifest {
                 id: manifest::manifest_id(script_rel),
@@ -1506,6 +1320,8 @@ impl AudioRenderer {
             .with_context(|| format!("script {} is not UTF-8", source_abs.display()))?;
         let nodes =
             tag_parser::parse(source).with_context(|| format!("parse {}", source_abs.display()))?;
+        // `<clip src>` in THIS file resolves against its own directory first.
+        self.set_clip_resolution(script_dir, agent_dir);
         // The tracker's total was seeded once, exactly, before synthesis
         // began (see `render_manifest`); nothing to add per file.
         let mut counter = 0usize;
@@ -1529,6 +1345,7 @@ impl AudioRenderer {
             version: manifest::MANIFEST_VERSION,
             hash: hash.clone(),
             glob_digest: glob_digest.clone(),
+            clips_digest: clips_digest.clone(),
             script: script_rel.to_string(),
             root,
         };
@@ -1558,9 +1375,9 @@ impl AudioRenderer {
     }
 
     /// Core recursive walker. Returns a `Sequence` whose children alternate
-    /// between `Static` segments (flat-rendered runs of non-interactive nodes)
-    /// and interactive constructs (`Until`/`Random`/`Scramble`/`Choice`/
-    /// `Import`/`Loop`/`Background`/`Overlay`/scoped `Voice`/`Speed`/`Volume`).
+    /// between `Static` segments (flat-rendered runs of non-dynamic nodes)
+    /// and dynamic constructs (`Random`/`Scramble`/`Import`/`Loop`/
+    /// `Background`/`Overlay`/scoped `Voice`/`Speed`/`Volume`/`Zone`/`Mark`).
     ///
     /// `counter` is the per-manifest WAV naming counter (`seg-NNN.wav`).
     fn walk(
@@ -1579,26 +1396,6 @@ impl AudioRenderer {
         let mut children: Vec<Segment> = Vec::new();
 
         for node in nodes {
-            // Sections are structural: handle them BEFORE the split check so a
-            // clean section becomes `Section{child: Static{…}}` (loopable by the
-            // player) rather than being flattened into the surrounding buffer.
-            // A section containing an interactive tag still recurses through
-            // `walk`, producing a `Section` over a Sequence — the player loops
-            // that sequence's main content.
-            if let Node::Section { role, children: sec_children } = node {
-                self.flush_static(
-                    &mut static_buf, ctx, out_dir, counter, &mut children, progress,
-                )?;
-                let child = self.walk(
-                    sec_children, ctx, out_dir, script_dir, agent_dir, tracks_dir, counter,
-                    visited, progress,
-                )?;
-                children.push(Segment::Section {
-                    role: *role,
-                    child: Box::new(child),
-                });
-                continue;
-            }
             if manifest::contains_split(node) {
                 self.flush_static(
                     &mut static_buf, ctx, out_dir, counter, &mut children, progress,
@@ -1614,40 +1411,6 @@ impl AudioRenderer {
         }
         self.flush_static(&mut static_buf, ctx, out_dir, counter, &mut children, progress)?;
         Ok(Segment::Sequence { children })
-    }
-
-    /// Extract `<visual>` configs from a node list that is about to be baked
-    /// into ONE clip, REMOVING the visual nodes so only their audio content
-    /// renders (a visual is audio-transparent — its children splice in
-    /// place). Recurses through `<effect>` bodies, the only container that
-    /// bakes without splitting; sequence-level visuals never reach a bake
-    /// buffer because the walker splits them out first.
-    fn take_visuals(nodes: &mut Vec<Node>, out: &mut Vec<VisualConfig>) {
-        let mut result = Vec::with_capacity(nodes.len());
-        for node in nodes.drain(..) {
-            match node {
-                Node::Visual { config, children } => {
-                    out.push(config);
-                    result.extend(children);
-                }
-                Node::Effect {
-                    effect_type,
-                    preset,
-                    cutoff,
-                    children: mut kids,
-                } => {
-                    Self::take_visuals(&mut kids, out);
-                    result.push(Node::Effect {
-                        effect_type,
-                        preset,
-                        cutoff,
-                        children: kids,
-                    });
-                }
-                other => result.push(other),
-            }
-        }
-        *nodes = result;
     }
 
     /// Render the accumulated `static_buf` to a single `Static` segment (if
@@ -1680,24 +1443,7 @@ impl AudioRenderer {
         };
         let file = self.write_seg(out_dir, counter, &samples)?;
         let duration = samples.len() as f32 / self.sample_rate as f32;
-        // A `<visual>` inside this baked run (only reachable via `<effect>`
-        // bodies — sequence-level visuals split out before reaching here)
-        // decorates the whole clip: strip the config out and attach it.
-        let mut visuals = Vec::new();
-        Self::take_visuals(buf, &mut visuals);
-        match visuals.len() {
-            0 => {}
-            1 => {}
-            n => bail!(
-                "{n} <visual> tags bake into this single clip — split the content so at most one <visual> is baked together"
-            ),
-        }
-        children.push(Segment::Static {
-            file,
-            duration,
-            beatmeter: None,
-            visual: visuals.into_iter().next(),
-        });
+        children.push(Segment::Static { file, duration });
         buf.clear();
         Ok(())
     }
@@ -1724,58 +1470,6 @@ impl AudioRenderer {
         progress: Option<&Arc<Mutex<progress::ProgressTracker>>>,
     ) -> Result<Segment> {
         match node {
-            Node::Until {
-                button,
-                waiting_sound,
-                waiting_sound_volume,
-                pre_pause: _,
-                post_pause: _,
-                children,
-            } => {
-                if ctx.forbid_pause {
-                    bail!("<until> is not allowed inside <background> or <overlay>");
-                }
-                // pre/post_pause are folded into the content render (render_nodes
-                // already handles them); the manifest model doesn't surface them.
-                // Use the tracked variant when a tracker is attached so progress
-                // ticks fire during the until-block's synthesis.
-                let (samples, _dur) = if let Some(tracker) = progress {
-                    self.render_nodes_tracked(
-                        children,
-                        &ctx.speaker,
-                        ctx.volume_scale,
-                        ctx.speed_scale,
-                        tracker,
-                    )?
-                } else {
-                    self.render_nodes(children, &ctx.speaker, ctx.volume_scale, ctx.speed_scale)?
-                };
-                let file = self.write_seg(out_dir, counter, &samples)?;
-                let duration = samples.len() as f32 / self.sample_rate as f32;
-                let text = tag_parser::extract_text(children);
-                let mut ws_file = None;
-                let mut ws_vol_out = None;
-                if let Some(ws) = waiting_sound {
-                    let ws_vol = waiting_sound_volume.unwrap_or(0.5) * ctx.volume_scale;
-                    let (ws_samples, _) = self.render_sound(ws, ws_vol)?;
-                    ws_file = Some(self.write_seg(out_dir, counter, &ws_samples)?);
-                    ws_vol_out = Some(ws_vol);
-                    // Accounted as its own paste-cost leaf (the pre-count
-                    // charges it via `ast_cost`'s Until arm).
-                    if let Some(tracker) = progress {
-                        self.emit_progress(tracker, progress::PASTE_COST, "Waiting sound");
-                    }
-                }
-                Ok(Segment::Until {
-                    file,
-                    duration,
-                    button: button.clone(),
-                    text: Some(text),
-                    waiting_sound: ws_file,
-                    waiting_sound_volume: ws_vol_out,
-                })
-            }
-
             Node::Random { parts } => {
                 let options = parts
                     .iter()
@@ -1802,197 +1496,28 @@ impl AudioRenderer {
                 Ok(Segment::Scramble { options })
             }
 
-            Node::Choice { prompt, options } => {
-                if ctx.forbid_pause {
-                    bail!("<choice> is not allowed inside <background> or <overlay>");
-                }
-                let options = options
-                    .iter()
-                    .map(|p| {
-                        let seg = self.walk_part(
-                            p, ctx, out_dir, script_dir, agent_dir, tracks_dir, counter, visited,
-                            progress,
-                        )?;
-                        Ok(ChoiceOption {
-                            label: p.label.clone(),
-                            segment: seg,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(Segment::Choice {
-                    prompt: prompt.clone(),
-                    options,
-                })
-            }
-
-            Node::Rating { prompt, min, max, .. } => {
-                if ctx.forbid_pause {
-                    bail!("<rating> is not allowed inside <background> or <overlay>");
-                }
-                Ok(Segment::Rating {
-                    prompt: prompt.clone(),
-                    min: *min,
-                    max: *max,
-                })
-            }
-
-            Node::React { button, parts } => {
-                if ctx.forbid_pause {
-                    bail!("<react> is not allowed inside <background> or <overlay>");
-                }
-                // `validate` guarantees exactly one main + one fallback; resolve
-                // them defensively here regardless.
-                let mut main_seg: Option<Segment> = None;
-                let mut fallback_seg: Option<Segment> = None;
-                for p in parts {
-                    let seg = self.walk_part(
-                        p, ctx, out_dir, script_dir, agent_dir, tracks_dir, counter, visited,
-                        progress,
-                    )?;
-                    match p.role.as_deref() {
-                        Some("main") => main_seg = Some(seg),
-                        Some("fallback") => fallback_seg = Some(seg),
-                        _ => {}
-                    }
-                }
-                let main = main_seg.ok_or_else(|| {
-                    anyhow::anyhow!("<react> requires a <part role=\"main\">")
-                })?;
-                let fallback = fallback_seg.ok_or_else(|| {
-                    anyhow::anyhow!("<react> requires a <part role=\"fallback\">")
-                })?;
-                Ok(Segment::React {
-                    button: button.clone(),
-                    main: Box::new(main),
-                    fallback: Box::new(fallback),
-                })
-            }
-
-            Node::Beatmeter {
-                bpm,
-                pattern,
-                sound,
-                volume,
-                accent_gain,
-                children,
-            } => {
-                if ctx.forbid_pause {
-                    bail!("<beatmeter> is not allowed inside <background> or <overlay>");
-                }
-                // The wrapped content must be non-interactive: a beat schedule
-                // is only meaningful over a single continuous clip, so any
-                // blocking split (until/choice/random/…/nested beatmeter/include)
-                // is rejected. A `<visual>` is NOT blocking — display-only —
-                // but it must be a DIRECT child: the slideshow then decorates
-                // the whole clip. (`<voice>`-wrapped visuals still count as
-                // splits via contains_split, and an interactive tag inside the
-                // visual recurses through contains_blocking_split.)
-                if children.iter().any(manifest::contains_blocking_split) {
-                    bail!(
-                        "<beatmeter> may only wrap non-interactive content (no <until>/<choice>/<random>/<scramble>/<include>/<beatmeter>; a <visual> is fine as a direct child but must not contain them)"
-                    );
-                }
-                let mut baked = children.clone();
-                let mut visuals = Vec::new();
-                Self::take_visuals(&mut baked, &mut visuals);
-                let visual = match visuals.len() {
-                    0 => None,
-                    1 => Some(visuals.pop().expect("len 1")),
-                    n => bail!(
-                        "{n} <visual> tags bake into this one <beatmeter> clip — use at most one"
-                    ),
-                };
-                // Bake the wrapped content into one clip.
-                let (samples, _dur) = if let Some(tracker) = progress {
-                    self.render_nodes_tracked(
-                        &baked,
-                        &ctx.speaker,
-                        ctx.volume_scale,
-                        ctx.speed_scale,
-                        tracker,
-                    )?
-                } else {
-                    self.render_nodes(&baked, &ctx.speaker, ctx.volume_scale, ctx.speed_scale)?
-                };
-                let file = self.write_seg(out_dir, counter, &samples)?;
-                let duration = samples.len() as f32 / self.sample_rate as f32;
-
-                // Resolve the beat schedule over the clip's duration.
-                let beats = compute_beats(*bpm, pattern.as_deref(), duration);
-
-                // Render the click sample once (gain 1.0 — the player applies
-                // `volume`/`accent_gain` at trigger time). A stable filename
-                // means identical sounds are written once and reused.
-                let sound_name = sound.as_deref().unwrap_or("click");
-                let (click_samples, _) = self.render_sound(sound_name, 1.0)?;
-                let sample_file = format!("beat-{}.wav", sound_name);
-                write_wav_file(
-                    out_dir.join(&sample_file),
-                    &click_samples,
-                    self.sample_rate as i32,
-                )?;
-
-                Ok(Segment::Static {
-                    file,
-                    duration,
-                    beatmeter: Some(BeatmeterMeta {
-                        sample: sample_file,
-                        volume: volume.unwrap_or(0.5),
-                        accent_gain: accent_gain.unwrap_or(1.5),
-                        beats,
-                    }),
-                    visual,
-                })
-            }
-
-            Node::Include { src } => self.emit_include(
-                src, out_dir, script_dir, agent_dir, tracks_dir, visited, progress,
-            ),
-
-            Node::Visual { config, children } => {
-                if ctx.forbid_pause {
-                    bail!("<visual> is not allowed inside <background> or <overlay>");
-                }
-                // Transparent to audio: the child subtree renders exactly as
-                // if the wrapper were absent; the config rides along in the
-                // manifest for the player's per-playback playlist fetch.
+            // Named boundary nodes. Both are split points (contains_split), so
+            // the surrounding static runs are flushed first — their positions
+            // are exact segment boundaries. A zone recurses (its child may
+            // itself contain further splits); a mark is zero-length.
+            Node::Zone { name, children } => {
                 let child = self.walk(
                     children, ctx, out_dir, script_dir, agent_dir, tracks_dir, counter, visited,
                     progress,
                 )?;
-                Ok(Segment::Visual {
-                    config: config.clone(),
+                Ok(Segment::Zone {
+                    name: name.clone(),
                     child: Box::new(child),
                 })
             }
 
-            Node::If {
-                cond,
-                then_branch,
-                r#else,
-            } => {
-                if ctx.forbid_pause {
-                    bail!("<if> is not allowed inside <background> or <overlay>");
-                }
-                // Both branches are fully rendered; the player picks one per
-                // playback against the run-context variables.
-                let then_seg = self.walk(
-                    then_branch, ctx, out_dir, script_dir, agent_dir, tracks_dir, counter,
-                    visited, progress,
-                )?;
-                let else_seg = match r#else {
-                    Some(nodes) => Some(self.walk(
-                        nodes, ctx, out_dir, script_dir, agent_dir, tracks_dir, counter, visited,
-                        progress,
-                    )?),
-                    None => None,
-                };
-                Ok(Segment::Cond {
-                    cond: cond.clone(),
-                    then: Box::new(then_seg),
-                    r#else: else_seg.map(Box::new),
-                })
-            }
+            Node::Mark { name } => Ok(Segment::Mark {
+                name: name.clone(),
+            }),
+
+            Node::Include { src } => self.emit_include(
+                src, out_dir, script_dir, agent_dir, tracks_dir, visited, progress,
+            ),
 
             Node::Loop { loops, children } => {
                 let child = self.walk(
@@ -2013,8 +1538,7 @@ impl AudioRenderer {
                 let layer_ctx = ctx
                     .clone()
                     .with_vol(volume.as_deref())
-                    .with_speed(speed.as_deref())
-                    .with_forbid_pause(true);
+                    .with_speed(speed.as_deref());
                 let layer = self.walk(
                     children, &layer_ctx, out_dir, script_dir, agent_dir, tracks_dir, counter,
                     visited, progress,
@@ -2031,13 +1555,12 @@ impl AudioRenderer {
                     .iter()
                     .map(|p| {
                         // Bake the part's volume/speed into its clip synthesis
-                        // (same as walk_part does for random/scramble/choice
-                        // parts) — playback-time element volume can't express
+                        // (same as walk_part does for random/scramble parts)
+                        // — playback-time element volume can't express
                         // >1.0 or speed, so the manifest's copies are
                         // informational only and must not be re-applied.
                         let part_ctx = ctx
                             .clone()
-                            .with_forbid_pause(true)
                             .with_vol(p.volume.as_deref())
                             .with_speed(p.speed.as_deref());
                         let seg = self.walk(
@@ -2093,19 +1616,6 @@ impl AudioRenderer {
                 self.walk(
                     children, &sub, out_dir, script_dir, agent_dir, tracks_dir, counter, visited,
                     progress,
-                )
-            }
-
-            // Sections are handled directly in `walk` (before the split check),
-            // so reaching one here means the walker changed shape — fail loudly.
-            Node::Section { role, .. } => {
-                bail!(
-                    "<{}> section reached emit_split (must be handled in walk)",
-                    match role {
-                        tag_parser::SectionRole::Intro => "intro",
-                        tag_parser::SectionRole::Main => "main",
-                        tag_parser::SectionRole::Outro => "outro",
-                    }
                 )
             }
 
@@ -2261,35 +1771,6 @@ fn truncate_label(text: &str, max_len: usize) -> String {
 // Manifest walker free helpers
 // ============================================================================
 
-/// Resolve a `<beatmeter>` bpm/pattern into a flat list of beat marks over a
-/// clip of `duration` seconds. The pattern cycles per beat: `X` = accent, `x` =
-/// normal, `.` = rest (no mark). Defaults to `"x"` (every beat, no accent).
-fn compute_beats(bpm: f32, pattern: Option<&str>, duration: f32) -> Vec<BeatMark> {
-    let interval = 60.0 / bpm.max(0.001);
-    let pat: Vec<char> = pattern
-        .filter(|p| !p.is_empty())
-        .unwrap_or("x")
-        .chars()
-        .collect();
-    let plen = pat.len().max(1);
-    let mut beats = Vec::new();
-    let mut i = 0u32;
-    loop {
-        let t = i as f32 * interval;
-        if t >= duration {
-            break;
-        }
-        match pat[(i as usize) % plen] {
-            'X' => beats.push(BeatMark { time: t, accent: true }),
-            'x' => beats.push(BeatMark { time: t, accent: false }),
-            // '.' (rest) and any stray char (validated elsewhere) → no mark.
-            _ => {}
-        }
-        i += 1;
-    }
-    beats
-}
-
 /// True if `dir` contains at least one `.wav` file (freshness precondition).
 pub(crate) fn has_any_wav(dir: &Path) -> bool {
     let Ok(entries) = fs::read_dir(dir) else {
@@ -2306,15 +1787,16 @@ pub(crate) fn has_any_wav(dir: &Path) -> bool {
 
 /// Freshness test shared by the render path and the progress pre-count
 /// ([`count_render_cost`]): a manifest is reusable when its stored format
-/// version, script hash and glob-include digest match the current script and
-/// at least one `.wav` survives in its directory. Returns the parsed
-/// `Some(existing)` manifest when reusable (the caller links to it instead
-/// of re-synthesizing).
+/// version, script hash, glob-include digest and clip-content digest match
+/// the current script and at least one `.wav` survives in its directory.
+/// Returns the parsed `Some(existing)` manifest when reusable (the caller
+/// links to it instead of re-synthesizing).
 fn manifest_is_fresh(
     manifest_path: &Path,
     out_dir: &Path,
     hash: &str,
     glob_digest: Option<&str>,
+    clips_digest: Option<&str>,
 ) -> Option<Manifest> {
     let existing = fs::read_to_string(manifest_path)
         .ok()
@@ -2322,6 +1804,7 @@ fn manifest_is_fresh(
     let fresh = existing.version == manifest::MANIFEST_VERSION
         && existing.hash == hash
         && existing.glob_digest.as_deref() == glob_digest
+        && existing.clips_digest.as_deref() == clips_digest
         && has_any_wav(out_dir);
     if fresh {
         Some(existing)
@@ -2341,34 +1824,20 @@ fn collect_include_srcs(nodes: &[Node], out: &mut Vec<String>) {
             | Node::Volume { children, .. }
             | Node::Effect { children, .. }
             | Node::Background { children, .. }
-            | Node::Until { children, .. }
-            | Node::Section { children, .. }
-            | Node::Beatmeter { children, .. }
-            | Node::Visual { children, .. }
+            | Node::Zone { children, .. }
             | Node::Loop { children, .. } => collect_include_srcs(children, out),
             Node::Overlay { parts, .. }
             | Node::Random { parts }
-            | Node::Scramble { parts }
-            | Node::React { parts, .. } => {
+            | Node::Scramble { parts } => {
                 for part in parts {
                     collect_include_srcs(&part.children, out);
                 }
             }
-            Node::Choice { options, .. } => {
-                for part in options {
-                    collect_include_srcs(&part.children, out);
-                }
-            }
-            Node::If {
-                then_branch, r#else, ..
-            } => {
-                collect_include_srcs(then_branch, out);
-                if let Some(else_nodes) = r#else {
-                    collect_include_srcs(else_nodes, out);
-                }
-            }
-            Node::Text(_) | Node::Pause { .. } | Node::Sound { .. } | Node::Tone { .. } => {}
-            Node::Rating { .. } => {}
+            Node::Text(_)
+            | Node::Pause { .. }
+            | Node::Tone { .. }
+            | Node::Clip { .. }
+            | Node::Mark { .. } => {}
         }
     }
 }
@@ -2409,6 +1878,9 @@ fn count_render_cost(
     let glob_digest = std::str::from_utf8(&bytes)
         .ok()
         .and_then(|source| glob_digest(source, &script_dir, agent_dir));
+    let clips_digest = std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|source| clips_digest(source, &script_dir, agent_dir));
     let script_rel = script_relative_to(source_abs, agent_dir);
     let out_dir = tracks_dir.join(manifest::manifest_id(&script_rel));
     if manifest_is_fresh(
@@ -2416,6 +1888,7 @@ fn count_render_cost(
         &out_dir,
         &hash,
         glob_digest.as_deref(),
+        clips_digest.as_deref(),
     )
     .is_some()
     {
@@ -2582,7 +2055,7 @@ pub fn glob_digest(source: &str, script_dir: &Path, agent_dir: &Path) -> Option<
 }
 
 /// Gather every glob `<include src>` declared in `nodes`, in document order,
-/// recursing through containers and interactive parts.
+/// recursing through containers and option parts.
 fn collect_glob_include_srcs(nodes: &[Node], out: &mut Vec<String>) {
     for node in nodes {
         match node {
@@ -2597,31 +2070,155 @@ fn collect_glob_include_srcs(nodes: &[Node], out: &mut Vec<String>) {
             | Node::Effect { children, .. }
             | Node::Loop { children, .. }
             | Node::Background { children, .. }
-            | Node::Until { children, .. }
-            | Node::Section { children, .. }
-            | Node::Beatmeter { children, .. }
-            | Node::Visual { children, .. } => {
+            | Node::Zone { children, .. } => {
                 collect_glob_include_srcs(children, out);
             }
             Node::Overlay { parts, .. }
             | Node::Random { parts }
-            | Node::Scramble { parts }
-            | Node::Choice { options: parts, .. }
-            | Node::React { parts, .. } => {
+            | Node::Scramble { parts } => {
                 for part in parts {
                     collect_glob_include_srcs(&part.children, out);
                 }
             }
-            Node::If {
-                then_branch, r#else, ..
-            } => {
-                collect_glob_include_srcs(then_branch, out);
-                if let Some(else_nodes) = r#else {
-                    collect_glob_include_srcs(else_nodes, out);
+            Node::Text(_)
+            | Node::Pause { .. }
+            | Node::Tone { .. }
+            | Node::Clip { .. }
+            | Node::Mark { .. } => {}
+        }
+    }
+}
+
+// ============================================================================
+// <clip> resolution + freshness
+// ============================================================================
+
+/// Resolve a `<clip src>` (no globs) the way the renderer plays it: against
+/// `script_dir` first, then against `agent_dir` — the same order as plain
+/// `<include>` targets. The first existing file wins; neither existing is an
+/// error.
+pub fn resolve_clip_target(src: &str, script_dir: &Path, agent_dir: &Path) -> Result<PathBuf> {
+    if include_src_is_glob(src) {
+        bail!("Wildcards are not allowed in <clip src=\"{}\">", src);
+    }
+    let relative = normalize_path(&script_dir.join(src));
+    if relative.is_file() {
+        return Ok(relative);
+    }
+    let from_agent = normalize_path(&agent_dir.join(src));
+    if from_agent.is_file() {
+        return Ok(from_agent);
+    }
+    bail!("Clip not found: {}", from_agent.display());
+}
+
+/// Decode a WAV file into (sample_rate, mono f32 samples). Integer PCM
+/// (16/24-bit) and float encodings are handled; multi-channel audio is
+/// averaged down to mono.
+pub fn decode_wav_mono(path: &Path) -> Result<(u32, Vec<f32>)> {
+    let mut reader = hound::WavReader::open(path)?;
+    let spec = reader.spec();
+    let samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Int => {
+            if spec.bits_per_sample == 24 {
+                reader
+                    .samples::<i32>()
+                    .filter_map(|s| s.ok())
+                    .map(|s| s as f32 / 8388608.0)
+                    .collect()
+            } else {
+                reader
+                    .samples::<i16>()
+                    .filter_map(|s| s.ok())
+                    .map(|s| s as f32 / 32768.0)
+                    .collect()
+            }
+        }
+        hound::SampleFormat::Float => reader.samples::<f32>().filter_map(|s| s.ok()).collect(),
+    };
+    let channels = spec.channels;
+    let mono = if channels > 1 {
+        samples
+            .chunks(channels as usize)
+            .map(|ch| ch.iter().sum::<f32>() / channels as f32)
+            .collect()
+    } else {
+        samples
+    };
+    Ok((spec.sample_rate, mono))
+}
+
+/// Digest of every `<clip src>` file's CONTENT, or `None` when the script
+/// references none.
+///
+/// Clip audio is baked into the rendered WAVs at render time, so freshness
+/// must notice when a referenced file's bytes change even though the script's
+/// own bytes didn't: this folds every declared clip src (document order) plus
+/// the SHA-256 of its current content into one hash. Manifests store the
+/// digest computed at render time; a mismatch — the WAV was re-exported,
+/// swapped, or (via `!error`/`!read` markers) went missing — marks the script
+/// stale and it re-renders with the new audio. Resolution errors fold into
+/// the digest as markers so a broken clip keeps forcing re-renders (and thus
+/// surfaces its error) instead of silently pinning old audio — same contract
+/// as [`glob_digest`].
+pub fn clips_digest(source: &str, script_dir: &Path, agent_dir: &Path) -> Option<String> {
+    let nodes = tag_parser::parse(source).ok()?;
+    let mut srcs: Vec<String> = Vec::new();
+    collect_clip_srcs(&nodes, &mut srcs);
+    if srcs.is_empty() {
+        return None;
+    }
+    let mut acc = String::new();
+    for src in &srcs {
+        acc.push_str(src);
+        acc.push('\u{0}');
+        match resolve_clip_target(src, script_dir, agent_dir) {
+            Ok(path) => match fs::read(&path) {
+                Ok(bytes) => {
+                    acc.push_str(&manifest::hash_bytes(&bytes));
+                    acc.push('\n');
+                }
+                Err(e) => {
+                    acc.push_str(&format!("!read: {e}"));
+                    acc.push('\n');
+                }
+            },
+            Err(e) => {
+                acc.push_str(&format!("!error: {e}"));
+                acc.push('\n');
+            }
+        }
+    }
+    Some(manifest::hash_bytes(acc.as_bytes()))
+}
+
+/// Gather every `<clip src>` declared in `nodes`, in document order,
+/// recursing through containers and option parts.
+fn collect_clip_srcs(nodes: &[Node], out: &mut Vec<String>) {
+    for node in nodes {
+        match node {
+            Node::Clip { src, .. } => out.push(src.clone()),
+            Node::Voice { children, .. }
+            | Node::Speed { children, .. }
+            | Node::Volume { children, .. }
+            | Node::Effect { children, .. }
+            | Node::Loop { children, .. }
+            | Node::Background { children, .. }
+            | Node::Zone { children, .. } => {
+                collect_clip_srcs(children, out);
+            }
+            Node::Overlay { parts, .. }
+            | Node::Random { parts }
+            | Node::Scramble { parts } => {
+                for part in parts {
+                    collect_clip_srcs(&part.children, out);
                 }
             }
-            Node::Text(_) | Node::Pause { .. } | Node::Sound { .. } | Node::Tone { .. } => {}
-            Node::Rating { .. } => {}
+            Node::Text(_)
+            | Node::Pause { .. }
+            | Node::Tone { .. }
+            | Node::Mark { .. }
+            | Node::Include { .. } => {}
         }
     }
 }
@@ -2732,25 +2329,6 @@ fn resolve_includes_in_node(
             }]
         }
 
-        Node::Until {
-            button,
-            waiting_sound,
-            waiting_sound_volume,
-            pre_pause,
-            post_pause,
-            children,
-        } => {
-            let children = resolve_includes_inner(children, base_dir, visited);
-            vec![Node::Until {
-                button,
-                waiting_sound,
-                waiting_sound_volume,
-                pre_pause,
-                post_pause,
-                children,
-            }]
-        }
-
         Node::Overlay { duration, parts } => {
             let parts = resolve_overlay_parts(parts, base_dir, visited);
             vec![Node::Overlay { duration, parts }]
@@ -2766,70 +2344,22 @@ fn resolve_includes_in_node(
             vec![Node::Scramble { parts }]
         }
 
-        Node::Choice { prompt, options } => {
-            let options = resolve_overlay_parts(options, base_dir, visited);
-            vec![Node::Choice { prompt, options }]
-        }
-
-        Node::React { button, parts } => {
-            let parts = resolve_overlay_parts(parts, base_dir, visited);
-            vec![Node::React { button, parts }]
-        }
-
-        Node::Section { role, children } => {
+        Node::Zone { name, children } => {
             let children = resolve_includes_inner(children, base_dir, visited);
-            vec![Node::Section { role, children }]
-        }
-
-        Node::If {
-            cond,
-            then_branch,
-            r#else,
-        } => {
-            let then_branch = resolve_includes_inner(then_branch, base_dir, visited);
-            let r#else = r#else.map(|nodes| resolve_includes_inner(nodes, base_dir, visited));
-            vec![Node::If {
-                cond,
-                then_branch,
-                r#else,
-            }]
-        }
-
-        Node::Beatmeter {
-            bpm,
-            pattern,
-            sound,
-            volume,
-            accent_gain,
-            children,
-        } => {
-            let children = resolve_includes_inner(children, base_dir, visited);
-            vec![Node::Beatmeter {
-                bpm,
-                pattern,
-                sound,
-                volume,
-                accent_gain,
-                children,
-            }]
-        }
-
-        Node::Visual { config, children } => {
-            let children = resolve_includes_inner(children, base_dir, visited);
-            vec![Node::Visual { config, children }]
+            vec![Node::Zone { name, children }]
         }
 
         // Leaves with no nested children — pass through unchanged.
         Node::Text(_)
         | Node::Pause { .. }
-        | Node::Sound { .. }
         | Node::Tone { .. }
-        | Node::Rating { .. } => vec![node],
+        | Node::Clip { .. }
+        | Node::Mark { .. } => vec![node],
     }
 }
 
 /// Resolve includes within a list of `OverlayPart`s, preserving each part's
-/// scalar attributes (`looped`, `volume`, `speed`, `label`) and recursing into
+/// scalar attributes (`looped`, `volume`, `speed`) and recursing into
 /// its children.
 fn resolve_overlay_parts(
     parts: Vec<OverlayPart>,
@@ -2842,8 +2372,6 @@ fn resolve_overlay_parts(
             looped: part.looped,
             volume: part.volume,
             speed: part.speed,
-            label: part.label,
-            role: part.role,
             children: resolve_includes_inner(part.children, base_dir, visited),
         })
         .collect()
@@ -3898,7 +3426,7 @@ mod tests {
 
         // Background with expression volume
         let input =
-            r#"<background volume="@env(0.2,0.3,0.5,0.2)"><sound type="swoosh"/></background>"#;
+            r#"<background volume="@env(0.2,0.3,0.5,0.2)"><pause duration="1"/></background>"#;
         let nodes = tag_parser::parse(input).unwrap();
         match &nodes[0] {
             tag_parser::Node::Background { volume, .. } => {
@@ -3917,14 +3445,14 @@ mod tests {
   <tone type="binaural" preset="theta" volume="0.15"/>
   Welcome to the comprehensive TTS demonstration.
   <pause duration="0.5"/>
-  <sound type="ding" volume="0.8"/>
+  <clip src="sfx/ding.wav" volume="0.8"/>
   <speed value="0.9">
     <volume value="@fade(1)">
       This part is slightly slower and fades in and out.
     </volume>
   </speed>
   <overlay>
-    <part looped="true" volume="0.4"><sound type="water_drop"/></part>
+    <part looped="true" volume="0.4"><clip src="sfx/water_drop.wav"/></part>
     <part>And here is an overlay with a looping sound under speech.</part>
   </overlay>
   <effect type="reverb" preset="large_hall">
@@ -3938,7 +3466,7 @@ mod tests {
     </voice>
     <pause duration="0.3"/>
   </loop>
-  <background volume="@env(0.2,0.3,0.5,0.2)"><sound type="swoosh" volume="0.5"/></background>
+  <background volume="@env(0.2,0.3,0.5,0.2)"><clip src="sfx/swoosh.wav" volume="0.5"/></background>
   Now take a deep breath and let it go.
   <pause duration="0.5"/>
   <voice speaker="female" volume="@min(1.0, @max(0.3, @beat(60, 0.5)))">
@@ -3947,14 +3475,10 @@ mod tests {
   <voice speaker="male" volume="@sin(2) * 0.5 + 0.5">
     This voice oscillates with a sine wave.
   </voice>
-  <until button="I'm ready"
-         waiting-sound="heart_beat"
-         waiting-sound-volume="0.4"
-         pre-pause="0.5"
-         post-pause="0.3">
-    Press the button when you are ready.
-  </until>
-  <sound type="success"/>
+  <zone name="finish">
+    <mark name="almost"/>
+    Press on to the end.
+  </zone>
   <voice speaker="female" volume="@fadeout(1)">
     Thank you for exploring every feature. Goodbye.
   </voice>
@@ -4066,6 +3590,248 @@ mod tests {
         assert!(resolve_include_targets("nope.xml", &hypnos, &agent).is_err());
     }
 
+    // ========================================================================
+    // <clip> resolution / decode / freshness
+    // ========================================================================
+
+    #[test]
+    fn resolve_clip_target_prefers_script_dir_and_rejects_globs() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent_data");
+        let sfx = agent.join("hypnos").join("sfx");
+        fs::create_dir_all(&sfx).unwrap();
+        fs::write(sfx.join("click.wav"), b"RIFF").unwrap();
+        // A DIRECTORY with the wanted name at the agent root must not win
+        // over the real file in the script dir.
+        fs::create_dir_all(agent.join("click.wav")).unwrap();
+
+        let got = resolve_clip_target("click.wav", &sfx, &agent).unwrap();
+        assert!(got.starts_with(&sfx) && got.ends_with("click.wav"));
+
+        // Missing everywhere errors.
+        assert!(resolve_clip_target("nope.wav", &sfx, &agent).is_err());
+        // Globs are rejected outright.
+        let err = resolve_clip_target("*.wav", &sfx, &agent).unwrap_err().to_string();
+        assert!(err.contains("Wildcards"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn clip_decode_resample_speed_and_volume() {
+        // A 3-sample ramp at 8000 Hz, decoded, resampled to 24000 Hz
+        // (×3 length via linear interpolation), scaled by volume — the exact
+        // pipeline `render_clip` runs (minus the renderer struct, which needs
+        // the TTS model).
+        let dir = tempdir().unwrap();
+        let wav_path = dir.path().join("src.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 8000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&wav_path, spec).unwrap();
+        for s in [0.0f32, 0.5f32, 1.0f32] {
+            writer.write_sample((s * 32767.0) as i16).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let (sr, mono) = decode_wav_mono(&wav_path).unwrap();
+        assert_eq!(sr, 8000);
+        assert_eq!(mono.len(), 3);
+        // 16-bit PCM decodes back to ~the written amplitudes.
+        assert!((mono[1] - 0.5).abs() < 0.001);
+
+        // Resample 8 kHz → 24 kHz: 3 samples become 9.
+        let up = resample(&mono, 8000, 24000);
+        assert_eq!(up.len(), 9);
+        assert!((up[0] - 0.0).abs() < 0.001);
+        assert!((up[3] - 0.5).abs() < 0.001, "on-grid samples map 1:1");
+        assert!((up[4] - 0.6667).abs() < 0.001, "interpolated sample");
+
+        // Speed folds into the resample ratio: at 2× a 3-sample/8 kHz clip
+        // behaves like 16 kHz → 24 kHz = 1.5 samples → truncated to 1… the
+        // ratio math must at least halve the duration at 24 kHz target.
+        let fast = resample(&mono, (8000f64 * 2.0) as u32, 24000);
+        let normal = resample(&mono, 8000, 24000);
+        assert!(
+            (fast.len() as f32 / normal.len() as f32 - 0.5).abs() < 0.1,
+            "2x speed ≈ half the samples: {} vs {}",
+            fast.len(),
+            normal.len()
+        );
+
+        // Volume scalar, exactly as render_clip applies it.
+        let scaled = apply_volume(&up, 0.5);
+        assert!((scaled[3] - 0.25).abs() < 0.001);
+        assert!(scaled.iter().all(|&s| s.abs() <= 1.0));
+
+        // Stereo input averages down to mono.
+        let stereo_path = dir.path().join("stereo.wav");
+        let sspec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 8000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&stereo_path, sspec).unwrap();
+        // Two frames: (1.0, -1.0) → 0.0 and (0.5, 0.25) → 0.375.
+        for s in [(32767i16, -32767i16), (16384, 8192)] {
+            writer.write_sample(s.0).unwrap();
+            writer.write_sample(s.1).unwrap();
+        }
+        writer.finalize().unwrap();
+        let (_, mono2) = decode_wav_mono(&stereo_path).unwrap();
+        assert_eq!(mono2.len(), 2);
+        assert!(mono2[0].abs() < 0.01, "L+R cancel to silence");
+        assert!((mono2[1] - 0.375).abs() < 0.01);
+    }
+
+    #[test]
+    fn clips_digest_tracks_wav_content_not_script_bytes() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent_data");
+        let hypnos = agent.join("hypnos");
+        fs::create_dir_all(&hypnos).unwrap();
+        fs::write(hypnos.join("a.wav"), b"first-bytes").unwrap();
+
+        let script = "<voice><clip src='a.wav'/></voice>";
+        let script_dir = hypnos.clone();
+
+        // No clips declared → None.
+        assert_eq!(
+            clips_digest("<voice>plain</voice>", &script_dir, &agent),
+            None
+        );
+
+        // Stable across calls with the same content…
+        let d1 = clips_digest(script, &script_dir, &agent).unwrap();
+        let d2 = clips_digest(script, &script_dir, &agent).unwrap();
+        assert_eq!(d1, d2);
+
+        // …changes when the WAV's CONTENT changes (script bytes identical).
+        fs::write(hypnos.join("a.wav"), b"different-bytes").unwrap();
+        let d3 = clips_digest(script, &script_dir, &agent).unwrap();
+        assert_ne!(d1, d3);
+
+        // …and again when the file goes missing (a marker keeps forcing
+        // re-renders so the render surfaces the error).
+        fs::remove_file(hypnos.join("a.wav")).unwrap();
+        let d4 = clips_digest(script, &script_dir, &agent).unwrap();
+        assert_ne!(d3, d4);
+    }
+
+    #[test]
+    fn manifest_freshness_compares_clips_digest() {
+        // manifest_is_fresh is the gate render_manifest_file uses; a changed
+        // clip digest must make an otherwise-identical manifest stale.
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let tracks = dir.path().join("tracks");
+        fs::create_dir_all(&agent).unwrap();
+        fs::create_dir_all(&tracks).unwrap();
+        fs::write(agent.join("a.wav"), b"first-bytes").unwrap();
+        let script = "<voice><clip src='a.wav'/></voice>";
+        fs::write(agent.join("main.xml"), script).unwrap();
+
+        let bytes = fs::read(agent.join("main.xml")).unwrap();
+        let hash = manifest::hash_bytes(&bytes);
+        let cd = clips_digest(script, &agent, &agent).unwrap();
+        let out_dir = tracks.join(manifest::manifest_id("main.xml"));
+        fs::create_dir_all(&out_dir).unwrap();
+        fs::write(out_dir.join("seg-000.wav"), b"RIFF").unwrap();
+
+        // Stored digest matching → fresh.
+        let stored = Manifest {
+            version: manifest::MANIFEST_VERSION,
+            hash: hash.clone(),
+            glob_digest: None,
+            clips_digest: Some(cd.clone()),
+            script: "main.xml".into(),
+            root: Segment::Sequence { children: vec![] },
+        };
+        fs::write(
+            out_dir.join("manifest.json"),
+            serde_json::to_string(&stored).unwrap(),
+        )
+        .unwrap();
+        assert!(manifest_is_fresh(
+            &out_dir.join("manifest.json"),
+            &out_dir,
+            &hash,
+            None,
+            Some(&cd),
+        )
+        .is_some());
+
+        // Same script bytes, but the WAV's content changed → stale.
+        fs::write(agent.join("a.wav"), b"different-bytes").unwrap();
+        let cd2 = clips_digest(script, &agent, &agent).unwrap();
+        assert!(manifest_is_fresh(
+            &out_dir.join("manifest.json"),
+            &out_dir,
+            &hash,
+            None,
+            Some(&cd2),
+        )
+        .is_none());
+    }
+
+    /// The manifest walker must emit zone/mark as their own nodes at exact
+    /// segment boundaries (needs the TTS model; skips without it).
+    #[test]
+    fn render_manifest_emits_zone_and_mark_boundaries() {
+        let model_dir = std::env::var_os("TRAIN_ME_MODEL_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        if !model_downloader::is_model_downloaded(&model_dir) {
+            eprintln!(
+                "skipping: no TTS model at {} (set TRAIN_ME_MODEL_DIR)",
+                model_dir.display()
+            );
+            return;
+        }
+        let tmp = tempdir().expect("tempdir");
+        let agent = tmp.path().join("agent");
+        let tracks = tmp.path().join("tracks");
+        fs::create_dir_all(&agent).expect("mkdir");
+        fs::write(
+            agent.join("main.xml"),
+            "<pause duration=\"0.2\"/><mark name=\"halfway\"/>\
+             <zone name=\"tail\"><pause duration=\"0.3\"/></zone>",
+        )
+        .expect("write script");
+
+        let mut renderer = AudioRenderer::new(&model_dir).expect("load model");
+        renderer
+            .render_manifest("main.xml", &agent, &tracks, None)
+            .expect("render");
+
+        let raw = fs::read_to_string(
+            tracks
+                .join(manifest::manifest_id("main.xml"))
+                .join("manifest.json"),
+        )
+        .unwrap();
+        let m: Manifest = serde_json::from_str(&raw).unwrap();
+        assert_eq!(m.version, manifest::MANIFEST_VERSION);
+        assert_eq!(m.clips_digest, None);
+        let Segment::Sequence { children } = m.root else {
+            panic!("expected sequence root");
+        };
+        // static | mark | zone(static) — the mark sits exactly between the
+        // two static runs and the zone wraps its own.
+        assert_eq!(children.len(), 3, "children: {children:?}");
+        assert!(matches!(&children[0], Segment::Static { .. }));
+        assert!(matches!(&children[1], Segment::Mark { name } if name == "halfway"));
+        match &children[2] {
+            Segment::Zone { name, child } => {
+                assert_eq!(name, "tail");
+                assert!(matches!(child.as_ref(), Segment::Static { .. }));
+            }
+            other => panic!("expected zone, got {other:?}"),
+        }
+    }
+
     #[test]
     fn glob_digest_tracks_match_set_not_script_bytes() {
         let dir = tempdir().unwrap();
@@ -4169,10 +3935,7 @@ mod tests {
             | Node::Effect { children, .. }
             | Node::Loop { children, .. }
             | Node::Background { children, .. }
-            | Node::Until { children, .. }
-            | Node::Section { children, .. }
-            | Node::Beatmeter { children, .. }
-            | Node::Visual { children, .. } => {
+            | Node::Zone { children, .. } => {
                 for child in children {
                     collect_text_recursive(child, texts);
                 }
@@ -4184,30 +3947,15 @@ mod tests {
                     }
                 }
             }
-            Node::Random { parts }
-            | Node::Scramble { parts }
-            | Node::Choice { options: parts, .. }
-            | Node::React { parts, .. } => {
+            Node::Random { parts } | Node::Scramble { parts } => {
                 for part in parts {
                     for child in &part.children {
                         collect_text_recursive(child, texts);
                     }
                 }
             }
-            Node::If {
-                then_branch, r#else, ..
-            } => {
-                for child in then_branch {
-                    collect_text_recursive(child, texts);
-                }
-                if let Some(else_nodes) = r#else {
-                    for child in else_nodes {
-                        collect_text_recursive(child, texts);
-                    }
-                }
-            }
-            Node::Pause { .. } | Node::Sound { .. } | Node::Tone { .. } | Node::Include { .. }
-            | Node::Rating { .. } => {}
+            Node::Pause { .. } | Node::Tone { .. } | Node::Include { .. } | Node::Clip { .. }
+            | Node::Mark { .. } => {}
         }
     }
 
@@ -4230,16 +3978,13 @@ mod tests {
             | Node::Effect { children, .. }
             | Node::Loop { children, .. }
             | Node::Background { children, .. }
-            | Node::Until { children, .. }
-            | Node::Section { children, .. } => {
+            | Node::Zone { children, .. } => {
                 children.iter().any(contains_include_recursive)
             }
             Node::Overlay { parts, .. } => parts
                 .iter()
                 .any(|p| p.children.iter().any(contains_include_recursive)),
-            Node::Random { parts }
-            | Node::Scramble { parts }
-            | Node::Choice { options: parts, .. } => parts
+            Node::Random { parts } | Node::Scramble { parts } => parts
                 .iter()
                 .any(|p| p.children.iter().any(contains_include_recursive)),
             _ => false,
@@ -4490,11 +4235,17 @@ mod tests {
         fs::create_dir_all(&agent).expect("mkdir");
         // Mixed content on purpose: word-costed TTS leaves + paste-costed
         // clip leaves, so the ledger must handle both scales in one render.
+        write_wav_file(
+            agent.join("click.wav"),
+            &vec![0.5f32; 240],
+            24000,
+        )
+        .expect("write clip wav");
         fs::write(
             agent.join("main.xml"),
             "Warm up slowly. <pause duration=\"0.3\"/> \
-             <sound type=\"pop\"/> Breathing deepens now. \
-             <sound type=\"snap\"/> Good.",
+             <clip src=\"click.wav\"/> Breathing deepens now. \
+             <clip src=\"click.wav\" volume=\"0.7\"/> Good.",
         )
         .expect("write script");
 

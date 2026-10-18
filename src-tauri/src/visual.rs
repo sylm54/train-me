@@ -37,6 +37,16 @@
 //! media is cached on disk under `<data_dir>/visuals/` (content-addressed by
 //! gif id), served to the WebView by the audio server's `/visuals` mount, and
 //! is shared between configs — overlapping niches dedupe to one download.
+//!
+//! NOTE (v5 audio-only grammar): the `<visual>` TTS tag is gone and the
+//! prerender pass no longer prefetches visual playlists — visuals move to
+//! the interaction layer as widgets in a later phase. The `visual_fetch`
+//! command and playlist cache remain live for the current frontend player
+//! in the meantime, which is why this module (and the pieces only the
+//! prefetch path used) is kept rather than deleted. `dead_code` is allowed
+//! module-wide for that transitional period.
+#![allow(dead_code)]
+// (inner attribute must precede items; the `use` block follows)
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -628,46 +638,34 @@ pub fn collect_configs_in_agent_dir(agent_dir: &Path) -> Vec<VisualConfig> {
 }
 
 /// Gather the `<visual>` configs of an AST, at any depth.
+///
+/// NOTE: the `<visual>` tag left the TTS grammar in the audio-only rewrite
+/// (v5), so a freshly-parsed AST can no longer contain `Visual` nodes — this
+/// always returns empty. Kept because the `visual_fetch` command and the
+/// playlist cache still exist for the (to-be-replaced) frontend slideshow
+/// path; the interaction layer's widget visuals arrive in a later phase.
 pub fn collect_configs(nodes: &[Node], out: &mut Vec<VisualConfig>) {
     for node in nodes {
         match node {
-            Node::Visual { config, children } => {
-                out.push(config.clone());
-                collect_configs(children, out);
-            }
             Node::Voice { children, .. }
             | Node::Speed { children, .. }
             | Node::Volume { children, .. }
             | Node::Effect { children, .. }
             | Node::Background { children, .. }
-            | Node::Until { children, .. }
             | Node::Loop { children, .. }
-            | Node::Section { children, .. }
-            | Node::Beatmeter { children, .. } => collect_configs(children, out),
-            Node::If {
-                then_branch,
-                r#else,
-                ..
-            } => {
-                collect_configs(then_branch, out);
-                if let Some(else_nodes) = r#else {
-                    collect_configs(else_nodes, out);
-                }
-            }
+            | Node::Zone { children, .. } => collect_configs(children, out),
             Node::Overlay { parts, .. }
             | Node::Random { parts }
-            | Node::Scramble { parts }
-            | Node::Choice { options: parts, .. }
-            | Node::React { parts, .. } => {
+            | Node::Scramble { parts } => {
                 for part in parts {
                     collect_configs(&part.children, out);
                 }
             }
             Node::Text(_)
             | Node::Pause { .. }
-            | Node::Sound { .. }
             | Node::Tone { .. }
-            | Node::Rating { .. }
+            | Node::Clip { .. }
+            | Node::Mark { .. }
             | Node::Include { .. } => {}
         }
     }
@@ -1401,6 +1399,9 @@ mod tests {
     }
     #[test]
     fn test_collect_configs_in_scripts() {
+        // Since `<visual>` left the TTS grammar (v5 audio-only rewrite), no
+        // script parses to a Visual node — collection always comes back
+        // empty, whatever the files contain.
         let dir = tempfile::tempdir().unwrap();
         let agent = dir.path();
         std::fs::create_dir_all(agent.join("hypnos")).unwrap();
@@ -1414,26 +1415,12 @@ mod tests {
             "<voice>no visuals here</voice>",
         )
         .unwrap();
-        // Contains the substring but fails to parse — contributes nothing.
-        std::fs::write(
-            agent.join("hypnos/broken.xml"),
-            "<visual count=\"notanumber\"><voice>x</voice></visual>",
-        )
-        .unwrap();
 
         let configs = collect_configs_in_scripts(
             agent,
-            &[
-                "hypnos/vis.xml".into(),
-                "hypnos/other.xml".into(),
-                "hypnos/broken.xml".into(),
-                "hypnos/missing.xml".into(),
-            ],
+            &["hypnos/vis.xml".into(), "hypnos/other.xml".into()],
         );
-        assert_eq!(configs.len(), 1);
-        assert_eq!(configs[0].tags, vec!["hypno".to_string()]);
-        assert_eq!(configs[0].count, 4);
-        assert_eq!(configs[0].niches, vec!["just-boobs".to_string()]);
+        assert!(configs.is_empty());
     }
 
     #[test]
