@@ -10,14 +10,20 @@
  * Framework props every widget accepts (validated here, consumed by
  * the Stage, never seen by the component):
  *
- *   area  "full" | preset | { col, row, cols?, rows? }   (default "center")
- *   z     integer stack order, negatives behind           (default 0)
+ *   area  "full" | preset | { col, row, cols?, rows? }   (default per type)
+ *   z     integer stack order, negatives behind           (default per type)
+ *
+ * A widget type may declare its own defaults for both (`layout`), so a
+ * media background mounts full-bleed behind everything and a beatmeter
+ * hugs the bottom without the script spelling it out.
  */
 
 import type { ComponentType } from "react";
+import { BeatmeterWidget, validateBeatmeterProps } from "@/widgets/beatmeter";
 import { ButtonsWidget, validateButtonsProps } from "@/widgets/buttons";
 import { ChecklistWidget, validateChecklistProps } from "@/widgets/checklist";
 import { InputWidget, validateInputProps } from "@/widgets/input";
+import { MediaWidget, validateMediaProps } from "@/widgets/media";
 import { SliderWidget, validateSliderProps } from "@/widgets/slider";
 import { TextWidget, validateTextProps } from "@/widgets/text";
 import { TimerWidget, validateTimerProps } from "@/widgets/timer";
@@ -47,6 +53,14 @@ const AREA_PRESETS: readonly AreaPreset[] = [
 
 // ── Widget type shape ───────────────────────────────────────────────────────
 
+/** Live snapshot of one run-audio handle (the beatmeter's `sync` source).
+ * Structurally `scriptHandle.AudioHandleState` — positions are nominal. */
+export interface AudioPositionState {
+  position: number;
+  duration: number;
+  playing: boolean;
+}
+
 /** What the Stage injects into every widget component. */
 export interface WidgetControl {
   /** The widget's script-facing id (`w.id`). */
@@ -57,6 +71,15 @@ export interface WidgetControl {
   complete(value: unknown): void;
   /** Emit a widget event (change / pick / custom) to the script. */
   emit(name: string, payload?: unknown): void;
+  /**
+   * Subscribe to a run-audio handle's live position — the beatmeter's
+   * `sync` clock. Unthrottled (every player tick). Throws an author-facing
+   * error when `id` is not a live audio handle of this run.
+   */
+  observeAudio(
+    id: string,
+    cb: (state: AudioPositionState) => void,
+  ): () => void;
 }
 
 export interface WidgetComponentProps<P> {
@@ -78,6 +101,11 @@ export interface WidgetType<P> {
    * flags is right from the moment of `show` — before anything mounts.
    */
   initialState?: (props: P) => Record<string, unknown>;
+  /**
+   * This type's framework-prop defaults, used when the script omits
+   * `area` / `z` (plain `"center"` / `0` otherwise).
+   */
+  layout?: { area?: Area; z?: number };
 }
 
 /** Heterogeneous storage type — the map holds widgets of many `P`s. */
@@ -116,6 +144,31 @@ function positiveInt(prop: string, value: unknown): number {
 }
 
 /**
+ * Scripts pass an audio ScriptHandle as a prop (the beatmeter's `sync`).
+ * A live handle carries promises, so it cannot cross postMessage — the
+ * iframe shim swaps it for a plain `{ __audioRef: id }` marker before the
+ * call. Unwrap those here so per-type validators and components see the
+ * bare handle id.
+ */
+function unwrapAudioRefs(
+  props: Record<string, unknown>,
+): Record<string, unknown> {
+  let out = props;
+  for (const [key, value] of Object.entries(props)) {
+    if (
+      value !== null &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      typeof (value as { __audioRef?: unknown }).__audioRef === "string"
+    ) {
+      if (out === props) out = { ...props };
+      out[key] = (value as { __audioRef: string }).__audioRef;
+    }
+  }
+  return out;
+}
+
+/**
  * Validate a widget's full props object (as sent by `show`, or merged
  * by `w.set` — pass the op for the error prefix). Throws author-facing
  * errors; never returns partial data.
@@ -143,7 +196,7 @@ export function validateWidgetProps(
     );
   }
 
-  let validArea: Area = "center";
+  let validArea: Area = widgetType.layout?.area ?? "center";
   if (area !== undefined) {
     if (typeof area === "string") {
       if (!AREA_PRESETS.includes(area as AreaPreset)) {
@@ -168,7 +221,7 @@ export function validateWidgetProps(
     }
   }
 
-  let validZ = 0;
+  let validZ = widgetType.layout?.z ?? 0;
   if (z !== undefined) {
     if (typeof z !== "number" || !Number.isInteger(z)) {
       throw new Error(`${op}: ${where}: props.z must be an integer`);
@@ -177,7 +230,7 @@ export function validateWidgetProps(
   }
 
   try {
-    const perType = widgetType.validate(rest);
+    const perType = widgetType.validate(unwrapAudioRefs(rest));
     return {
       type,
       props: perType,
@@ -229,4 +282,18 @@ defineWidget("timer", {
   initialState: (props) => ({
     seconds: props.mode === "down" ? props.duration : 0,
   }),
+});
+
+defineWidget("media", {
+  component: MediaWidget,
+  validate: validateMediaProps,
+  // A background layer: full-bleed behind everything.
+  layout: { area: "full", z: -1 },
+});
+
+defineWidget("beatmeter", {
+  component: BeatmeterWidget,
+  validate: validateBeatmeterProps,
+  // A thin scrolling strip along the bottom edge of the grid.
+  layout: { area: { col: 1, row: 6, cols: 6, rows: 1 } },
 });

@@ -25,6 +25,11 @@
  * leaking into the new one. Enclosing background layers are lost (they
  * were dropped by the cut, documented in FORMAT.md §3.4); volume/speed
  * survive because they live on the player.
+ *
+ * Widget sync reads handles through `observe(id, cb)` — unthrottled
+ * position callbacks (every player tick) for the `beatmeter` widget's
+ * sample-accurate click scheduling, wired per-run by `startScript` via
+ * `WidgetStore.setAudioObserver`.
  */
 
 import { invoke } from "@tauri-apps/api/core";
@@ -123,6 +128,12 @@ interface AudioEntry {
   lastPush: number;
   lastPushedPosition: number;
   lastPushedPlaying: boolean | null;
+  /**
+   * Live (unthrottled) position subscribers — the `beatmeter` widget's
+   * `sync` clock. Position updates fire per media tick here, while the
+   * iframe/chrome pushes above stay throttled to ~5 Hz.
+   */
+  positionListeners: Set<(state: AudioHandleState) => void>;
 }
 
 // ── SessionAudio ───────────────────────────────────────────────────────────
@@ -151,6 +162,36 @@ export class SessionAudio {
    * `bridge.emitEvent("audio:<id>:state", …)`. */
   setSink(sink: (id: string, state: AudioHandleState) => void): void {
     this.sink = sink;
+  }
+
+  /**
+   * Subscribe to an entry's live nominal position — unthrottled (fires on
+   * every player tick), unlike the ~5 Hz iframe/chrome pushes. The immediate
+   * first call hands back the current snapshot, so a subscriber never starts
+   * from nothing. Throws an author-facing error for an unknown id: the
+   * widget layer surfaces it, and a stale/never-played handle is the usual
+   * cause. Handles that already ended stay observable (frozen position,
+   * `playing: false`).
+   */
+  observe(
+    id: string,
+    cb: (state: AudioHandleState) => void,
+  ): () => void {
+    const entry = this.entries.get(id);
+    if (!entry) {
+      throw new Error(
+        `sync handle "${id}": no such audio handle — pass the handle audio.play returned`,
+      );
+    }
+    entry.positionListeners.add(cb);
+    cb({
+      position: entry.position,
+      duration: entry.duration,
+      playing: entry.phase === "playing",
+    });
+    return () => {
+      entry.positionListeners.delete(cb);
+    };
   }
 
   // ── Script-side ops (bridge RPC handlers call rpc) ────────────────────
@@ -210,6 +251,7 @@ export class SessionAudio {
           entry.phase = "paused";
           this.updateRow(entry);
           this.pushState(entry, true);
+          this.emitPosition(entry);
         }
         return null;
       case "resume":
@@ -218,6 +260,7 @@ export class SessionAudio {
           entry.phase = "playing";
           this.updateRow(entry);
           this.pushState(entry, true);
+          this.emitPosition(entry);
         }
         return null;
       case "stop":
@@ -386,11 +429,13 @@ export class SessionAudio {
         entry.spine = { id: info.segmentId, nominalStart: info.nominalStart };
         entry.position = info.nominalStart;
         this.pushState(entry, true);
+        this.emitPosition(entry);
       },
       onProgress: (state) => {
         if (!entry.spine || state.segmentId !== entry.spine.id) return;
         entry.position = entry.spine.nominalStart + state.currentTime;
         this.pushState(entry);
+        this.emitPosition(entry);
       },
     });
     entry = {
@@ -415,8 +460,20 @@ export class SessionAudio {
       lastPush: 0,
       lastPushedPosition: -1,
       lastPushedPlaying: null,
+      positionListeners: new Set(),
     };
     return entry;
+  }
+
+  /** Fan a position/phase snapshot out to the unthrottled observers. */
+  private emitPosition(entry: AudioEntry): void {
+    if (entry.positionListeners.size === 0) return;
+    const state: AudioHandleState = {
+      position: entry.position,
+      duration: entry.duration,
+      playing: entry.phase === "playing",
+    };
+    for (const cb of entry.positionListeners) cb(state);
   }
 
   /** Begin (or restart, after seek/loopZone) a walk from `root`. */
@@ -425,6 +482,7 @@ export class SessionAudio {
     entry.phase = "playing";
     this.updateRow(entry);
     this.pushState(entry, true);
+    this.emitPosition(entry);
     // start() resolves when the tree finishes; end/errors are handled by
     // the onEnded/onError callbacks. The catch is purely defensive.
     entry.player.start(root).catch(() => undefined);
@@ -435,6 +493,7 @@ export class SessionAudio {
     if (entry.phase === "ended") return;
     entry.phase = "ended";
     entry.player.destroy();
+    this.emitPosition(entry);
     for (const ws of entry.waiters.values()) for (const w of ws) w();
     entry.waiters.clear();
     entry.settleEnd(err);

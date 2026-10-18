@@ -1,35 +1,48 @@
 /**
- * Web Audio click scheduler for `<beatmeter>` segments.
+ * Web Audio click scheduler for beat-synced playback.
  *
  * The metronome's audible click is produced here, not baked into the clip: at
  * each beat time the player triggers a short rendered sample (an
  * `AudioBufferSourceNode`) through a master gain node. Timing is sample-accurate
  * because Web Audio `start(when)` is scheduled on the `AudioContext` clock; we
  * keep it fed with the standard **lookahead** technique — a short `setInterval`
- * polls the backing `HTMLAudioElement.currentTime` and schedules every beat
- * falling within the next ~100 ms, which absorbs timer jitter.
+ * polls the backing clock and schedules every beat falling within the next
+ * ~100 ms, which absorbs timer jitter.
  *
- * The element's clock and the AudioContext clock are different free-running
- * timers; we bridge them by mapping each beat's element-time to a context-time
- * as `ctxNow + (beatTime − elNow) + offset`. `offset` is the user-tunable beat
- * offset (ms) that compensates for any latency offset between the media element
- * path and the Web Audio path.
+ * The schedule clock is injected ({@link BeatClock}). The manifest player
+ * bridged an `HTMLAudioElement`'s clock and the AudioContext clock — two
+ * free-running timers — as `ctxNow + (beatTime − elNow) + offset`; a widget
+ * passes a virtual clock instead (interpolated script position, or wall time
+ * for a free-running meter). `offset` is the tunable latency offset (ms)
+ * that compensates for any offset between the clock source and Web Audio.
  *
  * The schedule itself (`beats`) and the click `sample` path come from the
- * manifest; nothing is re-derived at runtime.
+ * caller; nothing is re-derived at runtime. `sample` is a sandbox-relative
+ * path fetched through the audio server's `/files` route and decoded into
+ * Web Audio.
  */
 
-import { audioUrlForPath } from "@/lib/audioUrl";
+import { fileUrlForPath } from "@/lib/audioUrl";
 
 /**
- * Resolved beat schedule for a metronomed clip. `sample` is an absolute
- * path to a short click WAV the scheduler loads into Web Audio and triggers
- * at each `beat.time`. `volume` is the base gain; `accent_gain` multiplies
- * it on accented beats.
+ * The schedule's time source: `now()` returns schedule seconds — monotonic
+ * while running, frozen while paused. The old media-element callers pass
+ * `{ now: () => el.currentTime }`; widgets pass an interpolated position or
+ * a wall-clock origin.
+ */
+export interface BeatClock {
+  now(): number;
+}
+
+/**
+ * Resolved beat schedule for a metronomed clip. `sample` is a
+ * sandbox-relative path to a short click WAV the scheduler fetches through
+ * the audio server's `/files` route and triggers at each `beat.time`.
+ * `volume` is the base gain; `accent_gain` multiplies it on accented beats.
  *
- * Manifest v5 dropped the `<beatmeter>` tag, so nothing produces this
- * anymore — the class is kept for a later widget phase that will reintroduce
- * beat-synced audio.
+ * Manifest v5 dropped the `<beatmeter>` tag; the scheduler now serves the
+ * `beatmeter` widget's audible click (the widget generates `beats` from its
+ * bpm + pattern over the script's duration).
  */
 export interface BeatmeterMeta {
   sample: string;
@@ -64,7 +77,7 @@ export class BeatScheduler {
   private bufferCache = new Map<string, Promise<AudioBuffer>>();
   /** The sample + schedule currently being tracked, if scheduling is active. */
   private buffer: AudioBuffer | null = null;
-  private el: HTMLAudioElement | null = null;
+  private clock: BeatClock | null = null;
   private meta: BeatmeterMeta | null = null;
   private offsetMs = 0;
   /** Index into `meta.beats` of the next beat to schedule. */
@@ -88,28 +101,28 @@ export class BeatScheduler {
     return this.ctx;
   }
 
-  /** Decode (and cache) the click sample for an absolute path. */
-  private async decode(absPath: string): Promise<AudioBuffer> {
-    const cached = this.bufferCache.get(absPath);
+  /** Decode (and cache) the click sample for a sandbox-relative path. */
+  private async decode(relPath: string): Promise<AudioBuffer> {
+    const cached = this.bufferCache.get(relPath);
     if (cached) return cached;
     const p = (async () => {
-      const url = await audioUrlForPath(absPath);
+      const url = await fileUrlForPath(relPath);
       const resp = await fetch(url);
       const ab = await resp.arrayBuffer();
       // decodeAudioData must run on a live context; ensureCtx creates one.
       return await this.ensureCtx().decodeAudioData(ab);
     })();
-    this.bufferCache.set(absPath, p);
+    this.bufferCache.set(relPath, p);
     return p;
   }
 
   /**
-   * Begin triggering clicks for `meta` synced to `el`. Decodes the sample
-   * first (cached), resumes the context if suspended, then starts the
+   * Begin triggering clicks for `meta` on `clock`'s timeline. Decodes the
+   * sample first (cached), resumes the context if suspended, then starts the
    * lookahead loop. Resolves once scheduling is armed.
    */
   async start(
-    el: HTMLAudioElement,
+    clock: BeatClock,
     meta: BeatmeterMeta,
     offsetMs: number,
   ): Promise<void> {
@@ -118,16 +131,17 @@ export class BeatScheduler {
     this.buffer = await this.decode(meta.sample);
     if (token !== this.startToken) return; // superseded by a newer start/stop
     if (this.ctx!.state === "suspended") await this.ctx!.resume();
-    this.el = el;
+    this.clock = clock;
     this.meta = meta;
     this.offsetMs = offsetMs;
     this.rewind();
     this.ensureTimer();
   }
 
-  /** Re-derive `nextIdx` from the element's current position. */
-  private rewind(): void {
-    const t = this.el?.currentTime ?? 0;
+  /** Re-derive `nextIdx` from the clock's current position — public so a
+   * caller can re-sync after the clock jumps (a seek, a source swap). */
+  rewind(): void {
+    const t = this.clock?.now() ?? 0;
     const beats = this.meta?.beats ?? [];
     let i = 0;
     while (i < beats.length && beats[i].time < t - STALE_S) i++;
@@ -142,27 +156,27 @@ export class BeatScheduler {
 
   /** Resume scheduling after a pause. */
   async resume(): Promise<void> {
-    if (!this.ctx || !this.el || !this.meta) return;
+    if (!this.ctx || !this.clock || !this.meta) return;
     if (this.ctx.state === "suspended") await this.ctx.resume();
     this.rewind();
     this.ensureTimer();
   }
 
-  /** Stop tracking the current segment (e.g. segment ended). Keeps the ctx. */
+  /** Stop tracking the current schedule (e.g. the widget was removed). Keeps the ctx. */
   stop(): void {
     this.startToken++;
     this.clearTimer();
-    this.el = null;
+    this.clock = null;
     this.meta = null;
     this.buffer = null;
     this.nextIdx = 0;
   }
 
-  /** Tear everything down (player destroy). */
+  /** Tear everything down (widget unmount). */
   async close(): Promise<void> {
     this.startToken++;
     this.clearTimer();
-    this.el = null;
+    this.clock = null;
     this.meta = null;
     this.buffer = null;
     this.nextIdx = 0;
@@ -173,7 +187,7 @@ export class BeatScheduler {
   }
 
   private ensureTimer(): void {
-    if (this.timer || !this.ctx || !this.el || !this.meta) return;
+    if (this.timer || !this.ctx || !this.clock || !this.meta) return;
     this.timer = setInterval(() => this.tick(), TICK_MS);
     this.tick();
   }
@@ -184,16 +198,16 @@ export class BeatScheduler {
   }
 
   private tick(): void {
-    const { ctx, el, meta, master, buffer } = this;
-    if (!ctx || !el || !meta || !master || !buffer) return;
+    const { ctx, clock, meta, master, buffer } = this;
+    if (!ctx || !clock || !meta || !master || !buffer) return;
     const ctxNow = ctx.currentTime;
-    const elNow = el.currentTime;
+    const clockNow = clock.now();
     const offsetS = this.offsetMs / 1000;
     const beats = meta.beats;
 
     while (this.nextIdx < beats.length) {
       const b = beats[this.nextIdx];
-      const whenCtx = ctxNow + (b.time - elNow) + offsetS;
+      const whenCtx = ctxNow + (b.time - clockNow) + offsetS;
       const lag = whenCtx - ctxNow;
       if (lag < -STALE_S) {
         // Beat is already well past (e.g. after a stall/seek) — skip it.

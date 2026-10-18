@@ -68,6 +68,12 @@ interface VisualStageProps {
   error?: string | null;
   /** Mirrors the player's playing state — pauses the tempo + videos. */
   playing: boolean;
+  /**
+   * Slides have no timecode of their own, so hosts that want one (the
+   * `media` widget emits `tick` for script sync) learn of an advance here.
+   * Called with the new slide index on every switch (not on the initial 0).
+   */
+  onSlideIndex?: (index: number) => void;
 }
 
 /** Crossfade duration in ms (disabled by the `cut` effect). */
@@ -90,8 +96,17 @@ function shuffle<T>(input: T[]): T[] {
   return out;
 }
 
-export function VisualStage({ config, slides, error, playing }: VisualStageProps) {
+export function VisualStage({
+  config,
+  slides,
+  error,
+  playing,
+  onSlideIndex,
+}: VisualStageProps) {
   const [index, setIndex] = useState(0);
+  /** Latest onSlideIndex without putting it in the rAF effect's deps. */
+  const onSlideRef = useRef(onSlideIndex);
+  onSlideRef.current = onSlideIndex;
   /** Remaining ms for the current slide. Ref (not state) to avoid re-renders. */
   const remainingRef = useRef(0);
   /** Per-slide interval, redrawn from the range on every advance. */
@@ -124,6 +139,7 @@ export function VisualStage({ config, slides, error, playing }: VisualStageProps
         if (remainingRef.current <= 0) {
           const next = (index + 1) % count;
           setIndex(next);
+          onSlideRef.current?.(next);
           // Stack the new slide over the old one; the old layer unmounts
           // after its fade completes.
           intervalRef.current = 1000 * drawInterval(config);

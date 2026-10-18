@@ -118,6 +118,7 @@ function WidgetFrame({
       setState: (patch) => store.updateState(record.id, patch),
       complete: (value) => store.complete(record.id, value),
       emit: (name, payload) => store.emitEvent(record.id, name, payload),
+      observeAudio: (id, cb) => store.observeAudio(id, cb),
     }),
     [store, record.id],
   );

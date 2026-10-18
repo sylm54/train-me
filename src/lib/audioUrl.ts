@@ -51,6 +51,9 @@ export function getCachedBaseUrl(): string | null {
  */
 const TRACKS_MOUNT = "/tracks/";
 
+/** The route that serves the agent sandbox root (`/files/<rel-path>`). */
+const FILES_MOUNT = "/files/";
+
 /**
  * Turn an absolute track path (as emitted by the backend's
  * `read_manifest` / `list_tracks`) into a URL on the audio server.
@@ -82,4 +85,22 @@ export async function audioUrlForPath(absPath: string): Promise<string> {
   const url = query ? `${beforeQuery}${pathPart}?${query}` : `${beforeQuery}${pathPart}`;
   console.log(`[audioUrl] ${absPath} → ${url}`);
   return url;
+}
+
+/**
+ * Turn a sandbox-relative file path (what widget props like the `media`
+ * widget's `file` or the `beatmeter` widget's `sound` carry) into a URL on
+ * the audio server's `/files` route, which serves the agent sandbox root
+ * with the same `?t=<token>` auth as `/tracks`. Inserted before the query,
+ * path-encoded per segment, exactly like `audioUrlForPath`.
+ */
+export async function fileUrlForPath(relPath: string): Promise<string> {
+  const base = await audioBaseUrl();
+  const [beforeQuery, query = ""] = base.split("?", 2);
+  const pathPart = `${FILES_MOUNT}${relPath
+    .replace(/\\/g, "/")
+    .split("/")
+    .map(encodeURIComponent)
+    .join("/")}`;
+  return query ? `${beforeQuery}${pathPart}?${query}` : `${beforeQuery}${pathPart}`;
 }

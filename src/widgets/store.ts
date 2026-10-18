@@ -21,7 +21,10 @@
  * `setSink`, which `startScript` points at `bridge.emitEvent`.
  */
 
-import { validateWidgetProps } from "@/widgets/registry";
+import {
+  validateWidgetProps,
+  type AudioPositionState,
+} from "@/widgets/registry";
 
 /** One widget event as queued for `once` (payload is bridge-safe JSON). */
 export interface WidgetEvent {
@@ -59,6 +62,18 @@ export class WidgetStore {
   private readonly listeners = new Set<() => void>();
   private sink: ((id: string, name: string, payload: unknown) => void) | null =
     null;
+  /**
+   * Where `observeAudio` looks up run-audio handles — `startScript` points
+   * this at `SessionAudio.observe`, so a beatmeter's `sync` can follow the
+   * script it names. Null until wired (store created before the run's
+   * audio exists).
+   */
+  private audioObserver:
+    | ((
+        id: string,
+        cb: (state: AudioPositionState) => void,
+      ) => () => void)
+    | null = null;
   private version = 0;
 
   /** Where widget events and state snapshots go after the store —
@@ -67,6 +82,32 @@ export class WidgetStore {
     sink: (id: string, name: string, payload: unknown) => void,
   ): void {
     this.sink = sink;
+  }
+
+  /** Bind the run's audio so widget components can observe script
+   * handles (`control.observeAudio`). */
+  setAudioObserver(
+    observer: (
+      id: string,
+      cb: (state: AudioPositionState) => void,
+    ) => () => void,
+  ): void {
+    this.audioObserver = observer;
+  }
+
+  /** Subscribe to a run-audio handle's live nominal position. Throws
+   * author-facing errors — the component effect surfaces them through the
+   * Stage's per-widget error boundary. */
+  observeAudio(
+    id: string,
+    cb: (state: AudioPositionState) => void,
+  ): () => void {
+    if (!this.audioObserver) {
+      throw new Error(
+        `sync handle "${id}": this run has no audio yet — audio.play first`,
+      );
+    }
+    return this.audioObserver(id, cb);
   }
 
   // ── Stage plumbing ────────────────────────────────────────────────────────

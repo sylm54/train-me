@@ -9,8 +9,10 @@
  * ops back the iframe-side handles (`done`, `state`, `set`, `on`/
  * `once`, `remove`). `audio` is live too: `audio.prepare`/`play` and
  * the `audio.handle.*` ops run against this run's SessionAudio
- * (independent ManifestPlayers — nothing claims the audio bus). Only
- * `media` still rejects with "not implemented yet".
+ * (independent ManifestPlayers — nothing claims the audio bus), and its
+ * handles are observable by widgets (`beatmeter`'s `sync` follows a
+ * playing script). `media.prefetch` warms the visual playlist cache for
+ * a media-widget config.
  *
  * All timing is parent-driven: `wait(seconds)` is a parent setTimeout
  * that posts the response back — the iframe never runs a timer of its
@@ -18,9 +20,11 @@
  */
 
 import { emit } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import { logActivity } from "@/lib/activity";
 import { SANDBOX_SRCDOC, ScriptBridge, type OpHandler } from "@/lib/runtime/bridge";
 import { SessionAudio } from "@/lib/runtime/scriptHandle";
+import { validateMediaProps, toVisualConfig } from "@/widgets/media";
 import { WidgetStore } from "@/widgets/store";
 
 /** How the program ended — the only two ways a script run settles. */
@@ -62,13 +66,6 @@ export interface ScriptHandle {
    * the caller decides what the teardown means.
    */
   teardown: () => void;
-}
-
-/** Reject with a stable message for ops wired in later phases. */
-function notImplemented(op: string): OpHandler {
-  return () => {
-    throw new Error(`${op}: not implemented yet`);
-  };
 }
 
 /** The `audio.*` bridge ops, all dispatched through this run's
@@ -120,6 +117,8 @@ export async function startScript(config: ScriptConfig): Promise<ScriptHandle> {
   // This run's audio: independent players per `audio.play`, chrome rows
   // for the session mini-player, state pushes into the iframe handles.
   const audio = new SessionAudio();
+  // Widget components observe this run's audio handles (beatmeter `sync`).
+  widgets.setAudioObserver((id, cb) => audio.observe(id, cb));
   // The first `fail(reason)` wins even if the script catches it and the
   // program later resolves — a called fail is a failed run, period.
   let failReason: string | null = null;
@@ -190,7 +189,21 @@ export async function startScript(config: ScriptConfig): Promise<ScriptHandle> {
     "widget.done": ([id]) => widgets.done(id as string),
     "widget.once": ([id, name]) => widgets.onceEvent(id as string, name as string),
     ...audioOps(audio),
-    media: notImplemented("media"),
+    "media.prefetch": ([config]) => {
+      // Same validation the `media` widget's `show` runs, so a config that
+      // would be rejected on stage is rejected here too. The playlist cache
+      // lives on the backend: `visual_fetch` resolves the config against its
+      // source, stores the playlist on disk, and tops it up in the
+      // background when stale — the returned slides are irrelevant to a
+      // prefetch, only the warm cache matters.
+      if (typeof config !== "object" || config === null || Array.isArray(config)) {
+        throw new Error("media.prefetch expects a media config object");
+      }
+      const mediaProps = validateMediaProps(config as Record<string, unknown>);
+      return invoke("visual_fetch", { config: toVisualConfig(mediaProps) }).then(
+        () => null,
+      );
+    },
   };
 
   const bridge = new ScriptBridge(iframe, {

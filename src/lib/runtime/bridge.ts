@@ -125,8 +125,9 @@ const IFRAME_SHIM_JS = `
 
   // Plain ops are methods that forward to the parent; vars is swapped
   // for the run's snapshot right before the program starts (init).
-  // show/hide/audio are special-cased below (widget/audio handles).
-  ["wait", "media", "log", "notify", "fail"].forEach(function (op) {
+  // show/hide/audio/media are special-cased below (widget/audio/media
+  // handles).
+  ["wait", "log", "notify", "fail"].forEach(function (op) {
     tm[op] = function () {
       return call(op, Array.prototype.slice.call(arguments));
     };
@@ -160,12 +161,42 @@ const IFRAME_SHIM_JS = `
 
   function widgetEventName(id, event) { return "widget:" + id + ":" + event; }
 
+  // Props may embed an audio ScriptHandle (a beatmeter's "sync"). A live
+  // handle carries promises and cannot cross postMessage, so before the
+  // call every handle value is swapped for a plain "{ __audioRef: id }"
+  // marker the parent's registry unwraps back to the handle id. One level
+  // deep — handles only appear as prop values. Returns props untouched
+  // (same object) when no handle is present — the common case.
+  function normalizeRefs(props) {
+    if (!props || typeof props !== "object") return props;
+    var keys = Object.keys(props);
+    var i;
+    for (i = 0; i < keys.length; i++) {
+      var v = props[keys[i]];
+      if (v && typeof v === "object" && typeof v.__audio === "string") {
+        break;
+      }
+    }
+    if (i === keys.length) return props;
+    var out = {};
+    var k;
+    for (k = 0; k < i; k++) out[keys[k]] = props[keys[k]];
+    for (; k < keys.length; k++) {
+      var v2 = props[keys[k]];
+      out[keys[k]] =
+        v2 && typeof v2 === "object" && typeof v2.__audio === "string"
+          ? { __audioRef: v2.__audio }
+          : v2;
+    }
+    return out;
+  }
+
   function makeHandle(id) {
     return {
       id: id,
       done: call("widget.done", [id]),
       get state() { return widgetState.get(id); },
-      set: function (patch) { return call("widget.set", [id, patch]); },
+      set: function (patch) { return call("widget.set", [id, normalizeRefs(patch)]); },
       on: function (event, cb) { return tm.subscribe(widgetEventName(id, event), cb); },
       once: function (event) { return call("widget.once", [id, event]); },
       remove: function () { return call("hide", [id]); },
@@ -174,7 +205,7 @@ const IFRAME_SHIM_JS = `
 
   tm.show = function (id, props) {
     var handleId = String(id);
-    return call("show", [handleId, props]).then(function () {
+    return call("show", [handleId, normalizeRefs(props)]).then(function () {
       return makeHandle(handleId);
     });
   };
@@ -198,6 +229,11 @@ const IFRAME_SHIM_JS = `
 
   function makeAudioHandle(id) {
     return {
+      // "id" + "__audio" let hide() address the handle and show()/set()
+      // detect one crossing the props (normalizeRefs swaps it for a
+      // plain __audioRef marker — the handle itself can never post).
+      id: id,
+      __audio: id,
       pause: function () { return call("audio.handle.pause", [id]); },
       resume: function () { return call("audio.handle.resume", [id]); },
       stop: function () { return call("audio.handle.stop", [id]); },
@@ -223,6 +259,17 @@ const IFRAME_SHIM_JS = `
       return call("audio.play", [src]).then(function (id) {
         return makeAudioHandle(String(id));
       });
+    },
+  };
+
+  // ── Media (visual playlists) ─────────────────────────────────────────
+  //
+  // prefetch warms the backend's playlist cache for a media-widget config
+  // so the later show serves slides instantly. Takes the same props
+  // object the media widget does (minus the stage layout).
+  tm.media = {
+    prefetch: function (config) {
+      return call("media.prefetch", [config]);
     },
   };
 
