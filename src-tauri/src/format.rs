@@ -1,14 +1,24 @@
-//! Feature-format v2 parser.
+//! Feature-format v3 parser.
 //!
-//! The single canonical parser for the v2 feature grammar specified in
-//! `FORMAT.md`: routines (`routines/*.md` with `format: 2`), habits
-//! (`habits/*.md`), task templates (`tasks/*.md`), and store entries
-//! (`store/*.json`).
+//! The single canonical parser for the feature grammar: routines
+//! (`routines/*.js`), habits (`habits/*.md`), task templates
+//! (`tasks/*.js`), and store entries (`store/*.json`).
+//!
+//! Routines and tasks are JS scripts with a **comment front-matter**
+//! block: the file's first line is exactly `/*---`, the block ends with
+//! the first line that is exactly `---*/`, and the interior between them
+//! is `key: value` front-matter (the same grammar habits use — see
+//! [`parse_kv_block`]). Everything after the closing line is the raw JS
+//! body, stored verbatim (byte-exact) and handed to the sandboxed script
+//! runtime by the session runner; the Rust side never interprets it
+//! beyond a regex scan for `.xml` script references ([`script_srcs_in_body`]).
+//! The validator syntax-checks bodies with boa (parse-only, never
+//! evaluated).
 //!
 //! Design constraints:
 //!
 //!   - **One parser, many consumers.** The validator (`validators.rs`),
-//!     the scheduler, and (later) the session runner all consume the
+//!     the scheduler, and the session runner all consume the
 //!     typed structures produced here. Nothing else should re-parse
 //!     these files — the v1 lesson was three bespoke frontend parsers
 //!     drifted from their validator mirrors.
@@ -349,32 +359,6 @@ fn get_int(map: &FMap, key: &str, ctx: &str, diags: &mut Vec<Diag>) -> Option<i6
     }
 }
 
-fn get_num(map: &FMap, key: &str, ctx: &str, diags: &mut Vec<Diag>) -> Option<f64> {
-    match map.get(key) {
-        Some(FValue::Int(i)) => Some(*i as f64),
-        Some(FValue::Float(f)) => Some(*f),
-        Some(_) => {
-            diags.push(error_at(None, format!("{ctx}: `{key}` must be a number")));
-            None
-        }
-        None => None,
-    }
-}
-
-fn get_bool(map: &FMap, key: &str, ctx: &str, diags: &mut Vec<Diag>) -> Option<bool> {
-    match map.get(key) {
-        Some(FValue::Bool(b)) => Some(*b),
-        Some(_) => {
-            diags.push(error_at(
-                None,
-                format!("{ctx}: `{key}` must be true or false"),
-            ));
-            None
-        }
-        None => None,
-    }
-}
-
 /// Durations are strings with a unit (`30s`, `15m`, `4h`, `2d`).
 pub fn parse_duration(raw: &str) -> Result<u64, String> {
     let t = raw.trim();
@@ -424,14 +408,6 @@ fn req_int(map: &FMap, key: &str, ctx: &str, diags: &mut Vec<Diag>) -> Option<i6
     get_int(map, key, ctx, diags)
 }
 
-fn req_num(map: &FMap, key: &str, ctx: &str, diags: &mut Vec<Diag>) -> Option<f64> {
-    if !map.has(key) {
-        diags.push(error_at(None, format!("{ctx}: `{key}` is required")));
-        return None;
-    }
-    get_num(map, key, ctx, diags)
-}
-
 fn req_duration(map: &FMap, key: &str, ctx: &str, diags: &mut Vec<Diag>) -> Option<u64> {
     if !map.has(key) {
         diags.push(error_at(None, format!("{ctx}: `{key}` is required")));
@@ -476,811 +452,80 @@ fn warn_unknown_keys(map: &FMap, known: &[&str], ctx: &str, diags: &mut Vec<Diag
 }
 
 // ============================================================================
-// Body → pages → elements
+// Comment front-matter (.js routines & tasks)
 // ============================================================================
 
-#[derive(Clone, Debug, Serialize)]
-pub struct FeatureBlock {
-    pub ftype: String,
-    pub config: FMap,
-    pub body: String,
-    /// Optional run-time condition (`when:` config key). When it evaluates
-    /// false, the whole feature is skipped (not rendered, not gated).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub when: Option<String>,
-    /// Line of the opening ```feature fence.
-    pub line: usize,
+/// Outcome of looking for a comment front-matter block in a `.js` feature
+/// file (routines / tasks).
+pub enum JsFrontmatter {
+    /// The file does not start with a `/*---` line.
+    Missing,
+    /// The file starts with `/*---` but no `---*/` line ever closes it.
+    Unterminated,
+    /// A well-formed block: the `key: value` interior plus the verbatim JS
+    /// body (everything after the `---*/` line).
+    Block { fm: String, body: String },
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub enum Element {
-    Checklist {
-        label: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        when: Option<String>,
-        line: usize,
-    },
-    AudioLink {
-        src: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        when: Option<String>,
-        line: usize,
-    },
-    Feature(FeatureBlock),
-}
-
-/// One conditional segment of a page's markdown. Chunks with a `when`
-/// condition render only when the condition holds against the run
-/// context; a page without conditionals is a single unconditional chunk.
-#[derive(Clone, Debug, Serialize)]
-pub struct RawChunk {
-    pub text: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub when: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Default)]
-pub struct Page {
-    pub elements: Vec<Element>,
-    /// The page's markdown text with feature fences and checklist lines
-    /// stripped — those render as dedicated components, not markdown.
-    #[serde(default)]
-    pub raw: String,
-    /// The same markdown split at `{{#if}}` boundaries so the runner can
-    /// filter chunks by their condition. A page without conditionals has
-    /// exactly one chunk whose `when` is absent.
-    #[serde(default)]
-    pub raw_chunks: Vec<RawChunk>,
-    /// Page-level condition: an `@when <expr>` line as the page's first
-    /// content line. A false condition skips the entire page.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub when: Option<String>,
-}
-
-/// One open `{{#if}}` block while scanning a page: the branch predicate
-/// text and whether we are past the `{{#else}}` marker.
-struct CondFrame {
-    pred: String,
-    in_else: bool,
-    else_seen: bool,
-    line: usize,
-}
-
-/// Error message for the common inline-form mistake. Markers must each be
-/// on their own line; the engine gates whole lines/elements, so a one-line
-/// `{{#if x}} ... {{/if}}` cannot be supported.
-const INLINE_IF_MSG: &str = "`{{#if}}` / `{{/if}}` must be on their own lines — \
-    inline forms like `{{#if x}}- [ ] item{{/if}}` are not supported. \
-    Put the markers on separate lines.";
-
-/// The effective condition for a line: the conjunction of every open
-/// frame's branch predicate (else-branches contribute `not(pred)`).
-/// `None` when no `{{#if}}` is open (unconditional text).
-fn effective_condition(stack: &[CondFrame]) -> Option<String> {
-    if stack.is_empty() {
-        return None;
-    }
-    let parts: Vec<String> = stack
-        .iter()
-        .map(|f| {
-            if f.in_else {
-                format!("not({})", f.pred)
-            } else {
-                f.pred.clone()
-            }
-        })
-        .collect();
-    Some(parts.join(" and "))
-}
-
-/// Split a body into pages on `---` lines and extract the gated elements
-/// (checklist items, `.xml` audio links, feature blocks) from each page.
-/// `first_line` is the 1-based file line of the first body line.
+/// Split a `routines/*.js` / `tasks/*.js` file into its comment
+/// front-matter block and its raw JS body.
 ///
-/// Conditional syntax (evaluated at run time against the run context):
-///   - `@when <expr>` as a page's first content line — whole-page gate.
-///   - `{{#if <expr>}}` / `{{#else}}` / `{{/if}}` on their own lines —
-///     gate the markdown text and checklist items between the markers.
-///     Nesting composes by conjunction; markers are stripped from `raw`.
-pub fn parse_pages(body: &str, first_line: usize) -> (Vec<Page>, Vec<Diag>) {
-    let mut diags = Vec::new();
-    let lines: Vec<&str> = body.lines().collect();
-
-    // Pre-pass: locate and fully parse every ```feature block, so the
-    // main loop can emit each as one element and skip its interior
-    // (config lines must not be mistaken for page separators etc.).
-    let mut features: Vec<(usize, usize, Option<FeatureBlock>)> = Vec::new(); // (open, end, block)
-    for (span, span_diags) in scan_feature_spans(&lines) {
-        diags.extend(span_diags);
-        let (block, block_diags) = parse_feature_span(&lines, &span, first_line);
-        diags.extend(block_diags);
-        features.push((span.open, span.end, block));
-    }
-
-    let mut pages: Vec<Page> = vec![Page::default()];
-    let mut current: Vec<Element> = Vec::new();
-    let mut raw_lines: Vec<String> = Vec::new();
-    let mut raw_chunks: Vec<RawChunk> = Vec::new();
-    let mut page_has_text = false;
-    let mut in_plain_code = false;
-    let mut skip_until = 0usize; // feature interior: skip lines < skip_until
-    let mut cond_stack: Vec<CondFrame> = Vec::new();
-
-    // Push a raw markdown line into the chunk list under the line's
-    // effective condition (merging consecutive lines with the same one).
-    let push_raw = |raw_chunks: &mut Vec<RawChunk>, raw_lines: &mut Vec<String>, line: &str, when: Option<String>| {
-        raw_lines.push(line.to_string());
-        if let Some(last) = raw_chunks.last_mut() {
-            if last.when == when {
-                last.text.push('\n');
-                last.text.push_str(line);
-                return;
-            }
-        }
-        raw_chunks.push(RawChunk {
-            text: line.to_string(),
-            when,
-        });
+/// The rule (format v3): the file's **first line is exactly `/*---`**, the
+/// block **ends with the first line that is exactly `---*/`**, and the
+/// interior between the two is front-matter in the usual `key: value`
+/// grammar ([`parse_kv_block`]). Everything after the closing line is the
+/// JS body — returned **verbatim**: byte-exact, no trimming, no newline
+/// normalization, so the runtime executes exactly what the author wrote.
+/// "Exactly" means no surrounding whitespace: ` /*---` or `---*/ ` do not
+/// count (a trailing `\r` from CRLF line endings is tolerated).
+pub fn split_js_frontmatter(content: &str) -> JsFrontmatter {
+    let mut lines = content.split_inclusive('\n');
+    let Some(first) = lines.next() else {
+        return JsFrontmatter::Missing;
     };
-
-    for (i, raw) in lines.iter().enumerate() {
-        if i < skip_until {
-            continue;
-        }
-        let line_no = first_line + i;
-        let line = raw.trim_start();
-
-        // Plain (non-feature) fenced code block: skip contents entirely.
-        if in_plain_code {
-            if line.starts_with("```") {
-                in_plain_code = false;
-            } else if !raw.trim().is_empty() {
-                page_has_text = true;
-            }
-            let when = effective_condition(&cond_stack);
-            push_raw(&mut raw_chunks, &mut raw_lines, raw, when);
-            continue;
-        }
-
-        if let Some(info) = line.strip_prefix("```") {
-            page_has_text = true;
-            if info.trim() == "feature" {
-                if let Some(pos) = features.iter().position(|(open, _, _)| *open == i) {
-                    let (_, end, mut block) = features.remove(pos);
-                    if let Some(b) = block.as_mut() {
-                        // A feature inside `{{#if}}` inherits the enclosing
-                        // condition, ANDed with its own `when:` config key.
-                        if let Some(enclosing) = effective_condition(&cond_stack) {
-                            b.when = Some(match b.when.take() {
-                                Some(w) => format!("({w}) and ({enclosing})"),
-                                None => enclosing,
-                            });
-                        }
-                    }
-                    if let Some(b) = block {
-                        current.push(Element::Feature(b));
-                    }
-                    skip_until = end;
-                }
-            } else {
-                in_plain_code = true;
-            }
-            continue;
-        }
-
-        // Conditional markers — recognized only as whole (trimmed) lines.
-        let trimmed = line.trim();
-        if trimmed.starts_with("{{#if ") {
-            // A marker must be the entire line: inline forms like
-            // `{{#if x}} - [ ] item{{/if}}` on one line are not supported
-            // (the engine gates whole lines/elements). Catch the common
-            // mistakes with actionable messages instead of a confusing
-            // condition-parse error + spurious "never closed".
-            let after = &trimmed["{{#if ".len()..];
-            if after.contains("{{") {
-                // Another `{{...}}` on the line — a closer (or stray
-                // marker) glued after the opener's `}}`.
-                if after.contains("{{/if") {
-                    diags.push(error_at(Some(line_no), INLINE_IF_MSG));
-                } else {
-                    diags.push(error_at(Some(line_no), "`{{#if}}` must be on its own line"));
-                }
-            } else if after.ends_with("}}") {
-                let pred = after[..after.len() - 2].trim();
-                if pred.is_empty() {
-                    diags.push(error_at(
-                        Some(line_no),
-                        "`{{#if}}` needs a condition: `{{#if <expr>}}`",
-                    ));
-                } else if let Err(e) = crate::cond::parse(pred) {
-                    diags.push(error_at(Some(line_no), format!("`{{{{#if}}}}` condition: {e}")));
-                }
-                cond_stack.push(CondFrame {
-                    pred: pred.to_string(),
-                    in_else: false,
-                    else_seen: false,
-                    line: line_no,
-                });
-            } else {
-                // Prose trailing the opener's `}}` on the same line.
-                diags.push(error_at(Some(line_no), "`{{#if}}` must be on its own line"));
-            }
-            continue;
-        }
-        if trimmed == "{{#else}}" {
-            match cond_stack.last_mut() {
-                Some(f) if !f.else_seen => {
-                    f.in_else = true;
-                    f.else_seen = true;
-                }
-                Some(f) if f.else_seen => diags.push(error_at(
-                    Some(line_no),
-                    format!("`{{{{#else}}}}` twice for the same `{{{{#if}}}}` (opened line {})", f.line),
-                )),
-                _ => diags.push(error_at(
-                    Some(line_no),
-                    "`{{#else}}` without an open `{{#if}}`",
-                )),
-            }
-            continue;
-        }
-        if trimmed == "{{/if}}" {
-            match cond_stack.pop() {
-                Some(_) => {}
-                None => diags.push(error_at(
-                    Some(line_no),
-                    "`{{/if}}` without a matching `{{#if}}`",
-                )),
-            }
-            continue;
-        }
-        if trimmed.starts_with("{{/if") {
-            diags.push(error_at(Some(line_no), "`{{/if}}` must be on its own line"));
-            continue;
-        }
-        if trimmed.starts_with("{{#else") {
-            diags.push(error_at(Some(line_no), "`{{#else}}` must be on its own line"));
-            continue;
-        }
-        // A marker anywhere else in the line (mid-prose, glued to text) is
-        // not supported — markers gate whole lines/elements.
-        if trimmed.contains("{{#if") || trimmed.contains("{{#else") || trimmed.contains("{{/if") {
-            let which = if trimmed.contains("{{#if") {
-                "`{{#if}}`"
-            } else if trimmed.contains("{{#else") {
-                "`{{#else}}`"
-            } else {
-                "`{{/if}}`"
-            };
-            diags.push(error_at(Some(line_no), format!("{which} must be on its own line")));
-            continue;
-        }
-
-        // Page separator. A separator that would start an empty page
-        // (no text, no elements) is ignored rather than creating it.
-        if line.trim_end() == "---" {
-            let cur = pages.last_mut().expect("always one page");
-            cur.elements = std::mem::take(&mut current);
-            cur.raw = std::mem::take(&mut raw_lines).join("\n");
-            cur.raw_chunks = std::mem::take(&mut raw_chunks);
-            if !cur.elements.is_empty() || page_has_text {
-                pages.push(Page::default());
-            }
-            page_has_text = false;
-            continue;
-        }
-
-        if line.trim().is_empty() {
-            let when = effective_condition(&cond_stack);
-            push_raw(&mut raw_chunks, &mut raw_lines, raw, when);
-            continue;
-        }
-
-        // `@when <expr>` as a page's first content line gates the page.
-        if !page_has_text && trimmed.starts_with("@when ") {
-            let expr = trimmed["@when ".len()..].trim();
-            if let Err(e) = crate::cond::parse(expr) {
-                diags.push(error_at(Some(line_no), format!("`@when` condition: {e}")));
-            }
-            if pages.last_mut().expect("always one page").when.is_some() {
-                diags.push(error_at(
-                    Some(line_no),
-                    "`@when` twice on one page (it must be the first content line)",
-                ));
-            }
-            pages.last_mut().expect("always one page").when = Some(expr.to_string());
-            page_has_text = true;
-            continue;
-        }
-        page_has_text = true;
-        let when = effective_condition(&cond_stack);
-
-        // Checklist item: `- [ ] label` / `* [x] label` / `+ [ ] label`.
-        // Excluded from `raw` — rendered as an interactive toggle.
-        if let Some(label) = checklist_label(line) {
-            current.push(Element::Checklist {
-                label: label.to_string(),
-                when: when.clone(),
-                line: line_no,
-            });
-            continue;
-        }
-
-        // Markdown links to .xml scripts.
-        for src in audio_links_in_line(line) {
-            current.push(Element::AudioLink {
-                src,
-                when: when.clone(),
-                line: line_no,
-            });
-        }
-        push_raw(&mut raw_chunks, &mut raw_lines, raw, when);
+    let first_bare = first.trim_end_matches('\n').trim_end_matches('\r');
+    if first_bare != "/*---" {
+        return JsFrontmatter::Missing;
     }
-
-    for f in &cond_stack {
-        diags.push(error_at(
-            Some(f.line),
-            "`{{#if}}` is never closed (missing `{{/if}}`)",
-        ));
+    let mut offset = first.len();
+    for line in lines {
+        let bare = line.trim_end_matches('\n').trim_end_matches('\r');
+        if bare == "---*/" {
+            let fm = content[first.len()..offset].to_string();
+            let body = content[offset + line.len()..].to_string();
+            return JsFrontmatter::Block { fm, body };
+        }
+        offset += line.len();
     }
-
-    let last_empty = {
-        let last = pages.last_mut().expect("always one page");
-        last.elements = current;
-        last.raw = raw_lines.join("\n");
-        last.raw_chunks = raw_chunks;
-        last.elements.is_empty()
-    };
-    // Drop a trailing page that is entirely empty (body ended with `---`).
-    if pages.len() > 1 && last_empty && !page_has_text {
-        pages.pop();
-    }
-    (pages, diags)
+    JsFrontmatter::Unterminated
 }
 
-/// Label text of a markdown checkbox line, or None.
-fn checklist_label(line: &str) -> Option<&str> {
-    let t = line.trim_start();
-    let t = t
-        .strip_prefix(['-', '*', '+'])
-        .map(str::trim_start)
-        .unwrap_or(t);
-    let lower = t.to_ascii_lowercase();
-    let after = lower
-        .strip_prefix("[ ] ")
-        .or_else(|| lower.strip_prefix("[x] "))
-        .map(|_| &t[4.min(t.len())..])?;
-    let label = after.trim();
-    if label.is_empty() {
-        None
-    } else {
-        Some(label)
-    }
+/// 1-based file line of the first body line after a comment front-matter
+/// block whose interior is `fm`: line 1 is `/*---`, the interior follows,
+/// then the `---*/` line, then the body.
+pub fn js_body_first_line(fm: &str) -> usize {
+    fm.lines().count() + 3
 }
 
-/// Extract markdown link targets ending in `.xml` from one line
-/// (in-app links only; `http(s)://…` skipped). Images are ignored.
-fn audio_links_in_line(line: &str) -> Vec<String> {
-    let bytes = line.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'[' && (i == 0 || bytes[i - 1] != b'!') {
-            if let Some(cb) = line[i + 1..].find(']').map(|j| i + 1 + j) {
-                if bytes.get(cb + 1) == Some(&b'(') {
-                    if let Some(cp) = line[cb + 2..].find(')').map(|j| cb + 2 + j) {
-                        let target = line[cb + 2..cp].trim();
-                        let target = target.split('#').next().unwrap_or(target).trim();
-                        if target.to_ascii_lowercase().ends_with(".xml")
-                            && !target.contains("://")
-                            && !target.is_empty()
-                        {
-                            out.push(target.to_string());
-                        }
-                        i = cp;
-                        continue;
-                    }
-                }
-            }
-        }
-        i += 1;
-    }
-    out
-}
-
-/// A ```feature fenced block located in a body: byte-independent,
-/// described by the index of its opening line within `body.lines()`.
-struct FeatureSpan {
-    /// Index (0-based) of the ```feature line.
-    open: usize,
-    /// Index of the line after the closing fence.
-    end: usize,
-}
-
-/// Pre-pass: find all ```feature spans in the body, so the line loop in
-/// `parse_pages` can skip over them wholesale.
-fn scan_feature_spans(lines: &[&str]) -> Vec<(FeatureSpan, Vec<Diag>)> {
-    let mut spans = Vec::new();
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i].trim_start();
-        let is_feature_fence = line
-            .strip_prefix("```")
-            .map(|info| info.trim() == "feature")
-            .unwrap_or(false);
-        if is_feature_fence {
-            let mut j = i + 1;
-            let mut separator = None;
-            while j < lines.len() {
-                let l = lines[j].trim_start();
-                if l.starts_with("```") {
-                    break;
-                }
-                if separator.is_none() && l.trim_end() == "---" {
-                    separator = Some(j);
-                }
-                j += 1;
-            }
-            if j >= lines.len() {
-                spans.push((
-                    FeatureSpan {
-                        open: i,
-                        end: lines.len(),
-                    },
-                    vec![error_at(
-                        Some(i + 1),
-                        "feature block is never closed (missing closing ```)",
-                    )],
-                ));
-                break;
-            }
-            let mut diags = Vec::new();
-            if separator.is_none() {
-                diags.push(error_at(
-                    Some(i + 1),
-                    "feature block needs a `---` line separating config from body",
-                ));
-            }
-            spans.push((
-                FeatureSpan {
-                    open: i,
-                    end: j + 1,
-                },
-                diags,
-            ));
-            i = j + 1;
-        } else {
-            i += 1;
-        }
-    }
-    spans
-}
-
-/// Parse the feature block starting at `lines[span.open]` (the ```feature
-/// line). Returns the block (if it parsed far enough to have a type) and
-/// diagnostics.
-fn parse_feature_span(
-    lines: &[&str],
-    span: &FeatureSpan,
-    first_line: usize,
-) -> (Option<FeatureBlock>, Vec<Diag>) {
-    let mut diags = Vec::new();
-    // Config = lines after the fence until the `---` separator (or the
-    // closing fence if the separator is missing — already diagnosed).
-    let mut sep = span.end - 1; // closing fence index
-    for (idx, l) in lines
-        .iter()
-        .enumerate()
-        .take(span.end - 1)
-        .skip(span.open + 1)
-    {
-        if l.trim() == "---" {
-            sep = idx;
-            break;
-        }
-    }
-    let config_text = lines[span.open + 1..sep].join("\n");
-    let body = if sep < span.end - 1 {
-        lines[sep + 1..span.end - 1].join("\n")
-    } else {
-        String::new()
-    };
-    let (config, mut kv_diags) = parse_kv_block(&config_text, first_line + span.open + 1);
-    diags.append(&mut kv_diags);
-
-    let line = first_line + span.open;
-    let ftype = match config.get("type") {
-        Some(FValue::Str(s)) if !s.trim().is_empty() => s.trim().to_string(),
-        Some(_) => {
-            diags.push(error_at(Some(line), "feature `type` must be a string"));
-            return (None, diags);
-        }
-        None => {
-            diags.push(error_at(
-                Some(line),
-                "feature block is missing a `type` (first config line)",
-            ));
-            return (None, diags);
-        }
-    };
-    // `when` is cross-cutting: take it out of the config so per-type
-    // unknown-key warnings don't fire, and syntax-check the expression.
-    let mut config = config;
-    let when = match config.remove("when") {
-        None => None,
-        Some(FValue::Str(s)) if !s.trim().is_empty() => {
-            if let Err(e) = crate::cond::parse(&s) {
-                diags.push(error_at(Some(line), format!("feature `when`: {e}")));
-            }
-            Some(s.trim().to_string())
-        }
-        Some(FValue::Str(_)) => {
-            diags.push(error_at(Some(line), "feature `when` must not be empty"));
-            None
-        }
-        Some(_) => {
-            diags.push(error_at(Some(line), "feature `when` must be a condition string"));
-            None
-        }
-    };
-    let block = FeatureBlock {
-        ftype,
-        config,
-        body,
-        when,
-        line,
-    };
-    diags.extend(validate_feature(&block));
-    (Some(block), diags)
-}
-
-/// Valid voice analyzers (the six existing trackers).
-pub const VOICE_ANALYZERS: &[&str] = &[
-    "pitch",
-    "resonance",
-    "intonation",
-    "weight",
-    "loudness",
-    "genderspace",
-];
-
-const FEATURE_TYPES: &[&str] = &[
-    "voice", "wait", "chastity", "input", "choice", "slider", "audio",
-];
-
-/// Validate a feature's `field` answer key (required on `input`, optional
-/// on `choice`/`slider`): an identifier the answer is stored under, which
-/// makes it addressable in `when:` conditions and `{{ }}` interpolation.
-/// Reserved engine variable names cannot be shadowed.
-fn check_answer_field(c: &FMap, ctx: &str, line: usize, required: bool, diags: &mut Vec<Diag>) {
-    let valid = |s: &str| {
-        !s.is_empty()
-            && s.chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
-    };
-    match c.get("field") {
-        Some(FValue::Str(s)) if valid(s) => {
-            if crate::cond::RESERVED_VARS.contains(&s.as_str()) {
-                diags.push(error_at(
-                    Some(line),
-                    format!("{ctx}: `field: {s}` collides with a reserved run variable"),
-                ));
-            }
-        }
-        Some(FValue::Str(_)) => diags.push(error_at(
-            Some(line),
-            format!("{ctx}: `field` must be an identifier (letters, digits, `-`, `_`)"),
-        )),
-        Some(_) => diags.push(error_at(
-            Some(line),
-            format!("{ctx}: `field` must be an identifier (letters, digits, `-`, `_`)"),
-        )),
-        None => {
-            if required {
-                diags.push(error_at(
-                    Some(line),
-                    format!("{ctx}: `field` is required (identifier for the stored answer)"),
-                ));
-            }
-        }
-    }
-}
-
-/// Per-type semantic validation of a feature block's config.
-fn validate_feature(b: &FeatureBlock) -> Vec<Diag> {
-    let ctx = format!("feature `{}` (line {})", b.ftype, b.line);
-    let mut diags = Vec::new();
-    let c = &b.config;
-
-    if !FEATURE_TYPES.contains(&b.ftype.as_str()) {
-        diags.push(error_at(
-            Some(b.line),
-            format!(
-                "unknown feature type `{}` — known types: {}",
-                b.ftype,
-                FEATURE_TYPES.join(", ")
-            ),
-        ));
-        return diags;
-    }
-
-    // `required` is common to the interactive types.
-    if c.has("required") {
-        get_bool(c, "required", &ctx, &mut diags);
-    }
-
-    match b.ftype.as_str() {
-        "voice" => {
-            let known = &[
-                "type",
-                "analyzers",
-                "minHz",
-                "maxHz",
-                "targetHz",
-                "targetCentroid",
-                "targetDb",
-                "requiredScore",
-                "holdRatio",
-                "duration",
-                "required",
-                "displayMinHz",
-                "displayMaxHz",
-            ];
-            warn_unknown_keys(c, known, &ctx, &mut diags);
-            match c.get("analyzers") {
-                None => {}
-                Some(FValue::Str(s)) => {
-                    for a in s.split(',') {
-                        let a = a.trim();
-                        if !VOICE_ANALYZERS.contains(&a) {
-                            diags.push(error_at(
-                                Some(b.line),
-                                format!(
-                                    "{ctx}: unknown analyzer `{a}` — use: {}",
-                                    VOICE_ANALYZERS.join(", ")
-                                ),
-                            ));
-                        }
-                    }
-                }
-                Some(FValue::List(items)) => {
-                    for item in items {
-                        match item {
-                            FValue::Str(a) if VOICE_ANALYZERS.contains(&a.as_str()) => {}
-                            other => diags.push(error_at(
-                                Some(b.line),
-                                format!(
-                                    "{ctx}: `analyzers` entries must be strings from: {} (got {other:?})",
-                                    VOICE_ANALYZERS.join(", ")
-                                ),
-                            )),
-                        }
-                    }
-                }
-                Some(_) => diags.push(error_at(
-                    Some(b.line),
-                    format!("{ctx}: `analyzers` must be a comma-separated string or array"),
-                )),
-            }
-            let min = get_num(c, "minHz", &ctx, &mut diags);
-            let max = get_num(c, "maxHz", &ctx, &mut diags);
-            if let (Some(min), Some(max)) = (min, max) {
-                if min >= max {
-                    diags.push(error_at(
-                        Some(b.line),
-                        format!("{ctx}: `minHz` ({min}) must be below `maxHz` ({max})"),
-                    ));
-                }
-            }
-            if let Some(target) = get_num(c, "targetHz", &ctx, &mut diags) {
-                if let (Some(min), Some(max)) = (min, max) {
-                    if target < min || target > max {
-                        diags.push(warn_at(
-                            Some(b.line),
-                            format!(
-                                "{ctx}: `targetHz` ({target}) lies outside the [{min}, {max}] band"
-                            ),
-                        ));
-                    }
-                }
-            }
-            for (key, lo, hi) in [("requiredScore", 0.0, 1.0), ("holdRatio", 0.0, 1.0)] {
-                if let Some(v) = get_num(c, key, &ctx, &mut diags) {
-                    if !(lo..=hi).contains(&v) {
-                        diags.push(error_at(
-                            Some(b.line),
-                            format!("{ctx}: `{key}` must be between {lo} and {hi}"),
-                        ));
-                    }
-                }
-            }
-            req_duration(c, "duration", &ctx, &mut diags);
-        }
-        "wait" => {
-            warn_unknown_keys(c, &["type", "duration", "required"], &ctx, &mut diags);
-            req_duration(c, "duration", &ctx, &mut diags);
-        }
-        "chastity" => {
-            warn_unknown_keys(c, &["type", "state", "required"], &ctx, &mut diags);
-            match c.get("state").and_then(|v| match v {
-                FValue::Str(s) => Some(s.as_str()),
-                _ => None,
-            }) {
-                Some("locked") | Some("unlocked") => {}
-                None => diags.push(error_at(
-                    Some(b.line),
-                    format!("{ctx}: `state` is required (`locked` or `unlocked`)"),
-                )),
-                Some(_) => diags.push(error_at(
-                    Some(b.line),
-                    format!("{ctx}: `state` must be `locked` or `unlocked`"),
-                )),
-            }
-        }
-        "input" => {
-            warn_unknown_keys(c, &["type", "field", "required"], &ctx, &mut diags);
-            check_answer_field(c, &ctx, b.line, true, &mut diags);
-        }
-        "choice" => {
-            warn_unknown_keys(c, &["type", "options", "field", "required"], &ctx, &mut diags);
-            check_answer_field(c, &ctx, b.line, false, &mut diags);
-            let options = match c.get("options") {
-                Some(FValue::Str(s)) => s
-                    .split('|')
-                    .map(str::trim)
-                    .filter(|o| !o.is_empty())
-                    .count(),
-                Some(FValue::List(items)) => items.len(),
-                Some(_) => 0,
-                None => {
-                    diags.push(error_at(
-                        Some(b.line),
-                        format!("{ctx}: `options` is required (`A|B|C` string or array)"),
-                    ));
-                    0
-                }
-            };
-            if c.has("options") && options < 2 {
-                diags.push(error_at(
-                    Some(b.line),
-                    format!("{ctx}: `options` needs at least 2 entries"),
-                ));
-            }
-        }
-        "slider" => {
-            warn_unknown_keys(
-                c,
-                &["type", "min", "max", "label", "field", "required"],
-                &ctx,
-                &mut diags,
-            );
-            check_answer_field(c, &ctx, b.line, false, &mut diags);
-            let min = req_num(c, "min", &ctx, &mut diags);
-            let max = req_num(c, "max", &ctx, &mut diags);
-            if let (Some(min), Some(max)) = (min, max) {
-                if max <= min {
-                    diags.push(error_at(
-                        Some(b.line),
-                        format!("{ctx}: `max` ({max}) must be greater than `min` ({min})"),
-                    ));
-                }
-            }
-            req_str(c, "label", &ctx, &mut diags);
-        }
-        "audio" => {
-            warn_unknown_keys(c, &["type", "src"], &ctx, &mut diags);
-            if let Some(src) = req_str(c, "src", &ctx, &mut diags) {
-                if !src.to_ascii_lowercase().ends_with(".xml") {
-                    diags.push(error_at(
-                        Some(b.line),
-                        format!("{ctx}: `src` must point to a `.xml` TTS script"),
-                    ));
-                }
-            }
-        }
-        _ => unreachable!("handled above"),
-    }
-    diags
+/// Every quoted string in a JS body that ends in `.xml` — single or double
+/// quotes. These are *prioritization hints* for the prerender queue (a
+/// routine/task script plays these TTS scripts, so they render first), not
+/// validated references: the body is arbitrary JS and the scan deliberately
+/// over-approximates rather than parse it.
+pub fn script_srcs_in_body(body: &str) -> Vec<String> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        // A single- or double-quoted run of non-quote, non-newline
+        // characters ending in `.xml`. (The regex crate has no
+        // backreferences, so both quote kinds are matched by alternation
+        // and the quotes are stripped from the match — safe, because the
+        // matched content cannot contain either quote character.)
+        regex::Regex::new(r#"("[^"\r\n]*\.xml")|('[^'\r\n]*\.xml')"#).expect("valid regex")
+    });
+    re.captures_iter(body)
+        .filter_map(|c| c.get(1).or_else(|| c.get(2)))
+        .map(|m| m.as_str().trim_matches(['\'', '"']).to_string())
+        .collect()
 }
 
 // ============================================================================
@@ -1574,41 +819,42 @@ pub struct Routine {
     pub limit: Option<Limit>,
     pub success: Vec<Action>,
     pub failure: Vec<Action>,
-    pub pages: Vec<Page>,
+    /// The raw JS body — everything after the `---*/` line, verbatim. Run
+    /// by the sandboxed script runtime in the session runner; the engine
+    /// never interprets it beyond [`script_srcs_in_body`] hints.
+    pub body: String,
 }
 
-/// Line number (1-based) of the first body line, given the front-matter.
-fn body_first_line(fm: &Option<String>) -> usize {
-    match fm {
-        Some(fm) => fm.lines().count() + 3, // opening ---, fm lines, closing ---
-        None => 1,
-    }
-}
-
-/// Parse a `routines/*.md` file. v2 requires `format: 2` (the marker is
-/// what routes the file away from the v1 schedule-only parser).
+/// Parse a `routines/*.js` file: comment front-matter (first line exactly
+/// `/*---`, closed by a line exactly `---*/`) plus the verbatim JS body.
 pub fn parse_routine(content: &str) -> (Option<Routine>, Vec<Diag>) {
     let mut diags = Vec::new();
-    let (fm, body) = split_frontmatter(content);
-    let Some(fm) = fm else {
-        diags.push(error_at(
-            None,
-            "routine has no front-matter — start the file with a `---` block",
-        ));
-        return (None, diags);
-    };
-    let (map, kv_diags) = parse_kv_block(&fm, 2);
-    diags.extend(kv_diags);
-
-    // `format: 2` is mandatory — without it the file is not a valid
-    // routine and callers skip it entirely.
-    match map.get("format") {
-        Some(FValue::Int(2)) => {}
-        Some(FValue::Str(s)) if s == "2" => {}
-        _ => {
-            diags.push(error_at(None, "routines require `format: 2` in the front-matter"));
+    let (fm, body) = match split_js_frontmatter(content) {
+        JsFrontmatter::Missing => {
+            diags.push(error_at(
+                None,
+                "routine has no front-matter — the first line must be exactly `/*---`",
+            ));
             return (None, diags);
         }
+        JsFrontmatter::Unterminated => {
+            diags.push(error_at(
+                None,
+                "routine front-matter is never closed — add a line that is exactly `---*/`",
+            ));
+            return (None, diags);
+        }
+        JsFrontmatter::Block { fm, body } => (fm, body),
+    };
+    let (mut map, kv_diags) = parse_kv_block(&fm, 2);
+    diags.extend(kv_diags);
+
+    // `format:` is gone in v3 (the .js extension is the marker now).
+    if map.remove("format").is_some() {
+        diags.push(warn_at(
+            None,
+            "`format:` no longer exists — the .js extension marks the file type; remove the key",
+        ));
     }
 
     let title = req_str(&map, "title", "routine", &mut diags).unwrap_or_default();
@@ -1622,7 +868,6 @@ pub fn parse_routine(content: &str) -> (Option<Routine>, Vec<Diag>) {
     warn_unknown_keys(
         &map,
         &[
-            "format",
             "title",
             "schedule",
             "timeframe",
@@ -1649,9 +894,7 @@ pub fn parse_routine(content: &str) -> (Option<Routine>, Vec<Diag>) {
         ));
     }
 
-    let (pages, page_diags) = parse_pages(&body, body_first_line(&Some(fm.clone())));
-    diags.extend(page_diags);
-    if pages.iter().all(|p| p.elements.is_empty()) && body.trim().is_empty() {
+    if body.trim().is_empty() {
         diags.push(warn_at(None, "routine body is empty"));
     }
 
@@ -1664,7 +907,7 @@ pub fn parse_routine(content: &str) -> (Option<Routine>, Vec<Diag>) {
             limit,
             success,
             failure,
-            pages,
+            body,
         }),
         diags,
     )
@@ -1839,27 +1082,41 @@ pub struct TaskTemplate {
     pub max_timeout_secs: Option<u64>,
     pub success: Vec<Action>,
     pub failure: Vec<Action>,
-    pub pages: Vec<Page>,
+    /// The raw JS body — everything after the `---*/` line, verbatim (same
+    /// contract as [`Routine::body`]).
+    pub body: String,
 }
 
-/// Parse a `tasks/*.md` file (task templates are always v2).
+/// Parse a `tasks/*.js` file: comment front-matter (first line exactly
+/// `/*---`, closed by a line exactly `---*/`) plus the verbatim JS body.
 pub fn parse_task(content: &str) -> (Option<TaskTemplate>, Vec<Diag>) {
     let mut diags = Vec::new();
-    let (fm, body) = split_frontmatter(content);
-    let Some(fm) = fm else {
-        diags.push(error_at(
-            None,
-            "task template has no front-matter — start the file with a `---` block",
-        ));
-        return (None, diags);
+    let (fm, body) = match split_js_frontmatter(content) {
+        JsFrontmatter::Missing => {
+            diags.push(error_at(
+                None,
+                "task template has no front-matter — the first line must be exactly `/*---`",
+            ));
+            return (None, diags);
+        }
+        JsFrontmatter::Unterminated => {
+            diags.push(error_at(
+                None,
+                "task front-matter is never closed — add a line that is exactly `---*/`",
+            ));
+            return (None, diags);
+        }
+        JsFrontmatter::Block { fm, body } => (fm, body),
     };
-    let (map, kv_diags) = parse_kv_block(&fm, 2);
+    let (mut map, kv_diags) = parse_kv_block(&fm, 2);
     diags.extend(kv_diags);
 
-    match map.get("format") {
-        None => {}
-        Some(FValue::Int(2)) => {}
-        _ => diags.push(error_at(None, "`format` must be 2")),
+    // `format:` is gone in v3 (the .js extension is the marker now).
+    if map.remove("format").is_some() {
+        diags.push(warn_at(
+            None,
+            "`format:` no longer exists — the .js extension marks the file type; remove the key",
+        ));
     }
 
     let title = req_str(&map, "title", "task", &mut diags).unwrap_or_default();
@@ -1912,7 +1169,6 @@ pub fn parse_task(content: &str) -> (Option<TaskTemplate>, Vec<Diag>) {
     warn_unknown_keys(
         &map,
         &[
-            "format",
             "title",
             "description",
             "timeframe",
@@ -1925,9 +1181,6 @@ pub fn parse_task(content: &str) -> (Option<TaskTemplate>, Vec<Diag>) {
         &mut diags,
     );
 
-    let (pages, page_diags) = parse_pages(&body, body_first_line(&Some(fm.clone())));
-    diags.extend(page_diags);
-
     (
         Some(TaskTemplate {
             title,
@@ -1937,7 +1190,7 @@ pub fn parse_task(content: &str) -> (Option<TaskTemplate>, Vec<Diag>) {
             max_timeout_secs,
             success,
             failure,
-            pages,
+            body,
         }),
         diags,
     )
@@ -2031,73 +1284,13 @@ pub fn parse_store_entry(content: &str) -> (Option<StoreEntry>, Vec<Diag>) {
 // Reference extraction for the validator
 // ============================================================================
 
-/// Every condition expression in a page list, every answer `field` id
-/// declared by `input`/`choice`/`slider` features, and every `{{ var }}`
-/// interpolation identifier in markdown text and checklist labels. The
-/// validator checks the conditions' and interpolations' identifiers
-/// against the reserved run variables and these fields.
-pub fn collect_condition_refs(pages: &[Page]) -> (Vec<String>, Vec<String>, Vec<String>) {
-    let mut conds = Vec::new();
-    let mut fields = Vec::new();
-    let mut interp = Vec::new();
-    let mut push_cond = |c: &Option<String>| {
-        if let Some(c) = c {
-            conds.push(c.clone());
-        }
-    };
-    for page in pages {
-        push_cond(&page.when);
-        for chunk in &page.raw_chunks {
-            push_cond(&chunk.when);
-            interp.extend(crate::cond::interpolation_idents(&chunk.text));
-        }
-        for el in &page.elements {
-            match el {
-                Element::Checklist { label, when, .. } => {
-                    push_cond(when);
-                    interp.extend(crate::cond::interpolation_idents(label));
-                }
-                Element::AudioLink { when, .. } => push_cond(when),
-                Element::Feature(f) => {
-                    push_cond(&f.when);
-                    if matches!(f.ftype.as_str(), "input" | "choice" | "slider") {
-                        if let Some(FValue::Str(field)) = f.config.get("field") {
-                            fields.push(field.clone());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    (conds, fields, interp)
-}
-
-/// All `.xml` scripts referenced by `audio` features across pages.
-pub fn audio_feature_srcs(pages: &[Page]) -> Vec<String> {    let mut out = Vec::new();
-    for page in pages {
-        for el in &page.elements {
-            if let Element::AudioLink { src, .. } = el {
-                out.push(src.clone());
-            }
-            if let Element::Feature(f) = el {
-                if f.ftype == "audio" {
-                    if let Some(FValue::Str(src)) = f.config.get("src") {
-                        out.push(src.clone());
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
 /// Resolve a `task` action's `template` to a path under the sandbox:
-/// bare names map to `tasks/<name>.md`; explicit paths are used as-is.
+/// bare names map to `tasks/<name>.js`; explicit paths are used as-is.
 pub fn template_to_path(template: &str) -> String {
-    if template.ends_with(".md") {
+    if template.ends_with(".js") {
         template.to_string()
     } else {
-        format!("tasks/{template}.md")
+        format!("tasks/{template}.js")
     }
 }
 
@@ -2186,133 +1379,94 @@ mod tests {
         assert!(errs(&d).iter().any(|m| m.contains("conflicts")));
     }
 
-    // ── pages & elements ───────────────────────────────────────────────
+    // ── comment front-matter (.js) ─────────────────────────────────────
 
     #[test]
-    fn pages_split_and_checklists() {
-        let body = "intro\n- [ ] first task\n* [x] done thing\n\n---\n\npage two\n";
-        let (pages, d) = parse_pages(body, 1);
-        assert!(d.is_empty());
-        assert_eq!(pages.len(), 2);
-        assert_eq!(pages[0].elements.len(), 2);
+    fn js_frontmatter_extracts_fm_and_body() {
+        let JsFrontmatter::Block { fm, body } = split_js_frontmatter(
+            "/*---\ntitle: Drill\nschedule: 0 8 * * *\n---*/\nawait wait(\"10m\");\n",
+        ) else {
+            panic!("expected a block");
+        };
+        assert_eq!(fm, "title: Drill\nschedule: 0 8 * * *\n");
+        assert_eq!(body, "await wait(\"10m\");\n");
+    }
+
+    #[test]
+    fn js_frontmatter_body_is_byte_exact() {
+        // No trailing newline after the closer, CRLF interior, indented and
+        // blank body lines — the body comes back verbatim.
+        let content = "/*---\r\ntitle: X\r\n---*/\r\n\n  const a = 1;\r\n\r\n// comment\n";
+        let JsFrontmatter::Block { fm, body } = split_js_frontmatter(content) else {
+            panic!("expected a block");
+        };
+        assert_eq!(fm, "title: X\r\n");
+        assert_eq!(body, "\n  const a = 1;\r\n\r\n// comment\n");
+        // Closer as the very last line with no trailing newline → empty body.
+        let JsFrontmatter::Block { fm, body } =
+            split_js_frontmatter("/*---\ntitle: X\n---*/")
+        else {
+            panic!("expected a block");
+        };
+        assert_eq!(fm, "title: X\n");
+        assert!(body.is_empty());
+    }
+
+    #[test]
+    fn js_frontmatter_requires_exact_markers() {
+        // Not the first line / wrong markers → Missing.
         assert!(matches!(
-            &pages[0].elements[0],
-            Element::Checklist { label, .. } if label == "first task"
+            split_js_frontmatter("// hi\n/*---\ntitle: X\n---*/\n"),
+            JsFrontmatter::Missing
         ));
+        assert!(matches!(
+            split_js_frontmatter(" /*---\ntitle: X\n---*/\n"),
+            JsFrontmatter::Missing
+        ));
+        assert!(matches!(
+            split_js_frontmatter("---\ntitle: X\n---\n"),
+            JsFrontmatter::Missing
+        ));
+        // A `---*/ ` line with trailing space does not close the block.
+        assert!(matches!(
+            split_js_frontmatter("/*---\ntitle: X\n---*/ \nbody\n"),
+            JsFrontmatter::Unterminated
+        ));
+        // Opener without any closer.
+        assert!(matches!(
+            split_js_frontmatter("/*---\ntitle: X\n"),
+            JsFrontmatter::Unterminated
+        ));
+        // Empty file.
+        assert!(matches!(split_js_frontmatter(""), JsFrontmatter::Missing));
     }
 
     #[test]
-    fn audio_links_extracted_only_for_xml() {
-        let body = "[a](hypnos/x.xml) [b](rules/y.md) [c](https://z.xml) ![i](img.xml)\n";
-        let (pages, _) = parse_pages(body, 1);
-        let links: Vec<&Element> = pages[0].elements.iter().collect();
-        assert_eq!(links.len(), 1);
-        assert!(matches!(links[0], Element::AudioLink { src, .. } if src == "hypnos/x.xml"));
+    fn js_body_first_line_accounts_for_fm_lines() {
+        assert_eq!(js_body_first_line(""), 3); // /*---, ---*/, body
+        assert_eq!(js_body_first_line("title: X\n"), 4);
+        assert_eq!(js_body_first_line("a: 1\nb: 2\nc: 3\n"), 6);
     }
 
     #[test]
-    fn feature_block_extracts_type_config_body() {
-        let body = "```feature\ntype: wait\nduration: 15m\n---\nHold still.\n```\n";
-        let (pages, d) = parse_pages(body, 1);
-        assert!(errs(&d).is_empty(), "{d:?}");
-        assert_eq!(pages.len(), 1);
-        match &pages[0].elements[0] {
-            Element::Feature(f) => {
-                assert_eq!(f.ftype, "wait");
-                assert_eq!(f.config.get("duration"), Some(&FValue::Str("15m".into())));
-                assert_eq!(f.body.trim(), "Hold still.");
-            }
-            other => panic!("expected feature, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn feature_block_missing_separator_and_type() {
-        let body = "```feature\nduration: 15m\n```\n";
-        let (_, d) = parse_pages(body, 1);
-        let messages = errs(&d);
-        assert!(messages.iter().any(|m| m.contains("`---` line separating")));
-        assert!(messages.iter().any(|m| m.contains("missing a `type`")));
-
-        let body2 = "```feature\ntype: nope\n---\nx\n```\n";
-        let (_, d2) = parse_pages(body2, 1);
-        assert!(errs(&d2).iter().any(|m| m.contains("unknown feature type")));
-    }
-
-    #[test]
-    fn unclosed_feature_block_is_error() {
-        let body = "```feature\ntype: wait\nduration: 1m\n---\nnever closed\n";
-        let (_, d) = parse_pages(body, 1);
-        assert!(errs(&d).iter().any(|m| m.contains("never closed")));
-    }
-
-    #[test]
-    fn plain_code_fences_are_not_parsed() {
-        let body = "```rust\nlet x = \"- [ ] not a checklist\";\n```\n- [ ] real\n";
-        let (pages, _) = parse_pages(body, 1);
-        assert_eq!(pages[0].elements.len(), 1);
-    }
-
-    // ── feature validation ─────────────────────────────────────────────
-
-    fn feature(ftype: &str, config: &str) -> Vec<Diag> {
-        let body = format!("```feature\ntype: {ftype}\n{config}\n---\nbody\n```\n");
-        let (_, d) = parse_pages(&body, 1);
-        d
-    }
-
-    #[test]
-    fn voice_validation_ranges() {
-        assert!(errs(&feature(
-            "voice",
-            "analyzers: pitch,resonance\nminHz: 180\nmaxHz: 280\ntargetHz: 220\nduration: 30s"
-        ))
-        .is_empty());
-        assert!(
-            errs(&feature("voice", "minHz: 300\nmaxHz: 200\nduration: 30s"))
-                .iter()
-                .any(|m| m.contains("must be below"))
-        );
-        assert!(errs(&feature("voice", "duration: 30s\nrequiredScore: 1.5"))
-            .iter()
-            .any(|m| m.contains("`requiredScore` must be between")));
-        assert!(
-            errs(&feature("voice", "analyzers: pitch,bogus\nduration: 30s"))
-                .iter()
-                .any(|m| m.contains("unknown analyzer"))
-        );
-        assert!(errs(&feature("voice", "minHz: 100\nmaxHz: 200"))
-            .iter()
-            .any(|m| m.contains("`duration`")));
-    }
-
-    #[test]
-    fn choice_slider_chastity_input_audio_validation() {
-        assert!(errs(&feature("choice", "options: Yes|No")).is_empty());
-        assert!(errs(&feature("choice", "options: only"))
-            .iter()
-            .any(|m| m.contains("at least 2")));
-        assert!(errs(&feature("slider", "min: 1\nmax: 1\nlabel: x"))
-            .iter()
-            .any(|m| m.contains("greater")));
-        assert!(errs(&feature("chastity", "state: sideways"))
-            .iter()
-            .any(|m| m.contains("locked")));
-        assert!(errs(&feature("input", "field: has space"))
-            .iter()
-            .any(|m| contains_dbg(m)));
-        fn contains_dbg(m: &str) -> bool {
-            m.contains("`field` must be an identifier")
-        }
-        assert!(errs(&feature("audio", "src: hypnos/x.wav"))
-            .iter()
-            .any(|m| m.contains(".xml")));
-    }
-
-    #[test]
-    fn unknown_feature_keys_warn() {
-        let w = warns(&feature("wait", "duration: 1m\nbogus: 1"));
-        assert!(w.iter().any(|m| m.contains("unknown key `bogus`")));
+    fn script_srcs_in_body_finds_quoted_xml_strings() {
+        let body = r#"
+            const a = await audio("hypnos/warm.xml");
+            const b = await audio('hypnos/other.xml');
+            const not1 = "readme.md";      // not .xml
+            const not2 = "x.xml.txt";      // doesn't end in .xml
+            const not3 = "http://x/y.xml"; // kept — resolution filters later
+            const mixed = "a.xml';         // unterminated → no match
+        "#;
+        let srcs = script_srcs_in_body(body);
+        assert!(srcs.contains(&"hypnos/warm.xml".to_string()));
+        assert!(srcs.contains(&"hypnos/other.xml".to_string()));
+        assert!(srcs.contains(&"http://x/y.xml".to_string()));
+        assert!(!srcs.iter().any(|s| s.ends_with(".md")));
+        assert!(!srcs.iter().any(|s| s == "x.xml.txt"));
+        // A quote in the opposite kind cannot close a string: `"a.xml'` is
+        // not a match because the closing quote must match the opening one.
+        assert!(!srcs.iter().any(|s| s.contains("a.xml'")));
     }
 
     // ── actions ────────────────────────────────────────────────────────
@@ -2425,8 +1579,8 @@ mod tests {
 
     #[test]
     fn routine_happy_path_scheduled() {
-        let content = "---\nformat: 2\ntitle: Drill\nschedule: 0 8 * * *\ntimeframe: 45m\n\
-                       success: { \"type\": \"points\", \"delta\": 15 }\n---\n\nintro\n";
+        let content = "/*---\ntitle: Drill\nschedule: 0 8 * * *\ntimeframe: 45m\n\
+                       success: { \"type\": \"points\", \"delta\": 15 }\n---*/\nawait wait(\"45m\");\n";
         let (r, d) = parse_routine(content);
         assert!(errs(&d).is_empty(), "{d:?}");
         let r = r.expect("parsed");
@@ -2434,32 +1588,68 @@ mod tests {
         assert_eq!(r.schedule.as_deref(), Some("0 8 * * *"));
         assert_eq!(r.timeframe_secs, Some(2700));
         assert_eq!(r.success, vec![Action::Points { delta: 15 }]);
-        assert_eq!(r.pages.len(), 1);
+        assert_eq!(r.body, "await wait(\"45m\");\n");
     }
 
     #[test]
-    fn routine_requires_format_marker() {
-        let content = "---\ntitle: x\nschedule: 0 8 * * *\n---\nbody\n";
+    fn routine_missing_title_is_error() {
+        let content = "/*---\nschedule: 0 8 * * *\n---*/\nbody\n";
         let (r, d) = parse_routine(content);
-        assert!(r.is_none(), "invalid routine yields no value");
-        assert!(errs(&d).iter().any(|m| m.contains("format: 2")));
+        // Best-effort value still parses; the diag carries the error.
+        assert!(r.is_some());
+        assert!(
+            errs(&d).iter().any(|m| m.contains("`title` is required")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn routine_without_frontmatter_is_error() {
+        let (r, d) = parse_routine("---\ntitle: x\n---\nbody\n");
+        assert!(r.is_none(), "no comment front-matter → no value");
+        assert!(errs(&d).iter().any(|m| m.contains("`/*---`")));
+
+        let (r2, d2) = parse_routine("/*---\ntitle: x\n");
+        assert!(r2.is_none());
+        assert!(errs(&d2).iter().any(|m| m.contains("never closed")));
+    }
+
+    #[test]
+    fn routine_legacy_format_key_warns() {
+        let content = "/*---\nformat: 2\ntitle: x\nsuccess: { \"type\": \"points\", \"delta\": 5 }\n\
+                       limit: { \"daily\": 3 }\n---*/\nbody\n";
+        let (r, d) = parse_routine(content);
+        assert!(r.is_some());
+        assert!(
+            warns(&d).iter().any(|m| m.contains("`format:` no longer exists")),
+            "{d:?}"
+        );
+        // No unknown-key duplicate for the removed key.
+        assert!(!warns(&d).iter().any(|m| m.contains("unknown key `format`")));
     }
 
     #[test]
     fn routine_on_demand_farm_warning() {
-        let base = "---\nformat: 2\ntitle: x\nsuccess: { \"type\": \"points\", \"delta\": 5 }\n---\nbody\n";
+        let base = "/*---\ntitle: x\nsuccess: { \"type\": \"points\", \"delta\": 5 }\n---*/\nbody\n";
         let (_, d) = parse_routine(base);
         assert!(warns(&d).iter().any(|m| m.contains("default")));
 
-        let limited = "---\nformat: 2\ntitle: x\nsuccess: { \"type\": \"points\", \"delta\": 5 }\n\
-                       limit: { \"daily\": 3 }\n---\nbody\n";
+        let limited = "/*---\ntitle: x\nsuccess: { \"type\": \"points\", \"delta\": 5 }\n\
+                       limit: { \"daily\": 3 }\n---*/\nbody\n";
         let (_, d2) = parse_routine(limited);
         assert!(!warns(&d2).iter().any(|m| m.contains("default")));
 
-        let scheduled = "---\nformat: 2\ntitle: x\nschedule: 0 8 * * *\n\
-                         success: { \"type\": \"points\", \"delta\": 5 }\n---\nbody\n";
+        let scheduled = "/*---\ntitle: x\nschedule: 0 8 * * *\n\
+                         success: { \"type\": \"points\", \"delta\": 5 }\n---*/\nbody\n";
         let (_, d3) = parse_routine(scheduled);
         assert!(!warns(&d3).iter().any(|m| m.contains("default")));
+    }
+
+    #[test]
+    fn routine_empty_body_warns() {
+        let content = "/*---\ntitle: x\n---*/\n";
+        let (_, d) = parse_routine(content);
+        assert!(warns(&d).iter().any(|m| m.contains("body is empty")), "{d:?}");
     }
 
     #[test]
@@ -2497,15 +1687,25 @@ mod tests {
 
     #[test]
     fn task_timeouts_order_warning() {
-        let good = "---\ntitle: T\ntimeouts: [{ \"after\": \"30m\", \"action\": { \"type\": \"points\", \"delta\": -5 } }, \
-                    { \"after\": \"1h\", \"action\": { \"type\": \"notification\", \"text\": \"x\" } }]\n---\nbody\n";
+        let good = "/*---\ntitle: T\ntimeouts: [{ \"after\": \"30m\", \"action\": { \"type\": \"points\", \"delta\": -5 } }, \
+                    { \"after\": \"1h\", \"action\": { \"type\": \"notification\", \"text\": \"x\" } }]\n---*/\nbody\n";
         let (_, d) = parse_task(good);
         assert!(!warns(&d).iter().any(|m| m.contains("ascending")), "{d:?}");
 
-        let swapped = "---\ntitle: T\ntimeouts: [{ \"after\": \"1h\", \"action\": { \"type\": \"points\", \"delta\": -5 } }, \
-                       { \"after\": \"30m\", \"action\": { \"type\": \"points\", \"delta\": -5 } }]\n---\nbody\n";
+        let swapped = "/*---\ntitle: T\ntimeouts: [{ \"after\": \"1h\", \"action\": { \"type\": \"points\", \"delta\": -5 } }, \
+                       { \"after\": \"30m\", \"action\": { \"type\": \"points\", \"delta\": -5 } }]\n---*/\nbody\n";
         let (_, d2) = parse_task(swapped);
         assert!(warns(&d2).iter().any(|m| m.contains("ascending")));
+    }
+
+    #[test]
+    fn task_missing_title_and_bad_frontmatter() {
+        let (_, d) = parse_task("/*---\ndescription: x\n---*/\nbody\n");
+        assert!(errs(&d).iter().any(|m| m.contains("`title` is required")), "{d:?}");
+
+        let (t2, d2) = parse_task("---\ntitle: x\n---\nbody\n");
+        assert!(t2.is_none());
+        assert!(errs(&d2).iter().any(|m| m.contains("`/*---`")), "{d2:?}");
     }
 
     #[test]
@@ -2523,79 +1723,22 @@ mod tests {
     }
 
     #[test]
-    fn inline_conditional_markers_error_clearly() {
-        // `{{#if}}` / `{{/if}}` on one line was previously misread as a
-        // valid opener (the line starts with `{{#if ` and ends with `}}`),
-        // producing a confusing condition-parse error *and* a spurious
-        // "never closed". Now it's one actionable error, no stack junk.
-        let one_line = "---\nformat: 2\ntitle: T\n---\n{{#if weekday == \"monday\"}}- [ ] item{{/if}}\n";
-        let (_, d) = parse_routine(one_line);
-        assert!(
-            errs(&d).iter().any(|m| m.contains("must be on their own lines")),
-            "{d:?}"
-        );
-        // No leftover open frame → no "never closed" error.
-        assert!(
-            !errs(&d).iter().any(|m| m.contains("never closed")),
-            "{d:?}"
-        );
-
-        // A marker in the middle of prose is also rejected explicitly.
-        let mid = "---\nformat: 2\ntitle: T\n---\nToday {{#if weekday == \"monday\"}}is monday{{/if}}.\n";
-        let (_, d2) = parse_routine(mid);
-        assert!(
-            errs(&d2).iter().any(|m| m.contains("must be on its own line")),
-            "{d:?}"
-        );
-        let mid_errs = errs(&d2);
-        assert_eq!(mid_errs.len(), 1, "{mid_errs:?}");
-
-        // Proper block syntax still parses clean.
-        let block = "---\nformat: 2\ntitle: T\n---\n{{#if weekday == \"monday\"}}\n- [ ] item\n{{/if}}\n";
-        let (_, d3) = parse_routine(block);
-        assert!(errs(&d3).is_empty(), "{d3:?}");
-        assert!(warns(&d3).is_empty(), "{d3:?}");
-    }
-
-    #[test]
-    fn mid_line_closers_error_clearly() {
-        let closer = "---\nformat: 2\ntitle: T\n---\n- [ ] item {{/if}}\n";
-        let (_, d) = parse_routine(closer);
-        assert!(
-            errs(&d).iter().any(|m| m.contains("`{{/if}}` must be on its own line")),
-            "{d:?}"
-        );
-        let else_mid = "---\nformat: 2\ntitle: T\n---\n{{#else}} oops\n";
-        let (_, d2) = parse_routine(else_mid);
-        assert!(
-            errs(&d2).iter().any(|m| m.contains("`{{#else}}` must be on its own line")),
-            "{d2:?}"
-        );
+    fn template_to_path_maps_to_js() {
+        assert_eq!(template_to_path("punishment-light"), "tasks/punishment-light.js");
+        assert_eq!(template_to_path("tasks/x.js"), "tasks/x.js");
     }
 
     // ── shipped examples stay valid (dogfood) ──────────────────────────
 
     #[test]
     fn bundled_examples_parse_clean() {
-        let routine = include_str!("../../examples/routine-v2.md");
+        let routine = include_str!("../../examples/routine.js");
         let (r, d) = parse_routine(routine);
-        assert!(errs(&d).is_empty(), "routine-v2.md: {d:?}");
-        assert!(warns(&d).is_empty(), "routine-v2.md: {d:?}");
+        assert!(errs(&d).is_empty(), "routine.js: {d:?}");
+        assert!(warns(&d).is_empty(), "routine.js: {d:?}");
         let r = r.expect("parses");
-        assert_eq!(r.pages.len(), 3, "intro page + settle page + conditional bonus page");
-
-        // Conditional syntax lands in the parsed structures: page 1 has a
-        // `{{#if}}` checklist with a condition, page 3 a page-level `@when`,
-        // and the wait features carry `when:` conditions.
-        assert!(r.pages[0].elements.iter().any(|el| matches!(
-            el,
-            Element::Checklist { when: Some(_), .. }
-        )));
-        assert!(r.pages[2].when.is_some());
-        assert!(r.pages[1].elements.iter().any(|el| matches!(
-            el,
-            Element::Feature(f) if f.when.is_some()
-        )));
+        assert!(r.schedule.is_some());
+        assert!(!r.body.trim().is_empty());
 
         let habit = include_str!("../../examples/habit.md");
         let (_, hd) = parse_habit(habit);
@@ -2608,10 +1751,11 @@ mod tests {
         assert!(warns(&htd).is_empty(), "habit-time.md: {htd:?}");
         assert_eq!(ht.expect("parses").minutes, Some(40));
 
-        let task = include_str!("../../examples/task.md");
-        let (_, td) = parse_task(task);
-        assert!(errs(&td).is_empty(), "task.md: {td:?}");
-        assert!(warns(&td).is_empty(), "task.md: {td:?}");
+        let task = include_str!("../../examples/task.js");
+        let (t, td) = parse_task(task);
+        assert!(errs(&td).is_empty(), "task.js: {td:?}");
+        assert!(warns(&td).is_empty(), "task.js: {td:?}");
+        assert!(!t.expect("parses").body.trim().is_empty());
 
         let store = include_str!("../../examples/store.json");
         let (_, sd) = parse_store_entry(store);

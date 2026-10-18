@@ -22,7 +22,6 @@ mod audio_server;
 mod bash;
 mod chastity;
 mod chats;
-mod cond;
 mod debug_time;
 mod economy;
 // `expression` is public only so its doctests compile — doctests build as

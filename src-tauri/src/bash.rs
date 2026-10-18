@@ -524,8 +524,8 @@ fn seed_examples(agent_dir: &Path) -> std::io::Result<()> {
     }
     const EXAMPLES: &[BundledExample] = &[
         BundledExample {
-            rel: "examples/routine-v2.md",
-            contents: include_str!("../../examples/routine-v2.md"),
+            rel: "examples/routine.js",
+            contents: include_str!("../../examples/routine.js"),
         },
         BundledExample {
             rel: "examples/habit.md",
@@ -536,8 +536,8 @@ fn seed_examples(agent_dir: &Path) -> std::io::Result<()> {
             contents: include_str!("../../examples/habit-time.md"),
         },
         BundledExample {
-            rel: "examples/task.md",
-            contents: include_str!("../../examples/task.md"),
+            rel: "examples/task.js",
+            contents: include_str!("../../examples/task.js"),
         },
         BundledExample {
             rel: "examples/store.json",

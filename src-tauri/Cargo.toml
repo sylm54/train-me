@@ -147,6 +147,15 @@ cron = "0.16.0"
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
 tower-http = { version = "0.6", features = ["fs", "cors"] }
 
+# JavaScript syntax validation for scripted routines/tasks (format v3).
+# boa_parser is parse-only — the app never evaluates script bodies; the
+# validator reports syntax errors with line/column before the runtime ever
+# sees the file. boa_ast/boa_interner supply the `Scope`/`Interner` inputs
+# `Parser::parse_script` needs (same 0.22 line as boa_parser).
+boa_parser = "0.22.0"
+boa_ast = "0.22.0"
+boa_interner = "0.22.0"
+
 # Desktop-only `env_logger` backend for the `log` facade (see `init_logger` in
 # lib.rs). On Android we use `android_logger` instead, so this is gated to
 # non-Android targets to keep it out of the mobile build.

@@ -3,13 +3,13 @@
 //! Every `.xml` script in the agent sandbox is rendered in the background,
 //! keyed by the manifest's content hash — edited scripts re-render
 //! automatically, and rendered tracks whose script no longer exists are
-//! garbage-collected. Container-referenced scripts (`audio` features,
-//! markdown audio links, `script` actions, queued pending scripts) render
-//! first; scripts nothing references (pure `<include>` subscripts, works in
-//! progress, not-yet-wired ideas) render last so they're warm too. The
-//! root `chats/` directory is excluded: it holds the frontend's exported
-//! chat transcripts (`chats/<id>.xml`), which are conversation records,
-//! not scripts (see [`list_all_scripts`]).
+//! garbage-collected. Container-referenced scripts (`.xml` strings quoted
+//! in routine/task JS bodies, `script` actions, queued pending scripts)
+//! render first; scripts nothing references (pure `<include>` subscripts,
+//! works in progress, not-yet-wired ideas) render last so they're warm
+//! too. The root `chats/` directory is excluded: it holds the frontend's
+//! exported chat transcripts (`chats/<id>.xml`), which are conversation
+//! records, not scripts (see [`list_all_scripts`]).
 //!
 //! Scheduling is prioritized: scripts queued in the economy's pending
 //! list render first (the user is waiting on them), then scripts used by
@@ -112,9 +112,10 @@ pub fn collect_script_refs(
 
     let list = |dir: &str, ext: &str| crate::schedule::list_v2_files(agent_dir, dir, ext);
 
-    // Routines: audio features/links + script actions, prioritized by the
-    // routine's next fire (on-demand routines sort mid-pack).
-    for (rel, content) in list("routines", ".md") {
+    // Routines: `.xml` strings quoted in the JS body (hints) + script
+    // actions, prioritized by the routine's next fire (on-demand routines
+    // sort mid-pack).
+    for (rel, content) in list("routines", ".js") {
         if !wanted(&rel) {
             continue;
         }
@@ -123,7 +124,7 @@ pub fn collect_script_refs(
                 Some(expr) => next_fire_secs(expr, now),
                 None => now.timestamp() + 3600,
             };
-            for src in format::audio_feature_srcs(&r.pages) {
+            for src in format::script_srcs_in_body(&r.body) {
                 push(src, priority);
             }
             let mut arefs = format::ActionRefs::default();
@@ -136,13 +137,13 @@ pub fn collect_script_refs(
     }
 
     // Task templates: same model, no cron — mid-pack.
-    for (rel, content) in list("tasks", ".md") {
+    for (rel, content) in list("tasks", ".js") {
         if !wanted(&rel) {
             continue;
         }
         if let Some(t) = format::parse_task(&content).0 {
             let priority = now.timestamp() + 3600;
-            for src in format::audio_feature_srcs(&t.pages) {
+            for src in format::script_srcs_in_body(&t.body) {
                 push(src, priority);
             }
             let mut arefs = format::ActionRefs::default();
@@ -568,10 +569,11 @@ mod tests {
 
     #[test]
     fn collect_refs_prioritizes_and_filters_missing() {
-        let routine = "---\nformat: 2\ntitle: R\nschedule: 0 8 * * *\n---\n```feature\ntype: audio\nsrc: hypnos/a.xml\n---\nx\n```\n[link](hypnos/b.xml)\n";
+        let routine = "/*---\ntitle: R\nschedule: 0 8 * * *\n---*/\n\
+                       await audio(\"hypnos/a.xml\");\nawait audio('hypnos/b.xml');\n";
         let habit = "---\ntitle: H\ntype: min\ncount: 1\nfailure: { \"type\": \"script\", \"src\": \"hypnos/c.xml\" }\n---\n";
         let (tmp, agent, _tracks) = env(&[
-            ("routines/r.md", routine),
+            ("routines/r.js", routine),
             ("habits/h.md", habit),
             ("hypnos/a.xml", "<voice>a</voice>"),
             ("hypnos/b.xml", "<voice>b</voice>"),
@@ -592,9 +594,9 @@ mod tests {
 
     #[test]
     fn collect_refs_full_pass_sweeps_unreferenced_scripts() {
-        let routine = "---\nformat: 2\ntitle: R\n---\n```feature\ntype: audio\nsrc: hypnos/a.xml\n---\nx\n```\n";
+        let routine = "/*---\ntitle: R\n---*/\nawait audio(\"hypnos/a.xml\");\n";
         let (tmp, agent, _tracks) = env(&[
-            ("routines/r.md", routine),
+            ("routines/r.js", routine),
             ("hypnos/a.xml", "<voice>a</voice>"),
             // Referenced by nothing: a pure <include> subscript + a draft.
             ("hypnos/sub/only_included.xml", "<voice>sub</voice>"),
@@ -618,7 +620,7 @@ mod tests {
             &agent,
             None,
             chrono::Utc::now(),
-            Some(&["routines/r.md".to_string()]),
+            Some(&["routines/r.js".to_string()]),
         );
         let osrcs: Vec<&str> = only.iter().map(|r| r.src.as_str()).collect();
         assert_eq!(osrcs, vec!["hypnos/a.xml"]);
@@ -627,10 +629,10 @@ mod tests {
 
     #[test]
     fn collect_refs_honors_the_only_filter() {
-        let routine = "---\nformat: 2\ntitle: R\nschedule: 0 8 * * *\n---\n```feature\ntype: audio\nsrc: hypnos/a.xml\n---\nx\n```\n";
+        let routine = "/*---\ntitle: R\nschedule: 0 8 * * *\n---*/\nawait audio(\"hypnos/a.xml\");\n";
         let habit = "---\ntitle: H\ntype: min\ncount: 1\nfailure: { \"type\": \"script\", \"src\": \"hypnos/c.xml\" }\n---\n";
         let (tmp, agent, _tracks) = env(&[
-            ("routines/r.md", routine),
+            ("routines/r.js", routine),
             ("habits/h.md", habit),
             ("hypnos/a.xml", "<voice>a</voice>"),
             ("hypnos/c.xml", "<voice>c</voice>"),
@@ -666,19 +668,9 @@ mod tests {
 
     #[test]
     fn gc_targets_skips_referenced_and_recent() {
-        let routine = "---
-format: 2
-title: R
----
-```feature
-type: audio
-src: hypnos/a.xml
----
-x
-```
-";
+        let routine = "/*---\ntitle: R\n---*/\nawait audio(\"hypnos/a.xml\");\n";
         let (tmp, agent, tracks) = env(&[
-            ("routines/r.md", routine),
+            ("routines/r.js", routine),
             ("hypnos/a.xml", "<voice>a</voice>"),
         ]);
         let refs = collect_script_refs(&agent, None, chrono::Utc::now(), None);

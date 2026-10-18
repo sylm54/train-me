@@ -451,7 +451,7 @@ pub fn reconcile_blocking(
     let now = utc_now();
 
     // ── Routines: materialize expected occurrences, resolve lapses ──────
-    for (rel, content) in list_v2_files(agent_dir, "routines", ".md") {
+    for (rel, content) in list_v2_files(agent_dir, "routines", ".js") {
         let (Some(routine), _) = format::parse_routine(&content) else {
             continue;
         };
@@ -811,18 +811,15 @@ fn load_task_failure(sched: &Connection, agent_dir: &Path, iid: &str) -> Option<
 // ============================================================================
 
 // ============================================================================
-// Run context (condition variables)
+// Run context (run-time variables)
 // ============================================================================
 
-/// Engine-provided run-context variables, consumed by every condition in
-/// feature files (routine `@when`/`{{#if}}`/`when:`, TTS `<if cond>`) and
-/// by `{{ var }}` interpolation. Names mirror `RESERVED_VARS` in
-/// `src/lib/cond.ts`; answer fields merge on top at run time.
-///
-/// `target` names the container the context is for — `("routine", rel_path)`
-/// or `("task", template_name)` — adding its history stats (`streak`,
-/// `done`, …). `None` yields environment-only variables (standalone audio
-/// playback outside any run).
+/// Engine-provided run-context variables, handed to the JS runtime as the
+/// `vars` object when a routine/task script starts (and read by TTS
+/// `<if cond>` in standalone playback). `target` names the container the
+/// context is for — `("routine", rel_path)` or `("task", template_name)` —
+/// adding its history stats (`streak`, `done`, …). `None` yields
+/// environment-only variables (standalone audio playback outside any run).
 pub fn build_run_context(
     sched: &Connection,
     econ: &Connection,
@@ -999,8 +996,12 @@ pub struct RunStart {
     pub kind: String, // "routine" | "task"
     pub routine: Option<format::Routine>,
     pub task: Option<format::TaskTemplate>,
-    /// Engine-computed run-context variables (conditions + interpolation).
-    pub context: serde_json::Map<String, serde_json::Value>,
+    /// The raw JS body (everything after the `---*/` line, verbatim) — the
+    /// frontend feeds it to the sandboxed script runtime.
+    pub body: String,
+    /// Engine-computed run-context variables handed to the JS runtime as
+    /// its `vars` object (weekday, hour, points, streak, done, …).
+    pub vars: serde_json::Map<String, serde_json::Value>,
 }
 
 fn parse_errors(diags: &[format::Diag]) -> Option<String> {
@@ -1026,180 +1027,193 @@ pub async fn v2_start_run(
     let agent_dir = state.agent_dir.clone();
     let state_dir = state.state_dir.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let sched = open(&state_dir.join("schedule.db"))?;
-        let econ = open(&state_dir.join("economy.db"))?;
-        let now = utc_now();
+        start_run_inner(&agent_dir, &state_dir, &kind, &ref_id, occurrence.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
 
-        if kind == "task" {
-            let (title, template): (String, String) = sched.query_row(
-                "SELECT title, template FROM task_instances WHERE iid = ?1",
-                [&ref_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            ).map_err(|_| format!("unknown task instance `{ref_id}`"))?;
-            if !sched.execute(
-                "UPDATE task_instances SET status = 'in_progress' WHERE iid = ?1 AND status IN ('assigned', 'in_progress')",
-                [&ref_id],
-            ).map(|n| n > 0).unwrap_or(false) {
-                return Err("task instance is no longer open".into());
-            }
-            let full = crate::bash::resolve_under(&agent_dir, &format::template_to_path(&template))?;
-            let content = std::fs::read_to_string(full).map_err(|e| e.to_string())?;
-            let (task, diags) = format::parse_task(&content);
-            if let Some(e) = parse_errors(&diags) {
-                return Err(format!("task template invalid: {e}"));
-            }
-            let context = build_run_context(
-                &sched,
-                &econ,
-                &state_dir,
-                Some(("task", template.as_str())),
-            );
-            return Ok(RunStart {
-                run_id: ref_id.clone(),
-                title,
-                kind: "task".into(),
-                routine: None,
-                task,
-                context,
-            });
+/// Core of `v2_start_run`, split out so tests can drive it without a
+/// Tauri runtime. Claims/creates the occurrence, parses the container's
+/// front matter, and returns the raw JS body plus the run-context vars
+/// alongside the occurrence info.
+fn start_run_inner(
+    agent_dir: &Path,
+    state_dir: &Path,
+    kind: &str,
+    ref_id: &str,
+    occurrence: Option<&str>,
+) -> Result<RunStart, String> {
+    let sched = open(&state_dir.join("schedule.db"))?;
+    let econ = open(&state_dir.join("economy.db"))?;
+    let now = utc_now();
+
+    if kind == "task" {
+        let (title, template): (String, String) = sched.query_row(
+            "SELECT title, template FROM task_instances WHERE iid = ?1",
+            [ref_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).map_err(|_| format!("unknown task instance `{ref_id}`"))?;
+        if !sched.execute(
+            "UPDATE task_instances SET status = 'in_progress' WHERE iid = ?1 AND status IN ('assigned', 'in_progress')",
+            [ref_id],
+        ).map(|n| n > 0).unwrap_or(false) {
+            return Err("task instance is no longer open".into());
         }
-
-        // Routine.
-        let full = crate::bash::resolve_under(&agent_dir, &ref_id)?;
-        let content = std::fs::read_to_string(&full).map_err(|e| e.to_string())?;
-        let (routine, diags) = format::parse_routine(&content);
+        let full = crate::bash::resolve_under(agent_dir, &format::template_to_path(&template))?;
+        let content = std::fs::read_to_string(full).map_err(|e| e.to_string())?;
+        let (task, diags) = format::parse_task(&content);
         if let Some(e) = parse_errors(&diags) {
-            return Err(format!("routine invalid: {e}"));
+            return Err(format!("task template invalid: {e}"));
         }
-        let routine = routine.ok_or("routine parse failed")?;
+        let task = task.ok_or("task parse failed")?;
+        let vars = build_run_context(&sched, &econ, state_dir, Some(("task", template.as_str())));
+        return Ok(RunStart {
+            run_id: ref_id.to_string(),
+            title,
+            kind: "task".into(),
+            routine: None,
+            body: task.body.clone(),
+            task: Some(task),
+            vars,
+        });
+    }
 
-        // Resume an in-progress occurrence if one exists.
+    // Routine.
+    let full = crate::bash::resolve_under(agent_dir, ref_id)?;
+    let content = std::fs::read_to_string(&full).map_err(|e| e.to_string())?;
+    let (routine, diags) = format::parse_routine(&content);
+    if let Some(e) = parse_errors(&diags) {
+        return Err(format!("routine invalid: {e}"));
+    }
+    let routine = routine.ok_or("routine parse failed")?;
+
+    // Resume an in-progress occurrence if one exists.
+    if let Ok((id,)) = sched.query_row(
+        "SELECT id FROM occurrences WHERE container = ?1 AND status = 'in_progress' \
+         ORDER BY started DESC LIMIT 1",
+        [ref_id],
+        |r| Ok((r.get(0)?,)),
+    ) {
+        let vars = build_run_context(&sched, &econ, state_dir, Some(("routine", ref_id)));
+        return Ok(RunStart {
+            run_id: id,
+            title: routine.title.clone(),
+            kind: "routine".into(),
+            body: routine.body.clone(),
+            routine: Some(routine),
+            task: None,
+            vars,
+        });
+    }
+
+    let run_id = if routine.schedule.is_none() {
+        // On-demand: enforce cooldown (starts) and limit (completions).
+        if let Some(cooldown) = routine.cooldown_secs {
+            let last: Option<String> = sched
+                .query_row(
+                    "SELECT started FROM occurrences \
+                     WHERE container = ?1 AND started IS NOT NULL \
+                     ORDER BY started DESC LIMIT 1",
+                    [ref_id],
+                    |r| r.get(0),
+                )
+                .ok();
+            if let Some(last) = last {
+                let until = parse_ts(&last) + chrono::Duration::seconds(cooldown as i64);
+                if now < until {
+                    return Err(format!(
+                        "cooldown active — try again in {}",
+                        humanize((until - now).num_seconds())
+                    ));
+                }
+            }
+        }
+        if let Some(limit) = &routine.limit {
+            let completions: Vec<String> = {
+                let mut stmt = sched.prepare(
+                    "SELECT resolved FROM occurrences WHERE container = ?1 \
+                     AND status = 'completed' AND resolved IS NOT NULL",
+                ).map_err(|e| e.to_string())?;
+                let rows = stmt.query_map([ref_id], |r| r.get(0)).map_err(|e| e.to_string())?;
+                rows.filter_map(Result::ok).collect()
+            };
+            let today_s = local_day(now);
+            let daily: usize = completions
+                .iter()
+                .filter(|c| local_day(parse_ts(c)) == today_s)
+                .count();
+            let total = completions.len();
+            if let Some(d) = limit.daily {
+                if daily >= d as usize {
+                    return Err(format!(
+                        "daily limit reached ({daily}/{} rewarded completions today)",
+                        d
+                    ));
+                }
+            }
+            if let Some(t) = limit.total {
+                if total >= t as usize {
+                    return Err(format!("total limit reached ({total}/{t} completions)"));
+                }
+            }
+        }
+        format!(
+            "routine:{ref_id}:adhoc:{}{}",
+            now.timestamp_micros(),
+            rand::random::<u32>()
+        )
+    } else if let Some(occ) = occurrence {
+        occ.to_string()
+    } else {
+        // Scheduled start from the library: claim the occurrence whose
+        // window is open, else the next pending one, else ad-hoc now.
+        let now_s = ts(now);
         if let Ok((id,)) = sched.query_row(
-            "SELECT id FROM occurrences WHERE container = ?1 AND status = 'in_progress' \
-             ORDER BY started DESC LIMIT 1",
-            [&ref_id],
+            "SELECT id FROM occurrences WHERE container = ?1 AND status = 'pending' \
+             AND due <= ?2 AND window_end > ?2 ORDER BY due DESC LIMIT 1",
+            rusqlite::params![ref_id, now_s],
             |r| Ok((r.get(0)?,)),
         ) {
-            let context = build_run_context(&sched, &econ, &state_dir, Some(("routine", &ref_id)));
-            return Ok(RunStart {
-                run_id: id,
-                title: routine.title.clone(),
-                kind: "routine".into(),
-                routine: Some(routine),
-                task: None,
-                context,
-            });
-        }
-
-        let run_id = if routine.schedule.is_none() {
-            // On-demand: enforce cooldown (starts) and limit (completions).
-            if let Some(cooldown) = routine.cooldown_secs {
-                let last: Option<String> = sched
-                    .query_row(
-                        "SELECT started FROM occurrences \
-                         WHERE container = ?1 AND started IS NOT NULL \
-                         ORDER BY started DESC LIMIT 1",
-                        [&ref_id],
-                        |r| r.get(0),
-                    )
-                    .ok();
-                if let Some(last) = last {
-                    let until = parse_ts(&last) + chrono::Duration::seconds(cooldown as i64);
-                    if now < until {
-                        return Err(format!(
-                            "cooldown active — try again in {}",
-                            humanize((until - now).num_seconds())
-                        ));
-                    }
-                }
-            }
-            if let Some(limit) = &routine.limit {
-                let completions: Vec<String> = {
-                    let mut stmt = sched.prepare(
-                        "SELECT resolved FROM occurrences WHERE container = ?1 \
-                         AND status = 'completed' AND resolved IS NOT NULL",
-                    ).map_err(|e| e.to_string())?;
-                    let rows = stmt.query_map([&ref_id], |r| r.get(0)).map_err(|e| e.to_string())?;
-                    rows.filter_map(Result::ok).collect()
-                };
-                let today_s = local_day(now);
-                let daily: usize = completions
-                    .iter()
-                    .filter(|c| local_day(parse_ts(c)) == today_s)
-                    .count();
-                let total = completions.len();
-                if let Some(d) = limit.daily {
-                    if daily >= d as usize {
-                        return Err(format!(
-                            "daily limit reached ({daily}/{} rewarded completions today)",
-                            d
-                        ));
-                    }
-                }
-                if let Some(t) = limit.total {
-                    if total >= t as usize {
-                        return Err(format!("total limit reached ({total}/{t} completions)"));
-                    }
-                }
-            }
+            id
+        } else if let Ok((id,)) = sched.query_row(
+            "SELECT id FROM occurrences WHERE container = ?1 AND status = 'pending' \
+             ORDER BY due ASC LIMIT 1",
+            [ref_id],
+            |r| Ok((r.get(0)?,)),
+        ) {
+            id
+        } else {
             format!(
                 "routine:{ref_id}:adhoc:{}{}",
                 now.timestamp_micros(),
                 rand::random::<u32>()
             )
-        } else if let Some(occ) = occurrence {
-            occ
-        } else {
-            // Scheduled start from the library: claim the occurrence whose
-            // window is open, else the next pending one, else ad-hoc now.
-            let now_s = ts(now);
-            if let Ok((id,)) = sched.query_row(
-                "SELECT id FROM occurrences WHERE container = ?1 AND status = 'pending' \
-                 AND due <= ?2 AND window_end > ?2 ORDER BY due DESC LIMIT 1",
-                rusqlite::params![ref_id, now_s],
-                |r| Ok((r.get(0)?,)),
-            ) {
-                id
-            } else if let Ok((id,)) = sched.query_row(
-                "SELECT id FROM occurrences WHERE container = ?1 AND status = 'pending' \
-                 ORDER BY due ASC LIMIT 1",
-                [&ref_id],
-                |r| Ok((r.get(0)?,)),
-            ) {
-                id
-            } else {
-                format!(
-                    "routine:{ref_id}:adhoc:{}{}",
-                    now.timestamp_micros(),
-                    rand::random::<u32>()
-                )
-            }
-        };
+        }
+    };
 
-        let window_end = ts(
-            now + chrono::Duration::seconds(
-                routine.timeframe_secs.map(|s| s as i64).unwrap_or(DEFAULT_WINDOW_SECS),
-            ),
-        );
-        sched.execute(
-            "INSERT INTO occurrences (id, kind, container, due, window_end, status, created, started) \
-             VALUES (?1, 'routine', ?2, ?3, ?4, 'in_progress', ?3, ?3) \
-             ON CONFLICT(id) DO UPDATE SET status = 'in_progress', started = ?3",
-            rusqlite::params![run_id, ref_id, ts(now), window_end],
-        ).map_err(|e| e.to_string())?;
-        log_activity(&agent_dir, "routine", "start", &run_id);
-        let context = build_run_context(&sched, &econ, &state_dir, Some(("routine", &ref_id)));
-        Ok(RunStart {
-            run_id,
-            title: routine.title.clone(),
-            kind: "routine".into(),
-            routine: Some(routine),
-            task: None,
-            context,
-        })
+    let window_end = ts(
+        now + chrono::Duration::seconds(
+            routine.timeframe_secs.map(|s| s as i64).unwrap_or(DEFAULT_WINDOW_SECS),
+        ),
+    );
+    sched.execute(
+        "INSERT INTO occurrences (id, kind, container, due, window_end, status, created, started) \
+         VALUES (?1, 'routine', ?2, ?3, ?4, 'in_progress', ?3, ?3) \
+         ON CONFLICT(id) DO UPDATE SET status = 'in_progress', started = ?3",
+        rusqlite::params![run_id, ref_id, ts(now), window_end],
+    ).map_err(|e| e.to_string())?;
+    log_activity(agent_dir, "routine", "start", &run_id);
+    let vars = build_run_context(&sched, &econ, state_dir, Some(("routine", ref_id)));
+    Ok(RunStart {
+        run_id,
+        title: routine.title.clone(),
+        kind: "routine".into(),
+        body: routine.body.clone(),
+        routine: Some(routine),
+        task: None,
+        vars,
     })
-    .await
-    .map_err(|e| e.to_string())?
 }
 
 /// Run-context variables for playback outside a session: `ref_id` absent
@@ -1216,7 +1230,7 @@ pub async fn v2_context(
         let econ = open(&state_dir.join("economy.db"))?;
         let target = ref_id.as_deref().map(|r| {
             if let Some(stem) = r.strip_prefix("tasks/").or_else(|| r.strip_prefix("tasks\\")) {
-                let stem = stem.strip_suffix(".md").unwrap_or(stem);
+                let stem = stem.strip_suffix(".js").unwrap_or(stem);
                 ("task", stem.to_string())
             } else {
                 ("routine", r.to_string())
@@ -1704,11 +1718,12 @@ pub struct TimelineItem {
     pub adhoc: bool,
 }
 
-/// Script paths referenced by a container's pages and action lists,
-/// deduped — the summary cards expose them so the UI can offer prerender
-/// without starting anything.
-fn container_audio(pages: &[format::Page], action_lists: &[&[format::Action]]) -> Vec<String> {
-    let mut srcs = format::audio_feature_srcs(pages);
+/// Script paths referenced by a container's JS body (quoted `.xml`
+/// strings — [`format::script_srcs_in_body`]) and action lists, deduped —
+/// the summary cards expose them so the UI can offer prerender without
+/// starting anything.
+fn container_audio(body: Option<&str>, action_lists: &[&[format::Action]]) -> Vec<String> {
+    let mut srcs = body.map(format::script_srcs_in_body).unwrap_or_default();
     for actions in action_lists {
         let mut arefs = format::ActionRefs::default();
         format::collect_action_refs(actions, &mut arefs);
@@ -1749,7 +1764,7 @@ pub async fn v2_summary(state: State<'_, AppState>) -> Result<V2Summary, String>
         // Titles for the timeline's occurrence → routine join.
         let mut titles: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
-        for (rel, content) in list_v2_files(&agent_dir, "routines", ".md") {
+        for (rel, content) in list_v2_files(&agent_dir, "routines", ".js") {
             let Some(routine) = format::parse_routine(&content).0 else {
                 continue;
             };
@@ -1824,7 +1839,7 @@ pub async fn v2_summary(state: State<'_, AppState>) -> Result<V2Summary, String>
                 current,
                 next,
                 in_progress,
-                audio: container_audio(&routine.pages, &[&routine.success, &routine.failure]),
+                audio: container_audio(Some(&routine.body), &[&routine.success, &routine.failure]),
             });
         }
 
@@ -1857,7 +1872,7 @@ pub async fn v2_summary(state: State<'_, AppState>) -> Result<V2Summary, String>
                 limit,
                 today_count,
                 status,
-                audio: container_audio(&[], &[&habit.success, &habit.failure]),
+                audio: container_audio(None, &[&habit.success, &habit.failure]),
             });
         }
 
@@ -1867,11 +1882,11 @@ pub async fn v2_summary(state: State<'_, AppState>) -> Result<V2Summary, String>
         // `tasks/…md` paths — see `template_to_path`).
         let mut template_audio: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
-        for (rel, content) in list_v2_files(&agent_dir, "tasks", ".md") {
+        for (rel, content) in list_v2_files(&agent_dir, "tasks", ".js") {
             if let Some(t) = format::parse_task(&content).0 {
                 template_audio.insert(
                     rel,
-                    container_audio(&t.pages, &[&t.success, &t.failure]),
+                    container_audio(Some(&t.body), &[&t.success, &t.failure]),
                 );
             }
         }
@@ -1914,7 +1929,7 @@ pub async fn v2_summary(state: State<'_, AppState>) -> Result<V2Summary, String>
                 description: entry.description,
                 price: entry.price,
                 stock,
-                audio: container_audio(&[], &[&entry.actions]),
+                audio: container_audio(None, &[&entry.actions]),
             });
         }
 
@@ -2215,10 +2230,10 @@ mod tests {
     fn reconcile_materializes_and_lapses_routines() {
         // Schedule: every minute, 1-minute window → guarantees a lapsed
         // pending occurrence within the lookback window.
-        let routine = "---\nformat: 2\ntitle: Drill\nschedule: * * * * *\ntimeframe: 1m\n\
+        let routine = "/*---\ntitle: Drill\nschedule: * * * * *\ntimeframe: 1m\n\
                        success: { \"type\": \"points\", \"delta\": 15 }\n\
-                       failure: { \"type\": \"points\", \"delta\": -5 }\n---\nintro\n";
-        let (tmp, agent, state) = env(&[("routines/drill.md", routine)]);
+                       failure: { \"type\": \"points\", \"delta\": -5 }\n---*/\nawait wait(\"1m\");\n";
+        let (tmp, agent, state) = env(&[("routines/drill.js", routine)]);
         // Pretend the routine has existed for two days (same content hash),
         // so the lookback materializes the missed fires of the past day.
         {
@@ -2227,7 +2242,7 @@ mod tests {
                 .execute(
                     "INSERT INTO containers (container, hash, first_seen) VALUES (?1, ?2, ?3)",
                     rusqlite::params![
-                        "routines/drill.md",
+                        "routines/drill.js",
                         crate::manifest::hash_bytes(routine.as_bytes()),
                         ts(utc_now() - chrono::Duration::days(2))
                     ],
@@ -2268,9 +2283,9 @@ mod tests {
         // A routine the agent just wrote must not be punished for windows
         // that closed before the file existed — its first occurrence is
         // the next scheduled fire, not the missed past ones.
-        let routine = "---\nformat: 2\ntitle: Drill\nschedule: * * * * *\ntimeframe: 1m\n\
-                       failure: { \"type\": \"points\", \"delta\": -5 }\n---\nintro\n";
-        let (tmp, agent, state) = env(&[("routines/drill.md", routine)]);
+        let routine = "/*---\ntitle: Drill\nschedule: * * * * *\ntimeframe: 1m\n\
+                       failure: { \"type\": \"points\", \"delta\": -5 }\n---*/\nawait wait(\"1m\");\n";
+        let (tmp, agent, state) = env(&[("routines/drill.js", routine)]);
         let report = reconcile_blocking(&agent, &state, None);
         assert!(report.materialized > 0, "future fires materialized: {report:?}");
         assert_eq!(report.lapsed, 0, "no retro-failures for a new routine: {report:?}");
@@ -2283,12 +2298,12 @@ mod tests {
     fn edited_routine_reschedules_without_retro_failures() {
         // Re-writing a routine (here: tightening the schedule) counts as
         // new content — the past of the NEW schedule is not punished either.
-        let v1 = "---\nformat: 2\ntitle: Drill\nschedule: 0 6 * * *\n---\nintro\n";
-        let (tmp, agent, state) = env(&[("routines/drill.md", v1)]);
+        let v1 = "/*---\ntitle: Drill\nschedule: 0 6 * * *\n---*/\nawait log(\"intro\");\n";
+        let (tmp, agent, state) = env(&[("routines/drill.js", v1)]);
         reconcile_blocking(&agent, &state, None);
-        let v2 = "---\nformat: 2\ntitle: Drill\nschedule: * * * * *\ntimeframe: 1m\n\
-                  failure: { \"type\": \"points\", \"delta\": -5 }\n---\nintro\n";
-        std::fs::write(agent.join("routines/drill.md"), v2).unwrap();
+        let v2 = "/*---\ntitle: Drill\nschedule: * * * * *\ntimeframe: 1m\n\
+                  failure: { \"type\": \"points\", \"delta\": -5 }\n---*/\nawait wait(\"1m\");\n";
+        std::fs::write(agent.join("routines/drill.js"), v2).unwrap();
         let report = reconcile_blocking(&agent, &state, None);
         assert_eq!(report.lapsed, 0, "edit must not retro-fail: {report:?}");
         let econ = open(&state.join("economy.db")).unwrap();
@@ -2421,12 +2436,12 @@ mod tests {
 
     #[test]
     fn task_timeout_escalates_then_fails() {
-        let task = "---\ntitle: Check\n\
+        let task = "/*---\ntitle: Check\n\
                     timeouts: [{ \"after\": \"1s\", \"action\": { \"type\": \"points\", \"delta\": -5 } }]\n\
                     max_timeout: 1m\n\
                     success: { \"type\": \"points\", \"delta\": 10 }\n\
-                    failure: { \"type\": \"points\", \"delta\": -20 }\n---\nbody\n";
-        let (tmp, agent, state) = env(&[("tasks/check.md", task)]);
+                    failure: { \"type\": \"points\", \"delta\": -20 }\n---*/\nawait wait(\"1m\");\n";
+        let (tmp, agent, state) = env(&[("tasks/check.js", task)]);
         let sched = open(&state.join("schedule.db")).unwrap();
         let assigned = ts(utc_now() - chrono::Duration::minutes(5));
         sched
@@ -2500,9 +2515,9 @@ mod tests {
         // A routine whose failure wakes the agent: the wake must fire exactly
         // once for the lapsed occurrence, and a re-reconcile must not repeat
         // it (mark-before-fire gating — same guarantee class as `notification`).
-        let routine = "---\nformat: 2\ntitle: Drill\nschedule: @daily\ntimeframe: 1h\n\
-                       failure: { \"type\": \"agent\", \"message\": \"Drill lapsed — follow up with the user.\" }\n---\nintro\n";
-        let (tmp, agent, state) = env(&[("routines/drill.md", routine)]);
+        let routine = "/*---\ntitle: Drill\nschedule: @daily\ntimeframe: 1h\n\
+                       failure: { \"type\": \"agent\", \"message\": \"Drill lapsed — follow up with the user.\" }\n---*/\nawait wait(\"1h\");\n";
+        let (tmp, agent, state) = env(&[("routines/drill.js", routine)]);
         // One occurrence whose window already closed.
         {
             let sched = open(&state.join("schedule.db")).unwrap();
@@ -2510,8 +2525,8 @@ mod tests {
             sched
                 .execute(
                     "INSERT INTO occurrences (id, kind, container, due, window_end, status, created) \
-                     VALUES (?1, 'routine', 'routines/drill.md', ?2, ?2, 'pending', ?2)",
-                    rusqlite::params!["routine:routines/drill.md:past", past],
+                     VALUES (?1, 'routine', 'routines/drill.js', ?2, ?2, 'pending', ?2)",
+                    rusqlite::params!["routine:routines/drill.js:past", past],
                 )
                 .unwrap();
         }
@@ -2535,6 +2550,47 @@ mod tests {
                 .any(|l| l.contains("agent wake")),
             "no repeat wake: {report2:?}"
         );
+        let _ = tmp;
+    }
+
+    #[test]
+    fn start_run_returns_body_and_vars() {
+        // v2_start_run's core hands the frontend the raw JS body (verbatim)
+        // and the run-context vars alongside the occurrence info.
+        let routine = "/*---\ntitle: Drill\nschedule: 0 8 * * *\n---*/\nawait wait(\"45m\");\n";
+        let task = "/*---\ntitle: Check\n---*/\nawait audio(\"hypnos/x.xml\");\n";
+        let (tmp, agent, state) = env(&[
+            ("routines/drill.js", routine),
+            ("tasks/check.js", task),
+        ]);
+        {
+            let sched = open(&state.join("schedule.db")).unwrap();
+            sched
+                .execute(
+                    "INSERT INTO task_instances (iid, template, title, assigned) \
+                     VALUES ('t1', 'check', 'Check', ?1)",
+                    [&ts(utc_now())],
+                )
+                .unwrap();
+        }
+
+        // Routine: body is byte-exact; vars carry the engine variables.
+        let run = start_run_inner(&agent, &state, "routine", "routines/drill.js", None).unwrap();
+        assert_eq!(run.kind, "routine");
+        assert_eq!(run.title, "Drill");
+        assert_eq!(run.body, "await wait(\"45m\");\n");
+        assert!(run.routine.is_some());
+        for key in ["weekday", "hour", "points", "locked", "streak", "done", "fails"] {
+            assert!(run.vars.contains_key(key), "vars missing `{key}`: {:?}", run.vars);
+        }
+
+        // Task instance: same contract, task-targeted stats.
+        let trun = start_run_inner(&agent, &state, "task", "t1", None).unwrap();
+        assert_eq!(trun.kind, "task");
+        assert_eq!(trun.title, "Check");
+        assert_eq!(trun.body, "await audio(\"hypnos/x.xml\");\n");
+        assert!(trun.task.is_some());
+        assert!(trun.vars.contains_key("done"));
         let _ = tmp;
     }
 }

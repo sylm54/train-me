@@ -3,13 +3,13 @@
 //! The agent manages several kinds of user-facing feature files under
 //! `agent_data/`:
 //!
-//!   - `routines/*.md` (v1: `schedule` cron frontmatter; v2 when the
-//!     frontmatter has `format: 2` — parsed by `format.rs`, see FORMAT.md)
+//!   - `routines/*.js` (format v3: comment front-matter + JS body, parsed
+//!     by `format.rs`; bodies are syntax-checked with boa, parse-only)
 //!   - `conditioning/*.json` (TTS metadata sidecar)
 //!   - `journal/format.json` (journal field definitions)
 //!   - `voice/config.json` (voice-training tracker config)
-//!   - `habits/*.md`, `tasks/*.md`, `store/*.json` (v2-only containers,
-//!     parsed by `format.rs`)
+//!   - `habits/*.md`, `tasks/*.js`, `store/*.json` (containers parsed by
+//!     `format.rs`)
 //!
 //! Most of these are parsed leniently at runtime: a bad cron silently
 //! never schedules, an unknown tracker id is dropped, a dangling in-app
@@ -654,7 +654,7 @@ fn collect_include_srcs(nodes: &[crate::tag_parser::Node]) -> Vec<String> {
 }
 
 // ============================================================================
-// v2 feature-format validators (routines with `format: 2`, habits, tasks,
+// v3 feature-format validators (routines/tasks as .js scripts, habits,
 // store entries — grammar parsed by `format.rs`, see FORMAT.md)
 // ============================================================================
 
@@ -674,12 +674,75 @@ fn diag_problem(d: crate::format::Diag) -> Problem {
     }
 }
 
-/// Filesystem checks shared by every v2 container: referenced XML scripts
-/// (from `audio` features and `script` actions) must exist and their
-/// include trees must lint clean; `task` actions must reference an
-/// existing template. Existence problems land on `report`; each linted
-/// script tree comes back as its own `FileReport` (matching the
-/// conditioning precedent, so the caller can mark them reachable).
+/// Parse `body` as JavaScript and report the first syntax error with its
+/// file-absolute 1-based line/column (`body_first_line` is the body's
+/// first line in the enclosing file, so boa's source-relative positions
+/// are offset accordingly). Parse-only via boa — the validator never
+/// evaluates anything.
+///
+/// Bodies are driven as an async function by the runtime (top-level
+/// `await` is the authoring model), so they are validated in that shape:
+/// wrapped in an async IIFE. Script-goal parsing then accepts top-level
+/// `await` while still rejecting module-only syntax (`import`/`export`).
+/// The wrapper adds exactly one line before the body, so a boa line `L`
+/// maps to file line `body_first_line + L - 2` (clamped into the body).
+fn check_js_syntax(body: &str, body_first_line: usize, report: &mut FileReport) {
+    use boa_ast::scope::Scope;
+    use boa_interner::Interner;
+    use boa_parser::{Parser, Source};
+
+    let source = format!("(async () => {{\n{body}\n}})");
+    let mut parser = Parser::new(Source::from_bytes(source.as_bytes()));
+    let mut interner = Interner::new();
+    let scope = Scope::new_global();
+    if let Err(e) = parser.parse_script(&scope, &mut interner) {
+        let pos = boa_error_position(&e);
+        // boa's Display appends the wrapper-relative position — swap it for
+        // the file-absolute one so the agent can jump straight to the line.
+        let mut msg = e.to_string();
+        if let Some((l, c)) = pos {
+            let suffix = format!(" at line {l}, col {c}");
+            if let Some(stripped) = msg.strip_suffix(&suffix) {
+                msg = stripped.to_string();
+            }
+        }
+        // Last body line (clamped: never below the first, so an error on
+        // the wrapper's own head/tail still lands on a body line).
+        let last = body_first_line + body.lines().count().saturating_sub(1);
+        match pos {
+            Some((l, c)) => {
+                let file_line = (body_first_line + l as usize - 2).clamp(body_first_line, last);
+                report.push(err(format!(
+                    "invalid JavaScript at line {file_line}, column {c}: {msg}"
+                )));
+            }
+            None => report.push(err(format!("invalid JavaScript: {msg}"))),
+        }
+    }
+}
+
+/// The (line, column) boa reports for a parse error, when it has one.
+/// Both are 1-based and relative to the parsed source.
+fn boa_error_position(e: &boa_parser::Error) -> Option<(u32, u32)> {
+    use boa_parser::Error;
+    match e {
+        Error::Expected { span, .. } | Error::Unexpected { span, .. } => {
+            Some((span.start().line_number(), span.start().column_number()))
+        }
+        Error::General { position, .. } => Some((position.line_number(), position.column_number())),
+        Error::Lex {
+            err: boa_parser::lexer::Error::Syntax(_, pos),
+        } => Some((pos.line_number(), pos.column_number())),
+        _ => None, // AbruptEnd / IO / ScopeAnalysis carry no position
+    }
+}
+
+/// Filesystem checks shared by every v3 container: referenced XML scripts
+/// (from `script` actions) must exist and their include trees must lint
+/// clean; `task` actions must reference an existing template. Existence
+/// problems land on `report`; each linted script tree comes back as its
+/// own `FileReport` (matching the conditioning precedent, so the caller
+/// can mark them reachable).
 fn check_v2_refs(
     scripts: &[String],
     templates: &[String],
@@ -734,13 +797,13 @@ fn check_action_refs(
     check_v2_refs(&refs.scripts, &refs.templates, agent_dir, report)
 }
 
-/// `routines/*.md` with `format: 2`. Returns the routine's own report plus
-/// one `FileReport` per XML script tree reachable from its `audio`
-/// features and `script` actions.
+/// `routines/*.js` (comment front-matter + JS body). Checks the .js
+/// extension, the front-matter grammar (parse diags), the body's JS
+/// syntax (boa, parse-only), and the action reference graph.
 fn validate_routine_v2(rel_path: &str, content: &str, agent_dir: &Path) -> Vec<FileReport> {
     let mut report = FileReport::new(rel_path);
-    if !rel_path.to_ascii_lowercase().ends_with(".md") {
-        report.push(err("routine files must use the .md extension"));
+    if !rel_path.to_ascii_lowercase().ends_with(".js") {
+        report.push(err("routine files must use the .js extension"));
         return vec![report];
     }
 
@@ -749,8 +812,9 @@ fn validate_routine_v2(rel_path: &str, content: &str, agent_dir: &Path) -> Vec<F
         report.push(diag_problem(d));
     }
 
-    let (_, body) = crate::format::split_frontmatter(content);
-    check_md_links(&body, agent_dir, &mut report);
+    if let crate::format::JsFrontmatter::Block { fm, body } = crate::format::split_js_frontmatter(content) {
+        check_js_syntax(&body, crate::format::js_body_first_line(&fm), &mut report);
+    }
 
     let mut extra = Vec::new();
     if let Some(r) = &routine {
@@ -760,9 +824,6 @@ fn validate_routine_v2(rel_path: &str, content: &str, agent_dir: &Path) -> Vec<F
             agent_dir,
             &mut report,
         ));
-        let scripts = crate::format::audio_feature_srcs(&r.pages);
-        extra.extend(check_v2_refs(&scripts, &[], agent_dir, &mut report));
-        check_condition_idents(&r.pages, &r.title, &mut report);
     }
 
     let mut reports = vec![report];
@@ -770,54 +831,7 @@ fn validate_routine_v2(rel_path: &str, content: &str, agent_dir: &Path) -> Vec<F
     reports
 }
 
-/// Cross-check every condition expression (`@when`, `{{#if}}`, feature
-/// `when:`) and `{{ var }}` interpolation in a file against the reserved
-/// run variables and the file's own answer `field` ids. Unknown names are
-/// silent `false`/empty at run time — exactly the mistakes worth catching
-/// at lint time.
-fn check_condition_idents(pages: &[crate::format::Page], title: &str, report: &mut FileReport) {
-    let (conds, fields, interp) = crate::format::collect_condition_refs(pages);
-    let field_list = fields.join(", ");
-    for cond in &conds {
-        let Ok(parsed) = crate::cond::parse(cond) else {
-            continue; // syntax already reported by the parser
-        };
-        for ident in &parsed.identifiers {
-            if crate::cond::RESERVED_VARS.contains(&ident.as_str()) {
-                continue;
-            }
-            if fields.iter().any(|f| f == ident) {
-                continue;
-            }
-            report.push(err(format!(
-                "`{title}`: condition `{cond}` references unknown variable `{ident}` — \
-                 use a run variable ({}) or a `field` from an input/choice/slider \
-                 feature in this file{}",
-                crate::cond::RESERVED_VARS.join(", "),
-                if field_list.is_empty() {
-                    String::new()
-                } else {
-                    format!(" (declared here: {field_list})")
-                }
-            )));
-        }
-    }
-    for ident in &interp {
-        if crate::cond::RESERVED_VARS.contains(&ident.as_str()) {
-            continue;
-        }
-        if fields.iter().any(|f| f == ident) {
-            continue;
-        }
-        report.push(warn(format!(
-            "`{title}`: `{{{{{ident}}}}}` is not a known run variable or answer field — \
-             it renders empty (run variables: {})",
-            crate::cond::RESERVED_VARS.join(", ")
-        )));
-    }
-}
-
-/// `habits/*.md` (always v2).
+/// `habits/*.md`.
 fn validate_habit(rel_path: &str, content: &str, agent_dir: &Path) -> Vec<FileReport> {
     let mut report = FileReport::new(rel_path);
     if !rel_path.to_ascii_lowercase().ends_with(".md") {
@@ -848,11 +862,11 @@ fn validate_habit(rel_path: &str, content: &str, agent_dir: &Path) -> Vec<FileRe
     reports
 }
 
-/// `tasks/*.md` (always v2). Same page-model checks as routines.
+/// `tasks/*.js`. Same checks as routines (front matter + JS syntax + refs).
 fn validate_task(rel_path: &str, content: &str, agent_dir: &Path) -> Vec<FileReport> {
     let mut report = FileReport::new(rel_path);
-    if !rel_path.to_ascii_lowercase().ends_with(".md") {
-        report.push(err("task files must use the .md extension"));
+    if !rel_path.to_ascii_lowercase().ends_with(".js") {
+        report.push(err("task files must use the .js extension"));
         return vec![report];
     }
 
@@ -861,8 +875,9 @@ fn validate_task(rel_path: &str, content: &str, agent_dir: &Path) -> Vec<FileRep
         report.push(diag_problem(d));
     }
 
-    let (_, body) = crate::format::split_frontmatter(content);
-    check_md_links(&body, agent_dir, &mut report);
+    if let crate::format::JsFrontmatter::Block { fm, body } = crate::format::split_js_frontmatter(content) {
+        check_js_syntax(&body, crate::format::js_body_first_line(&fm), &mut report);
+    }
 
     let mut extra = Vec::new();
     if let Some(t) = &task {
@@ -872,9 +887,6 @@ fn validate_task(rel_path: &str, content: &str, agent_dir: &Path) -> Vec<FileRep
             agent_dir,
             &mut report,
         ));
-        let scripts = crate::format::audio_feature_srcs(&t.pages);
-        extra.extend(check_v2_refs(&scripts, &[], agent_dir, &mut report));
-        check_condition_idents(&t.pages, &t.title, &mut report);
     }
 
     let mut reports = vec![report];
@@ -985,8 +997,8 @@ fn scope_is_file(scope: Option<&str>) -> bool {
 /// Recursively list `(rel, full)` pairs for every regular file under `dir_rel`
 /// (relative to `agent_dir`). Returns empty if the dir doesn't exist. Used to
 /// walk `hypnos/` at arbitrary depth for standalone/unreferenced XML, and the
-/// v2 container dirs so files in nested subdirectories (e.g.
-/// `routines/_tmp/test.md`) are validated too.
+/// container dirs so files in nested subdirectories (e.g.
+/// `routines/_tmp/test.js`) are validated too.
 fn list_dir_files_recursive(dir_rel: &str, agent_dir: &Path) -> Vec<(String, PathBuf)> {
     let Ok(dir) = crate::bash::resolve_under(agent_dir, dir_rel) else {
         return Vec::new();
@@ -1173,7 +1185,7 @@ fn validate_data_files_inner(path: Option<String>, state: &AppState) -> Validate
         Some(s) => in_scope(rel, s),
         None => true,
     };
-    // Scope semantics: scoping an exact file (e.g. `routines/foo.md`) still
+    // Scope semantics: scoping an exact file (e.g. `routines/foo.js`) still
     // walks the whole routines dir (subdirs too) but only that file is
     // kept; scoping a directory covers its subdirectories as well.
     let scope_is_file = scope_is_file(scope.as_deref());
@@ -1183,10 +1195,10 @@ fn validate_data_files_inner(path: Option<String>, state: &AppState) -> Validate
     // below uses this to tell standalone scripts apart from reachable ones.
     let mut reachable_xml: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // routines/*.md (parsed + validated by format.rs). Recursive so files
-    // in nested dirs (e.g. `routines/_tmp/test.md`) are validated too.
+    // routines/*.js (parsed + validated by format.rs). Recursive so files
+    // in nested dirs (e.g. `routines/_tmp/test.js`) are validated too.
     for (rel, full) in list_dir_files_recursive("routines", &agent_dir) {
-        if !rel.to_ascii_lowercase().ends_with(".md") || !in_scope_of(&rel) {
+        if !rel.to_ascii_lowercase().ends_with(".js") || !in_scope_of(&rel) {
             continue;
         }
         let content = std::fs::read_to_string(&full).unwrap_or_default();
@@ -1212,9 +1224,9 @@ fn validate_data_files_inner(path: Option<String>, state: &AppState) -> Validate
         }
     }
 
-    // tasks/*.md (v2), recursive.
+    // tasks/*.js, recursive.
     for (rel, full) in list_dir_files_recursive("tasks", &agent_dir) {
-        if !rel.to_ascii_lowercase().ends_with(".md") || !in_scope_of(&rel) {
+        if !rel.to_ascii_lowercase().ends_with(".js") || !in_scope_of(&rel) {
             continue;
         }
         let content = std::fs::read_to_string(&full).unwrap_or_default();
@@ -1605,66 +1617,144 @@ mod tests {
     #[test]
     fn recursive_list_covers_nested_subdirs() {
         let dir = agent_dir_with(&[
-            ("routines/a.md", "---\nformat: 2\ntitle: A\n---\n"),
-            ("routines/sub/b.md", "---\nformat: 2\ntitle: B\n---\n"),
-            ("routines/deep/nested/c.md", "---\nformat: 2\ntitle: C\n---\n"),
-            // Non-.md files are listed too (the per-dir walkers filter);
+            ("routines/a.js", "/*---\ntitle: A\n---*/\n"),
+            ("routines/sub/b.js", "/*---\ntitle: B\n---*/\n"),
+            ("routines/deep/nested/c.js", "/*---\ntitle: C\n---*/\n"),
+            // Non-.js files are listed too (the per-dir walkers filter);
             // only the file-bearing reports matter here.
             ("routines/scratch.txt", "not a feature"),
         ]);
         let listed = list_dir_files_recursive("routines", dir.path());
         let rels: Vec<String> = listed.into_iter().map(|(rel, _)| rel).collect();
-        assert!(rels.contains(&"routines/a.md".to_string()));
-        assert!(rels.contains(&"routines/sub/b.md".to_string()));
-        assert!(rels.contains(&"routines/deep/nested/c.md".to_string()));
+        assert!(rels.contains(&"routines/a.js".to_string()));
+        assert!(rels.contains(&"routines/sub/b.js".to_string()));
+        assert!(rels.contains(&"routines/deep/nested/c.js".to_string()));
         assert!(rels.contains(&"routines/scratch.txt".to_string()));
     }
 
     #[test]
     fn scope_file_and_scope_dir_semantics() {
         // A file-scope doesn't pull in siblings' directories.
-        assert!(scope_is_file(Some("routines/foo.md")));
-        assert!(scope_is_file(Some("routines/sub/foo.md")));
+        assert!(scope_is_file(Some("routines/foo.js")));
+        assert!(scope_is_file(Some("routines/sub/foo.js")));
         assert!(!scope_is_file(Some("routines")));
         assert!(!scope_is_file(Some("routines/sub")));
         assert!(!scope_is_file(Some("routines/")));
         assert!(!scope_is_file(None));
     }
 
-    // ── v2 feature format (format.rs grammar) ───────────────────────────
+    // ── v3 feature format (format.rs grammar) ───────────────────────────
 
     #[test]
-    fn v2_routine_routes_to_format_parser() {
+    fn v3_routine_routes_to_format_parser() {
         let dir = agent_dir_with(&[(
-            "routines/drill.md",
-            "---\nformat: 2\ntitle: Drill\nschedule: 0 8 * * *\n---\n\nintro\n",
+            "routines/drill.js",
+            "/*---\ntitle: Drill\nschedule: 0 8 * * *\n---*/\nawait wait(\"45m\");\n",
         )]);
-        let content = std::fs::read_to_string(dir.path().join("routines/drill.md")).unwrap();
-        let reports = validate_routine_v2("routines/drill.md", &content, dir.path());
+        let content = std::fs::read_to_string(dir.path().join("routines/drill.js")).unwrap();
+        let reports = validate_routine_v2("routines/drill.js", &content, dir.path());
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].status, "ok", "{:?}", reports[0].problems);
     }
 
     #[test]
-    fn routine_without_marker_reports_error() {
+    fn routine_requires_js_extension_and_front_matter() {
         let dir = agent_dir_with(&[]);
+        // Wrong extension.
         let reports = validate_routine_v2(
             "routines/x.md",
-            "---
-schedule: 0 8 * * *
----
-```feature
-type: wait
-duration: 1m
----
-x
-```
-",
+            "/*---\ntitle: X\n---*/\nbody\n",
+            dir.path(),
+        );
+        assert_eq!(reports[0].status, "error");
+        assert!(
+            problems_for(&reports[0])
+                .iter()
+                .any(|m| m.contains(".js extension"))
+        );
+
+        // Old `---` front matter is not the v3 marker.
+        let reports = validate_routine_v2(
+            "routines/x.js",
+            "---\ntitle: X\nschedule: 0 8 * * *\n---\nbody\n",
             dir.path(),
         );
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].status, "error");
-        assert!(problems_for(&reports[0]).iter().any(|m| m.contains("format: 2")));
+        assert!(
+            problems_for(&reports[0]).iter().any(|m| m.contains("`/*---`")),
+            "{:?}",
+            reports[0].problems
+        );
+
+        // Unterminated comment block.
+        let reports = validate_routine_v2(
+            "routines/x.js",
+            "/*---\ntitle: X\n",
+            dir.path(),
+        );
+        assert_eq!(reports[0].status, "error");
+        assert!(
+            problems_for(&reports[0])
+                .iter()
+                .any(|m| m.contains("never closed"))
+        );
+    }
+
+    #[test]
+    fn routine_js_syntax_error_reports_line_and_column() {
+        let dir = agent_dir_with(&[]);
+        // One front-matter line → body starts at file line 4 (1: /*---,
+        // 2: title, 3: ---*/, 4: body). The syntax error is on body line
+        // 1, so the reported line must be the file-absolute 4.
+        let content = "/*---\ntitle: X\n---*/\nconst a = ;\n";
+        let reports = validate_routine_v2("routines/x.js", content, dir.path());
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].status, "error");
+        let msgs = problems_for(&reports[0]);
+        assert!(
+            msgs.iter().any(|m| m.contains("invalid JavaScript")),
+            "{msgs:?}"
+        );
+        let err = msgs
+            .iter()
+            .find(|m| m.contains("invalid JavaScript"))
+            .unwrap();
+        assert!(err.contains("line 4"), "{err}");
+        assert!(err.contains("column"), "{err}");
+    }
+
+    #[test]
+    fn routine_valid_js_body_passes_boa() {
+        let dir = agent_dir_with(&[]);
+        let content = "/*---\ntitle: X\nschedule: 0 8 * * *\n---*/\n\
+                      const hi = await audio(\"hypnos/x.xml\");\n\
+                      if (vars.streak > 3) { await wait(\"10m\"); }\n\
+                      function f(a) { return a.map((x) => x ** 2); }\n\
+                      await log(`${hi} ${f([1, 2])}`);\n";
+        let reports = validate_routine_v2("routines/x.js", content, dir.path());
+        assert_eq!(reports[0].status, "ok", "{:?}", reports[0].problems);
+    }
+
+    #[test]
+    fn task_js_syntax_and_front_matter_checked() {
+        let dir = agent_dir_with(&[]);
+        let bad = "/*---\ntitle: T\n---*/\nawait wait(;\n";
+        let reports = validate_task("tasks/t.js", bad, dir.path());
+        assert_eq!(reports[0].status, "error");
+        assert!(
+            problems_for(&reports[0])
+                .iter()
+                .any(|m| m.contains("invalid JavaScript")),
+            "{:?}",
+            reports[0].problems
+        );
+
+        // Old extension rejected outright.
+        let reports = validate_task("tasks/t.md", "/*---\ntitle: T\n---*/\nx\n", dir.path());
+        assert!(problems_for(&reports[0])
+            .iter()
+            .any(|m| m.contains(".js extension")));
     }
 
     #[test]
@@ -1679,20 +1769,23 @@ x
         assert_eq!(reports[0].status, "error");
         assert!(problems_for(&reports[0])
             .iter()
-            .any(|m| m.contains("tasks/missing-one.md")));
+            .any(|m| m.contains("tasks/missing-one.js")));
     }
 
     #[test]
-    fn v2_routine_audio_feature_lints_script_tree() {
+    fn v3_routine_script_action_lints_script_tree() {
+        // A `script` action's `.xml` is existence-checked and its include
+        // tree linted; `.xml` strings inside the JS body are prerender
+        // hints only, never validated refs.
         let dir = agent_dir_with(&[
             (
-                "routines/listen.md",
-                "---\nformat: 2\ntitle: Listen\n---\n```feature\ntype: audio\nsrc: hypnos/a.xml\n---\nlisten\n```\n",
+                "routines/listen.js",
+                "/*---\ntitle: Listen\nsuccess: { \"type\": \"script\", \"src\": \"hypnos/a.xml\" }\n---*/\nawait audio('hypnos/hint-only.xml');\n",
             ),
             ("hypnos/a.xml", "<voice speaker='female'>hi</voice>"),
         ]);
-        let content = std::fs::read_to_string(dir.path().join("routines/listen.md")).unwrap();
-        let reports = validate_routine_v2("routines/listen.md", &content, dir.path());
+        let content = std::fs::read_to_string(dir.path().join("routines/listen.js")).unwrap();
+        let reports = validate_routine_v2("routines/listen.js", &content, dir.path());
         // The routine's own report + one for the referenced script.
         assert_eq!(reports.len(), 2, "{:?}", reports);
         assert!(reports.iter().all(|r| r.status == "ok"), "{:?}", reports);
@@ -1729,8 +1822,8 @@ x
         // validator errors.
         let dir = agent_dir_with(&[]);
         let routine_with = |failure: &str| {
-            let content = format!("---\nformat: 2\ntitle: X\nfailure: {failure}\n---\nbody\n");
-            validate_routine_v2("routines/x.md", &content, dir.path())
+            let content = format!("/*---\ntitle: X\nfailure: {failure}\n---*/\nbody\n");
+            validate_routine_v2("routines/x.js", &content, dir.path())
         };
         for failure in [
             "{ \"type\": \"agent\" }",
@@ -1749,5 +1842,22 @@ x
         }
         let ok = routine_with("{ \"type\": \"agent\", \"message\": \"Drill lapsed\" }");
         assert_eq!(ok[0].status, "ok", "{:?}", ok[0].problems);
+    }
+
+    #[test]
+    fn v3_bundled_examples_lint_clean() {
+        // Dogfood: the shipped examples pass the full routine/task
+        // validation, including the boa JS syntax check. The routine's
+        // failure action references a task template, so seed it.
+        let dir = agent_dir_with(&[(
+            "tasks/punishment-light.js",
+            "/*---\ntitle: Punishment (light)\n---*/\nawait wait(\"10m\");\n",
+        )]);
+        let routine = include_str!("../../examples/routine.js");
+        let reports = validate_routine_v2("examples/routine.js", routine, dir.path());
+        assert_eq!(reports[0].status, "ok", "{:?}", reports[0].problems);
+        let task = include_str!("../../examples/task.js");
+        let reports = validate_task("examples/task.js", task, dir.path());
+        assert_eq!(reports[0].status, "ok", "{:?}", reports[0].problems);
     }
 }
