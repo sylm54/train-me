@@ -49,13 +49,6 @@ interface Props {
   src: string;
   onClose: () => void;
   onEnded?: () => void;
-  /**
-   * Accepted for call-site compatibility with SessionView, which still
-   * threads run-context variables — but ignored: manifest v5 dropped `<if>`
-   * condition segments, so there is nothing left to evaluate at playback
-   * time. Later phases rewrite SessionView and remove this.
-   */
-  variables?: Record<string, string | number | boolean>;
 }
 
 export function AudioPlayerOverlay({ src, onClose, onEnded }: Props) {

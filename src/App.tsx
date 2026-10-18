@@ -12,7 +12,7 @@ import { TtsView } from "@/views/TtsView";
 import { InventoryView } from "@/views/InventoryView";
 import { ActivityView } from "@/views/ActivityView";
 import { TodayView } from "@/views/TodayView";
-import { SessionView } from "@/views/SessionView";
+import { ScriptSessionView } from "@/views/ScriptSessionView";
 import { OnboardingView } from "@/views/OnboardingView";
 import { NoticeToasts } from "@/components/NoticeToasts";
 import { RenderProgressOverlay } from "@/components/RenderProgressOverlay";
@@ -63,7 +63,7 @@ export default function App() {
   // the same order — see React's Rules of Hooks.)
   const navigate = useCallback((next: View) => setView(next), []);
 
-  // The pending v2 session (routine/task run) handed to SessionView.
+  // The pending v2 session (routine/task run) handed to ScriptSessionView.
   const [sessionRequest, setSessionRequest] = useState<SessionRequest | null>(null);
   const openSession = useCallback((request: SessionRequest) => {
     setSessionRequest(request);
@@ -131,7 +131,7 @@ export default function App() {
       body = <TodayView onRequestSession={openSession} />;
       break;
     case "session":
-      body = <SessionView request={sessionRequest} navigate={navigate} />;
+      body = <ScriptSessionView request={sessionRequest} navigate={navigate} />;
       break;
     case "settings":
       body = <SettingsView onOpenActivity={() => navigate("activity")} />;

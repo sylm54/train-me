@@ -10,36 +10,6 @@ import { invoke } from "@tauri-apps/api/core";
 
 // ── Parsed containers (format.rs) ──────────────────────────────────────────
 
-export type FValue = string | number | boolean | FValue[] | { [key: string]: FValue };
-
-export interface FeatureBlock {
-  ftype: string;
-  config: { [key: string]: FValue };
-  body: string;
-  /** Run-time condition (`when:` config key): skip the feature when false. */
-  when?: string;
-  line: number;
-}
-
-export type Element =
-  | { Checklist: { label: string; when?: string; line: number } }
-  | { AudioLink: { src: string; when?: string; line: number } }
-  | { Feature: FeatureBlock };
-
-/** One conditional markdown segment of a page (`{{#if}}` split). */
-export interface RawChunk {
-  text: string;
-  when?: string;
-}
-
-export interface Page {
-  elements: Element[];
-  raw: string;
-  raw_chunks: RawChunk[];
-  /** Page-level condition (`@when` line): skip the whole page when false. */
-  when?: string;
-}
-
 export type Scope = "habits" | "routines" | "tasks" | "all";
 
 export type Action =
@@ -64,7 +34,8 @@ export interface Routine {
   limit: Limit | null;
   success: Action[];
   failure: Action[];
-  pages: Page[];
+  /** The raw JS body (everything after the front-matter closer, verbatim). */
+  body: string;
 }
 
 export interface TaskTemplate {
@@ -75,7 +46,8 @@ export interface TaskTemplate {
   max_timeout_secs: number | null;
   success: Action[];
   failure: Action[];
-  pages: Page[];
+  /** The raw JS body (everything after the front-matter closer, verbatim). */
+  body: string;
 }
 
 // ── Engine results (schedule.rs / economy.rs) ─────────────────────────────
@@ -86,8 +58,10 @@ export interface RunStart {
   kind: "routine" | "task";
   routine: Routine | null;
   task: TaskTemplate | null;
-  /** Engine-computed run-context variables (conditions + interpolation). */
-  context: Record<string, string | number | boolean>;
+  /** The raw JS body, run by the sandboxed script runtime. */
+  body: string;
+  /** Engine-computed run-context variables — the script's `vars` snapshot. */
+  vars: Record<string, string | number | boolean>;
 }
 
 export interface RunOutcome {
@@ -122,7 +96,7 @@ export interface RoutineCard {
   current: DueInfo | null;
   next: DueInfo | null;
   in_progress: string | null;
-  /** Audio scripts referenced by the routine (pages + actions). */
+  /** Audio scripts referenced by the routine (body + actions). */
   audio: string[];
 }
 
@@ -333,9 +307,9 @@ export function debugGrantPoints(delta: number): Promise<{ balance: number }> {
 
 // ── Display helpers ────────────────────────────────────────────────────────
 
-/** Mirror of the backend's `template_to_path` (bare name → tasks/<n>.md). */
+/** Mirror of the backend's `template_to_path` (bare name → tasks/<n>.js). */
 export function templateToPath(template: string): string {
-  return template.endsWith(".md") ? template : `tasks/${template}.md`;
+  return template.endsWith(".js") ? template : `tasks/${template}.js`;
 }
 
 export function humanDuration(secs: number): string {
@@ -367,7 +341,7 @@ export function describeAction(a: Action): string {
   }
 }
 
-// ── Session launcher contract (App-level state → SessionView) ─────────────
+// ── Session launcher contract (App-level state → ScriptSessionView) ───────
 
 export interface SessionRequest {
   kind: "routine" | "task";

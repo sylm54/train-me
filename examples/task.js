@@ -12,14 +12,17 @@ failure: { "type": "notification", "text": "Failure recorded" }
 // the agent, and instances carry their own deadline and `timeouts`
 // escalation as time passes.
 if (vars.locked) {
-  await show("locked", {
+  await show("status", {
+    type: "text",
     text: "Verify the device is secure and log the code.",
   });
 } else {
-  await show("unlocked", { text: "You've earned your release. Enjoy it." });
+  await show("status", { type: "text", text: "You've earned your release. Enjoy it." });
 }
-await audio("hypnos/voice-sample.xml");
-await input("reflection", {
+const sample = await audio.play("hypnos/voice-sample.xml");
+await sample.end;
+const reflection = await show("reflection", {
+  type: "input",
   prompt: "Write a short reflection on this check.",
-  required: true,
 });
+await log("task", "reflection", await reflection.done);
