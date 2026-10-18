@@ -16,7 +16,11 @@
 
 import type { ComponentType } from "react";
 import { ButtonsWidget, validateButtonsProps } from "@/widgets/buttons";
+import { ChecklistWidget, validateChecklistProps } from "@/widgets/checklist";
+import { InputWidget, validateInputProps } from "@/widgets/input";
+import { SliderWidget, validateSliderProps } from "@/widgets/slider";
 import { TextWidget, validateTextProps } from "@/widgets/text";
+import { TimerWidget, validateTimerProps } from "@/widgets/timer";
 
 // ── Framework prop types ────────────────────────────────────────────────────
 
@@ -68,8 +72,12 @@ export interface WidgetType<P> {
    * `widget "id" (type): ` prefix prepended.
    */
   validate: (props: Record<string, unknown>) => P;
-  /** Script-visible initial state snapshot (defaults to `{}`). */
-  initialState?: () => Record<string, unknown>;
+  /**
+   * Script-visible initial state snapshot (defaults to `{}`). Gets the
+   * validated per-type props, so state like a checklist's `checked`
+   * flags is right from the moment of `show` — before anything mounts.
+   */
+  initialState?: (props: P) => Record<string, unknown>;
 }
 
 /** Heterogeneous storage type — the map holds widgets of many `P`s. */
@@ -169,12 +177,13 @@ export function validateWidgetProps(
   }
 
   try {
+    const perType = widgetType.validate(rest);
     return {
       type,
-      props: widgetType.validate(rest),
+      props: perType,
       area: validArea,
       z: validZ,
-      initialState: widgetType.initialState?.() ?? {},
+      initialState: widgetType.initialState?.(perType) ?? {},
     };
   } catch (e) {
     throw new Error(
@@ -190,8 +199,34 @@ defineWidget("text", {
   validate: validateTextProps,
 });
 
+defineWidget("checklist", {
+  component: ChecklistWidget,
+  validate: validateChecklistProps,
+  initialState: (props) => ({ checked: props.items.map(() => false) }),
+});
+
 defineWidget("buttons", {
   component: ButtonsWidget,
   validate: validateButtonsProps,
   initialState: () => ({ picked: null }),
+});
+
+defineWidget("slider", {
+  component: SliderWidget,
+  validate: validateSliderProps,
+  initialState: (props) => ({ value: props.initial }),
+});
+
+defineWidget("input", {
+  component: InputWidget,
+  validate: validateInputProps,
+  initialState: () => ({ text: "" }),
+});
+
+defineWidget("timer", {
+  component: TimerWidget,
+  validate: validateTimerProps,
+  initialState: (props) => ({
+    seconds: props.mode === "down" ? props.duration : 0,
+  }),
 });
