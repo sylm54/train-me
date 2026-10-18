@@ -20,7 +20,29 @@
  */
 
 import { audioUrlForPath } from "@/lib/audioUrl";
-import type { BeatmeterMeta } from "./manifestPlayer";
+
+/**
+ * Resolved beat schedule for a metronomed clip. `sample` is an absolute
+ * path to a short click WAV the scheduler loads into Web Audio and triggers
+ * at each `beat.time`. `volume` is the base gain; `accent_gain` multiplies
+ * it on accented beats.
+ *
+ * Manifest v5 dropped the `<beatmeter>` tag, so nothing produces this
+ * anymore — the class is kept for a later widget phase that will reintroduce
+ * beat-synced audio.
+ */
+export interface BeatmeterMeta {
+  sample: string;
+  volume: number;
+  accent_gain: number;
+  beats: BeatMark[];
+}
+
+/** One beat in a {@link BeatmeterMeta} schedule: time (s) + accent flag. */
+export interface BeatMark {
+  time: number;
+  accent: boolean;
+}
 
 /** Beats further than this (s) behind the element clock are dropped as stale. */
 const STALE_S = 0.05;

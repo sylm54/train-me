@@ -12,15 +12,13 @@
  *     notification cover the user-away case);
  *   - never plays over the full-screen player (audio bus busy → the
  *     script stays queued for manual listening);
- *   - skips interactive scripts (`<until>`/`<choice>`/`<rating>`/`<react>`
- *     anywhere in the tree, includes included) — those need the real
- *     player UI, so they stay queued;
  *   - skips scripts longer than `MAX_JINGLE_SECS` for the same reason.
  *
- * Playbacks are serialized (a queue of jingles plays back-to-back) and
- * logged to the activity log under feature `script`, action `play`, just
- * like manual plays. On completion the pending row is dismissed; skipped
- * or failed jingles remain queued.
+ * Scripts are pure audio (manifest v5), so nothing is filtered for
+ * interactivity anymore. Playbacks are serialized (a queue of jingles plays
+ * back-to-back) and logged to the activity log under feature `script`,
+ * action `play`, just like manual plays. On completion the pending row is
+ * dismissed; skipped or failed jingles remain queued.
  */
 
 import { useEffect } from "react";
@@ -75,26 +73,9 @@ async function playJingle(item: QueueItem): Promise<void> {
       manifestPath: rendered.manifest_path,
     });
     if (rendered.duration > MAX_JINGLE_SECS) return;
-    if (await isInteractive(read.root, new Set())) return;
-
-    // Environment-only variables for `<if>` segments (jingles fire outside
-    // any run context). Best-effort — empty on failure.
-    let variables: Record<string, string | number | boolean> = {};
-    try {
-      variables = await invoke<Record<string, string | number | boolean>>("v2_context");
-    } catch {
-      /* keep empty */
-    }
 
     await new Promise<void>((resolve) => {
       const player = new ManifestPlayer({
-        variables,
-        onPrompt: () => {
-          // Interactive scripts are filtered above; a prompt here would
-          // have no UI — stop and leave the script queued.
-          player.destroy();
-          resolve();
-        },
         onPlayingChange: () => {},
         onEnded: () => resolve(),
         onError: (e) => {
@@ -148,68 +129,4 @@ export function useJinglePlayer(isForeground: () => boolean): void {
       void un.then((f) => f());
     };
   }, [isForeground]);
-}
-
-/**
- * True when the segment tree contains an interactive node (a prompt the
- * listener must answer). Sub-manifests (`import`) are read and recursed
- * into; `seen` breaks include cycles.
- */
-async function isInteractive(seg: Segment, seen: Set<string>): Promise<boolean> {
-  switch (seg.type) {
-    case "until":
-    case "choice":
-    case "rating":
-    case "react":
-      return true;
-    case "static":
-      return false;
-    case "sequence": {
-      for (const child of seg.children) {
-        if (await isInteractive(child, seen)) return true;
-      }
-      return false;
-    }
-    case "random":
-    case "scramble": {
-      for (const child of seg.options) {
-        if (await isInteractive(child, seen)) return true;
-      }
-      return false;
-    }
-    case "loop":
-      return isInteractive(seg.child, seen);
-    case "background":
-      return isInteractive(seg.layer, seen);
-    case "overlay": {
-      for (const part of seg.parts) {
-        if (await isInteractive(part.segment, seen)) return true;
-      }
-      return false;
-    }
-    case "section":
-      return isInteractive(seg.child, seen);
-    case "visual":
-      // A visual is not itself interactive; its wrapped content may be.
-      return isInteractive(seg.child, seen);
-    case "cond":
-      // Both branches may carry prompts; check the ones that exist.
-      return (
-        (await isInteractive(seg.then, seen)) ||
-        (!!seg.else && (await isInteractive(seg.else, seen)))
-      );
-    case "import": {
-      if (seen.has(seg.manifest)) return false;
-      seen.add(seg.manifest);
-      try {
-        const sub = await invoke<{ root: Segment }>("read_manifest", {
-          manifestPath: seg.manifest,
-        });
-        return await isInteractive(sub.root, seen);
-      } catch {
-        // Unreadable import — assume interactive so we never auto-block.
-        return true;
-      }
-    }
-  }
 }

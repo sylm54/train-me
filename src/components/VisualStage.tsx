@@ -19,7 +19,46 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Spinner } from "@/components/ui/spinner";
-import type { VisualConfig, VisualSlide } from "@/lib/manifestPlayer";
+
+/**
+ * Playback config of a visual segment — mirrors the backend's
+ * `visual::VisualConfig` exactly (serde field names). Manifest v5 dropped
+ * the `<visual>` tag, so nothing produces this anymore — the component is
+ * kept for a later widget phase that will reuse the slideshow.
+ */
+export interface VisualConfig {
+  /** Visual source plugin id (e.g. `redgifs`). */
+  source: string;
+  /** Curated source communities (the `niche` attribute, e.g. `just-boobs`). */
+  niches: string[];
+  /** Tags/niches the source should match. */
+  tags: string[];
+  /** Tags that disqualify a result. */
+  block: string[];
+  /** Free-text search hint. */
+  query?: string;
+  /** Ordering hint passed to the source (e.g. `recent`/`trending`). */
+  order?: string;
+  /** Slide interval bounds (s); a fresh value is drawn per slide. */
+  every_min: number;
+  every_max: number;
+  /** How many distinct slides to fetch (1–40). */
+  count: number;
+  /** Caption mode: `off` (default) or `meta` (show the source's captions). */
+  captions: "off" | "meta";
+  /** Visual effect presets (`cut`, `zoom`, `vignette`, …). */
+  effects: string[];
+  /** Authored caption lines, shown shuffled per playback. */
+  lines: string[];
+}
+
+/** One slideshow slide resolved by the backend's `visual_fetch` command. */
+export interface VisualSlide {
+  /** Absolute URL on the audio server's `/visuals` mount. */
+  url: string;
+  kind: "video" | "image";
+  caption?: string;
+}
 
 interface VisualStageProps {
   config: VisualConfig;
