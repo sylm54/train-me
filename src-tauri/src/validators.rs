@@ -1846,18 +1846,48 @@ mod tests {
 
     #[test]
     fn v3_bundled_examples_lint_clean() {
-        // Dogfood: the shipped examples pass the full routine/task
-        // validation, including the boa JS syntax check. The routine's
-        // failure action references a task template, so seed it.
-        let dir = agent_dir_with(&[(
-            "tasks/punishment-light.js",
-            "/*---\ntitle: Punishment (light)\n---*/\nawait wait(\"10m\");\n",
-        )]);
+        // Dogfood: the shipped examples pass the full validation — front
+        // matter, boa JS syntax, action reference graph, and the TTS
+        // scripts' parse + semantic lint. The routine's failure action
+        // references a task template, so seed it.
+        let dir = agent_dir_with(&[
+            (
+                "tasks/punishment-light.js",
+                "/*---\ntitle: Punishment (light)\n---*/\nawait wait(\"10m\");\n",
+            ),
+            (
+                "hypnos/warm-up.xml",
+                include_str!("../../examples/hypnos/warm-up.xml"),
+            ),
+            (
+                "hypnos/deepening.xml",
+                include_str!("../../examples/hypnos/deepening.xml"),
+            ),
+        ]);
         let routine = include_str!("../../examples/routine.js");
         let reports = validate_routine_v2("examples/routine.js", routine, dir.path());
+        assert_eq!(reports[0].status, "ok", "{:?}", reports[0].problems);
+        let tease = include_str!("../../examples/routine-tease.js");
+        let reports = validate_routine_v2("examples/routine-tease.js", tease, dir.path());
         assert_eq!(reports[0].status, "ok", "{:?}", reports[0].problems);
         let task = include_str!("../../examples/task.js");
         let reports = validate_task("examples/task.js", task, dir.path());
         assert_eq!(reports[0].status, "ok", "{:?}", reports[0].problems);
+        let habit = include_str!("../../examples/habit.md");
+        let reports = validate_habit("examples/habit.md", habit, dir.path());
+        assert_eq!(reports[0].status, "ok", "{:?}", reports[0].problems);
+        let habit_time = include_str!("../../examples/habit-time.md");
+        let reports = validate_habit("examples/habit-time.md", habit_time, dir.path());
+        assert_eq!(reports[0].status, "ok", "{:?}", reports[0].problems);
+        let store = include_str!("../../examples/store.json");
+        let reports = validate_store_entry("examples/store.json", store, dir.path());
+        assert_eq!(reports[0].status, "ok", "{:?}", reports[0].problems);
+
+        // The two TTS scripts lint clean too (parse + semantics + includes).
+        for src in ["hypnos/warm-up.xml", "hypnos/deepening.xml"] {
+            for r in validate_script_tree(src, dir.path()) {
+                assert_eq!(r.status, "ok", "{src}: {:?}", r.problems);
+            }
+        }
     }
 }

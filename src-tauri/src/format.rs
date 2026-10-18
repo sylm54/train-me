@@ -1740,6 +1740,16 @@ mod tests {
         assert!(r.schedule.is_some());
         assert!(!r.body.trim().is_empty());
 
+        // The on-demand example: no schedule, explicit limit, cooldown.
+        let tease = include_str!("../../examples/routine-tease.js");
+        let (t, td) = parse_routine(tease);
+        assert!(errs(&td).is_empty(), "routine-tease.js: {td:?}");
+        assert!(warns(&td).is_empty(), "routine-tease.js: {td:?}");
+        let t = t.expect("parses");
+        assert!(t.schedule.is_none());
+        assert!(t.limit.is_some());
+        assert!(t.cooldown_secs.is_some());
+
         let habit = include_str!("../../examples/habit.md");
         let (_, hd) = parse_habit(habit);
         assert!(errs(&hd).is_empty(), "habit.md: {hd:?}");
@@ -1752,10 +1762,10 @@ mod tests {
         assert_eq!(ht.expect("parses").minutes, Some(40));
 
         let task = include_str!("../../examples/task.js");
-        let (t, td) = parse_task(task);
-        assert!(errs(&td).is_empty(), "task.js: {td:?}");
-        assert!(warns(&td).is_empty(), "task.js: {td:?}");
-        assert!(!t.expect("parses").body.trim().is_empty());
+        let (task, td2) = parse_task(task);
+        assert!(errs(&td2).is_empty(), "task.js: {td2:?}");
+        assert!(warns(&td2).is_empty(), "task.js: {td2:?}");
+        assert!(!task.expect("parses").body.trim().is_empty());
 
         let store = include_str!("../../examples/store.json");
         let (_, sd) = parse_store_entry(store);

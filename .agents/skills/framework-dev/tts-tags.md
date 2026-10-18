@@ -1,12 +1,16 @@
+---
+description: Full TTS XML tag reference — speech, pauses, clips, tones, effects, layering, loops, structural markers, and the @ expression language.
+---
+
 # TTS Tag System
 
-The TTS tag markup is an XML-like language used inside the train-me app to author spoken-word audio scripts — speech, pauses, sound-effect clips, tones, DSP effects, concurrent layering, loops, and structural markers. Scripts are fully prerendered: a script renders to a segment-tree manifest of WAV clips, and playback is pure audio. There are no interactive tags — everything a listener could answer moved to the JS orchestration layer on routine/task pages; `<zone>`/`<mark>` markers are the named timeline seams that layer syncs to. Author scripts with `write_file` / `edit_file`, then check them with the `validate_files` tool (optionally scoped to a path) — it parses and semantically validates the markup and chases `<include>` references, reporting any errors per file.
+The TTS tag markup is an XML-like language used inside the train-me app to author spoken-word audio scripts — speech, pauses, sound-effect clips, tones, DSP effects, concurrent layering, loops, and structural markers. Scripts are fully prerendered: a script renders to a segment-tree manifest of WAV clips, and playback is pure audio. There are no interactive tags — everything a listener could answer moved to the JS orchestration layer in routine/task scripts; `<zone>`/`<mark>` markers are the named timeline seams that layer syncs to. Author scripts with `write_file` / `edit_file`, then check them with the `validate_files` tool (optionally scoped to a path) — it parses and semantically validates the markup and chases `<include>` references, reporting any errors per file.
 
 ## Conventions
 - Tags are case-sensitive and lowercase.
 - Self-closing tags end with `/>`; container tags require children and a matching `</tag>`.
 - Whitespace inside tags is ignored. Text nodes are trimmed; empty text nodes are filtered.
-- `<!-- comments -->` are supported and must be terminated with `-->`.
+- `<!-- comments -->` are supported and must be terminated with `-->`. Comments are recognized where children are parsed — but NOT directly inside `<overlay>`/`<random>`/`<scramble>` between their `<part>` elements; place such comments around the container instead.
 - Attribute values may be single- or double-quoted.
 - Unknown tags are a parse error. Unknown attribute values (e.g. invalid tone/effect names) are tolerated where noted but produce no/degraded audio.
 
@@ -130,7 +134,7 @@ Constant folding: literals, binops of constants, and `@max`/`@min`/`@step`/`@rou
 - `<overlay>` mixes all parts concurrently (all start together). `<loop>` repeats sequentially.
 - `<include>` renders to a linked sub-manifest in the target's own track directory (context resets at the boundary); each file is hashed separately for incremental re-rendering, and a glob include becomes a per-playback random pick among its linked matches.
 - `<random>`/`<scramble>`/`<include>`/`<zone>`/`<mark>` produce segment boundaries; decisions for `<random>`/`<scramble>` (and a glob `<include>`'s pick) happen per-playback, so each listen can differ. A `<background>` whose layer contains no dynamic construct is baked into its surrounding clip; one with a dynamic layer plays on a parallel track scoped to its enclosing sequence.
-- There are NO interactive tags — scripts are pure audio. Audience choices, ratings, and button-waits belong to the JS orchestration layer on routine/task pages; use `<zone>`/`<mark>` to give that layer named sync points in the audio.
+- There are NO interactive tags — scripts are pure audio. Audience choices, ratings, and button-waits belong to the JS orchestration layer in routine/task scripts (see `docs/internal/runtime-api.md`); use `<zone>`/`<mark>` to give that layer named sync points in the audio.
 - Sound effects are `<clip>` elements pointing at WAV files shipped with the framework (e.g. `agent_files/sounds/`); a clip's audio is baked in at render time and re-renders happen automatically when the WAV changes.
 
 ## Example

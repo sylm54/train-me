@@ -531,8 +531,8 @@ pub fn ensure_agent_dir(data_dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(&agent)?;
     // Conventional subdirs the agent is expected to populate. We pre-create
     // them so the layout is discoverable on first run; the agent is free to
-    // create others. (`habits`, `tasks`, `store` are v2-format dirs —
-    // see FORMAT.md.)
+    // create others. (Layout is the v3 feature format — see FORMAT.md:
+    // routines/*.js, tasks/*.js, habits/*.md, store/*.json.)
     for sub in ["docs", "routines", "habits", "tasks", "store", "hypnos"] {
         std::fs::create_dir_all(agent.join(sub))?;
     }
@@ -554,8 +554,8 @@ pub fn ensure_agent_dir(data_dir: &Path) -> std::io::Result<()> {
 /// are left untouched so edits persist.
 ///
 /// The system prompt's docs (`docs/internal/feature-files.md`) reference
-/// these paths as the formatting standard for rules, routines, the journal
-/// format, and voice config.
+/// these paths as the formatting standard for routines, tasks, habits,
+/// the store, and TTS scripts.
 fn seed_examples(agent_dir: &Path) -> std::io::Result<()> {
     /// One bundled example: its relative path under `examples/` and its
     /// contents (embedded at compile time from the repo's `examples/` dir).
@@ -567,6 +567,10 @@ fn seed_examples(agent_dir: &Path) -> std::io::Result<()> {
         BundledExample {
             rel: "examples/routine.js",
             contents: include_str!("../../examples/routine.js"),
+        },
+        BundledExample {
+            rel: "examples/routine-tease.js",
+            contents: include_str!("../../examples/routine-tease.js"),
         },
         BundledExample {
             rel: "examples/habit.md",
@@ -583,6 +587,14 @@ fn seed_examples(agent_dir: &Path) -> std::io::Result<()> {
         BundledExample {
             rel: "examples/store.json",
             contents: include_str!("../../examples/store.json"),
+        },
+        BundledExample {
+            rel: "examples/hypnos/warm-up.xml",
+            contents: include_str!("../../examples/hypnos/warm-up.xml"),
+        },
+        BundledExample {
+            rel: "examples/hypnos/deepening.xml",
+            contents: include_str!("../../examples/hypnos/deepening.xml"),
         },
     ];
 
@@ -620,6 +632,10 @@ fn seed_internal_docs(agent_dir: &Path) -> std::io::Result<()> {
         InternalDoc {
             rel: "docs/internal/feature-files.md",
             contents: include_str!("../internal-docs/feature-files.md"),
+        },
+        InternalDoc {
+            rel: "docs/internal/runtime-api.md",
+            contents: include_str!("../internal-docs/runtime-api.md"),
         },
         InternalDoc {
             rel: "docs/internal/voice-training.md",

@@ -34,4 +34,4 @@ CREATE TABLE IF NOT EXISTS activity (
 );
 ```
 
-- `ts` is RFC 3339. The engine logs routine/habit/task/store events; voice sessions log under `voice`, script playbacks and in-audio decisions under `script`.
+- `ts` is RFC 3339. The engine logs routine/habit/task/store events; session runs log failures under `session`; scripts append via `log(feature, action, details)` with whatever feature names the body chooses.

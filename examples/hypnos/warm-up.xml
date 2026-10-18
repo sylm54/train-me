@@ -1,0 +1,32 @@
+<!--
+  warm-up.xml — a short morning warm-up script. Demonstrates <tone>
+  (background layers), <clip> (a sandbox WAV baked in at render time),
+  <volume> with an @ expression, and the <mark>/<zone> seams the JS
+  orchestration layer syncs to (s.mark("halfway") / s.mark("sirens")).
+  Copy to hypnos/ in the sandbox.
+-->
+<tone preset='pinknoise' volume='0.25'/>
+<voice speaker='male' speed='1.0'>
+  Good morning. Sit tall and let the breath settle.
+  <pause duration='0.8'/>
+  <clip src='sounds/ding.wav' volume='0.6'/>
+  <volume value='@fadein(1.5)'>We begin.</volume>
+</voice>
+
+<!-- A zero-length sync point: s.mark("halfway") resolves here. -->
+<mark name='halfway'/>
+
+<!-- A named region: s.zone("sirens") resolves as its audio starts. -->
+<zone name='sirens'>
+  <voice speaker='female'>
+    <loop loops='4'>
+      Lift through the cheeks.
+      <pause duration='0.6'/>
+      <tone preset='binaural_theta' frequency='220' volume='0.2'/>
+      And release.
+      <pause duration='0.6'/>
+    </loop>
+  </voice>
+</zone>
+
+<voice speaker='male'>That is the warm-up. Carry the ease with you.</voice>

@@ -1,9 +1,15 @@
 /**
  * Format grammar validator — TypeScript port of the essential checks from
- * train-me's canonical Rust parser (`src-tauri/src/format.rs`, spec:
- * FORMAT.md). The app's `validate_files` remains authoritative; this port
- * exists so framework CI can catch the same classes of errors before
- * packaging. Keep in sync when the grammar changes.
+ * train-me's canonical Rust parsers (`src-tauri/src/format.rs`, spec:
+ * FORMAT.md v3; the app-side report lives in `src-tauri/src/validators.rs`).
+ * The app's `validate_files` remains authoritative; this port exists so
+ * framework CI can catch the same classes of errors before packaging. Keep
+ * in sync when the grammar changes.
+ *
+ * Format v3: routines/tasks are `.js` files with a comment front-matter
+ * block (opens with `/*---`, closes with `---` + a block-comment end) and a
+ * raw JS body (syntax-checked here, never executed); habits (`.md`) and
+ * store entries (`.json`) are unchanged.
  */
 
 export interface Diag {
@@ -12,9 +18,7 @@ export interface Diag {
   line?: number;
 }
 
-import { parseCondition, RESERVED_VARS } from "./cond";
-
-// ── front-matter ───────────────────────────────────────────────────────────
+// ── markdown front-matter (habits) ────────────────────────────────────────
 
 export function splitFrontmatter(content: string): { fm: string | null; body: string } {
   const first = content.split("\n")[0] ?? "";
@@ -23,6 +27,101 @@ export function splitFrontmatter(content: string): { fm: string | null; body: st
   if (!m) return { fm: null, body: content };
   return { fm: m[1], body: m[2] };
 }
+
+// ── comment front-matter (routines & tasks, mirrors split_js_frontmatter) ─
+
+export type JsFrontmatter =
+  | { kind: "missing" }
+  | { kind: "unterminated" }
+  | { kind: "block"; fm: string; body: string };
+
+/**
+ * Split a `routines/*.js` / `tasks/*.js` file into its comment front-matter
+ * block and its raw JS body. The first line must be exactly `/*---` (a
+ * trailing `\r` from CRLF files is tolerated) and the block ends with the
+ * first line that is exactly the closer (`---` + block-comment end). The
+ * body is returned verbatim.
+ */
+export function splitJsFrontmatter(content: string): JsFrontmatter {
+  const firstNl = content.indexOf("\n");
+  const first = firstNl === -1 ? content : content.slice(0, firstNl + 1);
+  if (first.replace(/\r\n$/, "").replace(/\n$/, "") !== "/*---") {
+    return { kind: "missing" };
+  }
+  let offset = first.length;
+  const rest = content.slice(offset);
+  let searchFrom = 0;
+  for (;;) {
+    const nl = rest.indexOf("\n", searchFrom);
+    const line = nl === -1 ? rest.slice(searchFrom) : rest.slice(searchFrom, nl + 1);
+    if (line.replace(/\r\n$/, "").replace(/\n$/, "") === "---*/") {
+      const fm = content.slice(first.length, offset + searchFrom);
+      const body = content.slice(offset + searchFrom + line.length);
+      return { kind: "block", fm, body };
+    }
+    if (nl === -1) break;
+    searchFrom = nl + 1;
+  }
+  return { kind: "unterminated" };
+}
+
+/** 1-based file line of the first body line (1 `/*---`, fm interior, closer, body). */
+export function jsBodyFirstLine(fm: string): number {
+  // Line count of the fm interior (Rust `str::lines()` semantics: a trailing
+  // newline does not start another line; the empty string has zero lines).
+  const n = fm === ""
+    ? 0
+    : fm.endsWith("\n") ? fm.split("\n").length - 1 : fm.split("\n").length;
+  return n + 3;
+}
+
+/**
+ * Every quoted string in a JS body that ends in `.xml` — single or double
+ * quotes. Mirrors format.rs `script_srcs_in_body`: the body is arbitrary JS
+ * and the scan deliberately over-approximates rather than parse it.
+ */
+export function scriptSrcsInBody(body: string): string[] {
+  const out: string[] = [];
+  for (const m of body.matchAll(/("[^"\r\n]*\.xml")|('[^'\r\n]*\.xml')/g)) {
+    out.push((m[1] ?? m[2])!.slice(1, -1));
+  }
+  return out;
+}
+
+/**
+ * Syntax-check a JS body by compiling it as an `AsyncFunction("tm", body)`
+ * — the shape the runtime runs it in (async function body, so top-level
+ * `await` works, module-only `import`/`export` is rejected). The function
+ * is never called; compilation alone catches syntax errors. Errors are
+ * reported with file-absolute 1-based line numbers where the runtime
+ * exposes them (the implicit `async function anonymous(tm\n) {` prologue is
+ * two lines, so body line L compiles at source line L+2).
+ */
+export function checkJsSyntax(body: string, bodyFirstLine: number, diags: Diag[]): void {
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor as new (
+    ...args: string[]
+  ) => unknown;
+  try {
+    new AsyncFunction("tm", body);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // JavaScriptCore puts the parse position in the stack ("at <parse> (:N)");
+    // other runtimes don't — fall back to a message without a line.
+    const m = /at <parse> \(:(\d+)\)/.exec(e instanceof Error ? (e.stack ?? "") : "");
+    if (m) {
+      const compiled = parseInt(m[1]!, 10);
+      // Map the compiled-source line back to the file, clamped into the body
+      // (an error on the prologue itself still lands on a body line).
+      const last = bodyFirstLine + (body.split("\n").length - 1);
+      const fileLine = Math.min(Math.max(bodyFirstLine + compiled - 3, bodyFirstLine), last);
+      diags.push({ severity: "error", line: fileLine, message: `invalid JavaScript: ${msg}` });
+    } else {
+      diags.push({ severity: "error", message: `invalid JavaScript: ${msg}` });
+    }
+  }
+}
+
+// ── kv blocks ──────────────────────────────────────────────────────────────
 
 type FValue = string | number | boolean | FValue[] | { [k: string]: FValue };
 type FMap = { [k: string]: FValue };
@@ -42,9 +141,10 @@ export function parseKv(
   diags: Diag[],
 ): FMap {
   const root: FMap = {};
-  for (let i = 0; i < text.split("\n").length; i++) {
+  const lines = text.split("\n");
+  for (let i = 0; i < lines.length; i++) {
     const lineNo = firstLine + i;
-    const line = (text.split("\n")[i] ?? "").trim();
+    const line = (lines[i] ?? "").trim();
     if (!line || line.startsWith("#")) continue;
     const idx = line.indexOf(":");
     if (idx === -1) {
@@ -129,10 +229,6 @@ function getStr(m: FMap, k: string): string | undefined {
   const v = m[k];
   return typeof v === "string" && v.trim() ? v.trim() : undefined;
 }
-function getNum(m: FMap, k: string): number | undefined {
-  const v = m[k];
-  return typeof v === "number" ? v : undefined;
-}
 function getDur(m: FMap, k: string, diags: Diag[], ctx: string): number | undefined {
   const raw = getStr(m, k);
   if (raw === undefined) return undefined;
@@ -203,7 +299,7 @@ function parseAction(v: FValue, ctx: string, diags: Diag[], depth: number): Acti
       if (template.includes("..")) {
         diags.push({
           severity: "error",
-          message: `${sub}: \`template\` must be a task name or \`tasks/<name>.md\` path`,
+          message: `${sub}: \`template\` must be a task name or \`tasks/<name>.js\` path`,
         });
         return null;
       }
@@ -301,439 +397,99 @@ function parseAction(v: FValue, ctx: string, diags: Diag[], depth: number): Acti
   }
 }
 
-// ── pages + features ───────────────────────────────────────────────────────
-
-export const FEATURE_TYPES = [
-  "voice",
-  "wait",
-  "chastity",
-  "input",
-  "choice",
-  "slider",
-  "audio",
-] as const;
-
-export const VOICE_ANALYZERS = [
-  "pitch",
-  "resonance",
-  "intonation",
-  "weight",
-  "loudness",
-  "genderspace",
-] as const;
+// ── containers ─────────────────────────────────────────────────────────────
 
 export interface ParsedContainer {
-  /** .xml script references: audio features, audio links, script actions. */
+  /** .xml script references: quoted `.xml` strings in the JS body + script actions. */
   scripts: string[];
   templates: string[];
 }
 
-/** `field` answer key: required on `input`, optional on `choice`/`slider`.
- *  Reserved run variables cannot be shadowed (mirrors format.rs). */
-function checkFieldIdent(
-  config: FMap,
-  ctx: string,
-  line: number,
-  required: boolean,
-  diags: Diag[],
-): void {
-  const f = config["field"];
-  if (f === undefined) {
-    if (required) {
-      diags.push({
-        severity: "error", line,
-        message: `${ctx}: \`field\` is required (letters, digits, \`-\`, \`_\`)`,
-      });
-    }
-    return;
-  }
-  if (typeof f !== "string" || !/^[A-Za-z0-9_-]+$/.test(f)) {
-    diags.push({
-      severity: "error", line,
-      message: `${ctx}: \`field\` must be an identifier (letters, digits, \`-\`, \`_\`)`,
-    });
-    return;
-  }
-  if (RESERVED_VARS.includes(f as (typeof RESERVED_VARS)[number])) {
-    diags.push({
-      severity: "error", line,
-      message: `${ctx}: \`field: ${f}\` collides with a reserved run variable`,
-    });
-  }
-}
-
-function validateFeature(
-  ftype: string,
-  config: FMap,
-  line: number,
-  diags: Diag[],
-): string[] {
-  const ctx = `feature \`${ftype}\` (line ${line})`;
-  const scripts: string[] = [];
-  if (!FEATURE_TYPES.includes(ftype as (typeof FEATURE_TYPES)[number])) {
-    diags.push({
-      severity: "error",
-      line,
-      message: `unknown feature type \`${ftype}\` — known: ${FEATURE_TYPES.join(", ")}`,
-    });
-    return scripts;
-  }
-  switch (ftype) {
-    case "voice": {
-      warnUnknown(
-        config,
-        ["type", "analyzers", "minHz", "maxHz", "targetHz", "targetCentroid", "targetDb",
-          "requiredScore", "holdRatio", "duration", "displayMinHz", "displayMaxHz"],
-        ctx, diags,
-      );
-      const an = config["analyzers"];
-      const list =
-        typeof an === "string"
-          ? an.split(",").map((s) => s.trim())
-          : Array.isArray(an) ? an.filter((s): s is string => typeof s === "string") : null;
-      if (list) {
-        for (const a of list) {
-          if (!VOICE_ANALYZERS.includes(a as (typeof VOICE_ANALYZERS)[number])) {
-            diags.push({
-              severity: "error", line,
-              message: `${ctx}: unknown analyzer \`${a}\` — use: ${VOICE_ANALYZERS.join(", ")}`,
-            });
-          }
-        }
-      }
-      const min = getNum(config, "minHz");
-      const max = getNum(config, "maxHz");
-      if (min !== undefined && max !== undefined && min >= max) {
-        diags.push({ severity: "error", line, message: `${ctx}: \`minHz\` must be below \`maxHz\`` });
-      }
-      for (const k of ["requiredScore", "holdRatio"]) {
-        const v = getNum(config, k);
-        if (v !== undefined && (v < 0 || v > 1)) {
-          diags.push({ severity: "error", line, message: `${ctx}: \`${k}\` must be between 0 and 1` });
-        }
-      }
-      const dur = getStr(config, "duration");
-      if (!dur || parseDuration(dur) === null) {
-        diags.push({ severity: "error", line, message: `${ctx}: \`duration\` is required (e.g. \`30s\`)` });
-      }
-      break;
-    }
-    case "wait": {
-      warnUnknown(config, ["type", "duration"], ctx, diags);
-      const dur = getStr(config, "duration");
-      if (!dur || parseDuration(dur) === null) {
-        diags.push({ severity: "error", line, message: `${ctx}: \`duration\` is required` });
-      }
-      break;
-    }
-    case "chastity": {
-      warnUnknown(config, ["type", "state"], ctx, diags);
-      if (!["locked", "unlocked"].includes(String(config["state"]))) {
-        diags.push({ severity: "error", line, message: `${ctx}: \`state\` must be locked or unlocked` });
-      }
-      break;
-    }
-    case "input": {
-      warnUnknown(config, ["type", "field", "required"], ctx, diags);
-      checkFieldIdent(config, ctx, line, true, diags);
-      break;
-    }
-    case "choice": {
-      warnUnknown(config, ["type", "options", "field", "required"], ctx, diags);
-      checkFieldIdent(config, ctx, line, false, diags);
-      const o = config["options"];
-      const count =
-        typeof o === "string"
-          ? o.split("|").map((s) => s.trim()).filter(Boolean).length
-          : Array.isArray(o) ? o.length : 0;
-      if (count < 2) {
-        diags.push({
-          severity: "error", line,
-          message: `${ctx}: \`options\` is required and needs ≥ 2 entries`,
-        });
-      }
-      break;
-    }
-    case "slider": {
-      warnUnknown(config, ["type", "min", "max", "label", "field", "required"], ctx, diags);
-      checkFieldIdent(config, ctx, line, false, diags);
-      const min = getNum(config, "min");
-      const max = getNum(config, "max");
-      if (min === undefined || max === undefined) {
-        diags.push({ severity: "error", line, message: `${ctx}: \`min\`/\`max\` are required numbers` });
-      } else if (max <= min) {
-        diags.push({ severity: "error", line, message: `${ctx}: \`max\` must be greater than \`min\`` });
-      }
-      if (!getStr(config, "label")) {
-        diags.push({ severity: "error", line, message: `${ctx}: \`label\` is required` });
-      }
-      break;
-    }
-    case "audio": {
-      warnUnknown(config, ["type", "src"], ctx, diags);
-      const src = getStr(config, "src");
-      if (!src || !src.toLowerCase().endsWith(".xml")) {
-        diags.push({
-          severity: "error", line,
-          message: `${ctx}: \`src\` is required and must point to a \`.xml\` script`,
-        });
-      } else {
-        scripts.push(src);
-      }
-      break;
-    }
-  }
-  return scripts;
-}
-
-/** Audio links in markdown: `[x](path.xml)`. */
-export function audioLinksInBody(body: string): string[] {
-  const out: string[] = [];
-  for (const m of body.matchAll(/\[[^\]]*\]\(([^)\s]+)\)/g)) {
-    const target = m[1]!.split("#")[0]!;
-    if (target.toLowerCase().endsWith(".xml") && !target.includes("://")) out.push(target);
-  }
-  return out;
-}
-
-function parseBody(body: string, firstLine: number, diags: Diag[]): string[] {
-  const scripts: string[] = [];
-  const lines = body.split("\n");
-  let i = 0;
-let inPlainCode = false;
-  // Conditional syntax (`{{#if}}` markers, `@when` pages, feature `when:`).
-  const condStack: { line: number }[] = [];
-  const conds: { expr: string; line: number }[] = [];
-  const fields = new Set<string>();
-  const interpIdents = new Set<string>();
-  let pageHasText = false;
-  const scanInterp = (text: string): void => {
-    for (const m of text.matchAll(/\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g)) {
-      interpIdents.add(m[1]!);
-    }
-  };
-  while (i < lines.length) {
-    const line = lines[i]!;
-    const t = line.trimStart();
-    const trimmed = t.trim();
-    const lineNo = firstLine + i;
-    if (inPlainCode) {
-      if (t.startsWith("```")) inPlainCode = false;
-      i++;
-      continue;
-    }
-    if (t.startsWith("```")) {
-      const info = t.slice(3).trim();
-      if (info !== "feature") {
-        inPlainCode = true;
-        i++;
-        continue;
-      }
-      pageHasText = true;
-      // Feature block: config until `---`, body until closing fence.
-      const openLine = firstLine + i;
-      let j = i + 1;
-      let sep: number | null = null;
-      while (j < lines.length && !lines[j]!.trimStart().startsWith("```")) {
-        if (sep === null && lines[j]!.trim() === "---") sep = j;
-        j++;
-      }
-      if (j >= lines.length) {
-        diags.push({
-          severity: "error", line: openLine,
-          message: "feature block is never closed (missing closing ```)",
-        });
-        break;
-      }
-      if (sep === null) {
-        diags.push({
-          severity: "error", line: openLine,
-          message: "feature block needs a `---` line separating config from body",
-        });
-        sep = j;
-      }
-      const configText = lines.slice(i + 1, sep).join("\n");
-      const config = parseKv(configText, firstLine + i + 1, diags);
-      // `when` is cross-cutting: validate + remove before per-type checks
-      // so unknown-key warnings don't fire (mirrors format.rs).
-      const whenRaw = config["when"];
-      delete config["when"];
-      if (typeof whenRaw === "string") {
-        if (whenRaw.trim()) {
-          const parsed = parseCondition(whenRaw);
-          if (!parsed.ok) {
-            diags.push({ severity: "error", line: openLine, message: `feature \`when\`: ${parsed.error}` });
-          }
-          conds.push({ expr: whenRaw, line: openLine });
-        } else {
-          diags.push({ severity: "error", line: openLine, message: "feature `when` must not be empty" });
-        }
-      } else if (whenRaw !== undefined) {
-        diags.push({ severity: "error", line: openLine, message: "feature `when` must be a condition string" });
-      }
-      const ftype = getStr(config, "type");
-      if (!ftype) {
-        diags.push({
-          severity: "error", line: openLine,
-          message: "feature block is missing a `type` (first config line)",
-        });
-      } else {
-        // input/choice/slider field ids become addressable variables.
-        if (["input", "choice", "slider"].includes(ftype)) {
-          const f = config["field"];
-          if (typeof f === "string" && /^[A-Za-z0-9_-]+$/.test(f)) {
-            if (RESERVED_VARS.includes(f as (typeof RESERVED_VARS)[number])) {
-              diags.push({
-                severity: "error", line: openLine,
-                message: `feature \`${ftype}\`: \`field: ${f}\` collides with a reserved run variable`,
-              });
-            } else {
-              fields.add(f);
-            }
-          }
-        }
-        scripts.push(...validateFeature(ftype, config, openLine, diags));
-      }
-      i = j + 1;
-      continue;
-    }
-    // Conditional markers — whole (trimmed) lines only.
-    if (trimmed.startsWith("{{#if ")) {
-      // A marker must be the entire line: inline forms like
-      // `{{#if x}}- [ ] item{{/if}}` are not supported (the engine gates
-      // whole lines/elements, not mid-line spans). Catch the common
-      // mistakes explicitly with actionable messages instead of falling
-      // through to a confusing condition-parse error + spurious
-      // "never closed".
-      const after = trimmed.slice("{{#if ".length);
-      if (after.includes("{{")) {
-        // Another `{{...}}` on the line — the closer (or a stray marker)
-        // glued after the opener's `}}`.
-        if (after.includes("{{/if")) {
-          diags.push({
-            severity: "error", line: lineNo,
-            message:
-              "`{{#if}}` / `{{/if}}` must be on their own lines — inline forms like `{{#if x}}- [ ] item{{/if}}` are not supported. Put the markers on separate lines.",
-          });
-        } else {
-          diags.push({ severity: "error", line: lineNo, message: "`{{#if}}` must be on its own line" });
-        }
-      } else if (after.endsWith("}}")) {
-        const expr = after.slice(0, -2).trim();
-        const parsed = parseCondition(expr);
-        if (!expr) {
-          diags.push({ severity: "error", line: lineNo, message: "`{{#if}}` needs a condition: `{{#if <expr>}}`" });
-        } else if (!parsed.ok) {
-          diags.push({ severity: "error", line: lineNo, message: `\`{{#if}}\` condition: ${parsed.error}` });
-        }
-        condStack.push({ line: lineNo });
-        conds.push({ expr, line: lineNo });
-      } else {
-        // Prose trailing the opener's `}}` on the same line.
-        diags.push({ severity: "error", line: lineNo, message: "`{{#if}}` must be on its own line" });
-      }
-      i++;
-      continue;
-    }
-    if (trimmed === "{{#else}}") {
-      if (condStack.length === 0) {
-        diags.push({ severity: "error", line: lineNo, message: "`{{#else}}` without an open `{{#if}}`" });
-      }
-      i++;
-      continue;
-    }
-    if (trimmed === "{{/if}}") {
-      if (condStack.pop() === undefined) {
-        diags.push({ severity: "error", line: lineNo, message: "`{{/if}}` without a matching `{{#if}}`" });
-      }
-      i++;
-      continue;
-    }
-    if (trimmed.startsWith("{{/if")) {
-      diags.push({ severity: "error", line: lineNo, message: "`{{/if}}` must be on its own line" });
-      i++;
-      continue;
-    }
-    if (trimmed.startsWith("{{#else")) {
-      diags.push({ severity: "error", line: lineNo, message: "`{{#else}}` must be on its own line" });
-      i++;
-      continue;
-    }
-    // A marker anywhere else in the line (mid-prose, glued to text) is not
-    // supported — the engine gates whole lines/elements, not mid-line spans.
-    const midMarker = trimmed.match(/\{\{(#if|#else|\/if)/);
-    if (midMarker) {
-      diags.push({
-        severity: "error", line: lineNo,
-        message: `\`{{${midMarker[1]}}}\` must be on its own line`,
-      });
-      i++;
-      continue;
-    }
-    if (!trimmed) {
-      i++;
-      continue;
-    }
-    // `@when <expr>` as a page's first content line gates the whole page.
-    if (!pageHasText && trimmed.startsWith("@when ")) {
-      const expr = trimmed.slice("@when ".length).trim();
-      const parsed = parseCondition(expr);
-      if (!parsed.ok) {
-        diags.push({ severity: "error", line: lineNo, message: `\`@when\` condition: ${parsed.error}` });
-      }
-      conds.push({ expr, line: lineNo });
-      pageHasText = true;
-      i++;
-      continue;
-    }
-    pageHasText = true;
-    scanInterp(trimmed, lineNo);
-    scripts.push(...audioLinksInBody(t).map((s) => s));
-    i++;
-  }
-  for (const f of condStack) {
-    diags.push({
-      severity: "error", line: f.line,
-      message: "`{{#if}}` is never closed (missing `{{/if}}`)",
-    });
-  }
-  // Unknown identifiers are silent `false`/empty at run time — catch them here.
-  for (const { expr } of conds) {
-    const parsed = parseCondition(expr);
-    if (!parsed.ok) continue;
-    for (const ident of parsed.cond.identifiers) {
-      if (RESERVED_VARS.includes(ident as (typeof RESERVED_VARS)[number])) continue;
-      if (fields.has(ident)) continue;
-      diags.push({
-        severity: "error",
-        message: `condition \`${expr}\` references unknown variable \`${ident}\` — use a run variable (${RESERVED_VARS.join(", ")}) or a \`field\` declared in this file`,
-      });
-    }
-  }
-  for (const ident of interpIdents) {
-    if (RESERVED_VARS.includes(ident as (typeof RESERVED_VARS)[number])) continue;
-    if (fields.has(ident)) continue;
+/** A leftover `format:` key warns in v3 — the .js extension is the marker. */
+function checkNoFormatKey(m: FMap, diags: Diag[]): void {
+  if (m["format"] !== undefined) {
     diags.push({
       severity: "warning",
-      message: `\`{{${ident}}}\` is not a known run variable or answer field — it renders empty`,
+      message: "`format:` no longer exists — the .js extension marks the file type; remove the key",
     });
   }
-  return scripts;
 }
 
-// ── containers ─────────────────────────────────────────────────────────────
+function parseLimit(m: FMap, diags: Diag[]): boolean {
+  const limit = m["limit"];
+  if (limit === undefined) return false;
+  if (typeof limit !== "object" || Array.isArray(limit)) {
+    diags.push({ severity: "error", message: '`limit` must be a map like { "daily": 1 }' });
+    return true;
+  }
+  const lm = limit as FMap;
+  const daily = lm["daily"];
+  const total = lm["total"];
+  if (daily === undefined && total === undefined) {
+    diags.push({ severity: "error", message: "`limit` needs `daily` and/or `total`" });
+  }
+  for (const [k, v] of [["daily", daily], ["total", total]] as const) {
+    if (v !== undefined && (typeof v !== "number" || v < 1)) {
+      diags.push({ severity: "error", message: `\`limit.${k}\` must be ≥ 1` });
+    }
+  }
+  return true;
+}
 
+function validateTimeouts(m: FMap, diags: Diag[]): ActionRef[] {
+  const refs: ActionRef[] = [];
+  const timeouts = m["timeouts"];
+  if (timeouts === undefined) return refs;
+  if (!Array.isArray(timeouts)) {
+    diags.push({
+      severity: "error",
+      message: '`timeouts` must be an array of { "after": <duration>, "action": {...} }',
+    });
+    return refs;
+  }
+  let prev = 0;
+  for (let i = 0; i < timeouts.length; i++) {
+    const t = timeouts[i]!;
+    const ctx = `\`timeouts\`[${i}]`;
+    if (typeof t !== "object" || Array.isArray(t)) {
+      diags.push({ severity: "error", message: `${ctx} must be { after, action }` });
+      continue;
+    }
+    const tm = t as FMap;
+    const after = getDur(tm, "after", diags, ctx) ?? -1;
+    if (after < 0) continue;
+    if (after < prev) {
+      diags.push({
+        severity: "warning",
+        message: "`timeouts` entries are not in ascending `after` order",
+      });
+    }
+    prev = after;
+    refs.push(...parseActions(tm["action"], `${ctx}.action`, diags));
+  }
+  return refs;
+}
+
+/** Parse a `routines/*.js` file (comment front-matter + JS body). */
 export function validateRoutine(content: string, diags: Diag[]): ParsedContainer | null {
-  const { fm, body } = splitFrontmatter(content);
-  if (fm === null) {
-    diags.push({ severity: "error", message: "routine has no front-matter" });
+  const split = splitJsFrontmatter(content);
+  if (split.kind === "missing") {
+    diags.push({
+      severity: "error",
+      message: "routine has no front-matter — the first line must be exactly `/*---`",
+    });
     return null;
   }
+  if (split.kind === "unterminated") {
+    diags.push({
+      severity: "error",
+      message: "routine front-matter is never closed — add a line that is exactly `---*/`",
+    });
+    return null;
+  }
+  const { fm, body } = split;
   const m = parseKv(fm, 2, diags);
-  if (m["format"] !== 2 && m["format"] !== "2") {
-    diags.push({ severity: "error", message: "routines require `format: 2` in the front-matter" });
-    return null;
-  }
+  checkNoFormatKey(m, diags);
   if (!getStr(m, "title")) diags.push({ severity: "error", message: "routine: `title` is required" });
   const schedule = getStr(m, "schedule");
   if (schedule) {
@@ -742,30 +498,11 @@ export function validateRoutine(content: string, diags: Diag[]): ParsedContainer
   }
   getDur(m, "timeframe", diags, "routine");
   getDur(m, "cooldown", diags, "routine");
-  const limit = m["limit"];
-  let hasLimit = false;
-  if (limit !== undefined) {
-    hasLimit = true;
-    if (typeof limit !== "object" || Array.isArray(limit)) {
-      diags.push({ severity: "error", message: "`limit` must be a map like { \"daily\": 1 }" });
-    } else {
-      const lm = limit as FMap;
-      const daily = lm["daily"];
-      const total = lm["total"];
-      if (daily === undefined && total === undefined) {
-        diags.push({ severity: "error", message: "`limit` needs `daily` and/or `total`" });
-      }
-      for (const [k, v] of [["daily", daily], ["total", total]] as const) {
-        if (v !== undefined && (typeof v !== "number" || v < 1)) {
-          diags.push({ severity: "error", message: `\`limit.${k}\` must be ≥ 1` });
-        }
-      }
-    }
-  }
   const success = parseActions(m["success"], "`success`", diags);
   const failure = parseActions(m["failure"], "`failure`", diags);
+  const hasLimit = parseLimit(m, diags);
   warnUnknown(
-    m, ["format", "title", "schedule", "timeframe", "success", "failure", "cooldown", "limit"],
+    m, ["title", "schedule", "timeframe", "success", "failure", "cooldown", "limit"],
     "routine", diags,
   );
   if (!schedule && success.some((a) => a.positivePoints) && !hasLimit) {
@@ -775,14 +512,15 @@ export function validateRoutine(content: string, diags: Diag[]): ParsedContainer
         "on-demand routine awards positive points but sets no `limit` — the default `daily: 1` applies",
     });
   }
-  const scripts = parseBody(body, fm.split("\n").length + 3, diags);
   if (!body.trim()) diags.push({ severity: "warning", message: "routine body is empty" });
+  checkJsSyntax(body, jsBodyFirstLine(fm), diags);
   return {
-    scripts: [...scripts, ...success.flatMap((a) => a.scripts), ...failure.flatMap((a) => a.scripts)],
+    scripts: [...scriptSrcsInBody(body), ...success.flatMap((a) => a.scripts), ...failure.flatMap((a) => a.scripts)],
     templates: [...success.flatMap((a) => a.templates), ...failure.flatMap((a) => a.templates)],
   };
 }
 
+/** Parse a `habits/*.md` file (classic `---` front-matter; always v2). */
 export function validateHabit(content: string, diags: Diag[]): ParsedContainer | null {
   const { fm } = splitFrontmatter(content);
   if (fm === null) {
@@ -790,6 +528,9 @@ export function validateHabit(content: string, diags: Diag[]): ParsedContainer |
     return null;
   }
   const m = parseKv(fm, 2, diags);
+  if (m["format"] !== undefined && m["format"] !== 2 && m["format"] !== "2") {
+    diags.push({ severity: "error", message: "`format` must be 2" });
+  }
   if (!getStr(m, "title")) diags.push({ severity: "error", message: "habit: `title` is required" });
   if (m["type"] !== "max" && m["type"] !== "min") {
     diags.push({
@@ -805,7 +546,7 @@ export function validateHabit(content: string, diags: Diag[]): ParsedContainer |
   if (minutes !== undefined && (typeof minutes !== "number" || minutes < 0)) {
     diags.push({ severity: "error", message: "habit `minutes` must be ≥ 0" });
   }
-  if (count !== undefined && minutes !== undefined) {
+  if (minutes !== undefined && count !== undefined) {
     diags.push({
       severity: "error",
       message: "habit `count` and `minutes` are mutually exclusive — pick one unit",
@@ -820,54 +561,49 @@ export function validateHabit(content: string, diags: Diag[]): ParsedContainer |
   };
 }
 
+/** Parse a `tasks/*.js` file (same contract as routines). */
 export function validateTask(content: string, diags: Diag[]): ParsedContainer | null {
-  const { fm, body } = splitFrontmatter(content);
-  if (fm === null) {
-    diags.push({ severity: "error", message: "task template has no front-matter" });
+  const split = splitJsFrontmatter(content);
+  if (split.kind === "missing") {
+    diags.push({
+      severity: "error",
+      message: "task template has no front-matter — the first line must be exactly `/*---`",
+    });
     return null;
   }
+  if (split.kind === "unterminated") {
+    diags.push({
+      severity: "error",
+      message: "task front-matter is never closed — add a line that is exactly `---*/`",
+    });
+    return null;
+  }
+  const { fm, body } = split;
   const m = parseKv(fm, 2, diags);
+  checkNoFormatKey(m, diags);
   if (!getStr(m, "title")) diags.push({ severity: "error", message: "task: `title` is required" });
   getDur(m, "timeframe", diags, "task");
   getDur(m, "max_timeout", diags, "task");
-  const timeouts = m["timeouts"];
   const success = parseActions(m["success"], "`success`", diags);
   const failure = parseActions(m["failure"], "`failure`", diags);
-  const scripts = [...parseBody(body, fm.split("\n").length + 3, diags)];
-  if (Array.isArray(timeouts)) {
-    let prev = 0;
-    for (let i = 0; i < timeouts.length; i++) {
-      const t = timeouts[i]!;
-      const ctx = `\`timeouts\`[${i}]`;
-      if (typeof t !== "object" || Array.isArray(t)) {
-        diags.push({ severity: "error", message: `${ctx} must be { after, action }` });
-        continue;
-      }
-      const tm = t as FMap;
-      const after = getDur(tm, "after", diags, ctx) ?? -1;
-      if (after < 0) continue;
-      if (after < prev) {
-        diags.push({
-          severity: "warning",
-          message: "`timeouts` entries are not in ascending `after` order",
-        });
-      }
-      prev = after;
-      scripts.push(...parseActions(tm["action"], `${ctx}.action`, diags).flatMap((a) => a.scripts));
-    }
-  } else if (timeouts !== undefined) {
-    diags.push({
-      severity: "error",
-      message: '`timeouts` must be an array of { "after": <duration>, "action": {...} }',
-    });
-  }
+  const timeoutRefs = validateTimeouts(m, diags);
   warnUnknown(
-    m, ["format", "title", "description", "timeframe", "timeouts", "max_timeout", "success", "failure"],
+    m, ["title", "description", "timeframe", "timeouts", "max_timeout", "success", "failure"],
     "task", diags,
   );
+  checkJsSyntax(body, jsBodyFirstLine(fm), diags);
   return {
-    scripts: [...scripts, ...success.flatMap((a) => a.scripts), ...failure.flatMap((a) => a.scripts)],
-    templates: [...success.flatMap((a) => a.templates), ...failure.flatMap((a) => a.templates)],
+    scripts: [
+      ...scriptSrcsInBody(body),
+      ...success.flatMap((a) => a.scripts),
+      ...failure.flatMap((a) => a.scripts),
+      ...timeoutRefs.flatMap((a) => a.scripts),
+    ],
+    templates: [
+      ...success.flatMap((a) => a.templates),
+      ...failure.flatMap((a) => a.templates),
+      ...timeoutRefs.flatMap((a) => a.templates),
+    ],
   };
 }
 

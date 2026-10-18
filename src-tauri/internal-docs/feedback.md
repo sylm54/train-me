@@ -11,7 +11,7 @@ description: Immediate feedback actions — `script` (auto-playing audio stings)
 - When the user is in the app it auto-plays right away as a background jingle — a clicker/confirmation sting scoring the event (think "cha-ching", not a session).
 - Author script-action scripts SHORT — under ~10 seconds.
 - Scripts longer than 60 s will not auto-play; they land in the "Queued for you" list on Today for manual listening.
-- Long audio belongs inside routine/task pages (`audio` feature blocks or links), not in `script` actions.
+- Long audio belongs inside routine/task bodies (`await audio.play("hypnos/….xml")` — see `docs/internal/runtime-api.md`), not in `script` actions.
 
 ## `notification` — immediate message
 

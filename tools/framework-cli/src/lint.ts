@@ -1,14 +1,14 @@
 /**
- * Framework linter: validates manifest/config/onboarding, every v2
- * container in base + parts (routines, habits, tasks, store), XML script
- * reference/include trees, prompt embeds/links, and the docs surface
- * (frontmatter contract, app-owned internal/ namespace). Exit code 1 when
- * any error is reported.
+ * Framework linter: validates manifest/config/onboarding, every v3
+ * container in base + parts (routines/tasks as .js scripts, habits, store),
+ * XML script reference/include trees, `<clip>` sources, prompt embed/link
+ * checks, and the docs surface (frontmatter contract, app-owned internal/
+ * namespace). Exit code 1 when any error is reported.
  */
 
 import { readdirSync, readFileSync, statSync, existsSync } from "fs";
 import { join, relative, resolve } from "path";
-import type { Diag } from "./validate";
+import type { Diag, ParsedContainer } from "./validate";
 import {
   validateHabit,
   validateRoutine,
@@ -16,7 +16,7 @@ import {
   validateTask,
 } from "./validate";
 import { validateOnboarding } from "./onboarding";
-import { includeSrcIsGlob, validateXml, wildcardMatch } from "./xml";
+import { clipSrcsInContent, includeSrcIsGlob, validateXml, wildcardMatch } from "./xml";
 
 interface Report {
   errors: number;
@@ -229,21 +229,23 @@ export function lint(rootArg: string): number {
     const agentDir = join(root, part, "agent_files");
     if (!statSync(agentDir, { throwIfNoEntry: false })?.isDirectory()) continue;
 
-    // Containers.
-    const containers: [string, (c: string, d: Diag[]) => unknown][] = [
-      ["routines", validateRoutine],
-      ["habits", validateHabit],
-      ["tasks", validateTask],
+    // Containers. Routines/tasks are v3 `.js` scripts (comment front-matter
+    // + JS body); habits stay `.md`. Mirrors the app's validator, which only
+    // picks the matching extension per directory.
+    const containers: [string, (c: string, d: Diag[]) => ParsedContainer | null, string][] = [
+      ["routines", validateRoutine, ".js"],
+      ["habits", validateHabit, ".md"],
+      ["tasks", validateTask, ".js"],
     ];
-    for (const [dir, validate] of containers) {
+    for (const [dir, validate, ext] of containers) {
       const full = join(agentDir, dir);
       if (!statSync(full, { throwIfNoEntry: false })?.isDirectory()) continue;
       for (const f of readdirSync(full).sort()) {
-        if (!f.toLowerCase().endsWith(".md")) continue;
+        if (!f.toLowerCase().endsWith(ext)) continue;
         const diags: Diag[] = [];
-        let parsed: { scripts: string[]; templates: string[] } | null = null;
+        let parsed: ParsedContainer | null = null;
         try {
-          parsed = validate(readFileSync(join(full, f), "utf-8"), diags) as never;
+          parsed = validate(readFileSync(join(full, f), "utf-8"), diags);
         } catch (e) {
           diags.push({ severity: "error", message: `unexpected error: ${e}` });
         }
@@ -259,9 +261,9 @@ export function lint(rootArg: string): number {
       for (const f of readdirSync(storeDir).sort()) {
         if (!f.toLowerCase().endsWith(".json")) continue;
         const diags: Diag[] = [];
-        let parsed: { scripts: string[]; templates: string[] } | null = null;
+        let parsed: ParsedContainer | null = null;
         try {
-          parsed = validateStore(readFileSync(join(storeDir, f), "utf-8"), diags) as never;
+          parsed = validateStore(readFileSync(join(storeDir, f), "utf-8"), diags);
         } catch (e) {
           diags.push({ severity: "error", message: `unexpected error: ${e}` });
         }
@@ -273,14 +275,27 @@ export function lint(rootArg: string): number {
       }
     }
 
-    // XML scripts: parse + semantic validation (port of tag_parser.rs).
+    // XML scripts: parse + semantic validation (port of tag_parser.rs),
+    // plus `<clip src>` existence — clips resolve like includes (the
+    // script's own directory first, then the agent root).
     for (const f of walk(agentDir).sort()) {
       if (!f.toLowerCase().endsWith(".xml")) continue;
       const diags: Diag[] = [];
+      let content = "";
       try {
-        diags.push(...validateXml(readFileSync(f, "utf-8")));
+        content = readFileSync(f, "utf-8");
+        diags.push(...validateXml(content));
       } catch (e) {
         diags.push({ severity: "error", message: `unexpected error: ${e}` });
+      }
+      const scriptDir = join(f, "..");
+      for (const src of new Set(clipSrcsInContent(content))) {
+        if (
+          !existsSync(resolve(scriptDir, src)) &&
+          !existsSync(join(agentDir, src))
+        ) {
+          diags.push({ severity: "error", message: `clip not found: ${src}` });
+        }
       }
       reportFile(relative(root, f).replaceAll("\\", "/"), diags, out);
     }
@@ -459,7 +474,8 @@ export function lint(rootArg: string): number {
     }
   }
   for (const template of allTemplates) {
-    const rel = template.endsWith(".md") ? template : `tasks/${template}.md`;
+    // Bare names map to `tasks/<name>.js` (v3 templates are .js scripts).
+    const rel = template.endsWith(".js") ? template : `tasks/${template}.js`;
     if (!existsInAnyPart(rel)) {
       refDiags.push({
         severity: "error",

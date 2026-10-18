@@ -1,0 +1,43 @@
+<!--
+  deepening.xml — an on-demand deepening/tease script. Demonstrates
+  <overlay> with looped <part>s, <background>, <speed>, <effect>,
+  per-playback <random>/<scramble>, and the <mark name="finale"/> seam
+  the JS layer can await (s.mark("finale")). Copy to hypnos/ in the
+  sandbox.
+-->
+<tone preset='binaural_alpha' frequency='140' volume='0.2'/>
+
+<zone name='deepen'>
+  <!-- NOTE: a comment directly inside <overlay>/<random>/<scramble>
+       (between parts) is NOT parsed — put comments around such containers,
+       as done here. The non-looped part below sets the overlay's length;
+       the looped parts repeat until the longest part ends. -->
+  <overlay>
+    <part>
+      <background volume='0.3'>Deeper.</background>
+      Sink down.
+      <pause duration='1.5'/>
+      <speed value='0.85'>and further down.</speed>
+    </part>
+    <part volume='0.3' speed='1.3' looped='true'>so heavy</part>
+    <part volume='0.2' looped='true'><tone preset='sine' frequency='110'/></part>
+  </overlay>
+</zone>
+
+<!-- s.mark("finale") resolves here. -->
+<mark name='finale'/>
+
+<effect type='reverb' preset='large_hall'>Every word lands twice.</effect>
+
+<!-- Each listen plays exactly one of these. -->
+<random>
+  <part>You feel a warm glow spreading through you.</part>
+  <part>A cool heaviness settles over you.</part>
+</random>
+
+<!-- Order is reshuffled every listen. -->
+<scramble>
+  <part>Deeper.</part>
+  <part>Calmer.</part>
+  <part>Heavier.</part>
+</scramble>

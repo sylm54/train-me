@@ -5,14 +5,15 @@ inline: true
 
 # App Overview
 
-You author feature files; the engine runs them. The engine owns schedules, occurrences, habit counts, streaks, the append-only points ledger, and the session runner that walks the user through gated pages in the Today view. Worked examples for every file type live in `examples/`.
+You author feature files; the engine runs them. The engine owns schedules, occurrences, habit counts, streaks, the append-only points ledger, and the session runner that executes your JS orchestration scripts in the Today view. Worked examples for every file type live in `examples/`.
 
 ## Surfaces
 
-- `routines/*.md` — guided sessions on a schedule or on demand; pages gate step by step.
+- `routines/*.js` — guided sessions on a schedule or on demand; a comment front-matter block declares the engine contract, the JS body drives the session (`wait`/`show`/`audio`/…).
 - `habits/*.md` — daily count goals (`min`) or limits (`max`); logged outside sessions. Set `minutes` instead of `count` to log minutes rather than occurrences.
-- `tasks/*.md` — one-off assignments with a deadline and timeout escalation.
+- `tasks/*.js` — one-off assignments with a deadline and timeout escalation (same comment front matter + JS body model as routines).
 - `store/*.json` — point-priced rewards, optionally stocked and restocked.
+- anywhere (e.g. `hypnos/*.xml`) — TTS audio scripts, played by routine/task bodies and `script` actions, pre-rendered in the background.
 
 ## Actions (usable in success/failure/timeouts/store)
 
@@ -24,11 +25,11 @@ You author feature files; the engine runs them. The engine owns schedules, occur
 - `chastity` builtin — lock status and unlock.
 - `inventory` builtin — owned items and the wishlist.
 - `redgifs` builtin — search niches/tags and count matching clips for the app's visual layer.
-- `activity.db` — SQLite log of everything the engine recorded; query read-only via the `sqlite` builtin.
+- `activity.db` — SQLite log of everything the engine and your scripts recorded; query read-only via the `sqlite` builtin.
 
 ## Invariants
 
-- Never store stats in files (streaks, counts, last-done) — the engine derives them from the activity log and will clobber hand-written ones.
+- Never store stats in files (streaks, counts, last-done) — the engine derives them from the ledger and will clobber hand-written ones. In a script body, read them from the `vars` snapshot.
 - The points ledger is append-only; balances are never rewritten.
 - After creating or editing any feature file or script, run `validate_files` and fix every reported `error` before considering the task done.
 
@@ -36,8 +37,9 @@ You author feature files; the engine runs them. The engine owns schedules, occur
 
 | When you need... | Read |
 |---|---|
-| Feature-file syntax (front-matter, pages, feature blocks) | `docs/internal/feature-files.md` |
-| Voice practice blocks (analyzers, targets, scoring) | `docs/internal/voice-training.md` |
+| Feature-file syntax (front matter, containers, actions, engine semantics) | `docs/internal/feature-files.md` |
+| The JS runtime (`tm`, widgets, `ScriptHandle`, zones/marks) | `docs/internal/runtime-api.md` |
+| Voice practice widgets (analyzers, targets, scoring) | `docs/internal/voice-training.md` |
 | Chastity gates and the lock lifecycle | `docs/internal/chastity.md` |
 | Audio/visual feedback (`script` + `notification` actions) | `docs/internal/feedback.md` |
 | Points/inventory/chastity commands, activity.db schema | `docs/internal/data.md` |
