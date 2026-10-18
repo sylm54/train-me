@@ -279,18 +279,59 @@ pub fn read_file_under(root: &Path, rel: &str) -> Result<String, String> {
 
 /// Tauri command: write a UTF-8 text file inside the agent's writable data
 /// directory (`<app_data>/agent_data`).
+///
+/// Binary content (a voice widget's `.wav` recording) rides in as
+/// `content_b64` instead — base64 so it survives the UTF-8-only JSON IPC
+/// channel and lands on disk as the real bytes. Pass `content` or
+/// `content_b64`, never both.
 #[tauri::command]
 pub fn write_data_file(
     path: String,
     content: String,
+    content_b64: Option<String>,
     state: State<'_, crate::AppState>,
 ) -> Result<(), String> {
-    write_file_under(&state.agent_dir, &path, &content)
+    write_data_file_under(&state.agent_dir, &path, &content, content_b64.as_deref())
+}
+
+/// Free body of `write_data_file`: `content` when no `content_b64` is
+/// given, the base64-decoded bytes otherwise.
+pub fn write_data_file_under(
+    root: &Path,
+    rel: &str,
+    content: &str,
+    content_b64: Option<&str>,
+) -> Result<(), String> {
+    match content_b64 {
+        Some(b64) => {
+            if !content.is_empty() {
+                return Err(
+                    "write_data_file: pass content or content_b64, not both".to_string(),
+                );
+            }
+            use base64::Engine as _;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(b64.trim())
+                .map_err(|e| format!("write_data_file: bad content_b64: {}", e))?;
+            write_file_bytes_under(root, rel, &bytes)
+        }
+        None => write_file_under(root, rel, content),
+    }
 }
 
 /// Free body of `write_data_file`, shared with the native agent's
 /// `write_file` tool.
 pub fn write_file_under(root: &Path, rel: &str, content: &str) -> Result<(), String> {
+    let p = resolve_under(root, rel)?;
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
+    }
+    std::fs::write(&p, content).map_err(|e| format!("write {}: {}", p.display(), e))
+}
+
+/// Binary sibling of `write_file_under` — same path rules, raw bytes.
+pub fn write_file_bytes_under(root: &Path, rel: &str, content: &[u8]) -> Result<(), String> {
     let p = resolve_under(root, rel)?;
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent)
@@ -681,6 +722,68 @@ mod tests {
         let root = tmp.path().canonicalize().unwrap();
         // `C:\...` must not be resolved under the agent dir.
         assert!(resolve_under(&root, "C:\\Windows\\system32").is_err());
+    }
+
+    // --- write_data_file: the content_b64 binary path --------------------
+
+    /// A voice widget's recording rides in as base64 (the JSON IPC channel
+    /// is UTF-8 only) and must land as the exact binary bytes — every byte
+    /// value matters for the WAV a `<clip>` later decodes.
+    #[test]
+    fn write_data_file_b64_lands_exact_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        // A fake WAV header plus high bytes that a UTF-8 write would mangle.
+        let bytes: Vec<u8> = (0..=255u8).chain(b"RIFF....WAVEfmt ".to_vec()).collect();
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        write_data_file_under(&root, "recordings/take.wav", "", Some(&b64)).unwrap();
+        let got = std::fs::read(root.join("recordings/take.wav")).unwrap();
+        assert_eq!(got, bytes);
+    }
+
+    #[test]
+    fn write_data_file_b64_overwrites_and_creates_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        use base64::Engine as _;
+        let enc = |s: &[u8]| base64::engine::general_purpose::STANDARD.encode(s);
+        write_data_file_under(&root, "recordings/a.wav", "", Some(&enc(b"first"))).unwrap();
+        // Overwriting is allowed (re-takes).
+        write_data_file_under(&root, "recordings/a.wav", "", Some(&enc(b"second"))).unwrap();
+        assert_eq!(
+            std::fs::read(root.join("recordings/a.wav")).unwrap(),
+            b"second"
+        );
+    }
+
+    #[test]
+    fn write_data_file_rejects_content_and_b64_together() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let err = write_data_file_under(&root, "x.txt", "text", Some("eA==")).unwrap_err();
+        assert!(err.contains("not both"), "got: {err}");
+        assert!(!root.join("x.txt").exists());
+    }
+
+    #[test]
+    fn write_data_file_rejects_bad_b64() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let err = write_data_file_under(&root, "x.wav", "", Some("not base64!!!")).unwrap_err();
+        assert!(err.contains("bad content_b64"), "got: {err}");
+        assert!(!root.join("x.wav").exists());
+    }
+
+    #[test]
+    fn write_data_file_text_path_still_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        write_data_file_under(&root, "notes/a.txt", "plain text", None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes/a.txt")).unwrap(),
+            "plain text"
+        );
     }
 
     // --- the CWD leak fix: every exec starts from the sandbox root --------

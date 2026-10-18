@@ -200,6 +200,10 @@ const IFRAME_SHIM_JS = `
       on: function (event, cb) { return tm.subscribe(widgetEventName(id, event), cb); },
       once: function (event) { return call("widget.once", [id, event]); },
       remove: function () { return call("hide", [id]); },
+      // Widget-type-specific capability (the voice widget's recording):
+      // the parent resolves it per widget type and rejects when the type
+      // has no save (or nothing was captured).
+      save: function (name) { return call("widget.save", [id, name]); },
     };
   }
 

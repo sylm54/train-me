@@ -52,6 +52,20 @@ export function ScriptSessionView({ request, navigate }: Props) {
   /** The live sandbox, if any — torn down on unmount, outcome, or give-up. */
   const handleRef = useRef<ScriptHandle | null>(null);
 
+  // Forced REC indicator input: any live voice widget whose `recording`
+  // state flag is set (the flag is pushed by the widget itself; the
+  // store bumps its version on every state push). App chrome — the
+  // script cannot turn the dot on or off.
+  useSyncExternalStore(
+    stageStore?.subscribe ?? noopSubscribe,
+    stageStore?.getVersion ?? getZero,
+    stageStore?.getVersion ?? getZero,
+  );
+  const voiceRecording =
+    stageStore?.getAll().some(
+      (w) => w.type === "voice" && w.state.recording === true,
+    ) ?? false;
+
   const completeRun = useCallback(async (runId: string) => {
     handleRef.current?.teardown();
     handleRef.current = null;
@@ -197,7 +211,21 @@ export function ScriptSessionView({ request, navigate }: Props) {
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
       <div className="max-w-2xl w-full mx-auto px-4 pt-6 pb-2 flex items-center justify-between gap-4">
-        <h1 className="text-lg font-bold truncate">{phase.title}</h1>
+        <div className="flex min-w-0 items-center gap-3">
+          <h1 className="truncate text-lg font-bold">{phase.title}</h1>
+          {voiceRecording && (
+            <span
+              className="flex shrink-0 items-center gap-1.5 text-xs font-semibold text-[var(--color-danger)]"
+              aria-live="polite"
+            >
+              <span className="relative flex size-2">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[var(--color-danger)] opacity-75" />
+                <span className="relative inline-flex size-2 rounded-full bg-[var(--color-danger)]" />
+              </span>
+              REC
+            </span>
+          )}
+        </div>
         <Button
           variant="ghost"
           className="shrink-0 text-[var(--color-danger)]"
@@ -220,6 +248,7 @@ export function ScriptSessionView({ request, navigate }: Props) {
 
 const EMPTY_ROWS: readonly never[] = [];
 const noopSubscribe = () => () => undefined;
+const getZero = () => 0;
 
 const basename = (p: string): string => p.split("/").pop() ?? p;
 

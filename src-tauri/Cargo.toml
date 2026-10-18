@@ -70,6 +70,11 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 # a transitive dep of reqwest; declared directly so we can use it by name.
 url = "2"
 
+# Base64 for `write_data_file`'s binary path (voice recordings land as real
+# .wav bytes; the JSON IPC channel is UTF-8 only). Already present as a
+# transitive dep; declared directly so we can use it by name.
+base64 = "0.22"
+
 # XML parsing for TTS tags
 quick-xml = "0.37"
 

@@ -7,7 +7,8 @@
  * and so are the stage ops: `show`/`hide` mount and remove widgets on
  * this run's WidgetStore (rendered by the Stage), and the `widget.*`
  * ops back the iframe-side handles (`done`, `state`, `set`, `on`/
- * `once`, `remove`). `audio` is live too: `audio.prepare`/`play` and
+ * `once`, `remove`, `save` — the last routes to the live voice
+ * widget's recorder). `audio` is live too: `audio.prepare`/`play` and
  * the `audio.handle.*` ops run against this run's SessionAudio
  * (independent ManifestPlayers — nothing claims the audio bus), and its
  * handles are observable by widgets (`beatmeter`'s `sync` follows a
@@ -25,6 +26,7 @@ import { logActivity } from "@/lib/activity";
 import { SANDBOX_SRCDOC, ScriptBridge, type OpHandler } from "@/lib/runtime/bridge";
 import { SessionAudio } from "@/lib/runtime/scriptHandle";
 import { validateMediaProps, toVisualConfig } from "@/widgets/media";
+import { saveVoiceRecording } from "@/widgets/voiceRecording";
 import { WidgetStore } from "@/widgets/store";
 
 /** How the program ended — the only two ways a script run settles. */
@@ -188,6 +190,11 @@ export async function startScript(config: ScriptConfig): Promise<ScriptHandle> {
     },
     "widget.done": ([id]) => widgets.done(id as string),
     "widget.once": ([id, name]) => widgets.onceEvent(id as string, name as string),
+    "widget.save": ([id, name]) =>
+      // Voice-widget recording save — resolves with the sandbox-relative
+      // path; rejections/throws are author-facing (no live voice widget
+      // under that id, nothing captured, bad name, write failure).
+      saveVoiceRecording(id as string, name),
     ...audioOps(audio),
     "media.prefetch": ([config]) => {
       // Same validation the `media` widget's `show` runs, so a config that

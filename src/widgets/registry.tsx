@@ -23,10 +23,12 @@ import { BeatmeterWidget, validateBeatmeterProps } from "@/widgets/beatmeter";
 import { ButtonsWidget, validateButtonsProps } from "@/widgets/buttons";
 import { ChecklistWidget, validateChecklistProps } from "@/widgets/checklist";
 import { InputWidget, validateInputProps } from "@/widgets/input";
+import { LockWidget, validateLockProps } from "@/widgets/lock";
 import { MediaWidget, validateMediaProps } from "@/widgets/media";
 import { SliderWidget, validateSliderProps } from "@/widgets/slider";
 import { TextWidget, validateTextProps } from "@/widgets/text";
 import { TimerWidget, validateTimerProps } from "@/widgets/timer";
+import { VoiceWidget, validateVoiceProps } from "@/widgets/voice";
 
 // ── Framework prop types ────────────────────────────────────────────────────
 
@@ -296,4 +298,17 @@ defineWidget("beatmeter", {
   validate: validateBeatmeterProps,
   // A thin scrolling strip along the bottom edge of the grid.
   layout: { area: { col: 1, row: 6, cols: 6, rows: 1 } },
+});
+
+defineWidget("voice", {
+  component: VoiceWidget,
+  validate: validateVoiceProps,
+  // The script reads w.state.recording (the runner's forced REC dot
+  // derives from the same flag).
+  initialState: () => ({ recording: false }),
+});
+
+defineWidget("lock", {
+  component: LockWidget,
+  validate: validateLockProps,
 });
