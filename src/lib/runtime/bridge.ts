@@ -125,8 +125,8 @@ const IFRAME_SHIM_JS = `
 
   // Plain ops are methods that forward to the parent; vars is swapped
   // for the run's snapshot right before the program starts (init).
-  // show/hide are special-cased below (widget handles).
-  ["wait", "audio", "media", "log", "notify", "fail"].forEach(function (op) {
+  // show/hide/audio are special-cased below (widget/audio handles).
+  ["wait", "media", "log", "notify", "fail"].forEach(function (op) {
     tm[op] = function () {
       return call(op, Array.prototype.slice.call(arguments));
     };
@@ -186,6 +186,59 @@ const IFRAME_SHIM_JS = `
     return call("hide", [id]);
   };
 
+  // ── Audio handles (tm.audio) ─────────────────────────────────────────
+  //
+  // audio.play resolves to a ScriptHandle whose methods are plain RPCs
+  // into the parent. position/duration/playing are synchronous getters
+  // over the state cache below, fed by "audio:<id>:state" pushes (the
+  // parent throttles them to ~5 Hz). The end property is an RPC promise
+  // created eagerly with the handle — the parent registers the entry
+  // before audio.play resolves, so the call always lands.
+  var audioState = new Map();
+
+  function makeAudioHandle(id) {
+    return {
+      pause: function () { return call("audio.handle.pause", [id]); },
+      resume: function () { return call("audio.handle.resume", [id]); },
+      stop: function () { return call("audio.handle.stop", [id]); },
+      setVolume: function (v) { return call("audio.handle.setVolume", [id, v]); },
+      setSpeed: function (r) { return call("audio.handle.setSpeed", [id, r]); },
+      get position() { var s = audioState.get(id); return s ? s.position : 0; },
+      get duration() { var s = audioState.get(id); return s ? s.duration : 0; },
+      get playing() { var s = audioState.get(id); return s ? !!s.playing : false; },
+      end: call("audio.handle.end", [id]),
+      mark: function (name) { return call("audio.handle.mark", [id, name]); },
+      zone: function (name) { return call("audio.handle.zone", [id, name]); },
+      timeUntil: function (name) { return call("audio.handle.timeUntil", [id, name]); },
+      seek: function (name) { return call("audio.handle.seek", [id, name]); },
+      loopZone: function (name, n) { return call("audio.handle.loopZone", [id, name, n]); },
+    };
+  }
+
+  tm.audio = {
+    prepare: function (src) {
+      return call("audio.prepare", [src]);
+    },
+    play: function (src) {
+      return call("audio.play", [src]).then(function (id) {
+        return makeAudioHandle(String(id));
+      });
+    },
+  };
+
+  // "widget:<id>:state" / "audio:<id>:state" — the cache-feeding pushes.
+  // Widget ids never contain ":", audio ids are numeric, so the first
+  // colon splits scope from id.
+  function parseStateName(name) {
+    if (name.slice(-6) !== ":state") return null;
+    var colon = name.indexOf(":");
+    if (colon <= 0) return null;
+    var scope = name.slice(0, colon);
+    if (scope !== "widget" && scope !== "audio") return null;
+    var id = name.slice(colon + 1, -6);
+    return id.length > 0 ? { scope: scope, id: id } : null;
+  }
+
   window.addEventListener("message", function (e) {
     if (e.source !== parent) return;
     var d = e.data;
@@ -203,12 +256,10 @@ const IFRAME_SHIM_JS = `
       }
       case "event": {
         var name = typeof d.name === "string" ? d.name : "";
-        if (
-          name.lastIndexOf("widget:", 0) === 0 &&
-          name.length > "widget::state".length &&
-          name.slice(-6) === ":state"
-        ) {
-          widgetState.set(name.slice(7, -6), d.payload);
+        var stateMatch = parseStateName(name);
+        if (stateMatch) {
+          if (stateMatch.scope === "widget") widgetState.set(stateMatch.id, d.payload);
+          else audioState.set(stateMatch.id, d.payload);
         }
         var set = subs.get(name);
         if (set) set.forEach(function (h) { h(d.payload); });
@@ -216,6 +267,7 @@ const IFRAME_SHIM_JS = `
       }
       case "teardown":
         widgetState.clear();
+        audioState.clear();
         rejectAll("script runtime torn down");
         break;
       case "init":

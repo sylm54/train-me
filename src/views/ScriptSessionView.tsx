@@ -12,12 +12,14 @@
  * renders the outcome.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
-import { ArrowLeft } from "lucide-react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { ArrowLeft, Pause, Play, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { logActivity } from "@/lib/activity";
 import { startScript, type ScriptHandle } from "@/lib/runtime/routineRuntime";
+import type { SessionAudio } from "@/lib/runtime/scriptHandle";
+import { displayPct, useRenderStore } from "@/lib/renderRegistry";
 import {
   failRun,
   finishRun,
@@ -45,6 +47,8 @@ export function ScriptSessionView({ request, navigate }: Props) {
   /** The live sandbox's widget store — what the Stage renders. Set as
    * soon as the script starts, before the first `show` can arrive. */
   const [stageStore, setStageStore] = useState<WidgetStore | null>(null);
+  /** The live sandbox's audio — what the mini-player strip renders. */
+  const [sessionAudio, setSessionAudio] = useState<SessionAudio | null>(null);
   /** The live sandbox, if any — torn down on unmount, outcome, or give-up. */
   const handleRef = useRef<ScriptHandle | null>(null);
 
@@ -52,6 +56,7 @@ export function ScriptSessionView({ request, navigate }: Props) {
     handleRef.current?.teardown();
     handleRef.current = null;
     setStageStore(null);
+    setSessionAudio(null);
     try {
       const outcome = await finishRun(runId);
       setPhase({ stage: "outcome", outcome, failed: false, reason: null });
@@ -64,6 +69,7 @@ export function ScriptSessionView({ request, navigate }: Props) {
     handleRef.current?.teardown();
     handleRef.current = null;
     setStageStore(null);
+    setSessionAudio(null);
     void logActivity("session", "fail", reason);
     try {
       const outcome = await failRun(runId);
@@ -78,6 +84,7 @@ export function ScriptSessionView({ request, navigate }: Props) {
     let cancelled = false;
     setPhase({ stage: "loading" });
     setStageStore(null);
+    setSessionAudio(null);
 
     startRun(request.kind, request.ref, request.occurrence)
       .then(async (run) => {
@@ -94,6 +101,7 @@ export function ScriptSessionView({ request, navigate }: Props) {
         }
         handleRef.current = handle;
         setStageStore(handle.widgets);
+        setSessionAudio(handle.audio);
         handle.result.then(
           (res) => (res.ok ? completeRun(run.run_id) : failWithReason(run.run_id, res.reason)),
           // `result` never rejects today (teardown leaves it pending);
@@ -110,6 +118,7 @@ export function ScriptSessionView({ request, navigate }: Props) {
       handleRef.current?.teardown();
       handleRef.current = null;
       setStageStore(null);
+      setSessionAudio(null);
     };
   }, [request, completeRun, failWithReason]);
 
@@ -181,6 +190,7 @@ export function ScriptSessionView({ request, navigate }: Props) {
     handleRef.current?.teardown();
     handleRef.current = null;
     setStageStore(null);
+    setSessionAudio(null);
     await failWithReason(phase.runId, "gave up");
   };
 
@@ -199,6 +209,104 @@ export function ScriptSessionView({ request, navigate }: Props) {
 
       {/* The stage: widgets the script shows render here, live. */}
       <Stage store={stageStore} className="mx-auto w-full flex-1 min-h-48 px-4 pb-6" />
+
+      {/* Session audio chrome: one row per preparing/audible script. */}
+      <AudioStrip audio={sessionAudio} />
+    </div>
+  );
+}
+
+// ── Audio chrome ────────────────────────────────────────────────────────────
+
+const EMPTY_ROWS: readonly never[] = [];
+const noopSubscribe = () => () => undefined;
+
+const basename = (p: string): string => p.split("/").pop() ?? p;
+
+/** `1:23` / `12:03` — nominal seconds to a clock readout. */
+function secsClock(secs: number): string {
+  const s = Math.max(0, Math.round(secs));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const two = (n: number) => String(n).padStart(2, "0");
+  return h > 0 ? `${h}:${two(m)}:${two(sec)}` : `${m}:${two(sec)}`;
+}
+
+/**
+ * The mini-player strip: a render-progress pill per script being
+ * prepared (fed by the app-wide render registry) and, once audible, a
+ * row with title, position/duration, and pause/resume/stop. Rows come
+ * from the run's SessionAudio; the script's own handles drive them —
+ * these buttons are the same ops.
+ */
+function AudioStrip({ audio }: { audio: SessionAudio | null }) {
+  const rows = useSyncExternalStore(
+    audio?.subscribe ?? noopSubscribe,
+    audio?.getRows ?? (() => EMPTY_ROWS),
+    audio?.getRows ?? (() => EMPTY_ROWS),
+  );
+  const renders = useRenderStore();
+  if (rows.length === 0) return null;
+  return (
+    <div className="border-t border-[var(--color-border)] max-w-2xl w-full mx-auto px-4 py-2 space-y-1">
+      {rows.map((row) => {
+        if (row.phase === "preparing") {
+          const render = renders.get(row.src) ?? null;
+          const pct = render && render.total > 0 ? displayPct(render) : null;
+          return (
+            <div
+              key={row.id}
+              className="flex items-center gap-2 text-xs text-muted-foreground"
+            >
+              <Spinner className="size-3" />
+              <span className="truncate font-medium text-foreground">
+                ♪ {basename(row.src)}
+              </span>
+              <span className="truncate">{render?.label || "rendering…"}</span>
+              {pct != null && <span className="tabular-nums shrink-0">{pct}%</span>}
+            </div>
+          );
+        }
+        return (
+          <div key={row.id} className="flex items-center gap-2 text-xs">
+            <span className="truncate font-medium flex-1">♪ {basename(row.src)}</span>
+            <span className="tabular-nums text-muted-foreground shrink-0">
+              {secsClock(row.position)} /{" "}
+              {Number.isFinite(row.duration) ? secsClock(row.duration) : "∞"}
+            </span>
+            <div className="flex items-center gap-0.5 shrink-0">
+              {row.phase === "playing" ? (
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label="Pause audio"
+                  onClick={() => audio?.control(row.id, "pause")}
+                >
+                  <Pause className="size-3.5" />
+                </Button>
+              ) : (
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label="Resume audio"
+                  onClick={() => audio?.control(row.id, "resume")}
+                >
+                  <Play className="size-3.5" />
+                </Button>
+              )}
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                aria-label="Stop audio"
+                onClick={() => audio?.control(row.id, "stop")}
+              >
+                <Square className="size-3" />
+              </Button>
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }

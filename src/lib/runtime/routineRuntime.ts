@@ -5,10 +5,12 @@
  * `bridge.ts` and implements the parent side of the `tm` API. The
  * headless ops — `wait`, `log`, `vars`, `notify`, `fail` — are live,
  * and so are the stage ops: `show`/`hide` mount and remove widgets on
- * this run's WidgetStore (rendered by the Stage), and the
- * `widget.*` ops back the iframe-side handles (`done`, `state`, `set`,
- * `on`/`once`, `remove`). `audio` and `media` still reject with "not
- * implemented yet" until the player phase wires them.
+ * this run's WidgetStore (rendered by the Stage), and the `widget.*`
+ * ops back the iframe-side handles (`done`, `state`, `set`, `on`/
+ * `once`, `remove`). `audio` is live too: `audio.prepare`/`play` and
+ * the `audio.handle.*` ops run against this run's SessionAudio
+ * (independent ManifestPlayers — nothing claims the audio bus). Only
+ * `media` still rejects with "not implemented yet".
  *
  * All timing is parent-driven: `wait(seconds)` is a parent setTimeout
  * that posts the response back — the iframe never runs a timer of its
@@ -18,6 +20,7 @@
 import { emit } from "@tauri-apps/api/event";
 import { logActivity } from "@/lib/activity";
 import { SANDBOX_SRCDOC, ScriptBridge, type OpHandler } from "@/lib/runtime/bridge";
+import { SessionAudio } from "@/lib/runtime/scriptHandle";
 import { WidgetStore } from "@/widgets/store";
 
 /** How the program ended — the only two ways a script run settles. */
@@ -47,10 +50,16 @@ export interface ScriptHandle {
    */
   widgets: WidgetStore;
   /**
+   * This run's audio: every `audio.play` handle, plus the chrome rows
+   * the session's mini-player strip renders (subscribe via
+   * `audio.subscribe` / `audio.getRows`). Stopped by teardown.
+   */
+  audio: SessionAudio;
+  /**
    * Kill the sandbox: reject every pending RPC on both sides, clear all
-   * parent-side wait timers, remove the iframe, drop every widget.
-   * Idempotent. Does NOT settle `result` — the caller decides what the
-   * teardown means.
+   * parent-side wait timers, stop every audio handle, remove the
+   * iframe, drop every widget. Idempotent. Does NOT settle `result` —
+   * the caller decides what the teardown means.
    */
   teardown: () => void;
 }
@@ -60,6 +69,31 @@ function notImplemented(op: string): OpHandler {
   return () => {
     throw new Error(`${op}: not implemented yet`);
   };
+}
+
+/** The `audio.*` bridge ops, all dispatched through this run's
+ * SessionAudio (prepare/play + the handle methods the iframe-side
+ * ScriptHandle object calls). */
+function audioOps(audio: SessionAudio): Record<string, OpHandler> {
+  const ops: Record<string, OpHandler> = {};
+  for (const op of [
+    "audio.prepare",
+    "audio.play",
+    "audio.handle.pause",
+    "audio.handle.resume",
+    "audio.handle.stop",
+    "audio.handle.setVolume",
+    "audio.handle.setSpeed",
+    "audio.handle.end",
+    "audio.handle.mark",
+    "audio.handle.zone",
+    "audio.handle.timeUntil",
+    "audio.handle.seek",
+    "audio.handle.loopZone",
+  ]) {
+    ops[op] = (args) => audio.rpc(op, args);
+  }
+  return ops;
 }
 
 /**
@@ -83,6 +117,9 @@ export async function startScript(config: ScriptConfig): Promise<ScriptHandle> {
   // This run's stage: the widget store the show/hide ops drive. Event
   // and state pushes leave through the bridge sink below.
   const widgets = new WidgetStore();
+  // This run's audio: independent players per `audio.play`, chrome rows
+  // for the session mini-player, state pushes into the iframe handles.
+  const audio = new SessionAudio();
   // The first `fail(reason)` wins even if the script catches it and the
   // program later resolves — a called fail is a failed run, period.
   let failReason: string | null = null;
@@ -152,7 +189,7 @@ export async function startScript(config: ScriptConfig): Promise<ScriptHandle> {
     },
     "widget.done": ([id]) => widgets.done(id as string),
     "widget.once": ([id, name]) => widgets.onceEvent(id as string, name as string),
-    audio: notImplemented("audio"),
+    ...audioOps(audio),
     media: notImplemented("media"),
   };
 
@@ -170,10 +207,17 @@ export async function startScript(config: ScriptConfig): Promise<ScriptHandle> {
     bridge.emitEvent(`widget:${id}:${name}`, payload),
   );
 
+  // Audio handle state (position/duration/playing) pushes the same
+  // way; the shim caches it for the ScriptHandle's getters.
+  audio.setSink((id, state) => bridge.emitEvent(`audio:${id}:state`, state));
+
   const teardown = () => {
     for (const id of timers) window.clearTimeout(id);
     timers.clear();
-    // Bridge first: its posts stop, then store teardown (which settles
+    // Audio first: its state pushes stop while the bridge is still
+    // alive, and `end` promises resolve (teardown is not an error).
+    audio.stopAll();
+    // Bridge next: its posts stop, then store teardown (which settles
     // waiters) can never push into a dead iframe.
     bridge.teardown();
     widgets.clear();
@@ -182,5 +226,5 @@ export async function startScript(config: ScriptConfig): Promise<ScriptHandle> {
 
   await bridge.ready;
   bridge.post({ tm: "init", body: config.body, vars: config.vars });
-  return { result, widgets, teardown };
+  return { result, widgets, audio, teardown };
 }
