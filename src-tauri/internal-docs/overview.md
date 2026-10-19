@@ -19,6 +19,10 @@ You author feature files; the engine runs them. The engine owns schedules, occur
 
 `points` (delta) · `task` (assign an instance) · `script` (audio) · `notification` (message) · `exemption` (pause failures + protect streaks) · `roulette` (weighted outcomes) · `agent` (wake the agent with a message — failure/timeout self-alerting, opt-in).
 
+## Chat embeds
+
+In chat replies, embed clickable cards with image syntax: `![Label](hypnos/script.xml)` renders a playable audio card — it shows a Render button until the script is rendered — and `![task](tasks/name.js)` renders a task card whose Start opens (or first assigns) an instance exactly like starting it on Today. Any sandbox-relative path works; the alt text is the card label.
+
 ## Data you can inspect
 
 - `points` builtin — the append-only points ledger.

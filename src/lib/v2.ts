@@ -228,6 +228,25 @@ export function startRun(
   return invoke("v2_start_run", { kind, refId: ref, occurrence: occurrence ?? null });
 }
 
+/** A task template resolved for the chat's task embeds (see ChatEmbeds). */
+export interface TaskInstanceRef {
+  /** Null when no instance is open and `assign` was false. */
+  iid: string | null;
+  title: string;
+}
+
+/**
+ * Resolve a task template (`tasks/name.js`, `name.js`, or bare `name`) to an
+ * open task instance — assigning a fresh one first when `assign` is set and
+ * none is open. Read-only with `assign: false` (title lookup only).
+ */
+export function resolveTaskInstance(
+  template: string,
+  assign: boolean,
+): Promise<TaskInstanceRef> {
+  return invoke("v2_resolve_task_instance", { template, assign });
+}
+
 export function finishRun(runId: string): Promise<RunOutcome> {
   return invoke("v2_finish_run", { runId });
 }

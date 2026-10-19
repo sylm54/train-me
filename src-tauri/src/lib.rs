@@ -1939,6 +1939,7 @@ pub fn run() {
             schedule::parse_v2_file,
             schedule::v2_summary,
             schedule::v2_start_run,
+            schedule::v2_resolve_task_instance,
             schedule::v2_context,
             schedule::v2_finish_run,
             schedule::v2_fail_run,

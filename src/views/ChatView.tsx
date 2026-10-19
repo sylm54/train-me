@@ -93,6 +93,12 @@ import { createMainAgentTransport } from "@/lib/agent";
 import type { AgentSettings } from "@/lib/types";
 import { useAgentEvents, useSessionUsage, type AgentEvent } from "@/lib/agent-events";
 import { useRenderStore } from "@/lib/renderRegistry";
+import { resolveTaskInstance, type SessionRequest } from "@/lib/v2";
+import {
+  chatEmbedComponents,
+  EmbedActionsProvider,
+} from "@/components/ChatEmbeds";
+import { AudioPlayerOverlay } from "@/components/AudioPlayerOverlay";
 import {
   archiveChat,
   createChat,
@@ -173,12 +179,15 @@ interface ChatViewProps {
   /** Called when the user picks/creates/archives a chat. */
   onActiveChatChange: (id: string) => void;
   onOpenSettings?: () => void;
+  /** Open a routine/task session — chat embeds start tasks through it. */
+  onRequestSession: (request: SessionRequest) => void;
 }
 
 export function ChatView({
   activeChatId,
   onActiveChatChange,
   onOpenSettings,
+  onRequestSession,
 }: ChatViewProps) {
   const { settings } = useSettings();
 
@@ -201,6 +210,7 @@ export function ChatView({
       settings={settings}
       apiKeyMissing={apiKeyMissing}
       onOpenSettings={onOpenSettings}
+      onRequestSession={onRequestSession}
     />
   );
 }
@@ -212,6 +222,7 @@ interface ChatViewInnerProps {
   settings: AgentSettings;
   apiKeyMissing: boolean;
   onOpenSettings?: () => void;
+  onRequestSession: (request: SessionRequest) => void;
 }
 
 function ChatViewInner({
@@ -221,6 +232,7 @@ function ChatViewInner({
   settings,
   apiKeyMissing,
   onOpenSettings,
+  onRequestSession,
 }: ChatViewInnerProps) {
   // useChat only captures the transport at Chat-instance creation time.
   // The outer component builds a STABLE transport, so there is no
@@ -244,6 +256,23 @@ function ChatViewInner({
   const renderStore = useRenderStore();
   const renderPillVisible =
     settings.audio.showRenderPill && renderStore.size > 0;
+
+  // ── Chat embeds (audio scripts + tasks, see ChatEmbeds) ─────────────
+  // Task starts resolve-or-assign an instance backend-side, then hand the
+  // session request to the app — the same door Today's Start button uses.
+  const [playingAudio, setPlayingAudio] = useState<string | null>(null);
+  const startTaskFromEmbed = useCallback(
+    async (template: string) => {
+      const inst = await resolveTaskInstance(template, true);
+      if (!inst.iid) throw new Error("could not assign the task instance");
+      onRequestSession({ kind: "task", ref: inst.iid });
+    },
+    [onRequestSession],
+  );
+  const embedActions = useMemo(
+    () => ({ playAudio: setPlayingAudio, startTask: startTaskFromEmbed }),
+    [startTaskFromEmbed],
+  );
 
   // ── Rehydrate messages for this chat on mount ───────────────────────
   // useChat keeps an internal store keyed by `id`, so returning to a chat
@@ -582,6 +611,7 @@ function ChatViewInner({
   };
 
   return (
+    <EmbedActionsProvider value={embedActions}>
     <div className="flex flex-col h-full">
       {/* ── Chat header: title + list + menu ───────────────────────── */}
       <ChatHeader
@@ -757,7 +787,16 @@ function ChatViewInner({
         }}
         onDelete={(id) => deleteChatPermanently(id)}
       />
+
+      {/* ── Embedded audio playback (chat audio cards) ────────── */}
+      {playingAudio && (
+        <AudioPlayerOverlay
+          src={playingAudio}
+          onClose={() => setPlayingAudio(null)}
+        />
+      )}
     </div>
+    </EmbedActionsProvider>
   );
 }
 
@@ -1961,6 +2000,7 @@ function ActivityParts({ message }: { message: UIMessage }) {
         <MessageResponse
           key={`text-${message.id}-${i}`}
           linkSafety={{ enabled: false }}
+          components={chatEmbedComponents}
         >
           {part.text}
         </MessageResponse>,

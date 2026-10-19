@@ -161,6 +161,7 @@ export default function App() {
             activeChatId={activeChatId}
             onActiveChatChange={changeActiveChat}
             onOpenSettings={() => setView("settings")}
+            onRequestSession={openSession}
           />
         )}
       </div>

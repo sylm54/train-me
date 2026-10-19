@@ -251,7 +251,7 @@ fn execute_action(
             Err(e) => format!("points failed: {e}"),
         },
         Action::Task { template } => match assign_task_instance(sched, agent_dir, template, source) {
-            Ok(title) => format!("task assigned: {title}"),
+            Ok((_, title)) => format!("task assigned: {title}"),
             Err(e) => format!("task assignment failed: {e}"),
         },
         Action::Script { src } => {
@@ -347,13 +347,14 @@ fn deterministic_u64(source: &str) -> u64 {
     h.finish()
 }
 
-/// Create a task instance from a template (used by `task` actions).
+/// Create a task instance from a template (used by `task` actions and the
+/// chat's task embeds). Returns `(iid, title)`.
 pub fn assign_task_instance(
     sched: &Connection,
     agent_dir: &Path,
     template: &str,
     source: &str,
-) -> Result<String, String> {
+) -> Result<(String, String), String> {
     let rel = format::template_to_path(template);
     let full = crate::bash::resolve_under(agent_dir, &rel)?;
     let content = std::fs::read_to_string(&full).map_err(|e| format!("`{rel}`: {e}"))?;
@@ -384,7 +385,97 @@ pub fn assign_task_instance(
             rusqlite::params![iid, template, task.title, ts(now), deadline, max_timeout, timeouts_json],
         )
         .map_err(|e| e.to_string())?;
-    Ok(task.title)
+    Ok((iid, task.title))
+}
+
+/// A task instance reference for the chat's task embeds: the instance id a
+/// session can be opened with, plus the task's display title.
+#[derive(Serialize)]
+pub struct TaskInstanceRef {
+    /// Null until an instance is assigned (the read-only lookup parses the
+    /// template for its title without creating anything).
+    pub iid: Option<String>,
+    pub title: String,
+}
+
+/// Resolve a task template (as embedded in a chat message) to an open task
+/// instance, assigning a fresh one when none is open and `assign` is set.
+/// With `assign = false` this is a read-only lookup: the embed card uses it
+/// to show the task's real title before anything is started.
+#[tauri::command]
+pub async fn v2_resolve_task_instance(
+    template: String,
+    assign: bool,
+    state: State<'_, AppState>,
+) -> Result<TaskInstanceRef, String> {
+    let agent_dir = state.agent_dir.clone();
+    let state_dir = state.state_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        resolve_task_instance_inner(&agent_dir, &state_dir, &template, assign)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Core of `v2_resolve_task_instance`. The embedded href may arrive as
+/// `tasks/name.js`, `name.js`, or a bare `name` — all normalize to the
+/// template name the instances table stores (what `task` actions carry).
+fn resolve_task_instance_inner(
+    agent_dir: &Path,
+    state_dir: &Path,
+    template: &str,
+    assign: bool,
+) -> Result<TaskInstanceRef, String> {
+    let sched = open(&state_dir.join("schedule.db"))?;
+
+    let raw = template.trim();
+    let normalized = raw
+        .trim_start_matches("./")
+        .trim_start_matches("tasks/")
+        .trim_end_matches(".js");
+    let normalized = normalized.trim();
+    // Match both forms: instances store whatever the `task` action carried,
+    // which is usually the bare name but may be a path.
+    let normalized = if normalized.is_empty() { raw } else { normalized };
+
+    if let Ok((iid, title)) = sched.query_row(
+        "SELECT iid, title FROM task_instances \
+         WHERE template IN (?1, ?2) AND status IN ('assigned', 'in_progress') \
+         ORDER BY assigned ASC LIMIT 1",
+        rusqlite::params![normalized, raw],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+    ) {
+        return Ok(TaskInstanceRef {
+            iid: Some(iid),
+            title,
+        });
+    }
+
+    if assign {
+        // A per-call source: re-using a constant would make the deterministic
+        // instance id collide with a completed earlier one, so a second run
+        // of the same embed could never start. Mirrors `task` actions, where
+        // each triggering event is its own source.
+        let source = format!("chat:{}", utc_now().timestamp_millis());
+        let (iid, title) = assign_task_instance(&sched, agent_dir, normalized, &source)?;
+        return Ok(TaskInstanceRef {
+            iid: Some(iid),
+            title,
+        });
+    }
+
+    // Read-only: parse the template for its display title, creating nothing.
+    let rel = format::template_to_path(normalized);
+    let full = crate::bash::resolve_under(agent_dir, &rel)?;
+    let content = std::fs::read_to_string(&full).map_err(|e| format!("`{rel}`: {e}"))?;
+    let (task, _) = format::parse_task(&content);
+    let title = task
+        .map(|t| t.title)
+        .unwrap_or_else(|| normalized.to_string());
+    Ok(TaskInstanceRef {
+        iid: None,
+        title,
+    })
 }
 
 // ============================================================================
@@ -2831,6 +2922,50 @@ mod tests {
             let econ = open(&state.join("economy.db")).unwrap();
             assert_eq!(economy::balance(&econ).unwrap(), 10, "only the in-deadline success fired");
         }
+        let _ = tmp;
+    }
+
+    /// Chat task embeds: the read-only lookup returns the template's title
+    /// without creating anything; assigning picks up an already-open
+    /// instance (path or bare href forms) and otherwise assigns a fresh
+    /// one — and a second assign after completion creates a NEW instance
+    /// rather than colliding with the completed one.
+    #[test]
+    fn resolve_task_instance_finds_assigns_and_reassigns() {
+        let task = "/*---\ntitle: Dishes\n\
+                    success: { \"type\": \"points\", \"delta\": 5 }\n---*/\nawait wait(\"1m\");\n";
+        let (tmp, agent, state) = env(&[("tasks/dishes.js", task)]);
+
+        // Read-only: no instance exists → title from the template, no row.
+        let info = resolve_task_instance_inner(&agent, &state, "tasks/dishes.js", false).unwrap();
+        assert_eq!(info.title, "Dishes");
+        assert!(info.iid.is_none());
+        {
+            let sched = open(&state.join("schedule.db")).unwrap();
+            let n: i64 = sched
+                .query_row("SELECT COUNT(*) FROM task_instances", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0, "read-only lookup must not assign");
+        }
+
+        // Assign: creates an instance from the path form of the href.
+        let assigned =
+            resolve_task_instance_inner(&agent, &state, "tasks/dishes.js", true).unwrap();
+        assert_eq!(assigned.title, "Dishes");
+        let iid = assigned.iid.expect("assigned");
+
+        // An existing open instance is found via the bare-name form too.
+        let again =
+            resolve_task_instance_inner(&agent, &state, "dishes", true).unwrap();
+        assert_eq!(again.iid.as_deref(), Some(iid.as_str()), "reused the open instance");
+
+        // Complete it; a further assign must get a FRESH instance (a
+        // constant source would collide with the completed row).
+        finish_run_inner(&agent, &state, None, &iid).unwrap();
+        let restarted =
+            resolve_task_instance_inner(&agent, &state, "tasks/dishes.js", true).unwrap();
+        let iid2 = restarted.iid.expect("re-assigned");
+        assert_ne!(iid, iid2, "a completed embed must assign a fresh instance");
         let _ = tmp;
     }
 }
