@@ -29,28 +29,39 @@ tauri-plugin-android-fs = "28"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-ort = { version = "2.0.0-rc.11", features = ["download-binaries", "ndarray", "xnnpack"] }
-
-# Array processing (like NumPy)
-ndarray = { version = "0.17.2", features = ["rayon"] }
 rand = "0.8"
 rand_distr = "0.4"
+
+# Kyutai pocket-tts speech synthesis (https://github.com/kyutai-labs/pocket-tts).
+# The model lives in the xn-ptts fork, pinned to the same commit pocket-tts'
+# own binary pins (its API is still moving between release candidates).
+ptts = { git = "https://github.com/gabrieldemarmiesse/xn-ptts", rev = "7efa26973f81bba42cf2ace8da2c1eb9b605d54d", default-features = false, features = ["hf"] }
+xn = "0.2.11"
+# Same major lines pocket-tts uses; aliased because the app itself is on the
+# 0.8/0.4 line (the noise RNG needs 0.9's API).
+rand09 = { package = "rand", version = "0.9", default-features = false, features = ["std", "std_rng", "os_rng"] }
+rand_distr09 = { package = "rand_distr", version = "0.5" }
+tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
+serde_yaml = "0.9"
+half = "2"
+# SentencePiece tokenizer of the tiny distilled checkpoints (2m/7m/18m). The
+# crate builds a C++ library via cmake — the reason the feature can be turned
+# off (`--no-default-features`) on toolchains without a working native setup.
+# Every other checkpoint uses a Hugging Face `tokenizers` JSON.
+sentencepiece = { version = "0.14", features = ["static"], optional = true }
+
 
 # Parallel processing
 rayon = "1.10"
 
 # Audio processing
 hound = "3.5"
-rustfft = "6.2"
 
 # CLI argument parsing
 clap = { version = "4.5", features = ["derive"] }
 
 # Error handling
 anyhow = "1.0"
-
-# Unicode normalization
-unicode-normalization = "0.1"
 
 # Regular expressions
 regex = "1.10"
@@ -184,3 +195,7 @@ http-body-util = "0.1"
 # `vendor/turso_ext` is the same source with that one build-script bug fixed.
 [patch.crates-io]
 turso_ext = { path = "vendor/turso_ext" }
+
+[features]
+default = ["tts-small-models"]
+tts-small-models = ["dep:sentencepiece"]

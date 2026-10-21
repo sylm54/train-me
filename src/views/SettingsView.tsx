@@ -39,6 +39,15 @@ import {
 import { useSettings, exportSettingsJson } from "@/lib/settings";
 import { clearAllChats } from "@/lib/chatStore";
 import { getCachedBaseUrl } from "@/lib/audioUrl";
+import {
+  downloadCheckpoint,
+  getModelStatus,
+  listTtsCheckpoints,
+  loadModel,
+  setTtsCheckpoint as invokeSetCheckpoint,
+  type CheckpointInfo,
+  type ModelStatus,
+} from "@/lib/tts";
 import type {
   AgentName,
   FileEntry,
@@ -98,13 +107,6 @@ import {
 } from "@/lib/renderRegistry";
 import { pickExportPath, isAndroid } from "@/lib/export";
 
-interface ModelStatus {
-  downloaded: boolean;
-  loaded: boolean;
-  missing_files: string[];
-  speakers: string[];
-}
-
 /** System-prompt files that back each agent, shown in the debug section. */
 const AGENT_PROMPTS: { agent: AgentName; file: string; label: string }[] = [
   { agent: "main", file: "main_agent.md", label: "Main agent" },
@@ -126,6 +128,7 @@ export function SettingsView({
     setChat,
     setPlayback,
     setAudio,
+    setTtsCheckpoint,
     resetOnboarding,
   } = useSettings();
   // Resolved context window for the main model (live catalog / preset /
@@ -140,8 +143,9 @@ export function SettingsView({
   });
   const [savedFlash, setSavedFlash] = useState(false);
 
-  // TTS model status
+  // TTS engine status + the swappable checkpoint catalog.
   const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
+  const [checkpoints, setCheckpoints] = useState<CheckpointInfo[]>([]);
   const [ttsBusy, setTtsBusy] = useState(false);
   const [ttsError, setTtsError] = useState<string | null>(null);
 
@@ -187,9 +191,7 @@ export function SettingsView({
   const [debugTools, setDebugTools] = useState(false);
 
   useEffect(() => {
-    invoke<ModelStatus>("get_model_status")
-      .then(setModelStatus)
-      .catch(() => {});
+    refreshTts();
     // Load the installed framework, its source URL, and any staged framework
     // (so re-entering Settings mid-configure resumes the options step).
     getInstalledFramework().then((installed) => {
@@ -212,15 +214,30 @@ export function SettingsView({
     setTimeout(() => setSavedFlash(false), 1200);
   };
 
-  const handleDownload = async () => {
+  const refreshTts = async () => {
+    try {
+      const [status, catalog] = await Promise.all([
+        getModelStatus(),
+        listTtsCheckpoints(),
+      ]);
+      setModelStatus(status);
+      setCheckpoints(catalog);
+    } catch {
+      // Status stays stale; the card shows the error via commands.
+    }
+  };
+
+  const handleDownload = async (checkpoint?: string) => {
     setTtsBusy(true);
     setTtsError(null);
     try {
-      await invoke("download_model");
-      const s = await invoke<ModelStatus>("get_model_status");
-      setModelStatus(s);
+      await downloadCheckpoint(checkpoint);
+      setTtsCheckpoint(checkpoint ?? (await getModelStatus()).checkpoint);
+      // Freshly downloaded → boot the engine for it right away.
+      await loadModel().catch(() => {});
+      await refreshTts();
     } catch (e) {
-      setTtsError(String(e));
+      setTtsError(tauriErrorToString(e));
     } finally {
       setTtsBusy(false);
     }
@@ -230,11 +247,30 @@ export function SettingsView({
     setTtsBusy(true);
     setTtsError(null);
     try {
-      await invoke("load_model");
-      const s = await invoke<ModelStatus>("get_model_status");
-      setModelStatus(s);
+      await loadModel();
+      await refreshTts();
     } catch (e) {
-      setTtsError(String(e));
+      setTtsError(tauriErrorToString(e));
+    } finally {
+      setTtsBusy(false);
+    }
+  };
+
+  const handleSelectCheckpoint = async (id: string) => {
+    setTtsBusy(true);
+    setTtsError(null);
+    try {
+      await invokeSetCheckpoint(id);
+      setTtsCheckpoint(id);
+      // Downloaded checkpoints boot right away; otherwise the card offers
+      // the download button for the new selection.
+      const status = await getModelStatus();
+      if (status.downloaded) {
+        await loadModel().catch(() => {});
+      }
+      await refreshTts();
+    } catch (e) {
+      setTtsError(tauriErrorToString(e));
     } finally {
       setTtsBusy(false);
     }
@@ -744,50 +780,111 @@ export function SettingsView({
           <ExportAllDataCard />
         </section>
 
-        {/* ── TTS model status ─────────────────────────────────────── */}
+        {/* ── TTS engine: swappable speech checkpoints ────────────── */}
         <section className="space-y-4">
           <h2 className="text-sm uppercase tracking-wider text-[var(--color-muted-foreground)]">
             TTS engine
           </h2>
           <div className="border border-[var(--color-border)] rounded-lg p-4 bg-[var(--color-surface)] space-y-3">
+            <p className="text-xs text-[var(--color-muted-foreground)]">
+              Speech is synthesized on-device by Kyutai's pocket-tts. Pick
+              which checkpoint to download — the default English model, a
+              tiny one for low-end devices, or another language. Switching
+              re-renders every script with the new voice set.
+            </p>
+
             <div className="flex items-center gap-4 text-sm">
               <StatusDot on={!!modelStatus?.downloaded} />
               <span>
-                Model:{" "}
-                {modelStatus?.downloaded ? "Downloaded" : "Not downloaded"}
+                Active:{" "}
+                <span className="font-medium">
+                  {modelStatus?.checkpoint ?? "…"}
+                </span>
               </span>
               <StatusDot on={!!modelStatus?.loaded} />
-              <span>
-                Engine: {modelStatus?.loaded ? "Loaded" : "Not loaded"}
-              </span>
+              <span>Engine: {modelStatus?.loaded ? "Loaded" : "Not loaded"}</span>
+            </div>
+
+            {/* Checkpoint catalog */}
+            <div className="max-h-72 overflow-y-auto divide-y divide-[var(--color-border)] border border-[var(--color-border)] rounded-md">
+              {checkpoints.map((cp) => {
+                const active = cp.id === modelStatus?.checkpoint;
+                return (
+                  <div
+                    key={cp.id}
+                    className={`px-3 py-2 flex items-start gap-3 text-sm ${
+                      active ? "bg-[var(--color-pink-50)]" : ""
+                    }`}
+                  >
+                    <div className="flex-1 min-w-0">
+                      <div className="font-medium flex items-center gap-2">
+                        <span className="truncate">{cp.label}</span>
+                        {active && (
+                          <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-[var(--color-pink-400)] text-[var(--color-primary-foreground)]">
+                            Active
+                          </span>
+                        )}
+                        {cp.downloaded && (
+                          <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded border border-[var(--color-border)] text-[var(--color-muted-foreground)]">
+                            Downloaded
+                          </span>
+                        )}
+                        {cp.requiresSentencepiece && (
+                          <span
+                            className="text-[10px] px-1.5 py-0.5 rounded border border-[var(--color-border)] text-[var(--color-muted-foreground)]"
+                            title="Tiny distilled checkpoint"
+                          >
+                            tiny
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-[11px] text-[var(--color-muted-foreground)]">
+                        {cp.description} · ~{formatBytes(cp.approxBytes)}
+                      </div>
+                    </div>
+                    {active ? (
+                      !cp.downloaded ? (
+                        <button
+                          onClick={() => handleDownload(cp.id)}
+                          disabled={ttsBusy}
+                          className="shrink-0 px-2.5 py-1.5 text-xs rounded-md bg-[var(--color-pink-400)] text-[var(--color-primary-foreground)] hover:bg-[var(--color-pink-500)] disabled:opacity-50 inline-flex items-center gap-1.5"
+                        >
+                          {ttsBusy && (
+                            <Loader2 size={12} className="animate-spin" />
+                          )}
+                          Download
+                        </button>
+                      ) : !modelStatus?.loaded ? (
+                        <button
+                          onClick={handleLoad}
+                          disabled={ttsBusy}
+                          className="shrink-0 px-2.5 py-1.5 text-xs rounded-md border border-[var(--color-border)] hover:bg-[var(--color-pink-100)] disabled:opacity-50"
+                        >
+                          Load
+                        </button>
+                      ) : null
+                    ) : (
+                      <button
+                        onClick={() => handleSelectCheckpoint(cp.id)}
+                        disabled={ttsBusy}
+                        className="shrink-0 px-2.5 py-1.5 text-xs rounded-md border border-[var(--color-border)] hover:bg-[var(--color-pink-50)] disabled:opacity-50"
+                      >
+                        {cp.downloaded ? "Use" : "Use…"}
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+              {checkpoints.length === 0 && (
+                <p className="px-3 py-2 text-xs text-[var(--color-muted-foreground)]">
+                  Loading catalog…
+                </p>
+              )}
             </div>
 
             {ttsError && (
               <p className="text-xs text-[var(--color-danger)]">{ttsError}</p>
             )}
-
-            <div className="flex gap-2">
-              {!modelStatus?.downloaded && (
-                <button
-                  onClick={handleDownload}
-                  disabled={ttsBusy}
-                  className="px-3 py-2 text-sm rounded-md bg-[var(--color-pink-400)] text-[var(--color-primary-foreground)] hover:bg-[var(--color-pink-500)] disabled:opacity-50 inline-flex items-center gap-2"
-                >
-                  {ttsBusy && <Loader2 size={14} className="animate-spin" />}
-                  Download model
-                </button>
-              )}
-              {modelStatus?.downloaded && !modelStatus?.loaded && (
-                <button
-                  onClick={handleLoad}
-                  disabled={ttsBusy}
-                  className="px-3 py-2 text-sm rounded-md border border-[var(--color-border)] hover:bg-[var(--color-pink-50)] disabled:opacity-50 inline-flex items-center gap-2"
-                >
-                  {ttsBusy && <Loader2 size={14} className="animate-spin" />}
-                  Load engine
-                </button>
-              )}
-            </div>
           </div>
         </section>
 

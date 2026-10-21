@@ -59,11 +59,19 @@ import {
 } from "@/lib/frameworks";
 import { fetchOnboardingState, importOnboardingAnswers } from "@/lib/onboarding";
 import { OnboardingFlow } from "@/components/OnboardingFlow";
+import { VoiceStep } from "@/components/VoiceStep";
 import { logActivity } from "@/lib/activity";
 
-type Step = "welcome" | "models" | "framework" | "profile" | "questions";
+type Step = "welcome" | "models" | "voice" | "framework" | "profile" | "questions";
 
-const STEP_ORDER: Step[] = ["welcome", "models", "framework", "profile", "questions"];
+const STEP_ORDER: Step[] = [
+  "welcome",
+  "models",
+  "voice",
+  "framework",
+  "profile",
+  "questions",
+];
 
 /** Sub-state of the framework step. */
 type FrameworkPhase = "browse" | "config" | "installed";
@@ -361,6 +369,7 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
               setReveal={setReveal}
             />
           )}
+          {step === "voice" && <VoiceStep />}
           {step === "framework" && (
             <FrameworkStep
               phase={phase}
@@ -452,6 +461,14 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
                 Skip, install later
               </button>
             )}
+            {step === "voice" && (
+              <button
+                onClick={goNext}
+                className="text-xs text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)] underline hover:no-underline"
+              >
+                Skip for now
+              </button>
+            )}
             {step !== "questions" && (
               <button
                 onClick={step === "profile" ? profileNextAction : frameworkNextAction}
@@ -505,6 +522,11 @@ function WelcomeStep() {
           icon={<Sparkles size={16} />}
           title="Pick your models"
           body="Connect an OpenRouter or OpenAI key and choose a model for your agent."
+        />
+        <FeatureCard
+          icon={<Sparkles size={16} />}
+          title="Hear your agent's voice"
+          body="Spoken audio is synthesized on this device. Pick a voice checkpoint to download and listen to a test render before continuing."
         />
         <FeatureCard
           icon={<PackageOpen size={16} />}

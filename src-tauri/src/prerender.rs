@@ -357,11 +357,13 @@ fn emit_done(app: &tauri::AppHandle, script: &str, error: Option<&str>) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn prerender_blocking(
     agent_dir: &Path,
     state_dir: &Path,
     tracks_dir: &Path,
     model_dir: &Path,
+    checkpoint: &str,
     renderer_arc: &parking_lot::Mutex<Option<crate::audio_renderer::AudioRenderer>>,
     only: Option<&[String]>,
     app: Option<&tauri::AppHandle>,
@@ -397,7 +399,7 @@ pub fn prerender_blocking(
     let mut hold = crate::render_service::RenderHold::new();
 
     if !stale.is_empty() {
-        if !crate::model_downloader::is_model_downloaded(model_dir) {
+        if !crate::model_downloader::is_model_downloaded(model_dir, checkpoint) {
             report.model_missing = true;
         } else {
             // Lazily construct the renderer (same as load_model) and hold
@@ -405,7 +407,7 @@ pub fn prerender_blocking(
             // the UI path on the same mutex.
             let mut guard = renderer_arc.lock();
             if guard.is_none() {
-                match crate::audio_renderer::AudioRenderer::new(model_dir) {
+                match crate::audio_renderer::AudioRenderer::new(model_dir, checkpoint) {
                     Ok(r) => *guard = Some(r),
                     Err(e) => report.errors.push(format!("engine init failed: {e:#}")),
                 }
@@ -514,6 +516,9 @@ pub async fn v2_prerender(
     let tracks_dir = state.tracks_dir.clone();
     let model_dir = state.model_dir.clone();
     let renderer_arc = state.renderer.clone();
+    let checkpoint = crate::settings::AgentSettings::load(&state.data_dir.join("settings.json"))
+        .audio
+        .tts_checkpoint;
     let report_app = app.clone();
     let report_webview = webview.clone();
     let report = tauri::async_runtime::spawn_blocking(move || {
@@ -522,6 +527,7 @@ pub async fn v2_prerender(
             &state_dir,
             &tracks_dir,
             &model_dir,
+            &checkpoint,
             &renderer_arc,
             paths.as_deref(),
             Some(&report_app),

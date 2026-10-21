@@ -36,6 +36,7 @@ mod manifest;
 mod model_downloader;
 mod onboarding;
 mod package_import;
+mod pocket_tts;
 mod package_manifest;
 mod prerender;
 mod progress;
@@ -113,8 +114,21 @@ pub struct SynthesizeRequest {
 pub struct ModelStatus {
     pub downloaded: bool,
     pub loaded: bool,
+    /// The active pocket-tts checkpoint id (settings `audio.ttsCheckpoint`).
+    pub checkpoint: String,
     pub missing_files: Vec<String>,
     pub speakers: Vec<String>,
+}
+
+/// Result of `render_test_track`: the rendered test track plus timing.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct TestRenderResult {
+    #[serde(flatten)]
+    pub track: TrackInfo,
+    /// Pure synthesis wall time in milliseconds (engine load excluded).
+    pub render_ms: u64,
+    /// Seconds of audio produced.
+    pub audio_seconds: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -177,38 +191,91 @@ pub struct ExportResult {
 /// "stuck on refreshing" hang when navigating away and back mid-render. We
 /// use `try_lock` instead: if the renderer is busy we still report `loaded:
 /// true` (it IS loaded, just busy), which is the correct answer for the UI.
+/// The active TTS checkpoint id, from `settings.json` (`audio.ttsCheckpoint`,
+/// default `"english"`). Every command that touches the engine resolves the
+/// checkpoint through here so settings and renders agree.
+fn active_tts_checkpoint(state: &State<'_, AppState>) -> String {
+    settings::AgentSettings::load(&state.data_dir.join("settings.json"))
+        .audio
+        .tts_checkpoint
+}
+
 #[tauri::command]
 fn get_model_status(state: State<'_, AppState>) -> Result<ModelStatus, String> {
-    let downloaded = model_downloader::is_model_downloaded(&state.model_dir);
+    let checkpoint = active_tts_checkpoint(&state);
+    let downloaded = model_downloader::is_model_downloaded(&state.model_dir, &checkpoint);
     let loaded = state
         .renderer
         .try_lock()
         .map(|g| g.is_some())
         .unwrap_or(true);
-    let missing_files = model_downloader::missing_files(&state.model_dir);
-    let speakers = model_downloader::available_speakers()
+    let missing_files = model_downloader::missing_files(&state.model_dir, &checkpoint);
+    let speakers = pocket_tts::available_speakers()
         .iter()
         .map(|s| s.to_string())
         .collect();
     Ok(ModelStatus {
         downloaded,
         loaded,
+        checkpoint,
         missing_files,
         speakers,
     })
 }
 
-/// Download model files from HuggingFace.
-/// Runs on a blocking thread so the UI stays responsive.
+/// The swappable checkpoint catalog: every embedded pocket-tts config with
+/// its metadata and cached state.
 #[tauri::command]
-async fn download_model(state: State<'_, AppState>) -> Result<String, String> {
-    let model_dir = state.model_dir.clone();
+fn list_tts_checkpoints(state: State<'_, AppState>) -> Result<Vec<model_downloader::CheckpointInfo>, String> {
+    Ok(model_downloader::list_checkpoints(&state.model_dir))
+}
+
+/// Select the checkpoint the engine loads. Unloads a loaded engine so the
+/// next render boots the new checkpoint; rendered tracks keep playing (they
+/// were synthesized at render time) and re-render on the next pass since the
+/// manifest version changed with the engine swap.
+#[tauri::command]
+async fn set_tts_checkpoint(
+    checkpoint: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    // Validate against the embedded catalog before persisting.
+    if let Err(e) = pocket_tts::config::Config::load(&state.model_dir, Some(&checkpoint), None) {
+        return Err(format!("Unknown checkpoint {checkpoint:?}: {e:#}"));
+    }
+    let path = state.data_dir.join("settings.json");
+    let mut s = settings::AgentSettings::load(&path);
+    s.audio.tts_checkpoint = checkpoint;
+    s.validate().map_err(|e| e.to_string())?;
+    s.save(&path)?;
+    // Unload so the next render boots the new checkpoint. Off the main
+    // thread: the engine lock is held for a render's whole duration, and a
+    // blocking wait here would freeze the UI mid-prerender.
+    let renderer = state.renderer.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        model_downloader::download_model(&model_dir, |current, total, file| {
+        *renderer.lock() = None;
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Download a checkpoint's files (weights, tokenizer, voice states) from the
+/// Hugging Face Hub into the model cache. `checkpoint` defaults to the
+/// active one. Runs on a blocking thread so the UI stays responsive.
+#[tauri::command]
+async fn download_model(
+    state: State<'_, AppState>,
+    checkpoint: Option<String>,
+) -> Result<String, String> {
+    let model_dir = state.model_dir.clone();
+    let checkpoint = checkpoint.unwrap_or_else(|| active_tts_checkpoint(&state));
+    tauri::async_runtime::spawn_blocking(move || {
+        model_downloader::download_checkpoint(&model_dir, &checkpoint, |current, total, file| {
             log::info!("[{}/{}] Downloading {}", current + 1, total, file);
         })
-        .map_err(|e| e.to_string())?;
-        Ok("Model downloaded successfully".to_string())
+        .map_err(|e| format!("Failed to download checkpoint {checkpoint:?}: {e}"))?;
+        Ok(format!("Checkpoint {checkpoint} downloaded successfully"))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -220,11 +287,12 @@ async fn download_model(state: State<'_, AppState>) -> Result<String, String> {
 async fn load_model(state: State<'_, AppState>) -> Result<String, String> {
     let model_dir = state.model_dir.clone();
     let renderer = state.renderer.clone();
+    let checkpoint = active_tts_checkpoint(&state);
     tauri::async_runtime::spawn_blocking(move || {
-        let r = audio_renderer::AudioRenderer::new(&model_dir)
+        let r = audio_renderer::AudioRenderer::new(&model_dir, &checkpoint)
             .map_err(|e| format!("Failed to load model: {}", e))?;
         *renderer.lock() = Some(r);
-        Ok("Model loaded".to_string())
+        Ok(format!("Checkpoint {checkpoint} loaded"))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -314,6 +382,98 @@ async fn synthesize(
             duration,
             created: chrono::Local::now().to_rfc3339(),
             size_bytes: metadata.len(),
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The static onboarding test script: a fixed markup exercising the TTS
+/// system's options — multiple voices, speed, pauses, background tone,
+/// echo effect, an overlay with a looped layer, a per-playback random
+/// branch, and a fade-in volume envelope. No `<clip>`s: the script must
+/// render with nothing but the engine present (no framework installed).
+pub(crate) const TTS_TEST_SCRIPT: &str = r#"<!-- train-me TTS engine test -->
+<voice speaker="female" speed="1.0">
+  Welcome to train-me. This voice was rendered locally, on this device.
+</voice>
+<pause duration="0.4"/>
+<tone preset="pinknoise" volume="0.22"/>
+<voice speaker="male" speed="0.9">
+  A second voice, slightly slower. Pink noise fades in behind it and stays.
+  <effect type="echo">
+    <volume value="@fadein(1.5)">Echoes can color a scene.</volume>
+  </effect>
+  <pause duration="0.3"/>
+</voice>
+<overlay duration="2.5">
+  <part>
+    <voice speaker="female2">Layers can speak together.</voice>
+  </part>
+  <part looped="true">
+    <tone preset="binaural_theta" frequency="220" volume="0.15"/>
+  </part>
+</overlay>
+<pause duration="0.4"/>
+<random>
+  <part>
+    <voice speaker="male2">Random picks one branch each time. This time, the first.</voice>
+  </part>
+  <part>
+    <voice speaker="female3">Or the second. Every listen can differ.</voice>
+  </part>
+</random>
+<pause duration="0.3"/>
+<voice speaker="male3" speed="1.15">And a third voice, a little faster, to close.</voice>
+"#;
+
+/// Render the static TTS test script to a track, timing the synthesis.
+///
+/// The onboarding voice step (and the settings diagnostics) play this back
+/// and report the render time. The engine must be loaded — same gating as
+/// `synthesize`.
+#[tauri::command]
+async fn render_test_track(state: State<'_, AppState>) -> Result<TestRenderResult, String> {
+    let tracks_dir = state.tracks_dir.clone();
+    let agent_dir = state.agent_dir.clone();
+    let renderer_arc = state.renderer.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        fs::create_dir_all(&tracks_dir).map_err(|e| e.to_string())?;
+
+        let nodes = tag_parser::parse(TTS_TEST_SCRIPT).map_err(|e| format!("Parse error: {e}"))?;
+        let nodes = audio_renderer::resolve_includes(nodes, &agent_dir);
+        if nodes.is_empty() {
+            return Err("Test script parsed to nothing".to_string());
+        }
+
+        let mut guard = renderer_arc.lock();
+        let renderer = guard
+            .as_mut()
+            .ok_or_else(|| "Model not loaded. Please load the model first.".to_string())?;
+        renderer.set_clip_resolution(&agent_dir, &agent_dir);
+
+        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let filename = format!("tts_test_{timestamp}.wav");
+        let output_path = tracks_dir.join(&filename);
+
+        let start = std::time::Instant::now();
+        let audio_seconds = renderer
+            .render_to_file(&nodes, &output_path)
+            .map_err(|e| format!("Render error: {e}"))?;
+        let render_ms = start.elapsed().as_millis() as u64;
+
+        let metadata = fs::metadata(&output_path).map_err(|e| e.to_string())?;
+        Ok(TestRenderResult {
+            track: TrackInfo {
+                name: filename.trim_end_matches(".wav").to_string(),
+                filename,
+                path: output_path.to_string_lossy().to_string(),
+                duration: audio_seconds,
+                created: chrono::Local::now().to_rfc3339(),
+                size_bytes: metadata.len(),
+            },
+            render_ms,
+            audio_seconds,
         })
     })
     .await
@@ -1831,6 +1991,9 @@ pub fn run() {
             // Existing TTS commands
             get_model_status,
             download_model,
+            list_tts_checkpoints,
+            set_tts_checkpoint,
+            render_test_track,
             load_model,
             synthesize,
             list_tracks,

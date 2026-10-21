@@ -294,6 +294,28 @@ export function useSettings() {
     });
   }, []);
 
+  /**
+   * Switch the active speech checkpoint. The backend command validates the
+   * id, persists settings.json itself, and unloads the engine; this keeps
+   * the in-memory store in sync so a later `save` can't clobber it with a
+   * stale checkpoint.
+   */
+  const setTtsCheckpoint = useCallback((id: string) => {
+    setSettings((prev) => {
+      const next: AgentSettings = {
+        ...prev,
+        audio: { ...prev.audio, ttsCheckpoint: id },
+      };
+      cache = next;
+      settled = true;
+      notifyListeners();
+      return next;
+    });
+    invoke("set_tts_checkpoint", { checkpoint: id }).catch((e) => {
+      console.warn("Failed to switch TTS checkpoint:", e);
+    });
+  }, []);
+
   return {
     settings,
     setApiKey,
@@ -302,6 +324,7 @@ export function useSettings() {
     setChat,
     setPlayback,
     setAudio,
+    setTtsCheckpoint,
     completeOnboarding,
     resetOnboarding,
   };

@@ -11,17 +11,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::expression::{self, Expr};
-use crate::helper::{load_text_to_speech, load_voice_style, write_wav_file, Style, TextToSpeech};
+use crate::helper::write_wav_file;
 use crate::manifest::{self, nominal_duration, relative_path, Manifest, OverlayPartSegment, Segment, WalkCtx};
-use crate::model_downloader;
+use crate::pocket_tts::PocketTtsEngine;
 use crate::progress;
 use crate::tag_parser::{self, include_src_is_glob, split_glob_src, wildcard_match, Node, OverlayPart};
 use crate::RenderedManifest;
 
 use rand::seq::SliceRandom;
 use rand::Rng;
-
-use std::collections::HashMap;
 
 // ============================================================================
 // Value resolution helpers
@@ -127,16 +125,9 @@ fn walker_nodes_cost(nodes: &[Node]) -> u64 {
 
 /// Render context carrying the TTS engine and current rendering state.
 pub struct AudioRenderer {
-    tts: TextToSpeech,
-    model_dir: std::path::PathBuf,
-    /// Current sample rate (from TTS model).
+    engine: PocketTtsEngine,
+    /// Current sample rate (from the TTS engine).
     pub sample_rate: u32,
-    /// Parsed voice styles, keyed by speaker name. `synthesize_text` used to
-    /// re-open and re-parse the JSON (`load_voice_style`) on every Text leaf;
-    /// a script with N lines re-parsed the same file N times. This cache loads
-    /// each style lazily on first use, then serves it from memory. `Arc` so a
-    /// future `&self` call path can return a cheap clone.
-    styles: HashMap<String, Arc<Style>>,
     /// Bases a `<clip src>` resolves against (script dir first, then agent
     /// dir — same order as `<include>` targets). Set per rendered file by the
     /// manifest walker (`render_manifest_file`) and by the flat-path caller
@@ -147,17 +138,16 @@ pub struct AudioRenderer {
 }
 
 impl AudioRenderer {
-    /// Create a new renderer by loading the TTS model from the given directory.
-    pub fn new(model_dir: &Path) -> Result<Self> {
-        let onnx_dir = model_dir.join("onnx");
-        let tts = load_text_to_speech(&onnx_dir, false).context("Failed to load TTS model")?;
-        let sample_rate = tts.sample_rate as u32;
+    /// Create a new renderer by loading the TTS engine for `checkpoint`
+    /// (a pocket-tts config id, e.g. `"english"`). Whatever checkpoint files
+    /// are missing is downloaded into the model dir's cache first.
+    pub fn new(model_dir: &Path, checkpoint: &str) -> Result<Self> {
+        let engine = PocketTtsEngine::load(model_dir, checkpoint).context("Failed to load TTS engine")?;
+        let sample_rate = engine.sample_rate();
 
         Ok(Self {
-            tts,
-            model_dir: model_dir.to_path_buf(),
+            engine,
             sample_rate,
-            styles: HashMap::new(),
             clip_script_dir: PathBuf::new(),
             clip_agent_dir: PathBuf::new(),
         })
@@ -545,41 +535,26 @@ impl AudioRenderer {
         self.render_nodes(children, speaker, volume_scale, speed_scale)
     }
 
-    /// Synthesize plain text using the TTS model.
+    /// Synthesize plain text using the TTS engine. `speed` becomes a
+    /// WSOLA time-stretch of the generated speech (the engine itself speaks
+    /// at its natural rate), keeping pitch intact.
     fn synthesize_text(
         &mut self,
         text: &str,
         speaker: &str,
         speed: f32,
     ) -> Result<(Vec<f32>, f32)> {
-        // Serve the parsed style from the cache, falling back to a one-time
-        // load + parse on first use of this speaker. Previously this re-read
-        // and re-parsed the JSON on every call.
-        let style = match self.styles.get(speaker) {
-            Some(s) => s.clone(),
-            None => {
-                let style_path = model_downloader::voice_style_path(&self.model_dir, speaker)
-                    .ok_or_else(|| anyhow::anyhow!("Unknown speaker: {}", speaker))?;
-                if !style_path.exists() {
-                    bail!("Voice style file not found: {:?}", style_path);
-                }
-                let parsed = load_voice_style(&[style_path.to_string_lossy().to_string()], false)
-                    .context("Failed to load voice style")?;
-                let arc = Arc::new(parsed);
-                self.styles.insert(speaker.to_string(), arc.clone());
-                arc
-            }
-        };
-
         let speed_clamped = speed.clamp(0.5, 1.5);
-        let (samples, _duration) = self
-            .tts
-            .call(text, "en", &style, 8, speed_clamped, 0.2)
+        let samples = self
+            .engine
+            .synthesize(text, speaker)
             .context("TTS synthesis failed")?;
+
+        let stretched = time_stretch(&samples, speed_clamped, self.sample_rate);
 
         // Trim leading/trailing silence so background audio aligns
         // precisely with the audible speech.
-        let samples = trim_silence(&samples, 0.01);
+        let samples = trim_silence(&stretched, 0.01);
         let duration = samples.len() as f32 / self.sample_rate as f32;
         Ok((samples, duration))
     }
@@ -2833,6 +2808,97 @@ fn apply_lowpass(samples: &[f32], cutoff: f32, sample_rate: u32) -> Vec<f32> {
     output
 }
 
+/// WSOLA time-stretch: change duration by `speed` (1.5 = 1.5× faster)
+/// without shifting pitch, the way the markup's `speed` attribute expects.
+///
+/// Overlap-add of Hann-windowed frames where each next input frame is slid
+/// within a small tolerance window to maximize cross-correlation with the
+/// previous frame's tail — the similarity search keeps transients coherent,
+/// which is what separates WSOLA from choppy naive OLA. Speech sits in the
+/// algorithm's sweet spot (quasi-periodic, ±20–50% is well within range).
+fn time_stretch(samples: &[f32], speed: f32, sample_rate: u32) -> Vec<f32> {
+    let _ = sample_rate;
+    let frame = 1024usize;
+    let overlap = frame / 2;
+    let hop_out = frame - overlap;
+    if (speed - 1.0).abs() < 0.01 || samples.len() <= frame + frame / 4 {
+        return samples.to_vec();
+    }
+    // Fractional input hop: output advances hop_out per step, input must
+    // advance hop_out/speed to compress (speed > 1) or stretch (< 1).
+    let hop_in = hop_out as f64 / speed as f64;
+    // Search radius and correlation stride — the perceptual gain of the
+    // exact-offset search plateaus well before ±frame/4, and correlating a
+    // 1-in-4 subsample of the overlap is indistinguishable here.
+    let tolerance = frame / 4;
+    let corr_stride = 4usize;
+
+    let window: Vec<f32> = (0..frame)
+        .map(|i| {
+            0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / frame as f64).cos()) as f32
+        })
+        .collect();
+
+    let out_len = (samples.len() as f64 / speed as f64) as usize + frame;
+    let mut out = vec![0.0f32; out_len];
+    let mut norm = vec![0.0f32; out_len];
+
+    // The offset the previous step actually used, carried into the next
+    // ideal position — this "natural progression" is the S in WSOLA.
+    let mut carried: i64 = 0;
+    let mut ideal: f64 = 0.0;
+    let mut step: usize = 0;
+    let max_pos = samples.len() as i64 - frame as i64;
+
+    while step * hop_out + frame < out_len {
+        ideal += if step == 0 { 0.0 } else { hop_in };
+        let ideal_pos = ideal as i64 + carried;
+        let lo = (ideal_pos - tolerance as i64).max(0);
+        let hi = (ideal_pos + tolerance as i64).min(max_pos);
+        let mut best_pos = ideal_pos.clamp(0, max_pos.max(0));
+        if step > 0 && hi > lo {
+            // Correlate candidate overlaps against the last output tail.
+            let tail_start = step * hop_out;
+            let mut best_score = f32::MIN;
+            let mut pos = lo;
+            while pos <= hi {
+                let mut score = 0.0f32;
+                let mut i = 0;
+                while i < overlap {
+                    score += out[tail_start + i] * samples[(pos + i as i64) as usize];
+                    i += corr_stride;
+                }
+                if score > best_score {
+                    best_score = score;
+                    best_pos = pos;
+                }
+                pos += corr_stride as i64;
+            }
+        }
+        carried = best_pos - ideal as i64;
+
+        let base = step * hop_out;
+        for i in 0..frame {
+            out[base + i] += samples[(best_pos + i as i64) as usize] * window[i];
+            norm[base + i] += window[i];
+        }
+        step += 1;
+    }
+
+    let mut end = out_len;
+    while end > 0 && norm[end - 1] == 0.0 {
+        end -= 1;
+    }
+    // Divide out the accumulated window (unity for full-overlap Hann).
+    for i in 0..end {
+        if norm[i] > f32::EPSILON {
+            out[i] /= norm[i];
+        }
+    }
+    out.truncate(end);
+    out
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -2840,6 +2906,7 @@ fn apply_lowpass(samples: &[f32], cutoff: f32, sample_rate: u32) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_downloader;
 
     #[test]
     fn test_apply_volume() {
@@ -2892,6 +2959,69 @@ mod tests {
             "RMS of full-scale signal should be > 0.5, got {}",
             rms
         );
+    }
+
+    #[test]
+    fn test_time_stretch_speed_one_is_identity() {
+        let samples: Vec<f32> = (0..5000).map(|i| ((i as f32) * 0.01).sin()).collect();
+        let out = time_stretch(&samples, 1.0, 24000);
+        assert_eq!(out.len(), samples.len());
+    }
+
+    #[test]
+    fn test_time_stretch_scales_duration() {
+        let samples: Vec<f32> = (0..24000)
+            .map(|i| (2.0 * std::f32::consts::PI * 220.0 * i as f32 / 24000.0).sin())
+            .collect();
+        let fast = time_stretch(&samples, 1.25, 24000);
+        let slow = time_stretch(&samples, 0.8, 24000);
+        let expected_fast = samples.len() as f32 / 1.25;
+        let expected_slow = samples.len() as f32 / 0.8;
+        // WSOLA's overlap-add frames land within one frame of the target.
+        assert!(
+            (fast.len() as f32 - expected_fast).abs() < 1100.0,
+            "fast: {} vs {}",
+            fast.len(),
+            expected_fast
+        );
+        assert!(
+            (slow.len() as f32 - expected_slow).abs() < 1100.0,
+            "slow: {} vs {}",
+            slow.len(),
+            expected_slow
+        );
+        // Pitch survives: the dominant frequency stays ~220 Hz (autocorrelation peak).
+        for out in [&fast, &slow] {
+            let freq = dominant_frequency(out, 24000);
+            assert!(
+                (freq - 220.0).abs() < 12.0,
+                "pitch drifted: {freq} Hz"
+            );
+        }
+    }
+
+    #[test]
+    fn test_time_stretch_short_input_passes_through() {
+        let samples = vec![0.5f32; 100];
+        assert_eq!(time_stretch(&samples, 1.5, 24000).len(), 100);
+    }
+
+    /// Crude FFT-free pitch estimate: first big autocorrelation peak.
+    fn dominant_frequency(samples: &[f32], sample_rate: u32) -> f32 {
+        let lag_range = (sample_rate as usize / 400)..(sample_rate as usize / 80);
+        let mut best_lag = 1usize;
+        let mut best_score = 0.0f32;
+        for lag in lag_range {
+            let score: f32 = (0..samples.len() - lag)
+                .step_by(8)
+                .map(|i| samples[i] * samples[i + lag])
+                .sum();
+            if score > best_score {
+                best_score = score;
+                best_lag = lag;
+            }
+        }
+        sample_rate as f32 / best_lag as f32
     }
 
     #[test]
@@ -3783,9 +3913,10 @@ mod tests {
         let model_dir = std::env::var_os("TRAIN_ME_MODEL_DIR")
             .map(PathBuf::from)
             .unwrap_or_default();
-        if !model_downloader::is_model_downloaded(&model_dir) {
+        let checkpoint = std::env::var("TRAIN_ME_TTS_CHECKPOINT").unwrap_or_else(|_| "english".into());
+        if !model_downloader::is_model_downloaded(&model_dir, &checkpoint) {
             eprintln!(
-                "skipping: no TTS model at {} (set TRAIN_ME_MODEL_DIR)",
+                "skipping: no TTS checkpoint {checkpoint:?} under {} (set TRAIN_ME_MODEL_DIR)",
                 model_dir.display()
             );
             return;
@@ -3801,7 +3932,7 @@ mod tests {
         )
         .expect("write script");
 
-        let mut renderer = AudioRenderer::new(&model_dir).expect("load model");
+        let mut renderer = AudioRenderer::new(&model_dir, &checkpoint).expect("load model");
         renderer
             .render_manifest("main.xml", &agent, &tracks, None)
             .expect("render");
@@ -4221,9 +4352,10 @@ mod tests {
         let model_dir = std::env::var_os("TRAIN_ME_MODEL_DIR")
             .map(PathBuf::from)
             .unwrap_or_default();
-        if !model_downloader::is_model_downloaded(&model_dir) {
+        let checkpoint = std::env::var("TRAIN_ME_TTS_CHECKPOINT").unwrap_or_else(|_| "english".into());
+        if !model_downloader::is_model_downloaded(&model_dir, &checkpoint) {
             eprintln!(
-                "skipping: no TTS model at {} (set TRAIN_ME_MODEL_DIR)",
+                "skipping: no TTS checkpoint {checkpoint:?} under {} (set TRAIN_ME_MODEL_DIR)",
                 model_dir.display()
             );
             return;
@@ -4251,7 +4383,7 @@ mod tests {
 
         let (tracker, log) = recording_tracker();
 
-        let mut renderer = AudioRenderer::new(&model_dir).expect("load model");
+        let mut renderer = AudioRenderer::new(&model_dir, &checkpoint).expect("load model");
         renderer
             .render_manifest("main.xml", &agent, &tracks, Some(&tracker))
             .expect("render");

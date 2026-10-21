@@ -23,7 +23,9 @@ use crate::tag_parser::Node;
 /// v5: audio-only grammar. The interactive/visual segment variants
 /// (`until`/`choice`/`rating`/`react`/`cond`/`section`/`visual` and the
 /// beatmeter metadata) are gone, and `zone`/`mark` boundary nodes were added.
-pub const MANIFEST_VERSION: u32 = 5;
+/// Bumped to 6 for the pocket-tts engine swap: every track rendered by the
+/// previous engine is stale (different voices, sample rate, synthesis).
+pub const MANIFEST_VERSION: u32 = 6;
 
 // ============================================================================
 // Segment tree

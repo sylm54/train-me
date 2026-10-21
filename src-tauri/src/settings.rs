@@ -111,6 +111,9 @@ pub struct AudioSettings {
     pub auto_prerender: bool,
     /// Show the floating render-progress pill while rendering.
     pub show_render_pill: bool,
+    /// The active pocket-tts checkpoint (an embedded config id, e.g.
+    /// `"english"`). Swappable; the engine reloads when it changes.
+    pub tts_checkpoint: String,
 }
 
 impl Default for AudioSettings {
@@ -118,6 +121,7 @@ impl Default for AudioSettings {
         Self {
             auto_prerender: true,
             show_render_pill: true,
+            tts_checkpoint: "english".into(),
         }
     }
 }
@@ -199,7 +203,7 @@ impl AgentSettings {
     /// (`agent.ts`) reads `agents.main` unguarded. The optional `spawn`
     /// entry, when present, must be fully specified too — an empty model
     /// there would otherwise only fail later, at spawn time.
-    fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         match self.agents.get("main") {
             Some(cfg) if !cfg.provider.is_empty() && !cfg.model.is_empty() => {}
             Some(_) => return Err("agents.main needs a non-empty provider and model".into()),
@@ -265,6 +269,7 @@ mod tests {
         assert_eq!(s.agents["main"].model, "z-ai/glm-5.3-flash");
         assert_eq!(s.chat.compact_threshold_pct, 85);
         assert!(s.audio.auto_prerender);
+        assert_eq!(s.audio.tts_checkpoint, "english");
         assert!(!s.onboarded);
     }
 

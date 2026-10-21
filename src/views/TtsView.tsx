@@ -8,6 +8,11 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { audioUrlForPath } from "@/lib/audioUrl";
+import {
+  getModelStatus,
+  loadModel,
+  type ModelStatus,
+} from "@/lib/tts";
 import { Loader2, Play, Square, Trash2, Volume2 } from "lucide-react";
 
 interface TrackInfo {
@@ -19,12 +24,7 @@ interface TrackInfo {
   size_bytes: number;
 }
 
-interface ModelStatus {
-  downloaded: boolean;
-  loaded: boolean;
-  missing_files: string[];
-  speakers: string[];
-}
+
 
 const DEFAULT_SCRIPT = [
   '<voice speaker="male" pitch="1.0" volume="1.0" speed="1.0">',
@@ -46,7 +46,7 @@ export function TtsView() {
 
   const refreshModelStatus = useCallback(async () => {
     try {
-      const s = await invoke<ModelStatus>("get_model_status");
+      const s = await getModelStatus();
       setModelStatus(s);
     } catch (e) {
       console.error(e);
@@ -69,7 +69,7 @@ export function TtsView() {
 
   useEffect(() => {
     if (modelStatus?.downloaded && !modelStatus?.loaded) {
-      invoke("load_model")
+      loadModel()
         .then(refreshModelStatus)
         .catch((e) => console.error("Auto-load failed:", e));
     }
@@ -80,6 +80,7 @@ export function TtsView() {
     setError(null);
     try {
       await invoke("download_model");
+      await invoke("load_model");
       await refreshModelStatus();
     } catch (e) {
       setError(String(e));
@@ -156,7 +157,8 @@ export function TtsView() {
         <section className="border border-[var(--color-border)] rounded-lg p-4 bg-[var(--color-surface)] text-sm space-y-2">
           <div className="flex items-center gap-4">
             <span>
-              Model: {modelStatus?.downloaded ? "Downloaded" : "Not downloaded"}
+              {modelStatus?.checkpoint ?? "Model"}:{" "}
+              {modelStatus?.downloaded ? "Downloaded" : "Not downloaded"}
             </span>
             <span>Engine: {modelStatus?.loaded ? "Loaded" : "Not loaded"}</span>
           </div>

@@ -1,239 +1,394 @@
-//! Model downloader for Supertone/supertonic-3 from HuggingFace.
+//! The pocket-tts checkpoint catalog and its downloader.
 //!
-//! Downloads ONNX model files and voice style JSON files to the app data directory.
+//! Replaces the Supertone/supertonic-3 downloader. A "checkpoint" is what
+//! pocket-tts calls a language config: one YAML (embedded in the binary)
+//! pointing at a weights safetensors, a tokenizer, and per-voice state
+//! exports on the Hugging Face Hub. The user picks which one to download;
+//! files cache under `<model_dir>/pocket-tts/` (see `pocket_tts::download`)
+//! and the same cache serves the engine at load time.
+//!
+//! The voice-cloning weights are Hub-gated, so the catalog only ever
+//! downloads the public `without-voice-cloning` weights — the engine falls
+//! back to those anyway at load time.
 
-use anyhow::{Context, Result};
-use std::fs;
-use std::path::{Path, PathBuf};
+use crate::pocket_tts::{config, defaults, download};
+use anyhow::Result;
+use std::path::Path;
 
-const HF_REPO: &str = "Supertone/supertonic-3";
-const HF_BASE_URL: &str = "https://huggingface.co";
-
-/// Model files that must be downloaded from the `onnx/` directory.
-const MODEL_FILES: &[&str] = &[
-    "onnx/duration_predictor.onnx",
-    "onnx/text_encoder.onnx",
-    "onnx/vector_estimator.onnx",
-    "onnx/vocoder.onnx",
-    "onnx/tts.json",
-    "onnx/unicode_indexer.json",
-];
-
-/// Voice style JSON files from the `voice_styles/` directory.
-const VOICE_STYLE_FILES: &[&str] = &[
-    "voice_styles/M1.json",
-    "voice_styles/M2.json",
-    "voice_styles/M3.json",
-    "voice_styles/M4.json",
-    "voice_styles/M5.json",
-    "voice_styles/F1.json",
-    "voice_styles/F2.json",
-    "voice_styles/F3.json",
-    "voice_styles/F4.json",
-    "voice_styles/F5.json",
-];
-
-/// All files that need to be downloaded.
-fn all_download_files() -> Vec<&'static str> {
-    let mut files: Vec<&str> = MODEL_FILES.to_vec();
-    files.extend(VOICE_STYLE_FILES);
-    files
+/// One selectable checkpoint in the UI.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointInfo {
+    /// Config id (`"english"`, `"french_24l"`, …).
+    pub id: String,
+    /// Short human label (`"English"`).
+    pub label: String,
+    /// One-line description for the picker (size/speed/quality guidance).
+    pub description: String,
+    /// Rough download size of weights + tokenizer + the mapped voices.
+    pub approx_bytes: u64,
+    /// Needs the `tts-small-models` feature (SentencePiece tokenizer).
+    pub requires_sentencepiece: bool,
+    /// Whether everything this checkpoint needs is already cached.
+    pub downloaded: bool,
 }
 
-/// Check if the model is already downloaded (all required files exist).
-pub fn is_model_downloaded(model_dir: &Path) -> bool {
-    for file in MODEL_FILES {
-        let path = model_dir.join(file);
-        if !path.exists() {
-            return false;
-        }
-    }
-    // At least one voice style should exist
-    for file in VOICE_STYLE_FILES {
-        if model_dir.join(file).exists() {
-            return true;
-        }
-    }
-    false
-}
+/// Curated (id, label, description, weights-MB) for the English variants.
+/// Weight sizes are the Hub's `x-linked-size` of the public weights file.
+const CURATED: &[(&str, &str, &str, u64)] = &[
+    (
+        "english",
+        "English",
+        "The default Kyutai model. Best overall quality — the recommended pick.",
+        219,
+    ),
+    (
+        "english_18m_2026-10",
+        "English · small",
+        "Distilled 18M-parameter model. Roughly twice as fast, a bit flatter.",
+        112,
+    ),
+    (
+        "english_18m_refl_2026-10",
+        "English · small (reward-tuned)",
+        "The 18M model with reward fine-tuning.",
+        112,
+    ),
+    (
+        "english_7m_2026-10",
+        "English · tiny",
+        "Distilled 7M-parameter model. Fast on phones, thinner prosody.",
+        66,
+    ),
+    (
+        "english_7m_refl_2026-10",
+        "English · tiny (reward-tuned)",
+        "The 7M model with reward fine-tuning.",
+        66,
+    ),
+    (
+        "english_2m_2026-10",
+        "English · extra tiny",
+        "Smallest model (2M parameters). For low-end devices.",
+        47,
+    ),
+    (
+        "english_2m_refl_2026-10",
+        "English · extra tiny (reward-tuned)",
+        "The 2M model with reward fine-tuning.",
+        47,
+    ),
+    (
+        "english_drifting_26-09",
+        "English · drifting sampler",
+        "Same size as English; a different sampler head (experimental).",
+        219,
+    ),
+    (
+        "english_2026-04_24l",
+        "English · large preview (Apr)",
+        "24-layer preview model. Highest quality, ~6× the download and slower.",
+        1304,
+    ),
+    (
+        "english_2026-09_24l",
+        "English · large preview (Sep)",
+        "24-layer preview model. Highest quality, ~6× the download and slower.",
+        1304,
+    ),
+    (
+        "english_2026-10",
+        "English (Oct)",
+        "Archived English revision (same weights as the default).",
+        219,
+    ),
+    (
+        "english_2026-09_2",
+        "English (Sep, rev 2)",
+        "Archived English revision.",
+        219,
+    ),
+    (
+        "english_2026-09",
+        "English (Sep)",
+        "Archived English revision.",
+        219,
+    ),
+    (
+        "english_2026-04",
+        "English (Apr)",
+        "Archived English revision.",
+        219,
+    ),
+    (
+        "english_2026-01",
+        "English (Jan)",
+        "Archived English revision.",
+        219,
+    ),
+];
 
-/// Get the list of missing model files.
-pub fn missing_files(model_dir: &Path) -> Vec<String> {
-    all_download_files()
+/// Pretty names for the non-English base languages.
+const LANGUAGE_LABELS: &[(&str, &str)] = &[
+    ("french", "French"),
+    ("german", "German"),
+    ("spanish", "Spanish"),
+    ("italian", "Italian"),
+    ("portuguese", "Portuguese"),
+    ("dutch", "Dutch"),
+];
+
+/// Label + description + weights MB for an id, falling back to generic
+/// wording derived from the config name (24-layer ids are ~4× bigger).
+fn metadata_for(id: &str) -> (String, String, u64) {
+    if let Some((_, label, description, mb)) = CURATED.iter().find(|(key, ..)| *key == id) {
+        return (label.to_string(), description.to_string(), *mb);
+    }
+    let base = id.trim_end_matches("_24l");
+    let language = LANGUAGE_LABELS
         .iter()
-        .filter(|f| !model_dir.join(f).exists())
-        .map(|f| f.to_string())
+        .find(|(key, _)| *key == base)
+        .map(|(_, label)| label.to_string())
+        .unwrap_or_else(|| base.to_string());
+    if id.ends_with("_24l") {
+        (
+            format!("{language} · large preview"),
+            "24-layer model. Higher quality, much larger download and slower.".to_string(),
+            672,
+        )
+    } else {
+        (language, "Language checkpoint.".to_string(), 219)
+    }
+}
+
+/// Catalog order: recommended first, archived revisions and large previews
+/// after, other languages last (base before its 24-layer variant).
+pub fn catalog_order() -> Vec<String> {
+    let mut ids: Vec<String> = config::available_languages()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    fn rank(id: &str) -> u8 {
+        if id == "english" {
+            0
+        } else if id.starts_with("english_2m")
+            || id.starts_with("english_7m")
+            || id.starts_with("english_18m")
+        {
+            1
+        } else if id.starts_with("english_drifting") {
+            2
+        } else if id.starts_with("english_2026") && !id.contains("24l") {
+            3
+        } else if id.contains("24l") && id.starts_with("english") {
+            4
+        } else if id.contains("24l") {
+            6
+        } else {
+            5
+        }
+    }
+    ids.sort_by_cached_key(|id| rank(id));
+    ids
+}
+
+/// The catalog the UI renders. `model_dir` decides the `downloaded` flags.
+pub fn list_checkpoints(model_dir: &Path) -> Vec<CheckpointInfo> {
+    catalog_order()
+        .into_iter()
+        .map(|id| checkpoint_info(model_dir, &id))
         .collect()
 }
 
-/// Download the model from HuggingFace.
-///
-/// `on_progress` is called with (current_file_index, total_files, filename).
-pub fn download_model<F: Fn(usize, usize, &str)>(model_dir: &Path, on_progress: F) -> Result<()> {
-    let files = all_download_files();
-    let total = files.len();
-
-    fs::create_dir_all(model_dir).context("Failed to create model directory")?;
-
-    for (i, file) in files.iter().enumerate() {
-        on_progress(i, total, file);
-
-        let local_path = model_dir.join(file);
-
-        // Skip if already exists
-        if local_path.exists() {
-            continue;
-        }
-
-        // Create parent directories
-        if let Some(parent) = local_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let url = format!("{}/{}/resolve/main/{}", HF_BASE_URL, HF_REPO, file);
-
-        download_file(&url, &local_path).with_context(|| format!("Failed to download {}", file))?;
-    }
-
-    Ok(())
-}
-
-/// Download a single file with retry logic.
-fn download_file(url: &str, dest: &Path) -> Result<()> {
-    let max_retries = 3;
-    let mut last_error = None;
-
-    for attempt in 0..max_retries {
-        match try_download(url, dest) {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                last_error = Some(e);
-                if attempt < max_retries - 1 {
-                    std::thread::sleep(std::time::Duration::from_secs(2));
-                }
-            }
-        }
-    }
-
-    Err(last_error.unwrap())
-}
-
-fn try_download(url: &str, dest: &Path) -> Result<()> {
-    let response = reqwest::blocking::Client::new()
-        .get(url)
-        .timeout(std::time::Duration::from_secs(600)) // 10 minute timeout for large files
-        .send()
-        .context("Failed to send HTTP request")?;
-
-    if !response.status().is_success() {
-        anyhow::bail!("HTTP {} for {}", response.status(), url);
-    }
-
-    let bytes = response.bytes().context("Failed to read response body")?;
-
-    // Write to temp file first, then rename (atomic)
-    let tmp_path = dest.with_extension("tmp");
-    fs::write(&tmp_path, &bytes).context("Failed to write temp file")?;
-    fs::rename(&tmp_path, dest).context("Failed to rename temp file")?;
-
-    Ok(())
-}
-
-/// Get the available voice style names and their file paths.
-#[cfg(test)]
-pub fn list_voice_styles(model_dir: &Path) -> Vec<(String, PathBuf)> {
-    VOICE_STYLE_FILES
-        .iter()
-        .filter_map(|f| {
-            let path = model_dir.join(f);
-            if path.exists() {
-                let name = Path::new(f)
-                    .file_stem()
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string();
-                Some((name, path))
-            } else {
-                None
-            }
+/// Catalog info for one checkpoint.
+pub fn checkpoint_info(model_dir: &Path, id: &str) -> CheckpointInfo {
+    let (label, description, weights_mb) = metadata_for(id);
+    let requires_sentencepiece = config::Config::load(model_dir, Some(id), None)
+        .map(|(config, _)| {
+            // tokenizer references carry a "@revision" suffix.
+            config
+                .flow_lm
+                .lookup_table
+                .tokenizer_path
+                .split('@')
+                .next()
+                .unwrap_or("")
+                .ends_with(".model")
         })
-        .collect()
-}
-
-/// Map speaker name from TTS tags to voice style file name.
-/// Returns the style code (e.g., "M1", "F1").
-pub fn speaker_to_style(speaker: &str) -> Option<&'static str> {
-    match speaker {
-        "male" => Some("M1"),
-        "male2" => Some("M2"),
-        "male3" => Some("M3"),
-        "male4" => Some("M4"),
-        "male5" => Some("M5"),
-        "female" => Some("F1"),
-        "female2" => Some("F2"),
-        "female3" => Some("F3"),
-        "female4" => Some("F4"),
-        "female5" => Some("F5"),
-        _ => None,
+        .unwrap_or(false);
+    CheckpointInfo {
+        id: id.to_string(),
+        label,
+        description,
+        approx_bytes: (weights_mb + 70) * 1024 * 1024,
+        requires_sentencepiece,
+        downloaded: is_checkpoint_downloaded(model_dir, id),
     }
 }
 
-/// Get the voice style file path for a given speaker name.
-pub fn voice_style_path(model_dir: &Path, speaker: &str) -> Option<PathBuf> {
-    speaker_to_style(speaker).map(|style| model_dir.join(format!("voice_styles/{}.json", style)))
+/// Everything a checkpoint needs on disk: the public weights, the tokenizer,
+/// and the state export of every voice the speaker mapping uses.
+fn checkpoint_files(model_dir: &Path, id: &str) -> Result<Vec<String>> {
+    let (config, origin) = config::Config::load(model_dir, Some(id), None)?;
+    let mut files = Vec::new();
+    // The gated weights_path is deliberately absent: the engine falls back
+    // to the public weights, so only that one is ever downloaded.
+    if let Some(fallback) = config.weights_path_without_voice_cloning.as_deref() {
+        files.push(fallback.to_string());
+    } else if let Some(weights) = config.weights_path.as_deref() {
+        files.push(weights.to_string());
+    }
+    files.push(config.flow_lm.lookup_table.tokenizer_path.clone());
+    if let config::Origin::Language(language) = &origin {
+        let mut voices: Vec<&str> = crate::pocket_tts::available_speakers()
+            .iter()
+            .filter_map(|speaker| crate::pocket_tts::speaker_voice_for(speaker))
+            .collect();
+        voices.sort_unstable();
+        voices.dedup();
+        for voice in voices {
+            files.push(defaults::get_predefined_voice(language, voice));
+        }
+    }
+    Ok(files)
 }
 
-/// List all available speaker names.
-pub fn available_speakers() -> Vec<&'static str> {
-    vec![
-        "male", "male2", "male3", "male4", "male5", "female", "female2", "female3", "female4",
-        "female5",
-    ]
+/// Whether every file the checkpoint needs is cached.
+pub fn is_checkpoint_downloaded(model_dir: &Path, id: &str) -> bool {
+    match checkpoint_files(model_dir, id) {
+        Ok(files) => files.iter().all(|f| download::is_cached(model_dir, f)),
+        Err(_) => false,
+    }
+}
+
+/// Missing cached files, for the status readout.
+pub fn missing_files(model_dir: &Path, id: &str) -> Vec<String> {
+    match checkpoint_files(model_dir, id) {
+        Ok(files) => files
+            .into_iter()
+            .filter(|f| !download::is_cached(model_dir, f))
+            .map(|f| short_name(&f))
+            .collect(),
+        Err(e) => vec![format!("catalog error: {e:#}")],
+    }
+}
+
+/// Trim an hf:// reference to something readable in the UI.
+fn short_name(file: &str) -> String {
+    match file.strip_prefix("hf://") {
+        Some(rest) => rest.split('@').next().unwrap_or(rest).to_string(),
+        None => file.to_string(),
+    }
+}
+
+/// The active checkpoint's downloaded state (settings supply the id).
+pub fn is_model_downloaded(model_dir: &Path, checkpoint: &str) -> bool {
+    is_checkpoint_downloaded(model_dir, checkpoint)
+}
+
+/// Download everything a checkpoint needs, reporting per-file progress via
+/// `on_progress(current_file_index, total_files, name)`. Already-cached
+/// files are skipped (without advancing the callback — the caller's UI is
+/// computed from the missing set).
+pub fn download_checkpoint<F: FnMut(usize, usize, &str)>(
+    model_dir: &Path,
+    id: &str,
+    mut on_progress: F,
+) -> Result<()> {
+    let files = checkpoint_files(model_dir, id)?;
+    let missing: Vec<&String> = files
+        .iter()
+        .filter(|f| !download::is_cached(model_dir, f))
+        .collect();
+    let total = missing.len();
+    for (i, file) in missing.iter().enumerate() {
+        on_progress(i, total, &short_name(file));
+        download::ensure_downloaded(model_dir, file)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
-    #[test]
-    fn test_speaker_to_style() {
-        assert_eq!(speaker_to_style("male"), Some("M1"));
-        assert_eq!(speaker_to_style("female"), Some("F1"));
-        assert_eq!(speaker_to_style("male2"), Some("M2"));
-        assert_eq!(speaker_to_style("female5"), Some("F5"));
-        assert_eq!(speaker_to_style("unknown"), None);
+    fn tmp_model_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tm-checkpoint-test-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
-    fn test_available_speakers() {
-        let speakers = available_speakers();
-        assert!(speakers.contains(&"male"));
-        assert!(speakers.contains(&"female"));
-        assert_eq!(speakers.len(), 10);
+    fn catalog_lists_every_embedded_config_with_metadata() {
+        let dir = tmp_model_dir("catalog");
+        let catalog = list_checkpoints(&dir);
+        assert_eq!(catalog.len(), config::available_languages().len());
+        assert_eq!(catalog[0].id, "english");
+        let english = &catalog[0];
+        assert_eq!(english.label, "English");
+        assert!(english.approx_bytes > 200 * 1024 * 1024);
+        assert!(!english.downloaded);
+        assert!(!english.requires_sentencepiece);
+
+        let tiny = catalog
+            .iter()
+            .find(|c| c.id == "english_2m_2026-10")
+            .expect("tiny model in catalog");
+        assert!(tiny.approx_bytes < 150 * 1024 * 1024);
+        #[cfg(feature = "tts-small-models")]
+        assert!(tiny.requires_sentencepiece);
+
+        // Curated metadata covers every English variant; the rest get labels.
+        for entry in &catalog {
+            assert!(!entry.label.is_empty(), "{} has no label", entry.id);
+            assert!(!entry.description.is_empty(), "{} has no description", entry.id);
+            assert!(entry.approx_bytes > 0);
+        }
     }
 
     #[test]
-    fn test_all_download_files() {
-        let files = all_download_files();
-        assert!(files.contains(&"onnx/duration_predictor.onnx"));
-        assert!(files.contains(&"voice_styles/M1.json"));
-        assert_eq!(files.len(), 16);
+    fn checkpoint_files_cover_weights_tokenizer_and_voices() {
+        let dir = tmp_model_dir("files");
+        let files = checkpoint_files(&dir, "english").unwrap();
+        // 1 weights + 1 tokenizer + 10 voice exports (the mapping is 1:1).
+        assert_eq!(files.len(), 12, "{files:?}");
+        assert!(files.iter().all(|f| f.contains("without-voice-cloning")));
+        // The gated weights are never in the download set.
+        assert!(!files
+            .iter()
+            .any(|f| f.starts_with("hf://kyutai/pocket-tts/")));
     }
 
     #[test]
-    fn test_voice_style_path() {
-        let dir = Path::new("/tmp/model");
-        assert_eq!(
-            voice_style_path(&dir, "male"),
-            Some(dir.join("voice_styles/M1.json"))
-        );
-        assert_eq!(voice_style_path(&dir, "unknown"), None);
+    fn missing_files_is_empty_when_downloaded() {
+        let dir = tmp_model_dir("missing");
+        let id = "english";
+        assert!(!missing_files(&dir, id).is_empty());
+        for file in checkpoint_files(&dir, id).unwrap() {
+            download::install_stub(&dir, &file);
+        }
+        let missing = missing_files(&dir, id);
+        assert!(missing.is_empty(), "still missing: {missing:?}");
+        assert!(is_model_downloaded(&dir, id));
     }
 
     #[test]
-    fn test_list_voice_styles_empty() {
-        let dir = Path::new("/nonexistent");
-        let styles = list_voice_styles(dir);
-        assert!(styles.is_empty());
+    fn curated_order_puts_english_first_and_previews_last() {
+        let ids = catalog_order();
+        assert_eq!(ids[0], "english");
+        let previews: Vec<usize> = ids
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| id.contains("24l") && id.starts_with("english"))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(previews.iter().all(|i| *i >= ids.len() / 2));
     }
 }

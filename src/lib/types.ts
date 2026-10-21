@@ -105,12 +105,19 @@ export interface AudioSettings {
    * background.
    */
   showRenderPill: boolean;
+  /**
+   * The active pocket-tts speech checkpoint (an id from the embedded
+   * catalog, e.g. "english"). Swappable from Settings and during
+   * onboarding; changing it reloads the engine and re-renders scripts.
+   */
+  ttsCheckpoint: string;
 }
 
 /** Default audio rendering settings. */
 export const DEFAULT_AUDIO_SETTINGS: AudioSettings = {
   autoPrerender: true,
   showRenderPill: true,
+  ttsCheckpoint: "english",
 };
 
 /** Complete settings persisted to `<app data dir>/settings.json` (via the
