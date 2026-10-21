@@ -96,6 +96,7 @@ import { useRenderStore } from "@/lib/renderRegistry";
 import { resolveTaskInstance, type SessionRequest } from "@/lib/v2";
 import {
   chatEmbedComponents,
+  chatEmbedRehypePlugins,
   EmbedActionsProvider,
 } from "@/components/ChatEmbeds";
 import { AudioPlayerOverlay } from "@/components/AudioPlayerOverlay";
@@ -2001,6 +2002,7 @@ function ActivityParts({ message }: { message: UIMessage }) {
           key={`text-${message.id}-${i}`}
           linkSafety={{ enabled: false }}
           components={chatEmbedComponents}
+          rehypePlugins={chatEmbedRehypePlugins}
         >
           {part.text}
         </MessageResponse>,

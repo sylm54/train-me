@@ -7,12 +7,28 @@
  *   ![Deepening](hypnos/deepening.xml)   → playable audio-script card
  *   ![task](tasks/dishes.js)             → task card (Start = Today's Start)
  *
- * `MessageResponse` (Streamdown) renders assistant text, and Streamdown
- * accepts react-markdown-style `components` overrides — the exported
- * {@link chatEmbedComponents} swaps the `img` element for these cards.
+ * `MessageResponse` (Streamdown) renders assistant text. Embeds need two
+ * hooks into it:
+ *
+ *  1. `components` — the exported {@link chatEmbedComponents} renders the
+ *     `chat-embed` element (and any plain `img` as fallback) as a card.
+ *  2. `rehypePlugins` — the exported {@link chatEmbedRehypePlugins} replaces
+ *     Streamdown's internal rehype chain with a mirror of it plus one extra
+ *     step: Streamdown runs `rehype-harden` over every image, and harden's
+ *     URL policy has no notion of sandbox-relative paths — a bare
+ *     `![alt](hypnos/deepening.xml)` parses as neither absolute nor
+ *     `./`-relative, so harden replaces the image with a literal
+ *     "[Image blocked: alt]" span before any `components` override runs.
+ *     Our extractor therefore renames embed-eligible images to a
+ *     `chat-embed` element BEFORE harden runs; harden (which only inspects
+ *     `img` and `a`) leaves it alone and the card component picks it up.
+ *     The rest of the chain mirrors Streamdown 2.5's internals
+ *     (raw → sanitize → harden with its exact default config) so ordinary
+ *     markdown keeps its existing behaviour.
+ *
  * Detection is by file extension for audio (`.xml`) and by extension or the
- * literal `task` alt marker for tasks; anything unrecognised still renders
- * as a plain `<img>`.
+ * literal `task` alt marker for tasks; anything unrecognised stays a plain
+ * (hardened) `<img>`.
  *
  * Audio cards resolve through the same pipeline as the Today view:
  * `manifest_status` tells rendered/stale, a Render button runs
@@ -34,6 +50,12 @@ import {
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { AudioLines, ClipboardList, Loader2, Play, RefreshCw } from "lucide-react";
+import rehypeRaw from "rehype-raw";
+import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
+import { harden } from "rehype-harden";
+import { visit } from "unist-util-visit";
+import type { PluggableList } from "unified";
+import type { Element, Root } from "hast";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -66,7 +88,10 @@ const MARKER_ALTS = new Set(["audio", "script", "tts", "task"]);
 /** Resolve an `![alt](href)` into an embed, or null for a plain image. */
 function resolveEmbed(href: string, alt: string): Embed | null {
   let h = href.trim();
+  // The backend resolves embed paths relative to the agent sandbox root, so
+  // tolerate `./` and a single leading `/` (but never `//`, a protocol-relative URL).
   if (h.startsWith("./")) h = h.slice(2);
+  else if (h.startsWith("/") && !h.startsWith("//")) h = h.slice(1);
   // Split off a fragment/query defensively — sandbox paths carry neither.
   const cut = h.search(/[?#]/);
   if (cut !== -1) h = h.slice(0, cut);
@@ -125,15 +150,72 @@ function useEmbedActions(): EmbedActions {
 
 // ── Streamdown img override ────────────────────────────────────────────────
 
+/** Tag the extractor renames embed images to (see the header comment). */
+const EMBED_TAG = "chat-embed";
+
 /**
  * Module-scope so its identity is stable — `MessageResponse` is memoized
  * and `useChat` re-renders on every stream chunk.
  */
 export const chatEmbedComponents = {
   img: EmbedImg,
+  [EMBED_TAG]: EmbedImg,
 };
 
-/** The `img` element override Streamdown calls for every markdown image. */
+/**
+ * Rehype plugin that lifts embed images out of rehype-harden's way by
+ * renaming them to {@link EMBED_TAG} before harden runs. The predicate is
+ * `resolveEmbed` itself, so exactly the images the cards would render get
+ * extracted and everything else keeps the default hardened-img treatment.
+ */
+function rehypeExtractEmbeds() {
+  return (tree: Root) => {
+    visit(tree, "element", (node: Element) => {
+      if (node.tagName !== "img") return;
+      const src = String(node.properties.src ?? "");
+      const alt = String(node.properties.alt ?? "");
+      if (resolveEmbed(src, alt)) node.tagName = EMBED_TAG;
+    });
+  };
+}
+
+/**
+ * Replacement for Streamdown's internal rehype chain — its exact 2.5 chain
+ * (raw → sanitize → harden, with harden's default config) plus the embed
+ * extractor between sanitize and harden. Streamdown's `rehypePlugins` prop
+ * REPLACES its defaults rather than appending, so the mirror must be kept
+ * faithful: if a future Streamdown changes its sanitize schema or harden
+ * config, this needs the same update.
+ */
+export const chatEmbedRehypePlugins: PluggableList = [
+  rehypeRaw,
+  [
+    rehypeSanitize,
+    {
+      ...defaultSchema,
+      protocols: {
+        ...defaultSchema.protocols,
+        href: [...(defaultSchema.protocols?.href ?? []), "tel"],
+      },
+      attributes: {
+        ...defaultSchema.attributes,
+        code: [...(defaultSchema.attributes?.code ?? []), "metastring"],
+      },
+    },
+  ],
+  rehypeExtractEmbeds,
+  [
+    harden,
+    {
+      allowedImagePrefixes: ["*"],
+      allowedLinkPrefixes: ["*"],
+      allowedProtocols: ["*"],
+      allowDataImages: true,
+    },
+  ],
+];
+
+/** The `img`/`chat-embed` element override the markdown renderer calls. */
 function EmbedImg({
   node: _node,
   alt = "",
