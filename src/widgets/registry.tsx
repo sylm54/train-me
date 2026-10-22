@@ -27,6 +27,7 @@ import { LockWidget, validateLockProps } from "@/widgets/lock";
 import { MediaWidget, validateMediaProps } from "@/widgets/media";
 import { SliderWidget, validateSliderProps } from "@/widgets/slider";
 import { TextWidget, validateTextProps } from "@/widgets/text";
+import { TierlistWidget, validateTierlistProps } from "@/widgets/tierlist";
 import { TimerWidget, validateTimerProps } from "@/widgets/timer";
 import { VoiceWidget, validateVoiceProps } from "@/widgets/voice";
 
@@ -276,6 +277,12 @@ defineWidget("input", {
   component: InputWidget,
   validate: validateInputProps,
   initialState: () => ({ text: "" }),
+});
+
+defineWidget("tierlist", {
+  component: TierlistWidget,
+  validate: validateTierlistProps,
+  initialState: () => ({ placement: {} }),
 });
 
 defineWidget("timer", {

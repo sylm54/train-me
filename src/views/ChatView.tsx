@@ -31,13 +31,14 @@
  * the UI or disk. (See `lib/compaction.ts`.)
  *
  * Design: the UI shows *progress*, not internals. Tool calls render as
- * compact one-liners (e.g. "Edited file · path/foo.ts"); reasoning just
- * shows a "Thinking…" label; only the latest tool call / thinking step
- * in a message is shown, with earlier steps collapsed behind a toggle.
- * Exact inputs/outputs are mirrored to the browser console by the agent
- * runtime. A status bar surfaces the context meter, a session cache-hit
- * rate, the money spent so far (OpenRouter), and high-level subagent
- * activity (Planning / Validating files).
+ * compact inline cards at the position the agent called them, batching
+ * consecutive calls into one cursory line ("Read 4 files · Wrote 3 files ·
+ * Checked files"); `ask_question` keeps a full Q&A card (it's conversation)
+ * and `spawn_agent` gets its own live subagent card. Reasoning shows only
+ * while it's the live phase, never after. Exact inputs/outputs are mirrored
+ * to the browser console by the agent runtime. A status bar surfaces the
+ * context meter, a session cache-hit rate, the money spent so far
+ * (OpenRouter), and high-level subagent activity.
  *
  * Stream liveness: the running indicator differentiates "waiting for the
  * model" (request sent, no token yet), "thinking" (reasoning streaming),
@@ -81,7 +82,6 @@ import {
   RotateCcw,
   ScrollText,
   Trash2,
-  Wrench,
   Zap,
   Check,
   X,
@@ -94,6 +94,8 @@ import type { AgentSettings } from "@/lib/types";
 import { useAgentEvents, useSessionUsage, type AgentEvent } from "@/lib/agent-events";
 import { useRenderStore } from "@/lib/renderRegistry";
 import { resolveTaskInstance, type SessionRequest } from "@/lib/v2";
+import { TierlistEditor } from "@/components/TierlistEditor";
+import type { TierlistPlacement } from "@/lib/onboarding";
 import {
   chatEmbedComponents,
   chatEmbedRehypePlugins,
@@ -141,11 +143,6 @@ import {
   MessageContent,
   MessageResponse,
 } from "@/components/ai-elements/message";
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from "@/components/ui/collapsible";
 import {
   Dialog,
   DialogContent,
@@ -677,22 +674,26 @@ function ChatViewInner({
           {messages.map((message: UIMessage) => (
             <Message key={message.id} from={message.role}>
               <MessageContent>
-                <ActivityParts message={message} />
+                <ActivityParts
+                  message={message}
+                  subagentFrames={subagentStack}
+                  subagentToolHistory={toolHistory}
+                  now={now}
+                />
               </MessageContent>
             </Message>
           ))}
 
-          {/* Persistent "agent is running" indicator with subagent
-              hierarchy. Shows the running spawned copy with elapsed time. The
-              ticking seconds prove the system is alive even during long
-              generations; the stream phase (connecting / thinking /
-              streaming) plus the token heartbeat flag a stuck stream. */}
+          {/* Persistent "agent is running" indicator. Live subagent progress
+              renders on the subagent cards in the transcript; this row shows
+              the main stream's phase (connecting / thinking / streaming) plus
+              a stall warning, and a quiet alive-spinner while a delegation
+              blocks the main loop. */}
           {isGenerating && (
             <SubagentProgressIndicator
               stack={subagentStack}
               phase={streamPhase}
               now={now}
-              toolHistory={toolHistory}
               msSinceActivity={now - lastStreamActivityRef.current}
               startedAt={generationStartedAtRef.current}
             />
@@ -1798,31 +1799,29 @@ function StreamPhaseRow({
 }
 
 /**
- * Progress indicator showing the active subagent delegations plus an
- * expandable tool-call history for the working agent(s).
+ * Conversation-area progress row. Live subagent progress now renders on the
+ * subagent cards inline in the transcript (at each `spawn_agent` call's
+ * position, see `SubagentCard`) — this row only covers the MAIN stream's
+ * phase: connecting / thinking / streaming, with a stall warning.
  *
- * Several copies can run in PARALLEL (multiple `spawn_agent` calls in one
- * turn): same-depth frames are siblings and render flush at the same indent,
- * each with its own spinner. Only a frame with something nested UNDER it
- * (a deeper depth still running) renders as a dim, waiting parent.
+ * While a delegation runs the main loop is blocked inside the tool call, so
+ * no stream chunks arrive; the stall warning would be a false alarm there.
+ * Instead the row degrades to a quiet "delegated, still alive" spinner —
+ * the details live on the card.
  */
 function SubagentProgressIndicator({
   stack,
   phase,
   now,
-  toolHistory,
   msSinceActivity,
   startedAt,
 }: {
   stack: ActiveSubagent[];
   phase: StreamPhase;
   now: number;
-  toolHistory: ToolHistoryEntry[];
   msSinceActivity: number;
   startedAt: number;
 }) {
-  // No subagent active — show the main-agent stream phase indicator
-  // (connecting / thinking / streaming, with a stall warning).
   if (stack.length === 0) {
     return (
       <StreamPhaseRow
@@ -1834,170 +1833,65 @@ function SubagentProgressIndicator({
     );
   }
 
-  // A frame is WORKING when nothing deeper is running under it (with the
-  // depth-1 cap today, every parallel copy is a working leaf).
-  const deepest = Math.max(...stack.map((s) => s.depth));
-  const isWorking = (sa: ActiveSubagent) => sa.depth === deepest;
-
-  // Tool history for the working agents — a waiting parent's past calls
-  // aren't useful while a child runs.
-  const workingIds = new Set(
-    stack.filter(isWorking).map((s) => s.runId),
-  );
-  const workingDepths = new Set(
-    stack.filter(isWorking).map((s) => s.depth),
-  );
-  const relevantHistory = toolHistory.filter(
-    (h) => workingIds.has(h.runId) || (!h.runId && workingDepths.has(h.depth)),
-  );
-
+  const active = stack[stack.length - 1];
   return (
-    <div className="flex flex-col gap-0.5 pl-1 py-1">
-      {stack.map((sa) => {
-        const working = isWorking(sa);
-        const elapsed = Math.max(0, Math.round((now - sa.startedAt) / 1000));
-
-        return (
-          <div
-            key={sa.runId}
-            className={`flex items-center gap-1.5 text-xs ${
-              working
-                ? "text-[var(--color-foreground)]"
-                : "text-[var(--color-muted-foreground)]"
-            }`}
-            // Indent by nesting level so a delegation chain reads as a
-            // hierarchy; parallel siblings (same depth) stay aligned.
-            style={{ marginLeft: (sa.depth - 1) * 14 }}
-          >
-            {/* Color dot */}
-            <span
-              className="size-1.5 rounded-full shrink-0"
-              style={{ background: SUBAGENT_COLOR[sa.agent] }}
-            />
-            {/* Spinner (working) or dim dot (nested-under / waiting) */}
-            {working ? (
-              <Loader2
-                size={12}
-                className="shrink-0 animate-spin"
-                style={{ color: SUBAGENT_COLOR[sa.agent] }}
-              />
-            ) : (
-              <span className="size-3 shrink-0 flex items-center justify-center">
-                <span className="size-1 rounded-full bg-current opacity-30" />
-              </span>
-            )}
-            <span className="capitalize font-medium">{sa.agent}</span>
-            {/* Show the recursion depth only when actually nested, so the
-                common single-level case looks exactly as before. */}
-            {sa.depth > 1 && (
-              <span className="opacity-50 shrink-0">L{sa.depth}</span>
-            )}
-            {/* What this copy is for (the spawn_agent `label`) — stays put
-                while sa.label tracks the current step. */}
-            {sa.task && (
-              <>
-                <span className="opacity-40">·</span>
-                <span
-                  className={`truncate max-w-[16rem] ${
-                    working ? "" : "opacity-70"
-                  }`}
-                  title={sa.task}
-                >
-                  {sa.task}
-                </span>
-              </>
-            )}
-            <span className="opacity-40">·</span>
-            <span className={working ? "" : "opacity-70"}>{sa.label}</span>
-            {working && sa.attempt && sa.attempt > 1 && (
-              <span className="opacity-60 shrink-0">· attempt {sa.attempt}</span>
-            )}
-            {/* Elapsed time + pulse on each working agent */}
-            {working && (
-              <span className="tabular-nums opacity-50 animate-[pulse-subtle_2s_ease-in-out_infinite]">
-                {formatElapsed(elapsed)}
-              </span>
-            )}
-          </div>
-        );
-      })}
-
-      {/* Expandable tool-call history for the working subagent(s). */}
-      {relevantHistory.length > 0 && (
-        <ToolHistoryList entries={relevantHistory} />
+    <div className="flex items-center gap-2 text-xs text-[var(--color-muted-foreground)] pl-1">
+      <Loader2
+        size={13}
+        className="shrink-0 animate-spin"
+        style={{ color: SUBAGENT_COLOR[active.agent] }}
+      />
+      <span>Subagent working — {active.label}</span>
+      {stack.length > 1 && (
+        <span className="opacity-50 shrink-0">×{stack.length}</span>
       )}
     </div>
   );
 }
 
-/** Collapsible list of a subagent's completed tool calls. */
-function ToolHistoryList({ entries }: { entries: ToolHistoryEntry[] }) {
-  // Show the most recent few first (newest at top) and cap the rendering to
-  // avoid an unbounded list during very long spawned-copy runs.
-  const recent = [...entries].reverse().slice(0, 20);
-  return (
-    <Collapsible className="ml-4 mt-0.5">
-      <CollapsibleTrigger className="flex items-center gap-1 text-[11px] text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)] transition-colors group/collapsible">
-        <ChevronDown
-          size={11}
-          className="transition-transform group-data-[state=open]/collapsible:rotate-90"
-        />
-        {entries.length} tool {entries.length === 1 ? "call" : "calls"}
-      </CollapsibleTrigger>
-      <CollapsibleContent className="mt-0.5 flex flex-col gap-0.5 border-l border-[var(--color-border)] pl-2">
-        {recent.map((e, i) => (
-          <div
-            key={`${e.ts}-${i}`}
-            className="flex items-center gap-1.5 text-[11px] text-[var(--color-muted-foreground)]"
-          >
-            {e.ok ? (
-              <Check size={11} className="text-[var(--color-success)] shrink-0" />
-            ) : (
-              <X size={11} className="text-[var(--color-danger)] shrink-0" />
-            )}
-            <span className="shrink-0">{e.label}</span>
-            {e.detail && (
-              <span className="font-mono opacity-70 truncate max-w-[220px]">
-                {e.detail}
-              </span>
-            )}
-            {e.attempt && e.attempt > 1 && (
-              <span className="opacity-60 shrink-0">· {e.attempt}</span>
-            )}
-          </div>
-        ))}
-      </CollapsibleContent>
-    </Collapsible>
-  );
-}
-
-// ── Per-message rendering: tools + thinking, collapsed except latest ──
+// ── Per-message rendering: inline cards, no collapsible ───────────────
 
 /**
- * Render the "activity" parts of a message (reasoning + tool calls).
- *
- * Only the *latest* activity part is shown; everything earlier is folded
- * behind a "N earlier steps" toggle (collapsed by default). Tool calls
- * render as compact one-liners — just a friendly verb + the affected path
- * where relevant. Reasoning renders as a bare "Thinking…" label with no
- * content. Text parts render inline as the message body.
- *
- * `ask_question` exchanges are the exception: they're conversation, not
- * internals — the user typed a real answer — so they render as full Q&A
- * cards inline at the point the agent asked, never collapsed.
+ * Render the parts of a message in place: text streams as markdown, and
+ * every tool call renders as a compact card at the position the agent called
+ * it — never collapsed to a bottom expandable. Consecutive tool calls batch
+ * into ONE cursory card ("Read 4 files · Wrote 3 files · Checked files");
+ * `ask_question` keeps its full Q&A card (it's conversation, not internals)
+ * and `spawn_agent` gets its own live subagent card. Reasoning renders
+ * nothing once finished — live thinking shows in the progress row.
  */
-function ActivityParts({ message }: { message: UIMessage }) {
+function ActivityParts({
+  message,
+  subagentFrames,
+  subagentToolHistory,
+  now,
+}: {
+  message: UIMessage;
+  subagentFrames: ActiveSubagent[];
+  subagentToolHistory: ToolHistoryEntry[];
+  now: number;
+}) {
   const parts = message.parts;
   if (!parts || parts.length === 0) return null;
 
-  // Split into the non-activity (text + question cards) children and the
-  // activity parts.
-  const textChildren: React.ReactNode[] = [];
-  const activity: { index: number; part: UIMessage["parts"][number] }[] = [];
+  const children: React.ReactNode[] = [];
+  // The run of plain tool parts currently being batched (a card is flushed
+  // whenever a non-batchable part — text, question, spawn — arrives).
+  let batch: UIMessage["parts"] = [];
+
+  const flushBatch = () => {
+    if (batch.length === 0) return;
+    const batched = batch;
+    batch = [];
+    children.push(
+      <ToolBatchCard key={`tools-${message.id}-${children.length}`} parts={batched} />,
+    );
+  };
 
   parts.forEach((part, i) => {
     if (part.type === "text") {
-      textChildren.push(
+      flushBatch();
+      children.push(
         <MessageResponse
           key={`text-${message.id}-${i}`}
           linkSafety={{ enabled: false }}
@@ -2010,119 +1904,152 @@ function ActivityParts({ message }: { message: UIMessage }) {
     } else if (part.type === "tool-ask_question") {
       // Interleave with the text so the card sits where the agent asked —
       // the reply that follows then reads as a reaction to the answer.
-      textChildren.push(
+      flushBatch();
+      children.push(
         <AskedQuestionCard key={`qa-${message.id}-${i}`} part={part} />,
       );
+    } else if (part.type === "tool-spawn_agent") {
+      flushBatch();
+      children.push(
+        <SubagentCard
+          key={`subagent-${message.id}-${i}`}
+          part={part}
+          frames={subagentFrames}
+          toolHistory={subagentToolHistory}
+          now={now}
+        />,
+      );
     } else if (part.type === "reasoning") {
-      // Skip empty, non-streaming reasoning shells — the SDK can emit
-      // stubs that would just add noise. Live or content-bearing ones
-      // are kept so the user sees "Thinking…".
-      const text = (part as { text?: string }).text ?? "";
-      const state = (part as { state?: string }).state;
-      const isActive = state === "streaming" || text.length > 0;
-      if (isActive) activity.push({ index: i, part });
+      // Reasoning renders nothing — finished thinking is noise, and live
+      // thinking shows in the progress row. It also never breaks a tool
+      // batch (thinking between calls stays part of the same run).
     } else if (part.type.startsWith("tool-")) {
-      activity.push({ index: i, part });
+      batch.push(part);
     }
   });
+  flushBatch();
 
+  return <>{children}</>;
+}
+
+/** Shared card chrome for the inline tool cards: compact, cursorily informative. */
+function ToolCard({
+  status,
+  children,
+}: {
+  status: "running" | "done" | "error" | "idle";
+  children: React.ReactNode;
+}) {
   return (
-    <>
-      {/* The answer text comes first; all tool/thinking activity is
-          collapsed to the bottom of the message (earlier steps behind a
-          toggle, the latest step shown directly beneath it). */}
-      {textChildren}
-      {activity.length > 0 && (
-        <Collapsible>
-          <CollapsibleTrigger className="flex items-center gap-1 text-[11px] text-[var(--color-muted-foreground)] hover:text-[var(--color-foreground)] transition-colors group/collapsible">
-            <ChevronDown
-              size={11}
-              className="transition-transform group-data-[state=open]/collapsible:rotate-90"
-            />
-            {activity.length} {activity.length === 1 ? "step" : "steps"}
-          </CollapsibleTrigger>
-          <CollapsibleContent className="mt-1 flex flex-col gap-1 border-l border-[var(--color-border)] pl-2">
-            {activity.map(({ index, part }) => (
-              <ActivityRow key={`activity-${message.id}-${index}`} part={part} />
-            ))}
-          </CollapsibleContent>
-        </Collapsible>
+    <div className="my-0.5 flex max-w-full items-center gap-2 self-start rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2 shadow-sm">
+      {status === "running" ? (
+        <Loader2
+          size={13}
+          className="shrink-0 animate-spin text-[var(--color-pink-500)]"
+        />
+      ) : status === "error" ? (
+        <X size={13} className="shrink-0 text-[var(--color-danger)]" />
+      ) : status === "done" ? (
+        <Check size={13} className="shrink-0 text-[var(--color-success)]" />
+      ) : (
+        <Loader2 size={13} className="shrink-0 text-[var(--color-muted-foreground)]" />
       )}
-    </>
+      <span className="flex min-w-0 items-center gap-2 text-xs text-[var(--color-muted-foreground)]">
+        {children}
+      </span>
+    </div>
   );
 }
 
 /**
- * One compact activity line. `prominent` highlights the current step
- * (slightly heavier weight + the live spinner while running).
+ * One batched card for a run of consecutive tool calls: a single line of
+ * counts per kind of work ("Read 4 files · Wrote 3 files · Checked files").
+ * A single call keeps its one-line detail (path / collapsed command).
  */
-function ActivityRow({
-  part,
-  prominent,
-}: {
-  part: UIMessage["parts"][number];
-  prominent?: boolean;
-}) {
-  if (part.type === "reasoning") {
-    // Per spec: never show thinking content, just the label. We still
-    // render it so the user sees the model is thinking.
-    const streaming =
-      "state" in part &&
-      typeof part.state === "string" &&
-      part.state === "streaming";
-    return (
-      <div
-        className={`flex items-center gap-1.5 text-xs text-[var(--color-muted-foreground)] ${
-          prominent ? "" : "opacity-70"
-        }`}
-      >
-        {streaming || prominent ? (
-          <Loader2 size={12} className="animate-spin" />
-        ) : (
-          <Brain size={12} />
-        )}
-        <span>Thinking…</span>
-      </div>
-    );
-  }
+function ToolBatchCard({ parts }: { parts: UIMessage["parts"] }) {
+  // Aggregate status: running wins over error wins over done, so a batch
+  // that's still executing shows the spinner even if an earlier call failed.
+  const statuses = parts.map(getToolStatus);
+  const status = statuses.includes("running")
+    ? "running"
+    : statuses.includes("error")
+      ? "error"
+      : "done";
 
-  if (part.type.startsWith("tool-")) {
-    const summary = summarizeToolPart(part);
-    const status = getToolStatus(part);
-    return (
-      <div
-        className={`flex items-center gap-1.5 text-xs ${
-          prominent
-            ? "text-[var(--color-foreground)]"
-            : "text-[var(--color-muted-foreground)]"
-        }`}
-      >
-        {status === "running" ? (
-          <Loader2
-            size={12}
-            className="animate-spin text-[var(--color-pink-500)]"
-          />
-        ) : status === "error" ? (
-          <X size={12} className="text-[var(--color-danger)]" />
-        ) : status === "done" ? (
-          <Check size={12} className="text-[var(--color-success)]" />
-        ) : (
-          <Wrench size={12} />
-        )}
-        <span>{summary.label}</span>
+  let body: React.ReactNode;
+  if (parts.length === 1) {
+    const summary = summarizeToolPart(parts[0]);
+    body = (
+      <>
+        <span className="shrink-0">{summary.label}</span>
         {summary.detail && (
           <span className="font-mono opacity-70 truncate max-w-[260px]">
             {summary.detail}
           </span>
         )}
-      </div>
+      </>
     );
+  } else {
+    body = <span>{summarizeToolBatch(parts).join(" · ")}</span>;
   }
 
-  return null;
+  return <ToolCard status={status}>{body}</ToolCard>;
 }
 
-/** Friendly verb + path/command summary for a tool part. */
+/**
+ * Category a tool call counts under in a batch summary. Batchable tools
+ * return a stable key + a count-aware label; tools that render their own
+ * card (`ask_question`, `spawn_agent`) never reach here.
+ */
+function toolCategory(name: string): {
+  key: string;
+  label: (n: number) => string;
+} {
+  switch (name) {
+    case "read_file":
+      return { key: "read", label: (n) => `Read ${n} file${n === 1 ? "" : "s"}` };
+    case "write_file":
+    case "edit_file":
+      return { key: "wrote", label: (n) => `Wrote ${n} file${n === 1 ? "" : "s"}` };
+    case "list_files":
+      return {
+        key: "checked",
+        label: (n) => (n === 1 ? "Checked files" : `Checked files ×${n}`),
+      };
+    case "validate_files":
+      return {
+        key: "validated",
+        label: (n) => (n === 1 ? "Validated files" : `Validated files ×${n}`),
+      };
+    case "bash":
+      return {
+        key: "ran",
+        label: (n) => `Ran ${n} command${n === 1 ? "" : "s"}`,
+      };
+    default:
+      return {
+        key: name,
+        label: (n) => (n === 1 ? name : `${name} ×${n}`),
+      };
+  }
+}
+
+/** Counts per kind of work across a batch, in first-appearance order. */
+function summarizeToolBatch(parts: UIMessage["parts"]): string[] {
+  const counts = new Map<string, { label: (n: number) => string; n: number }>();
+  for (const part of parts) {
+    const name = part.type.startsWith("tool-")
+      ? part.type.slice("tool-".length)
+      : ((part as { toolName?: string }).toolName ?? "tool");
+    const category = toolCategory(name);
+    const entry = counts.get(category.key);
+    if (entry) entry.n += 1;
+    else counts.set(category.key, { label: category.label, n: 1 });
+  }
+  return [...counts.values()].map(({ label, n }) => label(n));
+}
+
+/** Friendly verb + path/command summary for a single tool part. */
 function summarizeToolPart(part: UIMessage["parts"][number]): {
   label: string;
   detail?: string;
@@ -2142,7 +2069,7 @@ function summarizeToolPart(part: UIMessage["parts"][number]): {
     case "read_file":
       return { label: "Read file", detail: path };
     case "list_files":
-      return { label: "Listed files", detail: path ?? "." };
+      return { label: "Checked files", detail: path ?? "." };
     case "bash": {
       // Surface the command (collapsed to one line, capped) so the user can
       // see what ran without expanding internals.
@@ -2153,13 +2080,6 @@ function summarizeToolPart(part: UIMessage["parts"][number]): {
       const detail =
         cmd && cmd.length > 60 ? cmd.slice(0, 60) + "…" : cmd;
       return { label: "Ran command", detail };
-    }
-    case "spawn_agent": {
-      const label =
-        typeof input.label === "string" && input.label.trim()
-          ? input.label.trim()
-          : undefined;
-      return { label: "Delegating", detail: label };
     }
     default:
       return { label: name };
@@ -2186,6 +2106,87 @@ function getToolStatus(
   }
 }
 
+/**
+ * The card for a `spawn_agent` call, rendered at the position of the call.
+ * While the delegation runs it shows live cursory progress from the
+ * subagent event stream (current step, elapsed time, tool-call count);
+ * once the tool part settles it collapses to a done/failed marker.
+ *
+ * Live frames are matched by the spawn label (the backend puts it on the
+ * `subagent-start` event's `task` field); if the event window was lost (chat
+ * switch) a running call still shows its spinner without live detail.
+ */
+function SubagentCard({
+  part,
+  frames,
+  toolHistory,
+  now,
+}: {
+  part: UIMessage["parts"][number];
+  frames: ActiveSubagent[];
+  toolHistory: ToolHistoryEntry[];
+  now: number;
+}) {
+  const input = ((part as { input?: { label?: string } }).input ?? {}) as {
+    label?: string;
+  };
+  const name = (input.label ?? "").trim() || "task";
+  const status = getToolStatus(part);
+  const output =
+    status === "done"
+      ? ((part as { output?: { ok?: boolean } }).output ?? undefined)
+      : undefined;
+
+  const frame =
+    frames.find((f) => f.task === name) ??
+    (frames.length === 1 ? frames[0] : undefined);
+  const live = frame !== undefined;
+  const toolCount = frame
+    ? toolHistory.filter((h) => h.runId === frame.runId).length
+    : 0;
+  const elapsed = live
+    ? formatElapsed(Math.max(0, Math.round((now - frame.startedAt) / 1000)))
+    : null;
+
+  const failed = status === "error" || output?.ok === false;
+  const running = status === "running" || (live && status !== "done");
+
+  return (
+    <ToolCard status={failed ? "error" : running ? "running" : "done"}>
+      <span
+        className="size-1.5 shrink-0 rounded-full"
+        style={{ background: SUBAGENT_COLOR.spawn }}
+      />
+      <span className="shrink-0 font-medium">Subagent · {name}</span>
+      {running ? (
+        live && (
+          <>
+            <span className="opacity-40">·</span>
+            <span className="truncate max-w-[14rem]">{frame.label}</span>
+            <span className="tabular-nums opacity-50 shrink-0">
+              · {elapsed}
+            </span>
+          </>
+        )
+      ) : (
+        <span className="shrink-0 opacity-70">
+          {failed ? "failed" : "done"}
+        </span>
+      )}
+      {running && toolCount > 0 && (
+        <span className="opacity-50 shrink-0">
+          · {toolCount} tool {toolCount === 1 ? "call" : "calls"}
+        </span>
+      )}
+      {failed && !running && (
+        <span className="truncate max-w-[14rem] opacity-70">
+          {(part as { output?: { error?: string } }).output?.error}
+        </span>
+      )}
+    </ToolCard>
+  );
+}
+
 // ── Rendered ask_question exchanges (persisted in the transcript) ───
 
 /** Input of the `ask_question` tool as stored on the tool part. */
@@ -2193,17 +2194,35 @@ interface AskedQuestionInput {
   type?: string;
   question?: string;
   choices?: string[];
+  tiers?: string[];
   hint?: string;
 }
 
 /** Output of the `ask_question` tool (the `QuestionResult`). */
 type AskedQuestionOutput =
-  | { ok: true; type?: string; answer?: string | number | string[] }
+  | {
+      ok: true;
+      type?: string;
+      answer?: string | number | string[] | Record<string, string[]>;
+    }
   | { ok: false; reason?: string };
 
-/** Format an answer for display: strings verbatim, arrays joined. */
-function formatAnswer(answer: string | number | string[]): string {
-  return Array.isArray(answer) ? answer.join(", ") : String(answer);
+/**
+ * Format an answer for display: strings verbatim, arrays joined, tierlist
+ * placements tier by tier — `(tierlist) S: a, b | B: c`, the same shape the
+ * onboarding answer file uses.
+ */
+function formatAnswer(
+  answer: string | number | string[] | Record<string, string[]>,
+): string {
+  if (Array.isArray(answer)) return answer.join(", ");
+  if (typeof answer === "object" && answer !== null) {
+    const rows = Object.entries(answer)
+      .filter(([, items]) => items.length > 0)
+      .map(([tier, items]) => `${tier}: ${items.join(", ")}`);
+    return rows.length > 0 ? `(tierlist) ${rows.join(" | ")}` : "(tierlist) nothing placed";
+  }
+  return String(answer);
 }
 
 /**
@@ -2232,11 +2251,12 @@ function AskedQuestionCard({
   // Malformed part (no question text) — nothing meaningful to show.
   if (!prompt) return null;
 
-  // Answers already chosen, for highlighting choice chips.
+  // Answers already chosen, for highlighting choice chips. Tierlist
+  // placements highlight nothing — the answer line carries the tiers.
   const picked =
     output && output.ok && Array.isArray(output.answer)
       ? new Set(output.answer.map(String))
-      : output && output.ok
+      : output && output.ok && typeof output.answer !== "object"
         ? new Set([String(output.answer)])
         : new Set<string>();
 
@@ -2258,7 +2278,9 @@ function AskedQuestionCard({
         </p>
       )}
 
-      {input.choices && input.choices.length > 0 && (
+      {/* Tierlist questions skip the chips — their `choices` are the items
+          the user sorted, and the answer line below carries the placement. */}
+      {input.type !== "tierlist" && input.choices && input.choices.length > 0 && (
         <div className="mt-2 flex flex-wrap gap-1.5 pl-6">
           {input.choices.map((choice, i) => {
             const isPicked = picked.has(choice);
@@ -2389,6 +2411,17 @@ function QuestionCard({ q }: { q: PendingQuestion }) {
   // types), plus custom answers already added to a multi-choice selection.
   const [other, setOther] = useState("");
   const [custom, setCustom] = useState<string[]>([]);
+  // Placement draft for "tierlist" — submitted once every item sits in a tier.
+  const [placement, setPlacement] = useState<TierlistPlacement | undefined>(
+    undefined,
+  );
+
+  const items = q.choices ?? [];
+  const placedCount = placement
+    ? new Set(Object.values(placement).flat()).size
+    : 0;
+  const tierlistReady =
+    q.type === "tierlist" && items.length > 0 && placedCount === items.length;
 
   const submitOpen = () => {
     const value = text.trim();
@@ -2623,6 +2656,33 @@ function QuestionCard({ q }: { q: PendingQuestion }) {
               placeholder="Or answer in your own words…"
               label="Answer"
             />
+          </div>
+        </div>
+      )}
+
+      {q.type === "tierlist" && (
+        <div className="mt-2">
+          <TierlistEditor
+            tiers={q.tiers ?? []}
+            items={items}
+            value={placement}
+            onChange={setPlacement}
+          />
+          <div className="mt-2 flex items-center justify-between gap-2">
+            <span className="text-[10px] text-[var(--color-muted-foreground)]">
+              {items.length === 0
+                ? "The agent sent no items to sort"
+                : tierlistReady
+                  ? "All placed — ready to send"
+                  : `${items.length - placedCount} left to place`}
+            </span>
+            <Button
+              size="sm"
+              disabled={!tierlistReady}
+              onClick={() => placement && respondToQuestion(q.id, placement)}
+            >
+              Send
+            </Button>
           </div>
         </div>
       )}

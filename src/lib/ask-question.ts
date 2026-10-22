@@ -33,7 +33,8 @@ export type QuestionType =
   | "open"
   | "single-choice"
   | "multi-choice"
-  | "rating";
+  | "rating"
+  | "tierlist";
 
 /** A question awaiting the user's answer. */
 export interface PendingQuestion {
@@ -42,8 +43,11 @@ export interface PendingQuestion {
   type: QuestionType;
   /** The question text to show the user. */
   prompt: string;
-  /** For "single-choice"/"multi-choice": the options shown to the user. */
+  /** For "single-choice"/"multi-choice": the options shown to the user.
+   * For "tierlist": the items the user sorts into tiers. */
   choices?: string[];
+  /** For "tierlist": the tier rows, top→bottom (best first). */
+  tiers?: string[];
   /** Optional short hint shown beneath the prompt (e.g. an example). */
   hint?: string;
 }
@@ -51,10 +55,15 @@ export interface PendingQuestion {
 /**
  * What an answer resolves with — and what the tool returns to the LLM.
  * On success, `answer` is a string ("open"/"single-choice"), a string array
- * ("multi-choice"), or a number ("rating").
+ * ("multi-choice"), a number ("rating"), or a `{tier: [items]}` placement
+ * map ("tierlist").
  */
 export type QuestionResult =
-  | { ok: true; type: QuestionType; answer: string | number | string[] }
+  | {
+      ok: true;
+      type: QuestionType;
+      answer: string | number | string[] | Record<string, string[]>;
+    }
   | { ok: false; reason: string };
 
 /** What the backend's `respond_question` command reports back. */
@@ -117,7 +126,7 @@ if (typeof window !== "undefined") {
  */
 export function respondToQuestion(
   id: string,
-  answer: string | number | string[],
+  answer: string | number | string[] | Record<string, string[]>,
 ): void {
   const q = questions.find((x) => x.id === id);
   if (!q) return;

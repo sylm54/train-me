@@ -97,6 +97,7 @@ result, and events):
 | `buttons` | `items: string[]`, optional `prompt` | the picked label | `pick` (the label) |
 | `slider` | `min`, `max`, optional `step` (default 1), `initial`, `label` | never — reports via `change` until removed (`null`) | `change` (current value) |
 | `input` | `submit` (button text), optional `label`, `placeholder`, `multiline` (default false) | the submitted string | `change` (draft text) |
+| `tierlist` | `tiers: string[]` (≥2, top→bottom), `items: string[]` (≥2), optional `prompt` | `{tier: [items]}` once every item is placed | `change` (the placement so far) |
 | `timer` | `duration` (seconds), `mode` (`"down"` or `"up"`), optional `label` | `true` when a `"down"` timer hits 0; `"up"` never completes | `tick` (seconds remaining / elapsed) |
 | `media` | slideshow config (below) | never — runs until removed (`null`) | `tick` (slide index) |
 | `beatmeter` | `bpm` (below) | never — runs until removed (`null`) | `beat` (`{ index, accent }`) |
@@ -205,6 +206,32 @@ Details in `docs/internal/chastity.md`.
 ```js
 const st = await show("device", { type: "lock", state: "locked" });
 await st.done; // resolves "locked" once the device is locked
+```
+
+### `tierlist` — the tier sorter
+
+The classic tierlist: tier rows down the left, unsorted items pooled at
+the bottom; the user drags each item into a tier (or taps it, then taps
+where it goes). Left→right order within a tier is the ranking, best
+first.
+
+- `tiers` (≥2 unique labels, top→bottom, e.g. `["S", "A", "B"]`) and
+  `items` (≥2 unique strings to place); optional `prompt` above the
+  board.
+- Every move mirrors the placement into `w.state.placement` and emits
+  `change`; when the last item lands in a tier, `await w.done` resolves
+  to the placement — a `{tier: [items]}` map holding only non-empty
+  tiers, the same shape the onboarding answers and `showIf` tier
+  conditions use. The widget stays interactive afterwards; later moves
+  keep emitting `change`.
+
+```js
+const w = await show("rate", {
+  type: "tierlist", prompt: "Sort these by how much you dread them:",
+  tiers: ["S", "A", "B"], items: ["edges", "lines", "kneeling"],
+});
+const ranks = await w.done; // e.g. { S: ["edges"], A: ["kneeling"], B: ["lines"] }
+await log("task", "tierlist", JSON.stringify(ranks));
 ```
 
 ## Audio — the `ScriptHandle`

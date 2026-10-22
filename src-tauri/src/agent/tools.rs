@@ -178,7 +178,7 @@ const WRITE_FILE_DESC: &str = "Write a text file. Parent directories are created
 const LIST_FILES_DESC: &str = "List entries in a directory";
 const EDIT_FILE_DESC: &str = "Edit an existing file by search-and-replace. Provide `old_string` exactly as it appears in the file (include surrounding context to make it unique) and `new_string` to replace it with. By default `old_string` must match exactly once; set `replace_all` to true to substitute every occurrence.";
 const VALIDATE_FILES_DESC: &str = "Validate feature files for parse errors, schema problems, and dangling references. Checks routines/*.js and tasks/*.js (comment front-matter grammar, declarative keys like actions/cron/timeouts, and full JavaScript syntax validation of the body via a parse-only engine — never evaluated), habits/*.md, and store/*.json, plus every XML script they reference (script actions: tag syntax, semantic tag checks, and <include> import validity — dangling and circular includes are errors), and any in-app markdown links habits contain. Returns a per-file report; each problem says what is wrong and, when possible, how to fix it. XML scripts under hypnos/ that no feature file references are reported as a warning (still linted). Optional `path` narrows the scope to files at or under that path (relative to agent_data/, forward slashes) — e.g. 'routines', 'routines/foo.js', or 'hypnos'. Scoping a container still pulls in its full XML include tree. Omit `path` to validate everything. Call after creating/editing files, or when something isn't working, and fix any reported errors before considering the task done.";
-const ASK_QUESTION_DESC: &str = "Ask the user a question and wait for their answer. Use this whenever you need information, a decision, a preference, or feedback before proceeding — prefer it over guessing when the user's intent, preference, or consent is unclear. The call blocks until the user answers or cancels. Four types: 'open' (a free-text answer), 'single-choice' (pick exactly one option from `choices`), 'multi-choice' (pick one or more options from `choices`), and 'rating' (a whole number 1–10, where 1 is low and 10 is high). Prefer 'single-choice' when one option must win; use 'multi-choice' only when selecting several is meaningful. The UI always offers a free-text fallback next to the options, so the answer may not appear in `choices` (and a 'rating' answer may be text instead of a number) — accept it as the user's answer and work with what they wrote.";
+const ASK_QUESTION_DESC: &str = "Ask the user a question and wait for their answer. Use this whenever you need information, a decision, a preference, or feedback before proceeding — prefer it over guessing when the user's intent, preference, or consent is unclear. The call blocks until the user answers or cancels. Five types: 'open' (a free-text answer), 'single-choice' (pick exactly one option from `choices`), 'multi-choice' (pick one or more options from `choices`), 'rating' (a whole number 1–10, where 1 is low and 10 is high), and 'tierlist' (the user sorts every item in `choices` into the `tiers` rows, left→right order within a tier ranking best→worst; the answer is a map of tier → items). Prefer 'single-choice' when one option must win; use 'multi-choice' only when selecting several is meaningful; use 'tierlist' when the user should rank several items against each other. The UI always offers a free-text fallback next to the options, so the answer may not appear in `choices` (and a 'rating' answer may be text instead of a number) — accept it as the user's answer and work with what they wrote.";
 const SPAWN_AGENT_DESC: &str = "Spawn a fresh copy of yourself with a clean context to complete a self-contained task. The copy runs your same system prompt and tools (except this one) with the task as its only input; only its final text comes back to you — it cannot see this conversation, and the user does not see its work. Use this for substantial, separable authoring jobs (e.g. writing or reworking audio scripts, building a set of feature files) where a clean slate with the reference docs at the front of context produces better work than tacking it onto this chat. For small fixes, do them directly. Provide a fully self-contained brief — include the goal, relevant paths and context, and any constraints; assume the copy reads no part of this chat.";
 
 // ============================================================================
@@ -328,8 +328,8 @@ fn ask_question_spec() -> ToolSpec {
             "properties": {
                 "type": {
                     "type": "string",
-                    "enum": ["open", "single-choice", "multi-choice", "rating"],
-                    "description": "Question type: 'open' (free text), 'single-choice' (pick exactly one of `choices`), 'multi-choice' (pick one or more of `choices`), or 'rating' (a whole number 1–10)."
+                    "enum": ["open", "single-choice", "multi-choice", "rating", "tierlist"],
+                    "description": "Question type: 'open' (free text), 'single-choice' (pick exactly one of `choices`), 'multi-choice' (pick one or more of `choices`), 'rating' (a whole number 1–10), or 'tierlist' (sort every item of `choices` into `tiers`)."
                 },
                 "question": {
                     "type": "string",
@@ -338,7 +338,12 @@ fn ask_question_spec() -> ToolSpec {
                 "choices": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Required for 'single-choice' and 'multi-choice': two or more options the user picks from. Omit for 'open' and 'rating'."
+                    "description": "Required for 'single-choice' and 'multi-choice': two or more options the user picks from. Required for 'tierlist': two or more items the user sorts into tiers. Omit for 'open' and 'rating'."
+                },
+                "tiers": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Required for 'tierlist' only: two or more tier labels, top→bottom (best first), e.g. ['S', 'A', 'B']."
                 },
                 "hint": {
                     "type": "string",
@@ -567,16 +572,29 @@ async fn ask_question(ctx: &ToolCtx<'_>, args: &Value) -> Result<Value, String> 
     let choices: Option<Vec<String>> = args["choices"]
         .as_array()
         .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect());
+    let tiers: Option<Vec<String>> = args["tiers"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect());
     let hint = arg_str(args, "hint").map(str::to_string);
 
-    // A choice question is meaningless without options. Don't bother the
-    // user — bounce it straight back to the model so it can retry correctly.
+    // A choice question is meaningless without options, and a tierlist
+    // without tiers has nowhere to place items. Don't bother the user —
+    // bounce it straight back to the model so it can retry correctly.
     if (kind == "single-choice" || kind == "multi-choice")
         && choices.as_ref().map(|c| c.len()).unwrap_or(0) < 2
     {
         return Ok(json!({
             "ok": false,
             "reason": "A 'single-choice'/'multi-choice' question needs at least two options in `choices`. Retry with `choices` provided, or use type 'open'."
+        }));
+    }
+    if kind == "tierlist"
+        && (tiers.as_ref().map(|t| t.len()).unwrap_or(0) < 2
+            || choices.as_ref().map(|c| c.len()).unwrap_or(0) < 2)
+    {
+        return Ok(json!({
+            "ok": false,
+            "reason": "A 'tierlist' question needs at least two labels in `tiers` and at least two items in `choices`. Retry with both provided, or use type 'single-choice'."
         }));
     }
 
@@ -594,7 +612,8 @@ async fn ask_question(ctx: &ToolCtx<'_>, args: &Value) -> Result<Value, String> 
     // your answer" for the wait and back to "Working…" after — a run can ask
     // several questions per turn, so the transition goes both ways.
     crate::agent_service::update_phase("waiting-for-answer", None);
-    let result = questions::pose(app, ctx.chat_id, kind, question, choices, hint, ctx.cancel).await;
+    let result =
+        questions::pose(app, ctx.chat_id, kind, question, choices, tiers, hint, ctx.cancel).await;
     crate::agent_service::update_phase("running", None);
     serde_json::to_value(result).map_err(|e| e.to_string())
 }
@@ -731,7 +750,21 @@ mod tests {
         assert!(READ_FILE_DESC.contains("sandbox-absolute"));
         assert!(VALIDATE_FILES_DESC.contains("dangling and circular includes are errors"));
         assert!(ASK_QUESTION_DESC.contains("1–10"));
+        assert!(ASK_QUESTION_DESC.contains("tierlist"));
         assert!(SPAWN_AGENT_DESC.contains("assume the copy reads no part of this chat"));
+    }
+
+    #[test]
+    fn ask_question_spec_advertises_tierlist() {
+        let ask = main_tool_defs()
+            .into_iter()
+            .find(|t| t.name == "ask_question")
+            .unwrap();
+        assert_eq!(
+            ask.parameters["properties"]["type"]["enum"],
+            json!(["open", "single-choice", "multi-choice", "rating", "tierlist"])
+        );
+        assert!(ask.parameters["properties"].get("tiers").is_some());
     }
 
     #[test]

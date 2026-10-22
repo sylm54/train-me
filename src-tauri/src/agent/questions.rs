@@ -43,7 +43,13 @@ use tauri::{Emitter, Manager};
 use crate::agent::runner::CancelHandle;
 
 /// Kind of question. Mirrors the `ask_question` tool's `type` field.
-pub const TYPES: [&str; 4] = ["open", "single-choice", "multi-choice", "rating"];
+pub const TYPES: [&str; 5] = [
+    "open",
+    "single-choice",
+    "multi-choice",
+    "rating",
+    "tierlist",
+];
 
 /// A question awaiting the user's answer. The first four fields are the JS
 /// `PendingQuestion` shape verbatim; `chatId`/`seq`/`ts` are Rust-side
@@ -60,9 +66,13 @@ pub struct PendingQuestion {
     pub kind: QuestionType,
     /// The question text to show the user.
     pub prompt: String,
-    /// For single/multi-choice: the options shown to the user.
+    /// For single/multi-choice: the options shown to the user. For
+    /// `tierlist`: the items the user places into tiers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub choices: Option<Vec<String>>,
+    /// For `tierlist`: the tier rows, top→bottom.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tiers: Option<Vec<String>>,
     /// Optional short hint shown beneath the prompt.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
@@ -209,6 +219,7 @@ pub(crate) async fn pose(
     kind: &str,
     prompt: &str,
     choices: Option<Vec<String>>,
+    tiers: Option<Vec<String>>,
     hint: Option<String>,
     cancel: &CancelHandle,
 ) -> QuestionResult {
@@ -219,6 +230,7 @@ pub(crate) async fn pose(
         kind: QuestionType(kind.to_string()),
         prompt: prompt.to_string(),
         choices,
+        tiers,
         hint,
         chat_id: Some(chat_id.to_string()),
         seq: SEQ.fetch_add(1, Ordering::SeqCst),
@@ -301,6 +313,7 @@ mod tests {
             kind: QuestionType("single-choice".into()),
             prompt: "Pick one".into(),
             choices: Some(vec!["a".into(), "b".into()]),
+            tiers: None,
             hint: None,
             chat_id: Some("chat1".into()),
             seq: 3,
@@ -315,6 +328,26 @@ mod tests {
     }
 
     #[test]
+    fn tierlist_question_carries_tiers_and_items() {
+        let q = PendingQuestion {
+            id: "q2".into(),
+            kind: QuestionType("tierlist".into()),
+            prompt: "Rank these".into(),
+            choices: Some(vec!["a".into(), "b".into()]),
+            tiers: Some(vec!["S".into(), "A".into(), "B".into()]),
+            hint: None,
+            chat_id: Some("c".into()),
+            seq: 4,
+            ts: 0,
+        };
+        let v = serde_json::to_value(&q).unwrap();
+        assert_eq!(v["type"], "tierlist");
+        assert_eq!(v["tiers"], serde_json::json!(["S", "A", "B"]));
+        let back: PendingQuestion = serde_json::from_value(v).unwrap();
+        assert_eq!(back, q);
+    }
+
+    #[test]
     fn registry_orders_newest_first_and_respond_consumes() {
         // No AppHandle in unit tests — exercise registry + ordering only.
         let mk = |id: &str| PendingQuestion {
@@ -322,6 +355,7 @@ mod tests {
             kind: QuestionType("open".into()),
             prompt: "p".into(),
             choices: None,
+            tiers: None,
             hint: None,
             chat_id: Some("c".into()),
             seq: SEQ.fetch_add(1, Ordering::SeqCst),
