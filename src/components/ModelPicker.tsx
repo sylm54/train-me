@@ -8,7 +8,8 @@
  *   Reasoning: ▼   (default Max)
  *
  * The model dropdown lists the curated presets (name + description + price)
- * from [`MODEL_CATALOG`]. A "Custom model…" entry switches to a free-text
+ * from the live model catalog (`useModelCatalog` — fetched from GitHub,
+ * bundled fallback). A "Custom model…" entry switches to a free-text
  * input (the escape hatch) for arbitrary model ids; "Use preset list" returns
  * to the dropdown. Selecting a preset sets reasoning to the default (Max)
  * when none is configured yet.
@@ -26,12 +27,13 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import {
-  MODEL_CATALOG,
-  PROVIDER_LABELS,
-  DEFAULT_MODEL_ID,
+  defaultModelId,
   DEFAULT_REASONING,
-  REASONING_OPTIONS,
   findPreset,
+  providerLabel,
+  PROVIDER_LABELS,
+  REASONING_OPTIONS,
+  useModelCatalog,
 } from "@/lib/models";
 import type { AgentModelConfig, AgentName, ProviderName, ReasoningEffort } from "@/lib/types";
 
@@ -52,12 +54,15 @@ export interface ModelPickerProps {
 }
 
 export function ModelPicker({ cfg, onChange }: ModelPickerProps) {
+  // Live preset catalog (GitHub fetch + bundled fallback). Subscribing here
+  // re-renders the dropdown when a background refresh lands new presets.
+  const catalog = useModelCatalog();
   // Whether this agent is in "custom model" text-entry mode. We infer the
   // initial mode from whether the current model is a known preset.
   const knownPreset = findPreset(cfg.provider, cfg.model);
   const [custom, setCustom] = useState(!knownPreset && cfg.model.length > 0);
 
-  const presets = MODEL_CATALOG[cfg.provider].models;
+  const presets = catalog[cfg.provider].models;
 
   const selectPreset = (modelId: string) => {
     // First time picking a preset with no reasoning set → default to Max.
@@ -72,7 +77,7 @@ export function ModelPicker({ cfg, onChange }: ModelPickerProps) {
   const switchProvider = (provider: ProviderName) => {
     // Switching provider lands on that provider's default model + default
     // reasoning (so the agent is never left with a stale cross-provider id).
-    onChange(provider, DEFAULT_MODEL_ID[provider], {
+    onChange(provider, defaultModelId(provider), {
       reasoningEffort: cfg.reasoningEffort ?? DEFAULT_REASONING,
     });
     setCustom(false);
@@ -89,7 +94,7 @@ export function ModelPicker({ cfg, onChange }: ModelPickerProps) {
         >
           {(Object.keys(PROVIDER_LABELS) as ProviderName[]).map((p) => (
             <option key={p} value={p}>
-              {PROVIDER_LABELS[p]}
+              {providerLabel(p)}
             </option>
           ))}
         </select>

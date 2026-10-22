@@ -26,7 +26,11 @@ import { useSyncExternalStore } from "react";
 import type { UIMessage } from "ai";
 
 import type { AgentModelConfig, ChatSettings } from "./types";
-import { findPreset } from "./models";
+import {
+  findPreset,
+  getModelCatalogVersion,
+  subscribeModelCatalog,
+} from "./models";
 
 // ── visible char counting ─────────────────────────────────────────────
 
@@ -324,7 +328,8 @@ export function getContextWindow(
 
 /**
  * Resolve the context window as a React value: ensures the background catalog
- * fetch is running and re-renders when it lands.
+ * fetch is running and re-renders when it lands (this includes the model
+ * preset catalog refresh — a fetched preset can carry a fresh window).
  */
 export function useContextWindow(
   main: AgentModelConfig,
@@ -335,10 +340,14 @@ export function useContextWindow(
   useSyncExternalStore(
     (onChange) => {
       cacheListeners.add(onChange);
-      return () => cacheListeners.delete(onChange);
+      const offCatalog = subscribeModelCatalog(onChange);
+      return () => {
+        cacheListeners.delete(onChange);
+        offCatalog();
+      };
     },
-    () => cacheVersion,
-    () => cacheVersion,
+    () => cacheVersion + getModelCatalogVersion(),
+    () => cacheVersion + getModelCatalogVersion(),
   );
   return getContextWindow(main, overrideTokens);
 }

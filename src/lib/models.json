@@ -1,0 +1,46 @@
+{
+  "$comment": [
+    "Curated model catalog, bundled as the offline fallback for src/lib/models.ts.",
+    "The app also fetches this file's latest state from GitHub (see REMOTE_CATALOG_URL",
+    "in models.ts), so editing it here reaches users without an app release.",
+    "The first preset of each provider is that provider's default model."
+  ],
+  "openrouter": {
+    "label": "OpenRouter",
+    "models": [
+      {
+        "id": "z-ai/glm-5.3-flash",
+        "name": "GLM 5.3 Flash",
+        "description": "Great default.",
+        "price": "Cheap, a bit reserved, but competent.",
+        "contextWindow": 1048576
+      },
+      {
+        "id": "~deepseek/deepseek-v4-flash-latest",
+        "name": "DeepSeek V4 Flash",
+        "description": "Fast, but sometimes struggles a bit.",
+        "price": "Cheap",
+        "contextWindow": 1048576
+      },
+      {
+        "id": "deepseek/deepseek-v4-pro",
+        "name": "DeepSeek V4 Pro",
+        "description": "Stronger and Larger model than flash.",
+        "price": "Expensive",
+        "contextWindow": 1048576
+      }
+    ]
+  },
+  "openai": {
+    "label": "OpenAI",
+    "models": [
+      {
+        "id": "gpt-4",
+        "name": "GPT-4",
+        "description": "This is a placeholder, for a custom OpenAI endpoint you need to configure your own model.",
+        "price": "$0.03 in / $0.06 out per 1K tokens",
+        "contextWindow": 8192
+      }
+    ]
+  }
+}

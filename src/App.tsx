@@ -17,6 +17,7 @@ import { OnboardingView } from "@/views/OnboardingView";
 import { NoticeToasts } from "@/components/NoticeToasts";
 import { RenderProgressOverlay } from "@/components/RenderProgressOverlay";
 import { useSettings } from "@/lib/settings";
+import { ensureModelCatalog } from "@/lib/models";
 import { useGlobalAppLinkNavigation } from "@/lib/links";
 import { useRoutineNotifier } from "@/lib/use-routine-notifier";
 import { useAppForeground } from "@/lib/appFocus";
@@ -47,6 +48,14 @@ export default function App() {
     return () => {
       cancelled = true;
     };
+  }, []);
+
+  // Refresh the model preset catalog from its latest GitHub state in the
+  // background (stale-while-revalidate; the bundled JSON is the fallback),
+  // so preset edits ship to users without an app release. The restored
+  // localStorage copy keeps pickers correct until this lands.
+  useEffect(() => {
+    ensureModelCatalog();
   }, []);
 
   // Switch the active chat AND keep the backend's persisted working-chat

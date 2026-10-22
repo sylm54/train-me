@@ -37,8 +37,9 @@ import {
 } from "lucide-react";
 import { useSettings } from "@/lib/settings";
 import type { ProviderName } from "@/lib/types";
-import { AGENT_LABELS, PICKER_AGENTS, PROVIDER_LABELS } from "@/lib/models";
+import { AGENT_LABELS, PICKER_AGENTS, providerLabel, PROVIDER_LABELS } from "@/lib/models";
 import { ModelPicker } from "@/components/ModelPicker";
+import { ToggleField } from "@/components/ToggleField";
 import { FrameworkOptionsList } from "@/components/FrameworkOptions";
 import {
   PREDEFINED_FRAMEWORKS,
@@ -81,7 +82,7 @@ interface OnboardingViewProps {
 }
 
 export function OnboardingView({ onComplete }: OnboardingViewProps) {
-  const { settings, setApiKey, setAgent } = useSettings();
+  const { settings, setApiKey, setAgent, clearAgent } = useSettings();
   const [step, setStep] = useState<Step>("welcome");
   const [reveal, setReveal] = useState<Record<ProviderName, boolean>>({
     openrouter: false,
@@ -365,6 +366,7 @@ export function OnboardingView({ onComplete }: OnboardingViewProps) {
               settings={settings}
               setApiKey={setApiKey}
               setAgent={setAgent}
+              clearAgent={clearAgent}
               reveal={reveal}
               setReveal={setReveal}
             />
@@ -575,12 +577,14 @@ function ModelsStep({
   settings,
   setApiKey,
   setAgent,
+  clearAgent,
   reveal,
   setReveal,
 }: {
   settings: ReturnType<typeof useSettings>["settings"];
   setApiKey: ReturnType<typeof useSettings>["setApiKey"];
   setAgent: ReturnType<typeof useSettings>["setAgent"];
+  clearAgent: ReturnType<typeof useSettings>["clearAgent"];
   reveal: Record<ProviderName, boolean>;
   setReveal: React.Dispatch<React.SetStateAction<Record<ProviderName, boolean>>>;
 }) {
@@ -607,7 +611,7 @@ function ModelsStep({
             className="border border-[var(--color-border)] rounded-lg p-3 bg-[var(--color-surface)]"
           >
             <label className="block text-xs font-medium mb-1.5">
-              {PROVIDER_LABELS[p]}
+              {providerLabel(p)}
             </label>
             <div className="flex items-center gap-2">
               <input
@@ -657,6 +661,36 @@ function ModelsStep({
             </div>
           );
         })}
+        <div className="border border-[var(--color-border)] rounded-lg p-3 bg-[var(--color-surface)]">
+          <ToggleField
+            label={AGENT_LABELS.spawn}
+            value={!!settings.agents.spawn}
+            hint="Spawned copies (delegated tasks) reuse the Main agent's model unless you pick a different one here."
+            onChange={(useOwn) => {
+              if (useOwn) {
+                // Seed the override from the main agent's current config so
+                // enabling the toggle never changes the effective model.
+                const main = settings.agents.main;
+                setAgent("spawn", main.provider, main.model, {
+                  reasoningEffort: main.reasoningEffort,
+                });
+              } else {
+                clearAgent("spawn");
+              }
+            }}
+          />
+          {settings.agents.spawn && (
+            <div className="mt-3">
+              <ModelPicker
+                agent="spawn"
+                cfg={settings.agents.spawn}
+                onChange={(provider, model, extras) =>
+                  setAgent("spawn", provider, model, extras)
+                }
+              />
+            </div>
+          )}
+        </div>
       </section>
 
       <MissingKeyHint settings={settings} />
@@ -675,7 +709,7 @@ function MissingKeyHint({
     <p className="text-xs text-[var(--color-warning)] flex items-start gap-1.5">
       <AlertCircle size={14} className="mt-0.5 shrink-0" />
       <span>
-        Add a {PROVIDER_LABELS[mainProvider]} API key above to continue.
+        Add a {providerLabel(mainProvider)} API key above to continue.
       </span>
     </p>
   );

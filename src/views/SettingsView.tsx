@@ -76,6 +76,7 @@ import {
 import {
   AGENT_LABELS,
   PICKER_AGENTS,
+  providerLabel,
   PROVIDER_LABELS,
 } from "@/lib/models";
 import {
@@ -83,6 +84,7 @@ import {
   useContextWindow,
 } from "@/lib/contextUsage";
 import { ModelPicker } from "@/components/ModelPicker";
+import { ToggleField } from "@/components/ToggleField";
 import { FrameworkOptionsList } from "@/components/FrameworkOptions";
 import { loadPrompt } from "@/lib/prompts";
 import {
@@ -473,7 +475,7 @@ export function SettingsView({
               className="border border-[var(--color-border)] rounded-lg p-4 bg-[var(--color-surface)]"
             >
               <label className="block text-sm font-medium mb-1.5">
-                {PROVIDER_LABELS[p]} API key
+                {providerLabel(p)} API key
               </label>
               <div className="flex items-center gap-2">
                 <input
@@ -1150,40 +1152,6 @@ function ChatNumberField({
         </p>
       )}
     </div>
-  );
-}
-
-/** Labelled boolean switch (checkbox row) used by the settings sections. */
-function ToggleField({
-  label,
-  value,
-  hint,
-  onChange,
-}: {
-  label: string;
-  value: boolean;
-  hint?: string;
-  onChange: (v: boolean) => void;
-}) {
-  return (
-    <label className="flex items-start gap-3 cursor-pointer select-none">
-      <input
-        type="checkbox"
-        checked={value}
-        onChange={(e) => onChange(e.target.checked)}
-        // Accent the native checkbox with the app's pink; sized to match the
-        // number inputs' visual weight.
-        className="mt-0.5 h-4 w-4 accent-[var(--color-pink-400)]"
-      />
-      <span>
-        <span className="block text-sm font-medium">{label}</span>
-        {hint && (
-          <span className="block text-[11px] text-[var(--color-muted-foreground)] mt-0.5">
-            {hint}
-          </span>
-        )}
-      </span>
-    </label>
   );
 }
 

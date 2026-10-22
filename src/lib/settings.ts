@@ -23,7 +23,7 @@ import type {
   PlaybackSettings,
   AudioSettings,
 } from "./types";
-import { DEFAULT_MODEL_ID } from "./models";
+import { defaultModelId } from "./models";
 import { DEFAULT_PLAYBACK_SETTINGS, DEFAULT_AUDIO_SETTINGS } from "./types";
 
 import { ensureNotificationPermission } from "./notifications";
@@ -50,7 +50,7 @@ export const DEFAULT_CHAT_SETTINGS: ChatSettings = {
 const DEFAULT_SETTINGS: AgentSettings = {
   apiKeys: {},
   agents: {
-    main: { provider: "openrouter", model: DEFAULT_MODEL_ID.openrouter },
+    main: { provider: "openrouter", model: defaultModelId("openrouter") },
   },
   chat: { ...DEFAULT_CHAT_SETTINGS },
   playback: { ...DEFAULT_PLAYBACK_SETTINGS },
