@@ -9,24 +9,38 @@
     "label": "OpenRouter",
     "models": [
       {
-        "id": "z-ai/glm-5.3-flash",
-        "name": "GLM 5.3 Flash",
-        "description": "Great default.",
-        "price": "Cheap, a bit reserved, but competent.",
+        "id": "anthropic/claude-haiku-5.5",
+        "name": "Claude Haiku 5.5",
+        "description": "Good default",
+        "price": "Cheap, $0.10 / $0.50 per 1M",
+        "contextWindow": 1048576
+      },
+      {
+        "id": "anthropic/claude-sonnet-5.5",
+        "name": "Claude Sonnet 5.5",
+        "description": "A smarter Haiku",
+        "price": "Expensive, $2 / $10 per 1M",
+        "contextWindow": 1048576
+      },
+      {
+        "id": "anthropic/claude-opus-5.5",
+        "name": "Claude Opus 5.5",
+        "description": "Smartest",
+        "price": "Very expensive, $10 / $30 per 1M",
+        "contextWindow": 2097152
+      },
+      {
+        "id": "~z-ai/glm-flash-latest",
+        "name": "GLM Flash",
+        "description": "Fine, but a bit llm-ish",
+        "price": "Cheap, $0.15 / $0.50 per 1M",
         "contextWindow": 1048576
       },
       {
         "id": "~deepseek/deepseek-v4-flash-latest",
         "name": "DeepSeek V4 Flash",
-        "description": "Fast, but sometimes struggles a bit.",
-        "price": "Cheap",
-        "contextWindow": 1048576
-      },
-      {
-        "id": "deepseek/deepseek-v4-pro",
-        "name": "DeepSeek V4 Pro",
-        "description": "Stronger and Larger model than flash.",
-        "price": "Expensive",
+        "description": "Fine, sometimes a bit dense",
+        "price": "Cheap, $0.07 / $0.50 per 1M",
         "contextWindow": 1048576
       }
     ]
