@@ -1,19 +1,16 @@
 ---
-description: Feature-file grammar v3 — comment front matter + JS bodies for routines and tasks, markdown habits, JSON store entries, the action vocabulary, and engine semantics.
+description: Feature-file grammar, comment front matter + JS bodies for routines and tasks, markdown habits, JSON store entries, the action vocabulary, and engine semantics.
 ---
 
 # Feature Files
 
 The single grammar: **routines and tasks are JavaScript orchestration
-scripts** (`routines/*.js`, `tasks/*.js`) — a comment front-matter block
+scripts** (`routines/*.js`, `tasks/*.js`), a comment front-matter block
 declares the engine contract, the body drives the session through the
 sandboxed `tm` API (see `docs/internal/runtime-api.md`). Habits and store
-entries are unchanged markdown/JSON. There are no pages, no feature
-blocks, no `when:` conditions, no `{{ }}` interpolation — JS *is* the
-condition system.
+entries are markdown/JSON.
 
-Worked examples of every file type live in `examples/` (seeded into your
-sandbox). After authoring, run `validate_files` and fix every `error`.
+Worked examples of every file type live in `examples/`. After authoring, run `validate_files` and fix every `error`.
 
 ## Comment front matter (routines & tasks)
 
@@ -25,7 +22,7 @@ executed verbatim.
 
 Values are scalars (`text`, `15`, `true`), inline JSON (`{ ... }`,
 `[ ... ]`), or dotted keys addressing into nested maps
-(`success.type: points` + `success.delta: 15` ≡ inline JSON). Durations
+(`success.type: points` + `success.delta: 15` = inline JSON). Durations
 are integer + unit (`30s`, `15m`, `4h`, `2d` — front matter only; the
 JS `wait()` takes plain seconds). Cron is classic 5-field or 6-field,
 `@daily`-style shorthands accepted.
@@ -40,9 +37,6 @@ failure: { "type": "task", "template": "punishment-light" }
 ---*/
 // body: plain orchestration JS — see docs/internal/runtime-api.md
 ```
-
-There is no `format:` key in v3 — the `.js` extension IS the marker
-(a leftover `format:` key warns).
 
 ## Routines — `routines/*.js`
 
@@ -59,9 +53,8 @@ There is no `format:` key in v3 — the `.js` extension IS the marker
 - **Scheduled**: succeeds only if started inside its schedule window and
   the body resolved within `timeframe` (when set); otherwise the failure
   actions fire.
-- **On-demand anti-farming**: a `limit`-less routine is treated as
-  `limit: { daily: 1 }` (the validator warns when positive-point success
-  relies on that default).
+- **On-demand**: a `limit`-less routine is treated as
+  `limit: { daily: 1 }` so if you want to allow more completions give a budget.
 
 ## Tasks — `tasks/*.js`
 
@@ -104,8 +97,7 @@ description, shown in the habit inspector).
 
 `title` (warned if missing), `price` (int ≥ 0, required), optional
 `stock` (int ≥ 0) + `restock` cron, and `action` (required — same action
-vocabulary). Stock is the initial level; the economy ledger computes the
-current stock (purchases minus lazily recomputed restocks).
+vocabulary).
 
 ## Actions
 
@@ -114,16 +106,13 @@ action object or an array of them:
 
 | Type | Fields | Effect |
 | ---- | ------ | ------ |
-| `points` | `delta: int` | append to the points ledger (balances may go negative) |
+| `points` | `delta: int` | give or take away points (balances may go negative) |
 | `task` | `template: name` | assign a `tasks/<name>.js` instance |
 | `script` | `src: path.xml` | auto-play a short jingle when in-app; queued on Today otherwise |
 | `notification` | `text: string` | in-app overlay; OS notification when the app is closed |
 | `exemption` | `duration: dur.`, `scope: habits\|routines\|tasks\|all` | suspend failures and **protect streaks**; `all` is the blanket pause |
 | `roulette` | `outcomes: [{ weight: int ≥ 0, action }]` | one weighted-random outcome fires (needs ≥ 2 outcomes, positive total weight; `weight: 0` disables; the draw is keyed to the occurrence — no re-rolls) |
 | `agent` | `message: string` | wake you with `message` as the instruction |
-
-`script` and `notification` are the immediate-feedback pair — see
-`docs/internal/feedback.md` for their semantics before using them.
 
 `agent` is the ONLY way an engine failure reaches you; nothing wakes you
 unless a feature file asks. Put it in `failure`/`timeouts` slots you
@@ -133,36 +122,11 @@ should react to, with a message that says what failed and what to do:
 failure: { "type": "agent", "message": "Evening drill lapsed — check the streak in activity.db, then reschedule or check in with the user." }
 ```
 
-Semantics: fires at the reconcile that resolves that failure/timeout,
-exactly once per occurrence; the message lands as an invocation note in
-the working chat (origin `agent-action`) and a turn is queued FIFO
-behind whatever conversation is in flight (single-flight); enqueuing
-never blocks the engine.
+## Engine semantics
 
-## Engine semantics (what the runtime guarantees)
-
-- **Occurrence ledger** — a SQLite ledger of expected occurrences
-  (routine × fire time, habit × day, task instance), reconciled lazily on
-  app open / reboot / background checks. A window that lapsed
-  uncompleted is failed at the next reconciliation, never silently
-  skipped.
-- **Idempotency** — every scheduled action application carries a unique
-  source key; applying the same key twice is a no-op (safe lazy
-  reconciliation).
-- **Points** — append-only ledger; the balance is the sum of entries.
-  You may `points grant/deduct <n> "reason"`; there is no set/rewrite.
-- **Exemptions** — suspend failure actions (and streak breaks) for their
-  scope and duration.
-- **Sessions** — while a run is live the app holds the wake lock; the
-  script restarts from the top when resumed, so keep bodies
-  restartable. Script resolving = success; throwing / `fail()` /
-  give-up = failure.
-- **Audio rendering** — every `.xml` in the sandbox is pre-rendered in
-  the background keyed by content hash; edited scripts re-render,
-  deleted ones are GC'd. Scripts referenced by bodies and `script`
-  actions render first.
+- **Initial Scheduling**: when creating a new routine set to be done at the current time, the engine schedules it for the next cron match (not the current one).
 - **Never store stats in files** (streaks, counts, last-done) — the
-  engine derives them from the ledger and clobbers hand-written ones.
+  engine derives them.
   Read them in JS from the run-start `vars` snapshot instead.
 
 ## Validation summary
@@ -189,7 +153,6 @@ validated reference.
   `<mark>`, `<clip>`, the `@` expression language, …) →
   `docs/internal/tts-tags.md`
 - Voice widget → `docs/internal/voice-training.md`; lock widget →
-  `docs/internal/chastity.md`; feedback actions →
-  `docs/internal/feedback.md`; points/inventory/chastity/activity.db →
+  `docs/internal/chastity.md`; points/inventory/chastity/activity.db →
   `docs/internal/data.md`
 - Canonical worked examples → `examples/` in your sandbox

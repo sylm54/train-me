@@ -1,12 +1,11 @@
 ---
-description: Agent data access — the `points` and `inventory` bash builtins, chastity commands, and the activity.db SQLite schema.
+description: Agent data access, the `points` and `inventory` bash builtins, chastity commands, and the activity.db SQLite schema.
 ---
 
 # Data & Builtins
 
 ## Points (`points` bash builtin)
 
-- Append-only ledger; the balance is never rewritten.
 - `points info` shows balance + recent entries.
 - `points grant <n> "reason"` / `points deduct <n> "reason"` append visible, reasoned deltas. Negative balances are just a number.
 

@@ -1,0 +1,6 @@
+{
+  "id": "fw-fixture",
+  "name": "Framework Fixture",
+  "description": "Minimal v3 fixture used to prove tools/framework-cli.",
+  "version": "1.0.0"
+}

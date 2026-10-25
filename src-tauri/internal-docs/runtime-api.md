@@ -4,10 +4,8 @@ description: The JS runtime API for routine/task bodies — the `tm` surface (wa
 
 # The JS Runtime API
 
-A routine/task body is plain async JavaScript, executed verbatim inside a
-**sandboxed iframe** (`sandbox="allow-scripts"`, opaque origin): no DOM
-access to the app, no Tauri API, no fetch, no filesystem. The only
-channel out is the `tm` API, proxied over postMessage. The body runs as
+A routine/task body is plain async JavaScript. The only
+channel out is the `tm` API. The body runs as
 
 ```js
 (async (tm) => { const { wait, show, hide, audio, media, log, vars, notify, fail } = tm;
@@ -25,26 +23,26 @@ so top-level `await` works and `return` ends the script.
   the `failure` actions fire, the reason is logged (activity feature
   `session`) and shown on the outcome screen. A `fail()` the script
   catches still fails the run — the first `fail` wins.
-- **Give up** (always available in the runner UI) tears the sandbox
+- **Give up** (always available in the runner UI to the user) tears the sandbox
   down — every pending call rejects — and fails the run honestly.
 
 All timing is parent-driven: `wait()` is a parent-side timer, so the
 script cannot stall a run past its `timeframe`. The sandbox is torn down
 when the runner closes; an in-progress run resumes from the Today view
-with the script restarting from the top — keep bodies restartable.
+with the script restarting from the top.
 
 ## `tm` reference
 
 | Helper | Signature | Effect |
 | ------ | --------- | ------ |
-| `wait` | `await wait(seconds)` | resolve after `seconds` of parent-driven time |
-| `vars` | `vars.<name>` | read-only run-context snapshot (below), delivered at start |
+| `wait` | `await wait(seconds)` | resolve after `seconds` |
+| `vars` | `vars.<name>` | read-only run-context snapshot (more below) |
 | `log` | `await log(feature, action, details?)` | append to the activity log (`activity.db`); non-string `details` is JSON-stringified |
-| `notify` | `await notify(text)` | toast via the app's notice system (title = run title) |
+| `notify` | `await notify(text)` | toast via the app's notice system |
 | `fail` | `await fail(reason)` | controlled run failure — rejects the script with `reason` |
-| `show` | `const w = await show(id, props)` | mount a widget on the stage (below) |
+| `show` | `const w = await show(id, props)` | mount a widget on the stage (more below) |
 | `hide` | `await hide(target)` | remove that widget — `target` is the id or the handle `w` |
-| `audio` | object | TTS playback: `prepare` / `play` → `ScriptHandle` (below) |
+| `audio` | object | TTS playback: `prepare` / `play` → `ScriptHandle` (more below) |
 | `media` | object | `media.prefetch(cfg)` warms a slideshow's playlist cache — `cfg` is a `media` widget's props minus the stage layout |
 
 Run-context `vars` (write session state in ordinary JS variables):
@@ -77,7 +75,7 @@ to a **widget handle** `w`:
 | `w.set(patch)` | patch the live widget's props (change a label, swap text) |
 | `w.on(event, fn)` / `await w.once(event)` | widget events (below); `on` returns an unsubscribe, `once` resolves with the next payload (or `null` if removed) |
 | `w.remove()` | remove the widget from the stage |
-| `w.save(name)` | voice-only: save the captured mic audio as `recordings/<name>.wav` in the sandbox — resolves with the sandbox-relative path (usable in TTS via `<clip>`); rejects when nothing was recorded |
+| `w.save(name)` | voice-only: save the captured mic audio as `recordings/<name>.wav` in the sandbox — resolves with the relative path (usable in TTS via `<clip>` downstream); rejects when nothing was recorded |
 
 Every widget takes two **layout props**: `area` (`"full"`, a preset
 `top`/`bottom`/`center`/`left`/`right` — default `center` — or an
@@ -120,8 +118,7 @@ the widget, the type, and the bad prop.
   `contrast`/`blur`/`vignette`/`scanlines`), and `lines` (authored
   caption lines, shuffled, one per slide — they win over
   `captions="meta"`).
-- Direct form: `file` (sandbox-relative path or array, served through
-  the `/files` route) or `url` (http(s) URL or array) — exclusive, and
+- Direct form: `file` (relative path or array) or `url` (http(s) URL or array) — exclusive, and
   they silence the source props. Tempo, effects, and captions still
   apply.
 - No `done` — it plays until the script removes it; each slide switch

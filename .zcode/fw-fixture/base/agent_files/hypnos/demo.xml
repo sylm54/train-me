@@ -1,0 +1,17 @@
+<tone preset="pinknoise" volume="0.3"/>
+<voice speaker="female">
+  Welcome back. <pause duration="0.4"/>
+  <clip src="sounds/click.wav"/>
+  Let us begin.
+</voice>
+<zone name="warmup">
+  <loop loops="2">
+    <voice speaker="male">Inhale. <pause duration="1"/> And exhale.</voice>
+  </loop>
+</zone>
+<mark name="warmup-done"/>
+<random>
+  <part>Stay with the breath.</part>
+  <part>Let the shoulders drop.</part>
+</random>
+<include src="shared/part.xml"/>

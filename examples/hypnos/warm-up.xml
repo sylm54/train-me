@@ -9,7 +9,7 @@
 <voice speaker='male' speed='1.0'>
   Good morning. Sit tall and let the breath settle.
   <pause duration='0.8'/>
-  <clip src='sounds/ding.wav' volume='0.6'/>
+  <clip src='sounds/snap.wav' volume='0.6'/>
   <volume value='@fadein(1.5)'>We begin.</volume>
 </voice>
 

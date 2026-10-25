@@ -646,10 +646,6 @@ fn seed_internal_docs(agent_dir: &Path) -> std::io::Result<()> {
             contents: include_str!("../internal-docs/chastity.md"),
         },
         InternalDoc {
-            rel: "docs/internal/feedback.md",
-            contents: include_str!("../internal-docs/feedback.md"),
-        },
-        InternalDoc {
             rel: "docs/internal/data.md",
             contents: include_str!("../internal-docs/data.md"),
         },

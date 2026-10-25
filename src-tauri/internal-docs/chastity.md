@@ -1,5 +1,5 @@
 ---
-description: Chastity — the `lock` widget (`state: locked|unlocked`) inside sessions, the hidden code lifecycle, and the `chastity` bash builtin.
+description: Chastity — the `lock` widget, inside sessions, the hidden code lifecycle, and the `chastity` bash builtin.
 ---
 
 # Chastity
@@ -16,8 +16,7 @@ lock/unlock GATE on the session stage:
 - `unlocked`: releases the lock and reveals the code on screen.
 
 Show these gates inside a routine/task body to make locking/release part
-of a session flow — e.g. a `locked` gate before a long audio stretch, an
-`unlocked` gate as an earned reward.
+of a session flow.
 
 ## Lifecycle rules
 

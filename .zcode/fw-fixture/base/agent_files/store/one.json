@@ -1,0 +1,6 @@
+{
+  "title": "Lazy evening",
+  "description": "A quiet night off.",
+  "price": 25,
+  "action": { "type": "exemption", "duration": "12h", "scope": "habits" }
+}

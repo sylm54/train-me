@@ -4,7 +4,7 @@ description: Full TTS XML tag reference — speech, pauses, clips, tones, effect
 
 # TTS Tag System
 
-The TTS tag markup is an XML-like language used inside the train-me app to author spoken-word audio scripts — speech, pauses, sound-effect clips, tones, DSP effects, concurrent layering, loops, and structural markers. Scripts are fully prerendered: a script renders to a segment-tree manifest of WAV clips, and playback is pure audio. There are no interactive tags — everything a listener could answer moved to the JS orchestration layer in routine/task scripts; `<zone>`/`<mark>` markers are the named timeline seams that layer syncs to. Author scripts with `write_file` / `edit_file`, then check them with the `validate_files` tool (optionally scoped to a path) — it parses and semantically validates the markup and chases `<include>` references, reporting any errors per file.
+The TTS tag markup is an XML-like language used inside the train-me app to author spoken-word audio scripts — speech, pauses, sound-effect clips, tones, DSP effects, concurrent layering, loops, and structural markers. Scripts are fully prerendered: a script renders to a segment-tree manifest of WAV clips, and playback is pure audio. Author scripts with `write_file` / `edit_file`, then check them with the `validate_files` tool (optionally scoped to a path) — it parses and semantically validates the markup and chases `<include>` references, reporting any errors per file.
 
 ## Conventions
 - Tags are case-sensitive and lowercase.
@@ -32,8 +32,8 @@ Selects the speaking voice and applies volume/speed to inner content.
 - `duration` — default `0.5`; seconds. Inserts silence.
 
 ### `<clip>` — self-closing
-Plays a WAV file from the sandbox — sound effects are ordinary WAV files the framework ships (e.g. under `agent_files/sounds/`), not built-in types. The clip's audio is baked into the rendered clip at render time (mixed into the surrounding foreground), and the file's content hash is part of the script's freshness: editing or swapping the WAV re-renders the script.
-- `src` — required; a single file path (no wildcards). Resolved against the script's own directory first, then the agent directory root.
+Plays a WAV file from the sandbox — sound effects are ordinary WAV files the framework ships (e.g. under `sounds/`). The clip's audio is baked into the rendered clip at render time (mixed into the surrounding foreground), and the file's content hash is part of the script's freshness: editing or swapping the WAV re-renders the script.
+- `src` — required; a single file path (no wildcards). Resolved against the script's own directory first, then the directory root.
 - `volume` — optional; scalar, default 1.0.
 - `speed` — optional; scalar.
 
@@ -60,7 +60,7 @@ Children are `<part>` elements; any non-part tag or text is wrapped in an implic
 - `speed` — optional; scalar.
 
 ### `<loop>` — container (children required)
-- `loops` — default `2`; integer >1. Repeats inner content sequentially (not concurrently).
+- `loops` — default `2`; integer >1. Repeats inner content sequentially.
 
 ### `<background>` — container (children required)
 A BACKGROUND layer aligned to its start position; at the position of the tag, the background starts and continues until the end of the content of the tag.
@@ -74,8 +74,8 @@ At each playback, exactly ONE part is chosen uniformly at random and played; the
 At each playback, ALL parts are played once in a freshly-shuffled order (shuffled per-playback).
 
 ### `<include>` — self-closing (requires `src`)
-- `src` — required. Pulls in another XML file by path, or a glob of files. Nested includes are supported with circular-include detection: the same file may be included any number of times within a script (each occurrence splices it in again); only cycles — an include that reaches back to one of its ancestors — are rejected. An include is rendered as its OWN manifest and referenced by the parent: every script (top-level or included) renders exactly once into its own track directory and is linked to by everyone who uses it — include ten parents or also play it standalone, it is still synthesized once. Context (voice/speed/volume) is RESET at the include boundary, so an included file should declare its own `<voice>`. Each included file has its own content hash, so editing a sub-file re-renders only that sub-manifest and every parent picks the new audio up through its link.
-- Glob form: `src` may be a wildcard pattern like `tease/*.xml` (`*` = any run of characters, `?` = one character; wildcards only in the file name, never in directories). The pattern expands to every matching file at render time — each match renders as its own linked manifest — and one is chosen AT RANDOM PER PLAYBACK, so the same script can draw a different variant on each listen. A glob never matches the script that declares it (or any of its include ancestors), so a pattern in the same directory stays cycle-free. Matching zero files is a validation error, and the match set is part of the script's freshness: adding/removing a file in the globbed folder re-renders the script automatically, so dropping a new variant in is all it takes to add it to the pool. Use this instead of a "router" script that merely lists one `<include>` per variant.
+- `src` — required. Pulls in another XML file by path, or a glob of files. Nested includes are supported with circular-include detection: the same file may be included any number of times within a script (each occurrence splices it in again); only cycles — an include that reaches back to one of its ancestors — are rejected. Context (voice/speed/volume) is RESET at the include boundary, so an included file should declare its own `<voice>`.
+- Glob form: `src` may be a wildcard pattern like `tease/*.xml` (`*` = any run of characters, `?` = one character; wildcards only in the file name, never in directories). The pattern expands to every matching file at render time — each match renders as its own linked manifest — and one is chosen AT RANDOM PER PLAYBACK, so the same script can draw a different variant on each listen. A glob never matches the script that declares it (or any of its include ancestors), so a pattern in the same directory stays cycle-free.
 
 ### `<zone>` — container (children required)
 A named region of the timeline. Audio-transparent: the children play exactly as if the wrapper were absent. The tag becomes its own segment boundary (its position lands between rendered clips), and at playback the player notifies the interaction layer when the zone is entered, just before its audio plays — the JS orchestration layer uses zones as await/sync targets ("wait until the warmup zone starts").
@@ -125,87 +125,11 @@ Functions (unknown functions evaluate to 0):
 | `@step` | `(val, step)` | Quantize `val` to nearest multiple of `step` |
 | `@round` | `(val, decimals)` | Round `val` to `decimals` places |
 
-Constant folding: literals, binops of constants, and `@max`/`@min`/`@step`/`@round` (when all args are constant) fold to a scalar; all other functions are time-dependent.
-
 ## Authoring notes
 - Speed is clamped to 0.5–1.5 at every layer and multiplies the inherited scale.
 - Scalar volume is clamped to 0.0–1.5; expression volume is applied as a per-sample curve. The final mix is clamped to [-1.0, 1.0].
 - `<tone>` and `<background>` are background layers: aligned to their start position, then looped (tones) to the enclosing scope's foreground length.
 - `<overlay>` mixes all parts concurrently (all start together). `<loop>` repeats sequentially.
-- `<include>` renders to a linked sub-manifest in the target's own track directory (context resets at the boundary); each file is hashed separately for incremental re-rendering, and a glob include becomes a per-playback random pick among its linked matches.
-- `<random>`/`<scramble>`/`<include>`/`<zone>`/`<mark>` produce segment boundaries; decisions for `<random>`/`<scramble>` (and a glob `<include>`'s pick) happen per-playback, so each listen can differ. A `<background>` whose layer contains no dynamic construct is baked into its surrounding clip; one with a dynamic layer plays on a parallel track scoped to its enclosing sequence.
-- There are NO interactive tags — scripts are pure audio. Audience choices, ratings, and button-waits belong to the JS orchestration layer in routine/task scripts (see `docs/internal/runtime-api.md`); use `<zone>`/`<mark>` to give that layer named sync points in the audio.
-- Sound effects are `<clip>` elements pointing at WAV files shipped with the framework (e.g. `agent_files/sounds/`); a clip's audio is baked in at render time and re-renders happen automatically when the WAV changes.
-
-## Example
-
-```xml
-<!-- This tone will be played in the background for the entire thing -->
-<tone preset='pinknoise' volume='0.4'/>
-<voice speaker='male' speed='1.1'>
-  <!-- This tone will be layered in the background, starting from here until the end of the voice block -->
-  <tone preset='binaural_theta' frequency='220' volume='0.3'/>
-  Welcome to session one. <pause duration='0.4'/>
-  <clip src='sounds/ding.wav'/>
-  <volume value='@fadein(1.5)'>Let us begin with a short warm-up.</volume>
-  <effect type='reverb' preset='small_room'>Focus on your breath.</effect>
-</voice>
-<zone name='warmup'>
-  <loop loops='5'>
-    <voice speaker='female'>
-      <background volume='0.3'>
-        Deeper.
-      </background>
-      Inhale.
-      <!-- In the above case the Deep and Inhale will be played at the same time -->
-      <pause duration='1'/>
-      <background volume='0.3'>
-        Sink.
-      </background>
-      Exhale.
-    </voice>
-  </loop>
-</zone>
-<overlay>
-  <!-- This part determines how long this overlay is -->
-  <part>
-    And
-    <pause duration='2'/>
-    now
-    <speed value='0.8'>we will</speed>
-    <background><clip src='sounds/heart_beat.wav' volume='0.5'/></background>
-    rest.
-  </part>
-  <!-- This part will be played concurrently with the above, but at a lower volume and looped to fill the whole time -->
-  <part volume='0.3' speed='1.4' looped='true'>slower and slower</part>
-  <part volume='0.2' looped='true'><tone preset='binaural_alpha' frequency='120'/></part>
-</overlay>
-
-<!-- A zero-length sync point the orchestration layer can key on -->
-<mark name='warmup-done'/>
-
-<!-- Each listen plays exactly one of these -->
-<random>
-  <part>You feel a warm glow spreading through you.</part>
-  <part>A cool heaviness settles over you.</part>
-</random>
-
-<!-- Order is reshuffled every listen -->
-<scramble>
-  <part>Deeper.</part>
-  <part>Calmer.</part>
-  <part>Heavier.</part>
-</scramble>
-
-<!-- Shared subscripts render once and are linked in; a glob draws one
-     random variant per playback (see `<include>` above). -->
-<include src='closings/aftercare.xml'/>
-<include src='teases/*.xml'/>
-
-<!-- The orchestration layer can wait for this zone before showing widgets -->
-<zone name='cooldown'>
-  <voice speaker='male'>Come back slowly. Wiggle your fingers.</voice>
-  <pause duration='2'/>
-  <clip src='sounds/padlock.wav'/>
-</zone>
-```
+- `<random>`/`<scramble>`/`<include>`/`<zone>`/`<mark>` produce segment boundaries; decisions for `<random>`/`<scramble>` (and a glob `<include>`'s pick) happen per-playback, so each listen can differ.
+- Scripts are pure audio. Audience choices, ratings, and button-waits belong to the JS orchestration layer in routine/task scripts (see `docs/internal/runtime-api.md`); use `<zone>`/`<mark>` to give that layer named sync points in the audio.
+- Sound effects are `<clip>` elements pointing at WAV files shipped with the framework (e.g. `sounds/`).
