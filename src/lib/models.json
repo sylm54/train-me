@@ -30,6 +30,13 @@
         "contextWindow": 2097152
       },
       {
+        "id": "~z-ai/glm-latest",
+        "name": "GLM",
+        "description": "Pretty good",
+        "price": "Expensive, $1.40 / $4.40 per 1M",
+        "contextWindow": 1048576
+      },
+      {
         "id": "~z-ai/glm-flash-latest",
         "name": "GLM Flash",
         "description": "Fine, but a bit llm-ish",
@@ -37,10 +44,24 @@
         "contextWindow": 1048576
       },
       {
-        "id": "~deepseek/deepseek-v4-flash-latest",
-        "name": "DeepSeek V4 Flash",
+        "id": "~deepseek/deepseek-flash-latest",
+        "name": "DeepSeek Flash",
         "description": "Fine, sometimes a bit dense",
         "price": "Cheap, $0.07 / $0.50 per 1M",
+        "contextWindow": 1048576
+      },
+      {
+        "id":"xiaomi/mimo-v2.6-pro",
+        "name": "MiMo-V2.6-Pro",
+        "description": "Very good",
+        "price": "Medium, $0.435 / $0.87 per 1M",
+        "contextWindow": 1048576
+      },
+      {
+        "id": "xiaomi/mimo-v2.6-flash",
+        "name": "MiMo-V2.6-Flash",
+        "description": "Very good",
+        "price": "Cheap, $0.10 / $0.28 per 1M",
         "contextWindow": 1048576
       }
     ]
